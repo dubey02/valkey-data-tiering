@@ -700,7 +700,7 @@ void debugCommand(client *c) {
 
         sds s = sdsempty();
         s = sdscatprintf(s, "Value at:%p refcount:%d encoding:%s", (void *)val, val->refcount, strenc);
-        if (!fast) s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
+        if (!fast && !objectIsTiered(val)) s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
         /* Either lru or lfu field could work correctly which depends on server.maxmemory_policy. */
         if (lrulfu_isUsingLFU()) {
             s = sdscatprintf(s, " lfu_freq:%u lfu_access_time_minutes:%u", objectGetLFUFrequency(val), val->lru >> 8);
@@ -708,6 +708,14 @@ void debugCommand(client *c) {
             s = sdscatprintf(s, " lru:%d lru_seconds_idle:%u", val->lru, lru_getIdleSecs(val->lru));
         }
         s = sdscatprintf(s, "%s", extra);
+        /* Allocation instrumentation: report usable allocation of this entry. */
+        s = sdscatprintf(s, " ext_entry_usable:%zu", zmalloc_usable_size(val));
+        if (!val->hasembval && !objectIsTiered(val)) {
+            s = sdscatprintf(s, " ext_val_usable:%zu", sdsAllocSize(objectGetVal(val)));
+        } else if (objectIsTiered(val)) {
+            /* Tiered tombstone: val_ptr is an empty sds */
+            s = sdscatprintf(s, " ext_val_usable:%zu", sdsAllocSize(objectGetVal(val)));
+        }
         addReplyStatusLength(c, s, sdslen(s));
         sdsfree(s);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "sdslen") && c->argc == 3) {

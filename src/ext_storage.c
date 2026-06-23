@@ -376,13 +376,7 @@ static ValkeyModuleExternalStorageMsg *createStorageMessage(int type, int db_id,
 }
 #endif
 
-/* ---------------------------------------------------------------------------
- * Helper: check if dbEntry is embedded
- * ---------------------------------------------------------------------------*/
 
-static bool isEmbeddedObject(dbEntry *o) {
-    return (o->encoding == OBJ_ENCODING_EMBSTR || o->encoding == OBJ_ENCODING_INT || o->hasembval);
-}
 
 /* ---------------------------------------------------------------------------
  * keyBlocksClient — State machine aware blocking decision
@@ -718,7 +712,32 @@ void processCompletedStorageRequests(void) {
                          * OR compound: list/set/hash/zset/stream), reclaiming the
                          * RAM, then tombstone the entry as ONLY_FLASH. */
                         if (entry->hasembval) {
-                            objectUnembedVal(entry);
+                            /* Embedded value: build a smaller non-embedded tiered
+                             * tombstone preserving key+expire, swap it into the
+                             * kvstore slot, and free the old large allocation. */
+                            robj *tomb = createObject(OBJ_STRING, sdsnewlen("", 0));
+                            tomb->encoding = OBJ_ENCODING_TIERED;
+                            tomb->lru = entry->lru;
+                            sds key_copy = objectGetKey(entry);
+                            long long expire = objectGetExpire(entry);
+                            tomb = objectSetKeyAndExpire(tomb, key_copy, expire);
+
+                            /* Directly replace the hashtable slot (defrag pattern). */
+                            int slot = getKVStoreIndexForKey(key_name);
+                            void **ref = kvstoreHashtableFindRef(db->keys, slot, key_name);
+                            serverAssert(ref != NULL);
+                            robj *old = *ref;
+                            *ref = tomb;
+
+                            /* Update expires dict if key has TTL. */
+                            if (expire >= 0) {
+                                hashtable *ht = kvstoreGetHashtable(db->expires, slot);
+                                hashtableReplaceReallocatedEntry(ht, old, tomb);
+                            }
+
+                            /* Free old entry (zfree reclaims the large embedded allocation). */
+                            decrRefCount(old);
+                            /* entry is now DANGLING. */
                         } else {
                             robj *old = createObject(entry->type, objectGetVal(entry));
                             old->encoding = entry->encoding;
@@ -727,9 +746,9 @@ void processCompletedStorageRequests(void) {
                              * for the placeholder allocation below. */
                             objectSetVal(entry, NULL);
                             decrRefCount(old);
+                            entry->encoding = OBJ_ENCODING_TIERED;
+                            objectSetVal(entry, sdsnewlen("", 0));
                         }
-                        entry->encoding = OBJ_ENCODING_TIERED;
-                        objectSetVal(entry, sdsnewlen("", 0));
                         total_items_spilled_to_ext_storage++;
                         num_items_on_flash++;
                         extStorageSetState(db, key_name, TIERING_STATE_ONLY_FLASH, 0);
@@ -792,28 +811,38 @@ void processCompletedStorageRequests(void) {
                     /* FATAL assertion: read must succeed (matching dt-poc behavior) */
                     completion_read_ok++;
                     if (entry != NULL && objectIsTiered(entry)) {
-                        /* Restore value to existing entry. Free the tombstone
-                         * placeholder (empty sds) first. */
-                        void *placeholder = objectGetVal(entry);
-                        if (placeholder != NULL) sdsfree((sds)placeholder);
-                        if (new_value->hasembval) {
-                            /* EMBSTR: the value bytes live INSIDE new_value's own
-                             * allocation (objectGetVal returns a pointer into it).
-                             * Aliasing that pointer into the entry and then freeing
-                             * new_value would leave entry->val_ptr dangling — a
-                             * use-after-free that crashes on the next read once the
-                             * freed region is reused under allocation churn. Detach
-                             * into a standalone RAW sds the entry owns. Values that
-                             * embed (<=~115B here) are restored as RAW; correctness
-                             * over re-embedding. */
-                            objectSetVal(entry, sdsdup((sds)objectGetVal(new_value)));
-                            entry->encoding = OBJ_ENCODING_RAW;
-                            entry->type = new_value->type;
+                        if (new_value->type == OBJ_STRING) {
+                            /* Re-embed: reconstruct via embedding-aware constructor
+                             * so embeddable values return to embstr shape. This also
+                             * avoids the embstr restore UAF: the value bytes are
+                             * copied into the new entry's own allocation instead of
+                             * aliasing into new_value before it is freed. */
+                            sds emb_key = objectGetKey(entry);
+                            long long expire = objectGetExpire(entry);
+                            sds val_sds = (sds)objectGetVal(new_value);
+                            robj *restored = createStringObjectWithKeyAndExpire(
+                                val_sds, sdslen(val_sds), emb_key, expire);
+                            restored->lru = entry->lru;
+
+                            /* Swap into kvstore slot (defrag pattern). */
+                            int slot = getKVStoreIndexForKey(key_name);
+                            void **ref = kvstoreHashtableFindRef(db->keys, slot, key_name);
+                            serverAssert(ref != NULL);
+                            robj *old = *ref;
+                            *ref = restored;
+
+                            /* Update expires dict if key has TTL. */
+                            if (expire >= 0) {
+                                hashtable *ht = kvstoreGetHashtable(db->expires, slot);
+                                hashtableReplaceReallocatedEntry(ht, old, restored);
+                            }
+
+                            decrRefCount(old);
                             decrRefCount(new_value);
                         } else {
-                            /* RAW/INT string or compound (list/set/hash/zset/stream):
-                             * the value is a separate allocation (or an inline int),
-                             * so transfer the pointer and free only the robj wrapper. */
+                            /* Non-string: in-place restore (transfer sds, no copy). */
+                            void *placeholder = objectGetVal(entry);
+                            if (placeholder != NULL) sdsfree((sds)placeholder);
                             objectSetVal(entry, objectGetVal(new_value));
                             entry->encoding = new_value->encoding;
                             entry->type = new_value->type;
@@ -926,7 +955,9 @@ static int spillItemAsync(sds key, int db_id) {
     dbEntry *item = dbFind(db, key);
 
     if (item == NULL) return -1;
-    if (isEmbeddedObject(item)) return -1;
+    /* Skip INT-encoded strings: the integer lives in the pointer slot itself,
+     * so spilling reclaims nothing.  EMBSTR values ARE spillable (Phase 1). */
+    if (item->encoding == OBJ_ENCODING_INT) return -1;
     if (objectIsTiered(item)) return -1;
     if (item->refcount != 1) return -1;
 
