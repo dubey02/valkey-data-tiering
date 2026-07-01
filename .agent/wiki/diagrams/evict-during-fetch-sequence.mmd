@@ -1,0 +1,12 @@
+%% Eviction arriving during an in-flight fetch -> PENDING_EVICT. Source: ext_storage.c, state-machine-design.md
+%% Render: mmdc -i evict-during-fetch-sequence.mmd -o evict-during-fetch-sequence.png -p puppeteer-config.json
+sequenceDiagram
+    participant EV as evict.c
+    participant E as ext_storage.c
+    participant IO as backend IO thread
+    Note over E: key in COPYING_TO_MEMORY (fetch in-flight)
+    EV->>E: eviction selects this key
+    E->>E: COPYING_TO_MEMORY -> PENDING_EVICT
+    IO-->>E: fetch completion [beforeSleep]
+    E->>E: discard fetched value, dbDelete(key)
+    Note over E: avoids fetch-just-to-evict thrash

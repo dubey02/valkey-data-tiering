@@ -39,6 +39,7 @@
  */
 
 #include "server.h"
+#include "ext_storage.h"
 #include "hashtable.h"
 #include "eval.h"
 #include "script.h"
@@ -707,6 +708,17 @@ static void defragKey(defragKeysCtx *ctx, robj **elemref) {
     robj *newob, *ob;
     unsigned char *newzl;
     ob = *elemref;
+
+    /* Skip tiered entries — value is on external storage, nothing to defrag. */
+    if (objectIsTiered(ob)) return;
+
+    /* Skip entries with in-flight tiering IO — IO thread holds references.
+     * COPYING_TO_FLASH: IO thread reading value for serialization.
+     * COPYING_TO_MEMORY: fetch in-flight, entry has placeholder.
+     * PENDING_EVICT: eviction pending, don't relocate. */
+    if (ob->tiering_state == TIERING_STATE_COPYING_TO_FLASH ||
+        ob->tiering_state == TIERING_STATE_COPYING_TO_MEMORY ||
+        ob->tiering_state == TIERING_STATE_PENDING_EVICT) return;
 
     /* Try to defrag robj and/or string value. */
     if ((newob = activeDefragStringOb(ob))) {

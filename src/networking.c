@@ -40,6 +40,8 @@
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "ext_storage_throttle.h"
+#include "ext_storage.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -171,7 +173,7 @@ typedef enum {
  * for a string object. This includes internal fragmentation. */
 size_t getStringObjectSdsUsedMemory(robj *o) {
     serverAssertWithInfo(NULL, o, o->type == OBJ_STRING);
-    if (objectGetEncoding(o) != OBJ_ENCODING_INT) {
+    if (o->encoding != OBJ_ENCODING_INT) {
         return sdsAllocSize(objectGetVal(o));
     }
     return 0;
@@ -181,7 +183,7 @@ size_t getStringObjectSdsUsedMemory(robj *o) {
  * This does NOT include internal fragmentation or sds unused space. */
 size_t getStringObjectLen(robj *o) {
     serverAssertWithInfo(NULL, o, o->type == OBJ_STRING);
-    switch (objectGetEncoding(o)) {
+    switch (o->encoding) {
     case OBJ_ENCODING_RAW: return sdslen(objectGetVal(o));
     case OBJ_ENCODING_EMBSTR: return sdslen(objectGetVal(o));
     default: return 0; /* Just integer encoding for now. */
@@ -796,6 +798,26 @@ void addReply(client *c, robj *obj) {
         char buf[32];
         size_t len = ll2string(buf, sizeof(buf), (long)objectGetVal(obj));
         _addReplyToBufferOrList(c, buf, len);
+    } else if (obj->encoding == OBJ_ENCODING_TIERED) {
+        /* Defensive: a tiered object reached addReply — this means preCommandExec
+         * failed to block the client for this key. Log details for debugging. */
+        serverLog(LL_WARNING, "TIERED_REPLY_BUG: tiered object reached addReply, type=%d refcount=%d client_cmd=%s client_id=%llu pending_cmd=%d",
+            obj->type, obj->refcount,
+            c->cmd ? c->cmd->declared_name : "NULL",
+            (unsigned long long)c->id,
+            c->flag.pending_command);
+        /* Log the key if we can find it */
+        if (c->argc > 1 && c->argv[1]) {
+            serverLog(LL_WARNING, "TIERED_REPLY_BUG: key=%s db=%d",
+                (char*)objectGetVal(c->argv[1]), c->db->id);
+            /* Log the state of this key */
+            sds key_str = (sds)objectGetVal(c->argv[1]);
+            TieringState st = extStorageGetState(c->db, key_str);
+            dbEntry *de = dbFind(c->db, key_str);
+            serverLog(LL_WARNING, "TIERED_REPLY_BUG: state=%d entry=%p entry_enc=%d",
+                (int)st, (void*)de, de ? de->encoding : -1);
+        }
+        _addReplyToBufferOrList(c, "-ERR value on flash\r\n", 21);
     } else {
         serverPanic("Wrong obj->encoding in addReply()");
     }
@@ -1967,6 +1989,9 @@ void unlinkClient(client *c) {
     /* If this is marked as current client unset it. */
     if (c->conn && server.current_client == c) server.current_client = NULL;
 
+    /* Remove from throttle queue if queued (prevents dangling pointer in timer). */
+    if (ext_data_enabled) extStorageThrottle_removeClient(c);
+
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
      * conn is already set to NULL. */
@@ -2040,6 +2065,10 @@ void unlinkClient(client *c) {
 
     /* Clear the tracking status. */
     if (c->flag.tracking) disableTracking(c);
+
+    /* Client must not be in blocked or unblocked state at this point.
+     * Guaranteed by freeClient ordering: unblockClient -> freeClientBlockingState -> unlinkClient. */
+    serverAssert(!c->flag.blocked && !c->flag.unblocked);
 }
 
 /* Clear the client state to resemble a newly connected client. */
@@ -2169,7 +2198,7 @@ int freeClient(client *c) {
     /* Deallocate structures used to block on blocking ops. */
     /* If there is any in-flight command, we don't record their duration. */
     c->duration = 0;
-    if (c->flag.blocked) unblockClient(c, 1);
+    if (c->flag.blocked) unblockClient(c, 0);
 
     freeClientBlockingState(c);
     freeClientPubSubData(c);
@@ -3929,6 +3958,7 @@ int processPendingCommandAndInputBuffer(client *c) {
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
      * So whenever we change the code here we need to consider if we need this change on module
      * blocked client as well */
+    if (c->flag.close_asap) return C_ERR;
     if (c->flag.pending_command) {
         c->flag.pending_command = 0;
         if (processCommandAndResetClient(c) == C_ERR) {
@@ -4305,6 +4335,14 @@ static bool readToQueryBuf(client *c) {
 #define REPL_MAX_READS_PER_IO_EVENT 25
 void readQueryFromClient(connection *conn) {
     client *c = connGetPrivateData(conn);
+
+    /* External storage throttle: if memory pressure is high, queue this
+     * client and stop reading from its socket. The throttle timer will
+     * re-install the read handler when tokens are available. */
+    if (ext_data_enabled && extStorageThrottle_shouldThrottle(c)) {
+        return;
+    }
+
     /* Check if we can send the client to be handled by the IO-thread */
     if (postponeClientRead(c)) return;
 

@@ -1,0 +1,2270 @@
+{
+  "edges": [
+    {
+      "created": "2026-06-03",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "01-architecture.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/delete.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "00-overview.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/pluggable-storage-api.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/delete.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/evict-during-fetch.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/persistence-replication.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "contains",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/bridge-api.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/throttle-api.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/info-metrics.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "01-architecture.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/config-and-module-args.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/backends.md",
+      "invalidated": null,
+      "kind": "implements",
+      "needs_review": false,
+      "note": "every backend realises the storageType vtable",
+      "source": "llm_relation",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/backends.md",
+      "invalidated": null,
+      "kind": "depends_on",
+      "needs_review": false,
+      "note": "real backends serialise robj* to bytes on their IO thread",
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/backends.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/pluggable-storage-api.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/backends.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/backends.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/config-and-module-args.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/backends.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "two backend contradictions (unwired sync rocksdb; unregistered key_may_exist) fold here",
+      "source": "llm_relation",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/bridge-api.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "depends_on",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/pluggable-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "components/bridge-layer.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "carries ram_bytes (serialize footprint) on the completion msg",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "depends_on",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "calls",
+      "needs_review": false,
+      "note": "spill/fetch/del submitted via the bridge",
+      "source": "human",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "calls",
+      "needs_review": false,
+      "note": "records latency, reads throttle rate",
+      "source": "human",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "depends_on",
+      "needs_review": false,
+      "note": "borrowed robj serialized on the IO thread",
+      "source": "human",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "depends_on",
+      "needs_review": false,
+      "note": "spill candidate selection + eviction override",
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/delete.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/info-metrics.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "cap-less spill loop gates on projected memory",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "components/engine-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "items_spillover_batch_size now dead config",
+      "source": "llm_relation",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/delete.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "components/eviction-integration.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "spill controller gates on projected memory (Smith predictor)",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "00-overview.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/memory-accounting.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/persistence-replication.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "the tiered-state predicate objectIsTiered drives every skip",
+      "source": "llm_relation",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/persistence-replication.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "spill uses RDB DUMP; persistence here SKIPS instead of serialising",
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/persistence-replication.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "tiered val is an empty-SDS placeholder, relevant to AOF-plain emit",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/persistence-replication.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/persistence-replication.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "tiered keys dropped from RDB/full-sync; AOF-plain placeholder emit",
+      "source": "human",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/persistence-replication.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "each node owns a local backend; tiering state not replicated",
+      "source": "llm_relation",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "components/persistence-replication.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/pluggable-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/pluggable-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/pluggable-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/pluggable-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "contradicts",
+      "needs_review": false,
+      "note": "DUMP-format spill supports all types vs string-only limit",
+      "source": "human",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "components/serialization.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "IO-thread serialize measures ram_bytes for the Smith predictor",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/state-machine.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/evict-during-fetch.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/state-machine.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/state-machine.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/state-machine.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/state-machine.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "data-type tests exercise the spill round-trip",
+      "source": "human",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "read-after-spill tests exercise the fetch path",
+      "source": "human",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "DUMP/RESTORE + encoding-preservation tests",
+      "source": "human",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "pressure-driven (natural) spill test",
+      "source": "human",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "AOF/RDB crash-safety + persistence tests",
+      "source": "human",
+      "to": "components/persistence-replication.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "flashcache-mock default backend; ext-storage.tcl module load",
+      "source": "human",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "ext-storage-* config overrides; introspection skip_configs",
+      "source": "human",
+      "to": "interfaces/config-and-module-args.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "helpers poll the spill counter",
+      "source": "human",
+      "to": "interfaces/info-metrics.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "components/testing.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "AOF-reload test is the L1 regression marker",
+      "source": "human",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "components/throttle-equilibrium.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/throttle-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/throttle-equilibrium.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/throttle-equilibrium.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "components/throttle-equilibrium.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/info-metrics.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "components/throttle-equilibrium.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "spill owns [1.0x,1.1x] on projected; throttle reads raw used_memory",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "01-architecture.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "00-overview.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/pluggable-storage-api.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/persistence-replication.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "ADR-010 cap-less projected-gated spill controller",
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "ADR-010 Smith predictor / projected memory",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/adr-index.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "decisions/adr-index.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "contradicts",
+      "needs_review": false,
+      "note": "string-only limit superseded by createDumpPayload (resolved)",
+      "source": "human",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/persistence-replication.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-05",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "00-overview.md"
+    },
+    {
+      "created": "2026-06-17",
+      "from": "decisions/known-limitations.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "L1 regression marker is the failing AOF-reload test",
+      "source": "human",
+      "to": "components/testing.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "flows/completion-drain.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/completion-drain.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/completion-drain.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/completion-drain.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/completion-drain.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/completion-drain.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/delete.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/delete.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "flows/delete.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/delete.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/delete.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/delete.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/delete.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "flows/evict-during-fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/evict-during-fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/evict-during-fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/evict-during-fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/delete.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/evict-during-fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "flows/fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "flows/fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/evict-during-fetch.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/fetch.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/delete.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/info-metrics.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/fetch.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "flows/spill.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "spill gates on projected memory (Smith predictor)",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/bridge-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/bridge-layer.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/bridge-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/pluggable-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/bridge-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "configures",
+      "needs_review": false,
+      "note": "backend, db_path, capacity",
+      "source": "human",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "configures",
+      "needs_review": false,
+      "note": "throttle thresholds",
+      "source": "human",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "configures",
+      "needs_review": false,
+      "note": "ext-storage-enabled, maxmemory",
+      "source": "human",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/storagetype-vtable.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/bridge-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/ext-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/info-metrics.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/config-and-module-args.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/spill.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/state-machine.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/eviction-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/info-metrics.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/config-and-module-args.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "projected-memory + inflight RAM accounting API",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "interfaces/ext-storage-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "items_spillover_batch_size now vestigial",
+      "source": "llm_relation",
+      "to": "decisions/known-limitations.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/info-metrics.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/info-metrics.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "interfaces/throttle-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/info-metrics.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/engine-integration.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/info-metrics.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "flows/completion-drain.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "interfaces/info-metrics.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "inflight_spill_ram_bytes / projected_memory INFO fields",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/storagetype-vtable.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/pluggable-storage-api.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/storagetype-vtable.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/backends.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/storagetype-vtable.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "components/serialization.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/storagetype-vtable.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/bridge-api.md"
+    },
+    {
+      "created": "2026-06-08",
+      "from": "interfaces/storagetype-vtable.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": "storageCompletion.ram_bytes feeds the spill Smith predictor",
+      "source": "llm_relation",
+      "to": "components/memory-accounting.md"
+    },
+    {
+      "created": "2026-06-03",
+      "from": "interfaces/throttle-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "human",
+      "to": "components/throttle-equilibrium.md"
+    },
+    {
+      "created": "2026-06-04",
+      "from": "interfaces/throttle-api.md",
+      "invalidated": null,
+      "kind": "refers_to",
+      "needs_review": false,
+      "note": null,
+      "source": "llm_relation",
+      "to": "interfaces/info-metrics.md"
+    }
+  ],
+  "nodes": [
+    {
+      "claim_count": 6,
+      "id": "00-overview.md",
+      "label": "00-overview",
+      "migrated": true,
+      "status": "active",
+      "tier": "wisdom",
+      "type": "overview"
+    },
+    {
+      "claim_count": 8,
+      "id": "01-architecture.md",
+      "label": "01-architecture",
+      "migrated": true,
+      "status": "active",
+      "tier": "wisdom",
+      "type": "overview"
+    },
+    {
+      "claim_count": 16,
+      "id": "components/backends.md",
+      "label": "backends",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 8,
+      "id": "components/bridge-layer.md",
+      "label": "bridge-layer",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 10,
+      "id": "components/engine-integration.md",
+      "label": "engine-integration",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 9,
+      "id": "components/eviction-integration.md",
+      "label": "eviction-integration",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 8,
+      "id": "components/memory-accounting.md",
+      "label": "memory-accounting",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 12,
+      "id": "components/persistence-replication.md",
+      "label": "persistence-replication",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 8,
+      "id": "components/pluggable-storage-api.md",
+      "label": "pluggable-storage-api",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 7,
+      "id": "components/serialization.md",
+      "label": "serialization",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 9,
+      "id": "components/state-machine.md",
+      "label": "state-machine",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 56,
+      "id": "components/testing.md",
+      "label": "testing",
+      "migrated": true,
+      "status": "draft",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 9,
+      "id": "components/throttle-equilibrium.md",
+      "label": "throttle-equilibrium",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "component"
+    },
+    {
+      "claim_count": 9,
+      "id": "decisions/adr-index.md",
+      "label": "adr-index",
+      "migrated": true,
+      "status": "active",
+      "tier": "wisdom",
+      "type": "decision"
+    },
+    {
+      "claim_count": 15,
+      "id": "decisions/known-limitations.md",
+      "label": "known-limitations",
+      "migrated": true,
+      "status": "active",
+      "tier": "wisdom",
+      "type": "decision"
+    },
+    {
+      "claim_count": 6,
+      "id": "flows/completion-drain.md",
+      "label": "completion-drain",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "flow"
+    },
+    {
+      "claim_count": 6,
+      "id": "flows/delete.md",
+      "label": "delete",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "flow"
+    },
+    {
+      "claim_count": 6,
+      "id": "flows/evict-during-fetch.md",
+      "label": "evict-during-fetch",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "flow"
+    },
+    {
+      "claim_count": 6,
+      "id": "flows/fetch.md",
+      "label": "fetch",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "flow"
+    },
+    {
+      "claim_count": 6,
+      "id": "flows/spill.md",
+      "label": "spill",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "flow"
+    },
+    {
+      "claim_count": 5,
+      "id": "interfaces/bridge-api.md",
+      "label": "bridge-api",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "interface"
+    },
+    {
+      "claim_count": 6,
+      "id": "interfaces/config-and-module-args.md",
+      "label": "config-and-module-args",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "interface"
+    },
+    {
+      "claim_count": 7,
+      "id": "interfaces/ext-storage-api.md",
+      "label": "ext-storage-api",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "interface"
+    },
+    {
+      "claim_count": 6,
+      "id": "interfaces/info-metrics.md",
+      "label": "info-metrics",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "interface"
+    },
+    {
+      "claim_count": 8,
+      "id": "interfaces/storagetype-vtable.md",
+      "label": "storagetype-vtable",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "interface"
+    },
+    {
+      "claim_count": 5,
+      "id": "interfaces/throttle-api.md",
+      "label": "throttle-api",
+      "migrated": true,
+      "status": "active",
+      "tier": "working",
+      "type": "interface"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant C as client
+    participant E as ext_storage.c (preCommandExec)
+    participant S as bridge / storage vtable
+    participant IO as backend IO thread
+    participant B as blocked.c
+    C->>E: GET key
+    Note over E: keyBlocksClient: state == ONLY_FLASH
+    E->>S: extStorageBridge_submitGet(db,key)
+    E->>E: ONLY_FLASH -> COPYING_TO_MEMORY
+    E->>B: blockClientInUseOnKeys, pending_command=1
+    E-->>C: (blocked, command rejected for now)
+    S->>IO: get_async / middleware
+    Note over IO: read + deserialize on IO thread<br/>(rdbLoadObject) -> robj
+    IO-->>E: READ completion (deserialized robj) [beforeSleep]
+    E->>E: restore robj into entry, encoding/type back, setExpire if ttl
+    E->>E: COPYING_TO_MEMORY -> ONLY_MEMORY
+    E->>B: unblockClientsInUseOnKey
+    B-->>C: re-execute GET (now a RAM hit)

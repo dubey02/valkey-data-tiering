@@ -31,7 +31,7 @@ endif
 ifneq ($(OPTIMIZATION),-O0)
 	OPTIMIZATION+=-fno-omit-frame-pointer
 endif
-DEPENDENCY_TARGETS=libvalkey linenoise hdr_histogram fpconv
+DEPENDENCY_TARGETS=libvalkey linenoise hdr_histogram fpconv flashcache
 NODEPS:=clean distclean
 
 # Default settings
@@ -139,6 +139,10 @@ endif
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(SERVER_CFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(OPT) $(SERVER_LDFLAGS) $(DEBUG)
 FINAL_LIBS=-lm
+
+# FlashCache storage backend (built as a dep)
+FC_BUILD=../deps/flashcache/build
+FINAL_LIBS+=-L$(FC_BUILD) -lflashcache -laio
 DEBUG=-g -ggdb
 
 # Linux ARM32 needs -latomic at linking time
@@ -502,6 +506,13 @@ ENGINE_SERVER_OBJ = \
     eval.o \
     evict.o \
     expire.o \
+    ext_storage.o \
+    ext_storage_bridge.o \
+    ext_storage_throttle.o \
+    storage/storage_dispatch.o \
+    storage/storage_middleware.o \
+    storage/storage_mock.o \
+    storage/storage_flashcache_real.o \
     fifo.o \
     functions.o \
     geo.o \
@@ -755,6 +766,9 @@ DEP = $(ENGINE_SERVER_OBJ:%.o=%.d) $(ENGINE_CLI_OBJ:%.o=%.d) $(ENGINE_BENCHMARK_
 # depending on a single artifact, build all dependencies first.
 %.o: %.c .make-prerequisites
 	$(SERVER_CC) -MMD -o $@ -c $<
+
+storage/%.o: storage/%.c .make-prerequisites
+	$(SERVER_CC) -DSTORAGE_USE_ZMALLOC -Istorage -I../deps/flashcache/src/include -I../deps/flashcache/src -MMD -o $@ -c $<
 
 trace/%.o: trace/%.c .make-prerequisites
 	$(SERVER_CC) -Itrace -MMD -o $@ -c $<

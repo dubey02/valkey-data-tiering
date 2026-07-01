@@ -1,0 +1,27 @@
+// System context — NKS tiering. Source: src/storage.h, DATA-TIERING.md, ext_storage.c
+// Render: dot -Tpng system-context.dot -o system-context.png
+digraph system_context {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fillcolor="#eef3fb", fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=9];
+
+    subgraph cluster_engine {
+        label="Valkey engine (main thread)";
+        style="rounded,filled"; fillcolor="#f6f8fc";
+        client  [label="client command\n(GET/SET/DEL)"];
+        engine  [label="ext_storage.c\nstate machine + spill loop\n+ preCommandExec gate"];
+        evict   [label="evict.c\neviction override"];
+    }
+
+    api     [label="storage.h\nstorageType vtable\n(sync | async | middleware)", fillcolor="#fff4d6"];
+    backend [label="backend\nflashcache / rocksdb", fillcolor="#fdeede"];
+    nvme    [label="NVMe disk", shape=cylinder, fillcolor="#eeeeee"];
+
+    client -> engine;
+    evict  -> engine [label="spill candidate"];
+    engine -> api    [label="put/get/del\n(spill / fetch)"];
+    api    -> backend;
+    backend -> nvme;
+    backend -> api  [label="completion", style=dashed];
+    api    -> engine [label="completion\n(beforeSleep)", style=dashed];
+}

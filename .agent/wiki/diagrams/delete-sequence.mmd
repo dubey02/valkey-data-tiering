@@ -1,0 +1,14 @@
+%% DEL on a flash key (no fetch needed). Source: ext_storage.c, context/state-machine-design.md
+%% Render: mmdc -i delete-sequence.mmd -o delete-sequence.png -p puppeteer-config.json
+sequenceDiagram
+    participant C as client
+    participant E as ext_storage.c
+    participant S as storage vtable
+    participant IO as backend IO thread
+    C->>E: DEL key (state ONLY_FLASH)
+    E->>S: storageSubmitDel(db,key) (async delete, no fetch)
+    E->>E: ONLY_FLASH -> COPYING_TO_MEMORY (delete in-flight)
+    E-->>C: (blocked)
+    IO-->>E: delete completion [beforeSleep]
+    E->>E: dbDelete(key), remove state, signalKeyAsReady
+    E-->>C: unblock, DEL returns

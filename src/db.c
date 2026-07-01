@@ -35,6 +35,8 @@
 #include "functions.h"
 #include "io_threads.h"
 #include "module.h"
+#include "ext_storage.h"
+#include "ext_storage_bridge.h"
 #include "vector.h"
 #include "expire.h"
 #include "crc16_slottable.h"
@@ -174,7 +176,7 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
 /* For hash keys, checks if they contain volatile items and updates tracking accordingly.
  * Always accesses the tracking kvstore, even if the tracking state doesn't change. */
 void dbUpdateObjectWithVolatileItemsTracking(serverDb *db, robj *o) {
-    if (objectGetType(o) == OBJ_HASH) {
+    if (o->type == OBJ_HASH) {
         if (hashTypeHasVolatileFields(o)) {
             dbTrackKeyWithVolatileItems(db, o);
         } else {
@@ -359,7 +361,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         old = val;
     } else {
         /* Replace the old value at its location in the key space. */
-        objectSetLRU(val, objectGetLRU(old));
+        val->lru = old->lru;
         long long expire = objectGetExpire(old);
         new = objectSetKeyAndExpire(val, objectGetVal(key), expire);
         *oldref = new;
@@ -500,7 +502,7 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         }
 
         /* If deleting a hash object, un-track it from the volatile items tracking if it contains volatile items.*/
-        if (objectGetType(val) == OBJ_HASH && hashTypeHasVolatileFields(val)) {
+        if (val->type == OBJ_HASH && hashTypeHasVolatileFields(val)) {
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
@@ -525,7 +527,7 @@ int dbGenericDelete(serverDb *db, robj *key, int async, int flags) {
 /* Add a key with volatile items to the tracking kvstore. */
 void dbTrackKeyWithVolatileItems(serverDb *db, robj *o) {
     serverAssert(objectGetKey(o));
-    if (objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields(o)) {
+    if (o->type == OBJ_HASH && hashTypeHasVolatileFields(o)) {
         int dict_index = getKVStoreIndexForKey(objectGetKey(o));
         kvstoreHashtableAdd(db->keys_with_volatile_items, dict_index, o);
     }
@@ -583,7 +585,7 @@ int dbDelete(serverDb *db, robj *key) {
  * using an sdscat() call to append some data, or anything else.
  */
 robj *dbUnshareStringValue(serverDb *db, robj *key, robj *o) {
-    serverAssert(objectGetType(o) == OBJ_STRING);
+    serverAssert(o->type == OBJ_STRING);
     if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
         robj *decoded = getDecodedObject(o);
         o = createRawStringObject(objectGetVal(decoded), sdslen(objectGetVal(decoded)));
@@ -834,6 +836,13 @@ void flushdbCommand(client *c) {
 
     if (getFlushCommandFlags(c, &flags) == C_ERR) return;
 
+    /* Flush flash storage synchronously BEFORE deleting in-memory keys.
+     * This drains all in-flight IO and wipes the flash index, preventing
+     * crashes from deleting keys mid-spill. */
+    if (ext_data_enabled) {
+        extStorageBridge_flushDB(c->db->id);
+    }
+
     /* flushdb should not flush the functions */
     server.dirty += emptyData(c->db->id, flags | EMPTYDB_NOFUNCTIONS, NULL);
 
@@ -857,6 +866,10 @@ void flushdbCommand(client *c) {
 void flushallCommand(client *c) {
     int flags;
     if (getFlushCommandFlags(c, &flags) == C_ERR) return;
+
+    if (ext_data_enabled) {
+        extStorageBridge_flushAll();
+    }
 
     /* flushall should not flush the functions */
     flushAllDataAndResetRDB(flags | EMPTYDB_NOFUNCTIONS);
@@ -1067,7 +1080,7 @@ void hashtableScanCallback(void *privdata, void *entry) {
         zskiplistNode *node = (zskiplistNode *)entry;
         key = zslGetNodeElement(node);
         /* zset data is copied after filtering by key */
-    } else if (objectGetType(o) == OBJ_HASH) {
+    } else if (o->type == OBJ_HASH) {
         key = entryGetField(entry);
         if (!data->only_keys) {
             val.buf = entryGetValue(entry, &val.len);
@@ -1230,7 +1243,7 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
 
     /* Object must be NULL (to iterate keys names), or the type of the object
      * must be Set, Sorted Set, or Hash. */
-    serverAssert(o == NULL || o->type == OBJ_SET || objectGetType(o) == OBJ_HASH || o->type == OBJ_ZSET);
+    serverAssert(o == NULL || o->type == OBJ_SET || o->type == OBJ_HASH || o->type == OBJ_ZSET);
 
     /* Iterate the collection.
      *
@@ -1251,7 +1264,7 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
     } else if (o->type == OBJ_SET && o->encoding == OBJ_ENCODING_HASHTABLE) {
         ht = objectGetVal(o);
         free_callback = NULL;
-    } else if (objectGetType(o) == OBJ_HASH && o->encoding == OBJ_ENCODING_HASHTABLE) {
+    } else if (o->type == OBJ_HASH && o->encoding == OBJ_ENCODING_HASHTABLE) {
         ht = objectGetVal(o);
         free_callback = NULL;
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -1331,7 +1344,7 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
         }
         setTypeReleaseIterator(si);
         cursor = 0;
-    } else if ((objectGetType(o) == OBJ_HASH || o->type == OBJ_ZSET) && o->encoding == OBJ_ENCODING_LISTPACK) {
+    } else if ((o->type == OBJ_HASH || o->type == OBJ_ZSET) && o->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *p = lpFirst(objectGetVal(o));
         unsigned char *str;
         int64_t len;
@@ -1923,7 +1936,7 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     long long old_when = objectGetExpire(val);
 
     robj *newval = objectSetExpire(val, when);
-    if (objectGetType(newval) == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
+    if (newval->type == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
         /* Replace the pointer in the keys_with_volatile_items table without accessing the old pointer. */
         int dict_index = getKVStoreIndexForKey(objectGetKey(newval));
         hashtable *volatile_items_ht = kvstoreGetHashtable(db->keys_with_volatile_items, dict_index);
@@ -2162,6 +2175,19 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
     } else {
         if (!keyIsExpiredWithDictIndexImpl(db, key, dict_index)) return KEY_VALID;
     }
+
+    /* Tiering: if key has in-flight IO (spill or fetch), don't delete now.
+     * The IO thread holds references — deleting would cause UAF.
+     * Return KEY_EXPIRED so caller treats it as gone, but defer actual deletion. */
+    if (ext_data_enabled) {
+        TieringState state = extStorageGetState(db, objectGetVal(key));
+        if (state == TIERING_STATE_COPYING_TO_FLASH ||
+            state == TIERING_STATE_COPYING_TO_MEMORY ||
+            state == TIERING_STATE_PENDING_EVICT) {
+            return KEY_EXPIRED;
+        }
+    }
+
     expirationPolicy policy = getExpirationPolicyWithFlags(flags);
     if (policy == POLICY_IGNORE_EXPIRE) /* Ignore keys expiration. treat all keys as valid. */
         return KEY_VALID;

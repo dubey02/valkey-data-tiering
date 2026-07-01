@@ -1,0 +1,26 @@
+sequenceDiagram
+    participant EL as beforeSleep / 1ms timer / performEvictions
+    participant E as ext_storage.c (main thread)
+    participant S as bridge / storage vtable
+    participant IO as backend IO thread
+    participant K as key entry (robj)
+    EL->>E: processCompletedStorageRequestsAndSpillOldItems()
+    Note over E: spillFillToProjected (cap-less):<br/>while projected > maxmemory
+    E->>E: findBestEvictionCandidate(spillPoolLRU)
+    Note over E: guards: exists, not embedded,<br/>not tiered, refcount==1, state==ONLY_MEMORY
+    E->>E: borrow value robj (real type/encoding, zero-copy)
+    E->>S: extStorageBridge_submitPut(db,key,borrowed-val,ttl)
+    E->>E: extStorageOnSpillSubmit() (predictor window-1)
+    E->>K: ONLY_MEMORY -> COPYING_TO_FLASH
+    S->>IO: put_async / middleware
+    Note over IO: serialize on IO thread<br/>(createDumpPayload / rdbSaveObject)<br/>ram_bytes=objectComputeSize -> inflight (window-2)
+    IO-->>E: WRITE completion [beforeSleep]
+    E->>E: inflight_spill_ram_bytes -= ram_bytes
+    alt status OK
+      E->>K: free RAM value by real type, encoding=TIERED (empty sds) -> ONLY_FLASH
+    else status FAIL
+      E->>K: -> ONLY_MEMORY (value kept, no data loss)
+    else PENDING_EVICT (evict arrived mid-spill)
+      E->>K: dbDelete, remove state
+    end
+    E->>E: unblockClientsInUseOnKey

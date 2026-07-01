@@ -1,0 +1,13 @@
+%% Completion drain cycle in beforeSleep. Source: ext_storage.c processCompletedStorageRequests
+%% Render: mmdc -i completion-drain-sequence.mmd -o completion-drain-sequence.png -p puppeteer-config.json
+sequenceDiagram
+    participant EL as event loop
+    participant BS as beforeSleep
+    participant E as processCompletedStorageRequests
+    EL->>BS: each iteration
+    BS->>E: drain ALL completions (never capped)
+    loop every completion
+      Note over E: WRITE ok -> ONLY_FLASH (debit inflight RAM)<br/>READ ok -> ONLY_MEMORY + unblock<br/>DEL -> dbDelete
+    end
+    BS->>BS: spillFillToProjected(): submit while projected > maxmemory (cap-less)
+    BS->>BS: blockedBeforeSleep() re-run pending commands

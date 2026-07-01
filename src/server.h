@@ -346,6 +346,7 @@ typedef enum blocking_type {
     BLOCKED_ZSET,     /* BZPOP et al. */
     BLOCKED_POSTPONE, /* Blocked by processCommand, re-try processing later. */
     BLOCKED_SHUTDOWN, /* SHUTDOWN. */
+    BLOCKED_INUSE,    /* Key in use by background thread. */
     BLOCKED_NUM,      /* Number of blocked states. */
     BLOCKED_END       /* End of enumeration */
 } blocking_type;
@@ -770,8 +771,9 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_QUICKLIST 9  /* Encoded as linked list of listpacks */
 #define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
+#define OBJ_ENCODING_TIERED 15   /* Value is on external storage (flash-tiering) */
 
-#define OBJ_REFCOUNT_BITS 29
+#define OBJ_REFCOUNT_BITS 26
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
 #define OBJ_STATIC_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 2) /* Object allocated in the stack. */
 #define OBJ_FIRST_SPECIAL_REFCOUNT OBJ_STATIC_REFCOUNT
@@ -819,11 +821,17 @@ struct serverObject {
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
+    unsigned tiering_state : 3; /* TieringState (0-4), default 0 = ONLY_MEMORY */
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *val_ptr; /* Not always present. Use objectGetVal(obj) and
                     * objectSetVal(obj, val) instead. */
 };
 static_assert(sizeof(struct serverObject) <= 8 + sizeof(void *), "unexpected size - verify struct is packed correctly");
+
+/* Non-key-spilling tiering helpers: check/set tiered state.
+ * A tiered entry keeps the key in the dict but the value is on external storage.
+ * encoding == OBJ_ENCODING_TIERED indicates val_ptr is NULL (value on disk). */
+#define objectIsTiered(o) ((o)->encoding == OBJ_ENCODING_TIERED)
 
 /* The string name for an object's type as listed above
  * Native types are checked against the OBJ_STRING, OBJ_LIST, OBJ_* defines,
@@ -845,7 +853,6 @@ char *getObjectTypeName(robj *);
         _var.val_ptr = _ptr;                 \
     } while (0)
 
-struct evictionPoolEntry; /* Defined in evict.c */
 
 typedef struct payloadHeader payloadHeader; /* Defined in networking.c */
 
@@ -903,6 +910,8 @@ typedef struct serverDb {
                                            * This is a subset of blocking_keys*/
     dict *ready_keys;                     /* Blocked keys that received a PUSH */
     dict *watched_keys;                   /* WATCHED keys for MULTI/EXEC CAS */
+    /* keys_tiering_state removed — state is now in robj->tiering_state bitfield */
+    hashtable *keys_confirmed_absent;     /* keys confirmed absent from storage (consumed on use, prevents blocking loops) */
     int id;                               /* Database ID */
     struct {
         long long avg_ttl;    /* Average TTL, just for stats */
@@ -3178,7 +3187,7 @@ int compareStringObjects(const robj *a, const robj *b);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
-#define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
+#define sdsEncodedObject(objptr) (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
 
 /* Objects with val and/or key embedded */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
@@ -3191,16 +3200,6 @@ mstime_t objectGetExpire(const robj *o);
 uint8_t objectGetLFUFrequency(robj *o);
 uint32_t objectGetLRUIdleSecs(robj *o);
 uint32_t objectGetIdleness(robj *o);
-
-/* Accessor functions for serverObject fields.
- * Use these instead of direct field access for encapsulation. */
-int objectGetType(const robj *o);
-void objectSetType(robj *o, int type);
-int objectGetEncoding(const robj *o);
-void objectSetEncoding(robj *o, int encoding);
-unsigned int objectGetRefcount(const robj *o);
-unsigned int objectGetLRU(const robj *o);
-void objectSetLRU(robj *o, unsigned int lru);
 
 /* Synchronous I/O with timeout */
 ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout);
@@ -3898,6 +3897,9 @@ void signalKeyAsReady(serverDb *db, robj *key, int type);
 void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, int unblock_on_nokey);
 void blockClientShutdown(client *c);
 void blockPostponeClient(client *c);
+void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]);
+void unblockClientsInUseOnKey(robj *key);
+void unblockClientsInUseOnAllKeys(void);
 void blockClientForReplicaAck(client *c, mstime_t timeout, long long offset, int numreplicas, int numlocal);
 void replicationRequestAckFromReplicas(void);
 void signalDeletedKeyAsReady(serverDb *db, robj *key, int type);
@@ -3921,6 +3923,17 @@ void evictionPoolAlloc(void);
 #define EVICT_OK 0
 #define EVICT_RUNNING 1
 #define EVICT_FAIL 2
+#define EVPOOL_SIZE 16
+#define EVPOOL_CACHED_SDS_SIZE 255
+
+typedef struct evictionPoolEntry {
+    unsigned long long idle; /* Object idle time (inverse frequency for LFU) */
+    sds key;                 /* Key name. */
+    sds cached;              /* Cached SDS object for key name. */
+    int dbid;                /* Key DB number. */
+    int slot;                /* Slot. */
+} evictionPoolEntry;
+
 int performEvictions(void);
 void startEvictionTimeProc(void);
 
@@ -4158,6 +4171,7 @@ void askingCommand(client *c);
 void readonlyCommand(client *c);
 void readwriteCommand(client *c);
 int verifyDumpPayload(unsigned char *p, size_t len, uint16_t *rdbver_ptr);
+void createDumpPayload(rio *payload, robj *o, robj *key, int dbid);
 void dumpCommand(client *c);
 void objectCommand(client *c);
 void memoryCommand(client *c);

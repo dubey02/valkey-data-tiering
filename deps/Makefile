@@ -42,6 +42,7 @@ distclean:
 	-(cd jemalloc && [ -f Makefile ] && $(MAKE) distclean) > /dev/null || true
 	-(cd hdr_histogram && $(MAKE) clean) > /dev/null || true
 	-(cd fpconv && $(MAKE) clean) > /dev/null || true
+	-(cd flashcache && rm -rf build) > /dev/null || true
 	-(rm -f .make-*)
 
 .PHONY: distclean
@@ -132,3 +133,14 @@ gtest-parallel: .make-prerequisites
 		rm -rf gtest-parallel; \
 		git clone --depth 1 https://github.com/google/gtest-parallel.git gtest-parallel; \
 	fi
+
+flashcache: .make-prerequisites jemalloc
+	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
+	@which cmake3 >/dev/null 2>&1 || which cmake >/dev/null 2>&1 || \
+		(echo "ERROR: cmake not found. Install with: sudo yum install cmake3  (or: sudo apt install cmake)" && exit 1)
+	@test -f /usr/include/libaio.h || \
+		(echo "ERROR: libaio-devel not found. Install with: sudo yum install libaio-devel  (or: sudo apt install libaio-dev)" && exit 1)
+	@mkdir -p flashcache/build
+	cd flashcache/build && $(if $(shell which cmake3 2>/dev/null),cmake3,cmake) .. -DCMAKE_BUILD_TYPE=Release && $(MAKE)
+
+.PHONY: flashcache

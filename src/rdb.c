@@ -716,33 +716,33 @@ int rdbLoadBinaryFloatValue(rio *rdb, float *val) {
 /* Return the RDB object type to use for saving object "o", or -1 if the object
  * can't be represented in the given RDB version (only for older RDB). */
 int rdbGetObjectType(robj *o, int rdbver) {
-    switch (objectGetType(o)) {
+    switch (o->type) {
     case OBJ_STRING: return RDB_TYPE_STRING;
     case OBJ_LIST:
-        if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST || objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
+        if (o->encoding == OBJ_ENCODING_QUICKLIST || o->encoding == OBJ_ENCODING_LISTPACK)
             return RDB_TYPE_LIST_QUICKLIST_2;
         else
             serverPanic("Unknown list encoding");
     case OBJ_SET:
-        if (objectGetEncoding(o) == OBJ_ENCODING_INTSET)
+        if (o->encoding == OBJ_ENCODING_INTSET)
             return RDB_TYPE_SET_INTSET;
-        else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE)
+        else if (o->encoding == OBJ_ENCODING_HASHTABLE)
             return RDB_TYPE_SET;
-        else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
+        else if (o->encoding == OBJ_ENCODING_LISTPACK)
             return RDB_TYPE_SET_LISTPACK;
         else
             serverPanic("Unknown set encoding");
     case OBJ_ZSET:
-        if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
+        if (o->encoding == OBJ_ENCODING_LISTPACK)
             return RDB_TYPE_ZSET_LISTPACK;
-        else if (objectGetEncoding(o) == OBJ_ENCODING_SKIPLIST)
+        else if (o->encoding == OBJ_ENCODING_SKIPLIST)
             return RDB_TYPE_ZSET_2;
         else
             serverPanic("Unknown sorted set encoding");
     case OBJ_HASH:
-        if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
+        if (o->encoding == OBJ_ENCODING_LISTPACK)
             return RDB_TYPE_HASH_LISTPACK;
-        else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE)
+        else if (o->encoding == OBJ_ENCODING_HASHTABLE)
             if (hashTypeHasVolatileFields(o))
                 if (rdbver >= 80)
                     return RDB_TYPE_HASH_2;
@@ -872,13 +872,13 @@ ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
  * Returns -1 on error, number of bytes written on success. */
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbtype) {
     ssize_t n = 0, nwritten = 0;
-    if (objectGetType(o) == OBJ_STRING) {
+    if (o->type == OBJ_STRING) {
         /* Save a string value */
         if ((n = rdbSaveStringObject(rdb, o)) == -1) return -1;
         nwritten += n;
-    } else if (objectGetType(o) == OBJ_LIST) {
+    } else if (o->type == OBJ_LIST) {
         /* Save a list value */
-        if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST) {
+        if (o->encoding == OBJ_ENCODING_QUICKLIST) {
             quicklist *ql = objectGetVal(o);
             quicklistNode *node = ql->head;
 
@@ -900,7 +900,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 }
                 node = node->next;
             }
-        } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
             unsigned char *lp = objectGetVal(o);
 
             /* Save list listpack as a fake quicklist that only has a single node. */
@@ -913,9 +913,9 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         } else {
             serverPanic("Unknown list encoding");
         }
-    } else if (objectGetType(o) == OBJ_SET) {
+    } else if (o->type == OBJ_SET) {
         /* Save a set value */
-        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) {
             hashtable *set = objectGetVal(o);
 
             if ((n = rdbSaveLen(rdb, hashtableSize(set))) == -1) {
@@ -935,26 +935,26 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 nwritten += n;
             }
             hashtableCleanupIterator(&iterator);
-        } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
+        } else if (o->encoding == OBJ_ENCODING_INTSET) {
             size_t l = intsetBlobLen((intset *)objectGetVal(o));
 
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
-        } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
             size_t l = lpBytes((unsigned char *)objectGetVal(o));
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
         } else {
             serverPanic("Unknown set encoding");
         }
-    } else if (objectGetType(o) == OBJ_ZSET) {
+    } else if (o->type == OBJ_ZSET) {
         /* Save a sorted set value */
-        if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
             size_t l = lpBytes((unsigned char *)objectGetVal(o));
 
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
-        } else if (objectGetEncoding(o) == OBJ_ENCODING_SKIPLIST) {
+        } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = objectGetVal(o);
             zskiplist *zsl = zs->zsl;
 
@@ -981,14 +981,14 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         } else {
             serverPanic("Unknown sorted set encoding");
         }
-    } else if (objectGetType(o) == OBJ_HASH) {
+    } else if (o->type == OBJ_HASH) {
         /* Save a hash value */
-        if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
             size_t l = lpBytes((unsigned char *)objectGetVal(o));
 
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
-        } else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        } else if (o->encoding == OBJ_ENCODING_HASHTABLE) {
             serverAssert(rdbtype == RDB_TYPE_HASH || rdbtype == RDB_TYPE_HASH_2);
             hashtable *ht = objectGetVal(o);
 
@@ -1030,7 +1030,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         } else {
             serverPanic("Unknown hash encoding");
         }
-    } else if (objectGetType(o) == OBJ_STREAM) {
+    } else if (o->type == OBJ_STREAM) {
         /* Store how many listpacks we have inside the radix tree. */
         stream *s = objectGetVal(o);
         rax *rax = s->rax;
@@ -1140,7 +1140,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             }
             raxStop(&ri);
         }
-    } else if (objectGetType(o) == OBJ_MODULE) {
+    } else if (o->type == OBJ_MODULE) {
         /* Save a module-specific value. */
         ValkeyModuleIO io;
         moduleValue *mv = objectGetVal(o);
@@ -1188,6 +1188,12 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid, int rdbver) {
+    /* Skip tiered entries — value is on external storage, not in memory.
+     * The storage module handles its own persistence. On restart, tiered
+     * keys will not be present (cold data is lost unless the module
+     * restores them from its own persistent store). */
+    if (objectIsTiered(val)) return 0;
+
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
@@ -1449,7 +1455,7 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, int rdbver, long *key_counte
          * OS and possibly avoid or decrease COW. We give the dismiss
          * mechanism a hint about an estimated size of the object we stored. */
         size_t dump_size = rdb->processed_bytes - rdb_bytes_before_key;
-        if (server.in_fork_child) dismissObject(o, dump_size);
+        if (server.in_fork_child && !objectIsTiered(o)) dismissObject(o, dump_size);
 
         /* Update child info every 1 second (approximately).
          * in order to avoid calling mstime() on each iteration, we will
@@ -1992,7 +1998,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             sumelelen += elelen;
             if (elelen > maxelelen) maxelelen = elelen;
 
-            if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
+            if (o->encoding == OBJ_ENCODING_INTSET) {
                 /* Fetch integer value from element. */
                 if (isSdsRepresentableAsLongLong(sdsele, &llval) == C_OK) {
                     uint8_t success;
@@ -2019,7 +2025,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
 
             /* This will also be called when the set was just converted
              * to a listpack encoded set. */
-            if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+            if (o->encoding == OBJ_ENCODING_LISTPACK) {
                 if (setTypeSize(o) < server.set_max_listpack_entries && elelen <= server.set_max_listpack_value &&
                     lpSafeToAdd(objectGetVal(o), elelen)) {
                     unsigned char *p = lpFirst(objectGetVal(o));
@@ -2040,7 +2046,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
 
             /* This will also be called when the set was just converted
              * to a regular hash table encoded set. */
-            if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+            if (o->encoding == OBJ_ENCODING_HASHTABLE) {
                 if (!hashtableAdd((hashtable *)objectGetVal(o), sdsele)) {
                     rdbReportCorruptRDB("Duplicate set members detected");
                     decrRefCount(o);
@@ -2144,7 +2150,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
 
 
         /* Load every field and value into the ziplist */
-        while (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK && len > 0) {
+        while (o->encoding == OBJ_ENCODING_LISTPACK && len > 0) {
             len--;
             /* Load raw strings */
             if ((field = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) {
@@ -2173,7 +2179,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             }
 
             /* Convert to hash table if size threshold is exceeded */
-            if (objectGetEncoding(o) != OBJ_ENCODING_HASHTABLE &&
+            if (o->encoding != OBJ_ENCODING_HASHTABLE &&
                 (sdslen(field) > server.hash_max_listpack_value || sdslen(value) > server.hash_max_listpack_value ||
                  !lpSafeToAdd(objectGetVal(o), sdslen(field) + sdslen(value)))) {
                 hashTypeConvert(o, OBJ_ENCODING_HASHTABLE);
@@ -2205,7 +2211,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             dupSearchHashtable = NULL;
         }
 
-        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) {
             if (!hashtableTryExpand(objectGetVal(o), len)) {
                 rdbReportCorruptRDB("OOM in hashtableTryExpand %llu", (unsigned long long)len);
                 decrRefCount(o);
@@ -2214,7 +2220,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
         }
 
         /* Load remaining fields and values into the hash table */
-        while (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE && len > 0) {
+        while (o->encoding == OBJ_ENCODING_HASHTABLE && len > 0) {
             len--;
             /* Load encoded strings */
             if ((field = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) {
@@ -2417,8 +2423,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 hashtableRelease(dupSearchHashtable);
                 zfree(objectGetVal(o));
                 objectSetVal(o, lp);
-                objectSetType(o, OBJ_HASH);
-                objectSetEncoding(o, OBJ_ENCODING_LISTPACK);
+                o->type = OBJ_HASH;
+                o->encoding = OBJ_ENCODING_LISTPACK;
 
                 if (hashTypeLength(o) > server.hash_max_listpack_entries || maxlen > server.hash_max_listpack_value) {
                     hashTypeConvert(o, OBJ_ENCODING_HASHTABLE);
@@ -2446,9 +2452,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             }
 
             zfree(encoded);
-            objectSetType(o, OBJ_LIST);
+            o->type = OBJ_LIST;
             objectSetVal(o, ql);
-            objectSetEncoding(o, OBJ_ENCODING_QUICKLIST);
+            o->encoding = OBJ_ENCODING_QUICKLIST;
             break;
         }
         case RDB_TYPE_SET_INTSET:
@@ -2460,8 +2466,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 return NULL;
             }
-            objectSetType(o, OBJ_SET);
-            objectSetEncoding(o, OBJ_ENCODING_INTSET);
+            o->type = OBJ_SET;
+            o->encoding = OBJ_ENCODING_INTSET;
             if (intsetLen(objectGetVal(o)) > server.set_max_intset_entries) setTypeConvert(o, OBJ_ENCODING_HASHTABLE);
             break;
         case RDB_TYPE_SET_LISTPACK:
@@ -2473,8 +2479,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 return NULL;
             }
-            objectSetType(o, OBJ_SET);
-            objectSetEncoding(o, OBJ_ENCODING_LISTPACK);
+            o->type = OBJ_SET;
+            o->encoding = OBJ_ENCODING_LISTPACK;
 
             if (setTypeSize(o) == 0) {
                 zfree(encoded);
@@ -2508,9 +2514,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             }
 
             zfree(objectGetVal(o));
-            objectSetType(o, OBJ_ZSET);
+            o->type = OBJ_ZSET;
             objectSetVal(o, lp);
-            objectSetEncoding(o, OBJ_ENCODING_LISTPACK);
+            o->encoding = OBJ_ENCODING_LISTPACK;
             if (zsetLength(o) == 0) {
                 decrRefCount(o);
                 goto emptykey;
@@ -2542,8 +2548,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 return NULL;
             }
-            objectSetType(o, OBJ_ZSET);
-            objectSetEncoding(o, OBJ_ENCODING_LISTPACK);
+            o->type = OBJ_ZSET;
+            o->encoding = OBJ_ENCODING_LISTPACK;
             if (zsetLength(o) == 0) {
                 decrRefCount(o);
                 goto emptykey;
@@ -2564,8 +2570,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
 
             zfree(objectGetVal(o));
             objectSetVal(o, lp);
-            objectSetType(o, OBJ_HASH);
-            objectSetEncoding(o, OBJ_ENCODING_LISTPACK);
+            o->type = OBJ_HASH;
+            o->encoding = OBJ_ENCODING_LISTPACK;
             if (hashTypeLength(o) == 0) {
                 decrRefCount(o);
                 goto emptykey;
@@ -2586,8 +2592,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 return NULL;
             }
-            objectSetType(o, OBJ_HASH);
-            objectSetEncoding(o, OBJ_ENCODING_LISTPACK);
+            o->type = OBJ_HASH;
+            o->encoding = OBJ_ENCODING_LISTPACK;
             if (hashTypeLength(o) == 0) {
                 decrRefCount(o);
                 goto emptykey;

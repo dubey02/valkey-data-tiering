@@ -1,0 +1,29 @@
+// Throttle / spill control: TWO DECOUPLED controllers, coupled only implicitly via memory.
+// Source: src/ext_storage_throttle.c (throttle), src/ext_storage.c spillFillToProjected (spill).
+// Render: dot -Tpng throttle-feedback.dot -o throttle-feedback.png
+digraph throttle_feedback {
+    rankdir=LR;
+    node [shape=box, style="rounded,filled", fillcolor="#eef3fb", fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    mem  [label="memory zone\n1.0x spill starts\n1.1x throttle starts\n1.2x OOM reject", fillcolor="#fdeede"];
+
+    // Spill controller — reads PROJECTED memory, cap-less, no throttle signal
+    spill [label="SPILL controller\nspillFillToProjected (cap-less)\nwhile projected > maxmemory", fillcolor="#dceefb"];
+    disk  [label="DISK (FlashCache)\ndrain <= bandwidth", fillcolor="#e9e9e9"];
+
+    // Throttle controller — reads RAW used_memory, no spill signal
+    rate [label="throttle_rate (0..1)\n0 below 1.1x maxmem,\n1 at >= 1.2x maxmem", fillcolor="#fff4d6"];
+    tps  [label="client TPS ceiling\nallowed_tps = max_tps*(1 - rate*0.99)"];
+
+    mem  -> spill [label="projected"];
+    spill -> disk [label="submit (no cap)"];
+    disk -> mem   [label="frees RAM on completion", style=dashed];
+
+    mem  -> rate  [label="raw used_memory"];
+    rate -> tps   [label="slow clients"];
+    tps  -> mem   [label="less intake", style=dashed];
+
+    // Implicit coupling: disk saturation -> in-flight backlog -> raw memory climbs into throttle band
+    spill -> rate [label="implicit: disk-sat backlog\nraises raw memory", style=dotted, constraint=false];
+}

@@ -1985,7 +1985,7 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
 int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
     long long count = 0, items = zsetLength(o);
 
-    if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+    if (o->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = objectGetVal(o);
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
@@ -2020,7 +2020,7 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
             if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0;
             items--;
         }
-    } else if (objectGetEncoding(o) == OBJ_ENCODING_SKIPLIST) {
+    } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = objectGetVal(o);
         hashtableIterator iter;
         hashtableInitIterator(&iter, zs->ht, 0);
@@ -2365,24 +2365,24 @@ int rewriteObjectRio(rio *aof, robj *o, int db_num) {
     expiretime = objectGetExpire(o);
 
     /* Save the key and associated value */
-    if (objectGetType(o) == OBJ_STRING) {
+    if (o->type == OBJ_STRING) {
         /* Emit a SET command */
         char cmd[] = "*3\r\n$3\r\nSET\r\n";
         if (rioWrite(aof, cmd, sizeof(cmd) - 1) == 0) return C_ERR;
         /* Key and value */
         if (rioWriteBulkObject(aof, &key) == 0) return C_ERR;
         if (rioWriteBulkObject(aof, o) == 0) return C_ERR;
-    } else if (objectGetType(o) == OBJ_LIST) {
+    } else if (o->type == OBJ_LIST) {
         if (rewriteListObject(aof, &key, o) == 0) return C_ERR;
-    } else if (objectGetType(o) == OBJ_SET) {
+    } else if (o->type == OBJ_SET) {
         if (rewriteSetObject(aof, &key, o) == 0) return C_ERR;
-    } else if (objectGetType(o) == OBJ_ZSET) {
+    } else if (o->type == OBJ_ZSET) {
         if (rewriteSortedSetObject(aof, &key, o) == 0) return C_ERR;
-    } else if (objectGetType(o) == OBJ_HASH) {
+    } else if (o->type == OBJ_HASH) {
         if (rewriteHashObject(aof, &key, o) == 0) return C_ERR;
-    } else if (objectGetType(o) == OBJ_STREAM) {
+    } else if (o->type == OBJ_STREAM) {
         if (rewriteStreamObject(aof, &key, o) == 0) return C_ERR;
-    } else if (objectGetType(o) == OBJ_MODULE) {
+    } else if (o->type == OBJ_MODULE) {
         if (rewriteModuleObject(aof, &key, o, db_num) == 0) return C_ERR;
     } else {
         serverPanic("Unknown object type");
@@ -2437,6 +2437,8 @@ int rewriteSlotToAppendOnlyFileRio(rio *aof, int db_num, int hashslot, size_t *k
             }
         }
 
+        // TODO: Handle tiered objects
+        if (objectIsTiered(o)) serverAssert(false);
         if (rewriteObjectRio(aof, o, db_num) == C_ERR) return C_ERR;
     }
 
@@ -2485,6 +2487,9 @@ int rewriteAppendOnlyFileRio(rio *aof) {
                     updated_time = now;
                 }
             }
+
+            // TODO: Handle tiered objects
+            if (objectIsTiered(o)) serverAssert(false);
 
             if (rewriteObjectRio(aof, o, j) == C_ERR) goto werr;
         }

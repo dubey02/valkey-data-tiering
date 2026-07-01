@@ -58,3 +58,26 @@ cmake-build-debug/
 cmake-build-release/
 __pycache__
 src/unit/.flags
+src/flashcache/
+benchmark/results/
+benchmark/benchmark.env
+deps/flashcache/build/
+# Build artifacts
+target/
+build/
+*.db
+*.o
+*.so
+test_init
+test_init_dbg
+
+# Compiled binaries (keep source, not binaries)
+benchmark/tools/trace-replay/trace-replay
+perf/
+
+# Benchmark results (large data)
+deps/flashcache/bench/results/
+
+# Dev artifacts (kept locally, not in public fork)
+.kiro/
+context/

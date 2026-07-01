@@ -1,0 +1,19 @@
+// Eviction decision flow. Source: src/evict.c (extStoragePerformEvictions), ext_storage.c
+// Render: dot -Tpng eviction-flow.dot -o eviction-flow.png
+digraph eviction_flow {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fillcolor="#eef3fb", fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    trig [label="performEvictions\n-> extStoragePerformEvictions"];
+    cand [label="findBestEvictionCandidate\n(spillPoolLRU sample)"];
+    st   [label="candidate state?", shape=diamond, fillcolor="#fff4d6"];
+    spill[label="ONLY_MEMORY:\nspillItemAsync\n-> COPYING_TO_FLASH", fillcolor="#dff5e1"];
+    adel [label="ONLY_FLASH:\nasync delete to flash\n-> COPYING_TO_MEMORY", fillcolor="#fdeede"];
+    skip [label="in-flight (CTF/CTM):\nskip / PENDING_EVICT"];
+
+    trig -> cand -> st;
+    st -> spill [label="in RAM"];
+    st -> adel  [label="on flash"];
+    st -> skip  [label="in-flight"];
+}

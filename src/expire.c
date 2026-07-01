@@ -39,6 +39,8 @@
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "util.h"
+#include "ext_storage.h"
+#include "ext_storage_bridge.h"
 
 /*-----------------------------------------------------------------------------
  * Incremental collection of expired keys.
@@ -67,8 +69,27 @@ int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx) 
     mstime_t t = objectGetExpire(val);
     serverAssert(t >= 0);
     if (now > t) {
-        enterExecutionUnit(1, 0);
         sds key = objectGetKey(val);
+
+        /* Tiering: handle expired keys that are on flash or in-flight */
+        if (ext_data_enabled) {
+            TieringState state = extStorageGetState(db, key);
+            if (state == TIERING_STATE_ONLY_FLASH) {
+                /* Key is on flash — issue async delete. The completion handler
+                 * will call deleteExpiredKeyAndPropagate when delete completes. */
+                extStorageBridge_submitDel(db->id, key);
+                extStorageSetState(db, key, TIERING_STATE_COPYING_TO_MEMORY,
+                    VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_DELETE);
+                return 0;  /* not deleted yet — will complete async */
+            }
+            if (state == TIERING_STATE_COPYING_TO_FLASH ||
+                state == TIERING_STATE_COPYING_TO_MEMORY ||
+                state == TIERING_STATE_PENDING_EVICT) {
+                return 0;  /* in-flight IO — skip, retry next cycle */
+            }
+        }
+
+        enterExecutionUnit(1, 0);
         robj *keyobj = createStringObject(key, sdslen(key));
         deleteExpiredKeyAndPropagateWithDictIndex(db, keyobj, didx);
         decrRefCount(keyobj);

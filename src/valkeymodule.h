@@ -554,6 +554,94 @@ typedef void (*ValkeyModuleEventCallback)(struct ValkeyModuleCtx *ctx,
                                           uint64_t subevent,
                                           void *data);
 
+// Data tiering storage module callback methods. Registered from the module during initialization.
+
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_WRITE      0
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ       1
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_DELETE     2
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_FLUSH_DB   3
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_FLUSH_ALL  4
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_FSYNC      5
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_START_SAVE 6
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_LOAD_SNAP  7
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_SHUTDOWN   8
+#define VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_EVICT      9
+
+typedef struct ValkeyModuleExternalStorageMsg {
+    // Holds the type of the message.
+    int msg_type;
+
+    // Indicate the status of the message (e.g. did the operation succeed)
+    int status;
+
+    // TTL of the item in milliseconds
+    long long ttl;
+
+    // Holds the database Id for the corresponding data.
+    int db_id;
+
+    // This is the key.
+    void *key;
+
+    // This is the value.
+    void *value;
+
+    // In-RAM footprint of the spilled value (WRITE completions); for in-flight accounting.
+    size_t ram_bytes;
+} ValkeyModuleExternalStorageMsg;
+
+/* READ-completion status sentinel: the read was transiently rejected by the
+ * storage backend (e.g. FlashCache in-flight read queue full / backpressure),
+ * NOT a genuine "key absent" miss. The value is still on flash and the index
+ * entry is intact, so the core must re-issue the fetch rather than treat the
+ * key as missing (which would strip tiering state while the value object keeps
+ * TIERED encoding — a KEY_STATE_BUG wedge). Distinct from VALKEYMODULE_OK(0)
+ * and VALKEYMODULE_ERR(1). */
+#define VALKEYMODULE_EXTERNAL_STORAGE_READ_RETRY 2
+
+// Core invokes this callback to send a request to the external storage module to perform a task
+// such as read/write/delete an item, flush, start snapshot, retrieving key names, etc.
+// Returns VALKEYMODULE_OK if the request is received successfully, VALKEYMODULE_ERR otherwise.
+typedef int (*ValkeyModuleExternalStorageRequestCallback)(struct ValkeyModuleCtx *ctx,
+                                                    int type,
+                                                    int db_id,
+                                                    ValkeyModuleString *key,
+                                                    long long ttl,
+                                                    void *data);
+
+// Core invokes this callback to get the next completed storage response from the external storage module.
+// The response can indicate task completion for read/write/delete, flush, expiry/eviction, getting key names, etc.
+// Returns the storage message containing the relevant information on success, NULL if no more responses.
+typedef ValkeyModuleExternalStorageMsg *(*ValkeyModuleExternalStorageResponseCallback)(struct ValkeyModuleCtx *ctx);
+
+// Serialization callbacks — passed from core to module during SubscribeToExternalStorageWithCallbacks.
+// The module's IO worker thread invokes these to serialize/deserialize robj* on the IO thread,
+// keeping the main thread free of serialization CPU cost.
+
+// Serialize a key robj* to bytes. Returns length of serialized key, -1 on error.
+typedef int (*ValkeyModuleSerializeKeyCallback)(void *key, char **serialized_key);
+
+// Serialize a value robj* to RDB DUMP format bytes. Returns length of serialized value, -1 on error.
+typedef int (*ValkeyModuleSerializeValueCallback)(void *value, char **serialized_value);
+
+// Deserialize key bytes back to robj*.
+typedef void *(*ValkeyModuleDeserializeKeyCallback)(char *key, int length);
+
+// Deserialize value bytes back to robj* (wraps rdbLoadObject).
+typedef void *(*ValkeyModuleDeserializeValueCallback)(char *value, int length);
+
+// Free a serialized key buffer produced by SerializeKeyCallback.
+typedef void (*ValkeyModuleFreeSerializedKeyCallback)(void *key);
+
+// Free a serialized value buffer produced by SerializeValueCallback.
+typedef void (*ValkeyModuleFreeSerializedValueCallback)(void *value);
+
+// Synchronous key existence check callback.
+// Called from the main thread to check if a key may exist in external storage.
+// Returns 1 if the key may exist on disk, 0 if definitely not on disk.
+// This is called synchronously — must be fast (bloom filter / index lookup).
+typedef int (*ValkeyModuleKeyMayExistCallback)(int db_id, const char *key, size_t key_len);
+
 /* IMPORTANT: When adding a new version of one of below structures that contain
  * event data (ValkeyModuleFlushInfoV1 for example) we have to avoid renaming the
  * old ValkeyModuleEvent structure.
@@ -2292,6 +2380,8 @@ VALKEYMODULE_API int (*ValkeyModule_RdbSave)(ValkeyModuleCtx *ctx,
                                              ValkeyModuleRdbStream *stream,
                                              int flags) VALKEYMODULE_ATTR;
 
+VALKEYMODULE_API void *(*ValkeyModule_DeserializeDumpPayload)(ValkeyModuleCtx *ctx, char *val, size_t len) VALKEYMODULE_ATTR;
+
 VALKEYMODULE_API int (*ValkeyModule_RegisterScriptingEngine)(ValkeyModuleCtx *module_ctx,
                                                              const char *engine_name,
                                                              ValkeyModuleScriptingEngineCtx *engine_ctx,
@@ -2318,6 +2408,36 @@ VALKEYMODULE_API int (*ValkeyModule_ACLCheckKeyPrefixPermissions)(ValkeyModuleUs
                                                                   const char *key,
                                                                   size_t len,
                                                                   unsigned int flags) VALKEYMODULE_ATTR;
+
+// Exported data tiering APIs for external storage modules to invoke
+VALKEYMODULE_API int (*ValkeyModule_SubscribeToExternalStorage)(ValkeyModuleCtx *ctx,
+                                                       ValkeyModuleExternalStorageRequestCallback req_callback,
+                                                       ValkeyModuleExternalStorageResponseCallback res_callback) VALKEYMODULE_ATTR;
+
+VALKEYMODULE_API int (*ValkeyModule_SubscribeToExternalStorageWithCallbacks)(ValkeyModuleCtx *ctx,
+                        ValkeyModuleExternalStorageRequestCallback req_callback,
+                        ValkeyModuleExternalStorageResponseCallback res_callback,
+                        ValkeyModuleSerializeKeyCallback serialize_key,
+                        ValkeyModuleSerializeValueCallback serialize_value,
+                        ValkeyModuleDeserializeKeyCallback deserialize_key,
+                        ValkeyModuleDeserializeValueCallback deserialize_value,
+                        ValkeyModuleFreeSerializedKeyCallback free_serialized_key,
+                        ValkeyModuleFreeSerializedValueCallback free_serialized_value) VALKEYMODULE_ATTR;
+
+VALKEYMODULE_API int (*ValkeyModule_UnsubscribeFromExternalStorage)(ValkeyModuleCtx *ctx) VALKEYMODULE_ATTR;
+
+/* New pluggable storage API — module registers a storageType struct.
+ * After registration, the engine calls the struct's function pointers directly
+ * (zero per-call overhead, same as native backends). */
+VALKEYMODULE_API int (*ValkeyModule_RegisterStorageBackend)(ValkeyModuleCtx *ctx, void *storage_type) VALKEYMODULE_ATTR;
+
+VALKEYMODULE_API int (*ValkeyModule_GetExternalStorageSerializationCallbacks)(ValkeyModuleCtx *ctx,
+                        ValkeyModuleSerializeKeyCallback *serialize_key,
+                        ValkeyModuleSerializeValueCallback *serialize_value,
+                        ValkeyModuleDeserializeKeyCallback *deserialize_key,
+                        ValkeyModuleDeserializeValueCallback *deserialize_value,
+                        ValkeyModuleFreeSerializedKeyCallback *free_serialized_key,
+                        ValkeyModuleFreeSerializedValueCallback *free_serialized_value) VALKEYMODULE_ATTR;
 
 #define ValkeyModule_IsAOFClient(id) ((id) == UINT64_MAX)
 /* This is included inline inside each Valkey module. */
@@ -2609,6 +2729,10 @@ static int ValkeyModule_Init(ValkeyModuleCtx *ctx, const char *name, int ver, in
     VALKEYMODULE_GET_API(BlockedClientMeasureTimeEnd);
     VALKEYMODULE_GET_API(SetDisconnectCallback);
     VALKEYMODULE_GET_API(SubscribeToKeyspaceEvents);
+    VALKEYMODULE_GET_API(SubscribeToExternalStorage);
+    VALKEYMODULE_GET_API(SubscribeToExternalStorageWithCallbacks);
+    VALKEYMODULE_GET_API(RegisterStorageBackend);
+    VALKEYMODULE_GET_API(GetExternalStorageSerializationCallbacks);
     VALKEYMODULE_GET_API(AddPostNotificationJob);
     VALKEYMODULE_GET_API(NotifyKeyspaceEvent);
     VALKEYMODULE_GET_API(GetNotifyKeyspaceEvents);
@@ -2692,6 +2816,7 @@ static int ValkeyModule_Init(ValkeyModuleCtx *ctx, const char *name, int ver, in
     VALKEYMODULE_GET_API(RdbStreamFree);
     VALKEYMODULE_GET_API(RdbLoad);
     VALKEYMODULE_GET_API(RdbSave);
+    VALKEYMODULE_GET_API(DeserializeDumpPayload);
     VALKEYMODULE_GET_API(RegisterScriptingEngine);
     VALKEYMODULE_GET_API(UnregisterScriptingEngine);
     VALKEYMODULE_GET_API(GetFunctionExecutionState);

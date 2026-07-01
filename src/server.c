@@ -32,6 +32,9 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "server.h"
+#include "ext_storage.h"
+#include "ext_storage_bridge.h"
+#include "ext_storage_throttle.h"
 #include "connection.h"
 #include "monotonic.h"
 #include "cluster.h"
@@ -494,7 +497,7 @@ uint64_t dictEncObjHash(const void *key) {
 
     if (sdsEncodedObject(o)) {
         return dictGenHashFunction(objectGetVal(o), sdslen((sds)objectGetVal(o)));
-    } else if (objectGetEncoding(o) == OBJ_ENCODING_INT) {
+    } else if (o->encoding == OBJ_ENCODING_INT) {
         char buf[32];
         int len;
 
@@ -1188,6 +1191,24 @@ void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage) {
     *out_usage = o;
 }
 
+/* Detect and free zombie connections whose read handler was removed (e.g.
+ * BLOCKED_INUSE). Without a read handler the event loop won't notice the
+ * remote side closing, so these fds would leak until the fd limit is hit. */
+static bool clientsCronTcpIsClosing(client *c) {
+    if (!c->conn) return false;
+
+    if (!connIsClosing(c->conn)) return false;
+
+    if (server.verbosity <= LL_VERBOSE) {
+        sds client_info = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
+        serverLog(LL_VERBOSE, "Client closed connection while blocked %s", client_info);
+        sdsfree(client_info);
+    }
+
+    freeClientAsync(c);
+    return true;
+}
+
 /* This function is called by clientsTimeProc() and is used in order to perform
  * operations on clients that are important to perform constantly. For instance
  * we use this function in order to disconnect clients after a timeout, including
@@ -1242,6 +1263,7 @@ static void clientsCron(int clients_this_cycle) {
         if (clientsCronResizeQueryBuffer(c)) continue;
         if (clientsCronResizeOutputBuffer(c, now)) continue;
         if (clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot)) continue;
+        if (clientsCronTcpIsClosing(c)) continue;
 
         /* Iterating all the clients in getMemoryOverheadData() is too slow and
          * in turn would make the INFO command too slow. So we perform this
@@ -1353,6 +1375,11 @@ void databasesCron(void) {
         if (server.activerehashing) {
             uint64_t elapsed_us = 0;
             uint64_t threshold_us = 1 * 1000000 / server.hz / 100;
+            /* Skip rehash while items are being spilled to flash (zero-copy safety:
+             * IO thread holds references to sds values in the hashtable). */
+            if (ext_data_enabled && total_items_spilling_to_ext_storage > 0) {
+                /* Don't rehash — pointers must remain stable */
+            } else
             for (j = 0; j < dbs_per_call; j++) {
                 serverDb *db = server.db[rehash_db % server.dbnum];
                 if (db != NULL) {
@@ -1878,6 +1905,13 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
+    /* Process completed external storage requests and spill items if needed.
+     * Called once per event loop iteration (matching dt-poc's beforeSleep pattern).
+     * Must be before blockedBeforeSleep so unblocked clients can re-execute. */
+    if (ext_data_enabled) {
+        processCompletedStorageRequestsAndSpillOldItems();
+    }
+
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     int conn_pending = connTypeProcessPendingData();
     if (conn_pending > 0) server.el_iteration_active = true;
@@ -1894,6 +1928,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Handle blocked clients.
      * must be done before flushAppendOnlyFile, in case of appendfsync=always,
      * since the unblocked clients may write data. */
+
     blockedBeforeSleep();
 
     /* Record cron time in beforeSleep, which is the sum of active-expire, active-defrag and all other
@@ -1996,6 +2031,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Disconnect some clients if they are consuming too much memory. */
     evictClients();
+
+    // Process all completed tiered storage IO requests and spill a batch of
+    // old items to disk if we are over the memory threshold for spilling items
+    processCompletedStorageRequestsAndSpillOldItems();
 
     /* Record cron time in beforeSleep. */
     monotime current_time = getMonotonicUs();
@@ -2900,6 +2939,8 @@ serverDb *createDatabase(int id) {
     db->blocking_keys_unblock_on_nokey = dictCreate(&objectKeyPointerValueDictType);
     db->ready_keys = dictCreate(&objectKeyPointerValueDictType);
     db->watched_keys = dictCreate(&keylistDictType);
+    /* keys_tiering_state removed — tiering state stored in robj->tiering_state */
+    db->keys_confirmed_absent = hashtableCreate(&setHashtableType);
     db->id = id;
     resetDbExpiryState(db);
     return db;
@@ -3127,6 +3168,8 @@ void initServer(void) {
 
     /* Initialize the EVAL scripting component. */
     evalInit();
+
+    /* ext_storage init is deferred to after module loading (see main) */
 
     applyWatchdogPeriod();
 
@@ -3971,6 +4014,12 @@ void call(client *c, int flags) {
     dirty = server.dirty - dirty;
     if (dirty < 0) dirty = 0;
 
+    /* Feed the external storage throttler. */
+    if (ext_data_enabled) {
+        extStorageThrottle_recordCommandLatency((long long)duration);
+
+    }
+
     /* Update failed command calls if required. */
 
     int command_failed = incrCommandStatsOnError(real_cmd, ERROR_COMMAND_FAILED);
@@ -4301,6 +4350,8 @@ void unprepareCommand(client *c) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+    serverAssert(!c->flag.blocked && !c->flag.unblocked);
+
     if (!scriptIsTimedout()) {
         /* Both EXEC and scripts call call() directly so there should be
          * no way in_exec or scriptIsRunning() is 1.
@@ -4693,6 +4744,29 @@ int processCommand(client *c) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
     } else {
+        if (preCommandExec(c) == CMD_FILTER_REJECT) {
+            return C_OK;
+        }
+        /* Safety check: verify no key has TIERED encoding after preCommandExec allowed the command.
+         * This catches the race condition where a key is spilled between preCommandExec and call(). */
+        if (ext_data_enabled) {
+            getKeysResult chk_result;
+            initGetKeysResult(&chk_result);
+            int chk_num = getKeysFromCommand(c->cmd, c->argv, c->argc, &chk_result);
+            for (int i = 0; i < chk_num; i++) {
+                sds chk_key = objectGetVal(c->argv[chk_result.keys[i].pos]);
+                dbEntry *chk_entry = dbFind(c->db, chk_key);
+                if (chk_entry && objectIsTiered(chk_entry)) {
+                    serverLog(LL_WARNING, "TIERED_SAFETY: key %s is TIERED after preCommandExec allowed cmd=%s, re-running preCommandExec",
+                        chk_key, c->cmd->declared_name);
+                    getKeysFreeResult(&chk_result);
+                    /* Re-run preCommandExec — it will now see the TIERED key and block */
+                    preCommandExec(c);
+                    return C_OK;
+                }
+            }
+            getKeysFreeResult(&chk_result);
+        }
         int flags = CMD_CALL_FULL;
         call(c, flags);
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
@@ -6718,6 +6792,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         }
     }
 
+    /* External storage */
+    if (all_sections || (dictFind(section_dict, "external_storage") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscatprintf(info, "# External Storage\r\n");
+        info = genExternalStorageInfoString(info);
+    }
+
     /* Modules */
     if (all_sections || (dictFind(section_dict, "module_list") != NULL) ||
         (dictFind(section_dict, "modules") != NULL)) {
@@ -7757,6 +7838,9 @@ __attribute__((weak)) int main(int argc, char **argv) {
         moduleInitModulesSystemLast();
         moduleLoadFromQueue();
     }
+
+    /* If a module registered a storage backend, use it. Otherwise init native. */
+    extStorage_init();
     ACLLoadUsersAtStartup();
     initListeners();
     if (server.cluster_enabled) {

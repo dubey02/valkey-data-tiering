@@ -1,0 +1,33 @@
+// Component graph — NKS tiering modules and engine touch-points.
+// Source: src/ext_storage*.{c,h}, src/storage.h, src/evict.c, object.c, rdb.c, blocked.c
+// Render: dot -Tpng components.dot -o components.png
+digraph components {
+    rankdir=LR;
+    node [shape=box, style="rounded,filled", fillcolor="#eef3fb", fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    ext      [label="ext_storage.c\nspill/fetch/evict\nstate machine\ncompletion drain", fillcolor="#dff5e1"];
+    bridge   [label="ext_storage_bridge.c\nengine ↔ vtable adapter"];
+    throttle [label="ext_storage_throttle.c\ntoken bucket\nspill concurrency"];
+    storage  [label="storage.h dispatch\nstorageSubmit*()\nmiddleware"];
+    mw       [label="shared middleware\nIO threads (sync backends)"];
+    fc       [label="flashcache backend", fillcolor="#fdeede"];
+    rocks    [label="rocksdb backend", fillcolor="#fdeede"];
+
+    // engine touch-points
+    evict    [label="evict.c\nextStoragePerformEvictions"];
+    object   [label="object.c\nTIERED encoding,\nobjectComputeSize"];
+    rdb      [label="rdb.c\nskip tiered keys"];
+    blocked  [label="blocked.c\nblock/unblock clients"];
+    db       [label="db.c / server.c\ndbFind, DB init"];
+
+    ext -> bridge -> storage -> mw;
+    storage -> fc [label="async path"];
+    mw -> rocks [label="sync path"];
+    ext -> throttle [dir=both];
+    evict -> ext [label="evict hook"];
+    ext -> object;
+    ext -> blocked;
+    ext -> db;
+    rdb -> object [style=dashed, label="reads encoding"];
+}

@@ -1,0 +1,77 @@
+// Data-tiering memory control: two DECOUPLED controllers + the two-stage Smith
+// predictor that computes "projected" memory.
+// Source (this repo): src/ext_storage.c:79-88 (extStorageProjectedMemory),
+//   :997-1033 (spillFillToProjected), :42-71 (predictor counters/EMA);
+//   src/ext_storage_throttle.c:221-230 (throttle band);
+//   src/storage/storage_flashcache_real.c:197-201 (ram_bytes at serialize).
+// Render: dot -Tpng controller-model.dot -o controller-model.png
+digraph controller_model {
+    rankdir=TB;
+    compound=true;
+    labelloc=t;
+    fontname="Helvetica-Bold";
+    fontsize=14;
+    label="Data-Tiering Memory Control — two decoupled controllers + projected-memory predictor";
+    node [fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ---- Top half: the two controllers around the memory zone ----
+    subgraph cluster_ctrl {
+        label="Controllers (no shared signal — coupled only implicitly through memory)";
+        labelloc=t; fontsize=11; fontname="Helvetica"; style="rounded"; color="#999999";
+
+        clients [label="CLIENTS\n(writes add RAM; reads fetch from disk)",
+                 shape=box, style="rounded,filled", fillcolor="#eef3fb"];
+
+        // Memory zone bands (top = highest memory). Thresholds per code.
+        mem [shape=plaintext, label=<
+          <table border="0" cellborder="1" cellspacing="0" cellpadding="5">
+            <tr><td bgcolor="#f5b7b1"><b>&#8805; 1.2x</b>  reject (OOM hard cap, ext_storage.c:940)</td></tr>
+            <tr><td bgcolor="#f8c471"><b>1.1x - 1.2x</b>  spill + throttle</td></tr>
+            <tr><td bgcolor="#fcf3cf"><b>1.0x - 1.1x</b>  spill only (no client penalty)</td></tr>
+            <tr><td bgcolor="#d5f5e3"><b>under 1.0x</b>  normal (no action)</td></tr>
+          </table>>];
+
+        spill [label="SPILL controller\nspillFillToProjected (cap-less)\nwhile projected > maxmemory\n(ext_storage.c:997-1033)",
+               shape=box, style="rounded,filled", fillcolor="#d4e6f1"];
+        throttle [label="THROTTLE controller\nreads RAW used_memory\nramp 1.1x -> 1.2x, cut intake\n(ext_storage_throttle.c:221-230)",
+                  shape=box, style="rounded,filled", fillcolor="#fdebd0"];
+        disk [label="DISK (FlashCache)\ndrain <= bandwidth",
+              shape=box, style="rounded,filled", fillcolor="#eaeaea"];
+
+        clients -> mem [label="ingress (W)"];
+        mem -> spill [label="projected", style=dashed, color="#2471a3", fontcolor="#2471a3"];
+        spill -> disk [label="submit (no cap)", color="#2471a3"];
+        disk -> mem [label="frees RAM on completion", style=dashed, color="#1e8449", fontcolor="#1e8449"];
+        mem -> throttle [label="raw used_memory", style=dashed, color="#b9770e", fontcolor="#b9770e"];
+        throttle -> clients [label="pause / release", color="#b9770e"];
+    }
+
+    // ---- Bottom half: how "projected" is computed (two-stage Smith predictor) ----
+    subgraph cluster_proj {
+        label="projected = used_memory - P1 - P2   (extStorageProjectedMemory, ext_storage.c:79-88)";
+        labelloc=t; fontsize=11; fontname="Helvetica"; style="rounded"; color="#999999";
+
+        submit [label="submit\nextStorageOnSpillSubmit()\nMAIN thread (:849)",
+                shape=box, style="rounded,filled", fillcolor="#eef3fb"];
+        serialize [label="serialize\nobjectComputeSize -> ram_bytes\nIO thread (flashcache_real.c:197)",
+                   shape=box, style="rounded,filled", fillcolor="#d5f5e3"];
+        completion [label="completion\ndebit inflight (ext_storage.c:613)\nMAIN thread",
+                    shape=box, style="rounded,filled", fillcolor="#d5f5e3"];
+
+        submit -> serialize [label="window 1 -> P1"];
+        serialize -> completion [label="window 2 -> P2"];
+
+        p1 [shape=note, style=filled, fillcolor="#fcf3cf",
+            label="P1 = submit_depth x mean_spill_ram\nMODELED (size not yet known)\nsubmit_depth = submitted - serialized (exact)\nmean_spill_ram = EMA, alpha = 1/16"];
+        p2 [shape=note, style=filled, fillcolor="#d5f5e3",
+            label="P2 = inflight_spill_ram_bytes\nEXACT (measured at serialize)\n+= at serialize, -= at completion"];
+
+        submit -> p1 [style=dotted, arrowhead=none, constraint=false];
+        serialize -> p2 [style=dotted, arrowhead=none, constraint=false];
+    }
+
+    // Tie the two halves: the spill controller gates on projected (computed below).
+    spill -> submit [ltail=cluster_ctrl, lhead=cluster_proj,
+                     label="gates on projected", style=dashed, color="#2471a3", fontcolor="#2471a3"];
+}

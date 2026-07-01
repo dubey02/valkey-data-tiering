@@ -1274,6 +1274,10 @@ start_server {tags {"introspection"}} {
             rdma-rx-size
             rdma-bind
             rdma-port
+            ext-storage-enabled
+            ext-storage-backend
+            ext-storage-path
+            ext-storage-capacity-mb
         }
 
         if {!$::tls} {

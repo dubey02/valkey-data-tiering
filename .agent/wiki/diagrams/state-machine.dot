@@ -1,0 +1,25 @@
+// NKS tiering state machine — source: src/ext_storage.h, context/state-machine-design.md
+// Render: dot -Tpng state-machine.dot -o state-machine.png
+digraph nks_tiering_state {
+    rankdir=LR;
+    bgcolor="white";
+    node [shape=box, style="rounded,filled", fillcolor="#eef3fb", fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=9];
+
+    OM   [label="ONLY_MEMORY (0)\nvalue in RAM\n(not in HT)", fillcolor="#dff5e1"];
+    CTF  [label="COPYING_TO_FLASH (1)\nspill in-flight\nvalue still in RAM"];
+    OF   [label="ONLY_FLASH (2)\nvalue on disk\nencoding=TIERED", fillcolor="#fdeede"];
+    CTM  [label="COPYING_TO_MEMORY (3)\nfetch/delete in-flight"];
+    PE   [label="PENDING_EVICT (4)\nevict requested\nduring in-flight op", fillcolor="#f7dede"];
+    DEL  [label="key deleted", shape=ellipse, fillcolor="#eeeeee"];
+
+    OM  -> CTF [label="spillItemAsync()"];
+    CTF -> OF  [label="spill OK\n(free RAM, mark tiered)"];
+    CTF -> OM  [label="spill FAIL\n(keep RAM value)"];
+    CTF -> PE  [label="eviction during spill"];
+    OF  -> CTM [label="GET/SET fetch\nDEL/evict async delete"];
+    CTM -> OM  [label="fetch OK\n(restore, unblock)"];
+    CTM -> DEL [label="delete OK"];
+    CTM -> PE  [label="eviction during fetch"];
+    PE  -> DEL [label="op completes\n(discard value)"];
+}

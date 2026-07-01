@@ -38,6 +38,7 @@
 #include "cluster_migrateslots.h"
 #include "eval.h"
 #include "lrulfu.h"
+#include "ext_storage.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -66,6 +67,19 @@ configEnum maxmemory_policy_enum[] = {
     {"allkeys-lfu", MAXMEMORY_ALLKEYS_LFU},
     {"allkeys-random", MAXMEMORY_ALLKEYS_RANDOM},
     {"noeviction", MAXMEMORY_NO_EVICTION},
+    {NULL, 0}};
+
+/* External-storage (data-tiering) control-strategy selectors — A/B benchmark switches.
+ * v2 = current/default, v1 = legacy. (throttle v1 is "coupled" — drives the spill cap —
+ * but that is a property of v1, not a separate dimension.) */
+configEnum ext_storage_throttling_strategy_enum[] = {
+    {"v1", THROTTLING_STRATEGY_V1},
+    {"v2", THROTTLING_STRATEGY_V2},
+    {NULL, 0}};
+
+configEnum ext_storage_spilling_strategy_enum[] = {
+    {"v1", SPILLING_STRATEGY_V1},
+    {"v2", SPILLING_STRATEGY_V2},
     {NULL, 0}};
 
 configEnum syslog_facility_enum[] = {
@@ -2594,6 +2608,15 @@ static int updateReplBacklogSize(const char **err) {
     return 1;
 }
 
+static int updateExtStorageFcConfig(const char **err) {
+    UNUSED(err);
+    if (ext_data_enabled) {
+        extern void extStorageBridge_applyFcConfigs(void);
+        extStorageBridge_applyFcConfigs();
+    }
+    return 1;
+}
+
 static int updateMaxmemory(const char **err) {
     UNUSED(err);
     if (server.maxmemory) {
@@ -3326,8 +3349,11 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
+    createBoolConfig("ext-storage-enabled", NULL, IMMUTABLE_CONFIG, ext_data_enabled, 0, NULL, NULL),
 
     /* String Configs */
+    createStringConfig("ext-storage-backend", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, ext_storage_backend, "", NULL, NULL),
+    createStringConfig("ext-storage-path", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, ext_storage_path, "", NULL, NULL),
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
     createStringConfig("unixsocket", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.unixsocket, NULL, NULL, NULL),
     createStringConfig("unixsocketgroup", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.unix_ctx_config.group, NULL, NULL, NULL),
@@ -3436,6 +3462,21 @@ standardConfig static_configs[] = {
     createIntConfig("rdma-rx-size", NULL, IMMUTABLE_CONFIG, 64 * 1024, 16 * 1024 * 1024, server.rdma_ctx_config.rx_size, 1024 * 1024, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("rdma-completion-vector", NULL, IMMUTABLE_CONFIG, -1, 1024, server.rdma_ctx_config.completion_vector, -1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-message-gossip-perc", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 100, server.cluster_message_gossip_perc, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("ext-storage-items-spillover-batch-size", NULL, MODIFIABLE_CONFIG, 1, 100, items_spillover_batch_size, 10, INTEGER_CONFIG, NULL, NULL),
+    createLongLongConfig("ext-storage-capacity-mb", NULL, IMMUTABLE_CONFIG, 64, 4194304, ext_storage_capacity_mb, 1024, MEMORY_CONFIG, NULL, NULL),
+    createLongLongConfig("ext-storage-max-spill-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, ext_storage_max_spill_size, 128*1024*1024, MEMORY_CONFIG, NULL, NULL),
+    createLongLongConfig("ext-storage-index-size", NULL, IMMUTABLE_CONFIG, 1024, LLONG_MAX, ext_storage_index_size, 1048576, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("ext-storage-max-allocated-percent", NULL, IMMUTABLE_CONFIG, 50, 100, ext_storage_max_allocated_percent, 90, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("ext-storage-max-in-flight-reads", NULL, IMMUTABLE_CONFIG, 1, 4096, ext_storage_max_in_flight_reads, 128, INTEGER_CONFIG, NULL, NULL),
+    createLongLongConfig("ext-storage-min-gc-rate", NULL, MODIFIABLE_CONFIG, 4096, 1073741824, ext_storage_min_gc_rate, 4096, MEMORY_CONFIG, NULL, updateExtStorageFcConfig),
+    createLongLongConfig("ext-storage-max-gc-rate", NULL, MODIFIABLE_CONFIG, 4096, 1073741824, ext_storage_max_gc_rate, 30*1024*1024, MEMORY_CONFIG, NULL, updateExtStorageFcConfig),
+    createLongLongConfig("ext-storage-max-buffered-write-size", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, ext_storage_max_buffered_write_size, 4*1024*1024, MEMORY_CONFIG, NULL, updateExtStorageFcConfig),
+    createLongLongConfig("ext-storage-buffered-write-flush-threshold", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, ext_storage_buffered_write_flush_threshold, 1024*1024, MEMORY_CONFIG, NULL, updateExtStorageFcConfig),
+    createEnumConfig("ext-storage-throttling-strategy", NULL, MODIFIABLE_CONFIG, ext_storage_throttling_strategy_enum, ext_storage_throttling_strategy, THROTTLING_STRATEGY_V2, NULL, NULL),
+    createEnumConfig("ext-storage-spilling-strategy", NULL, MODIFIABLE_CONFIG, ext_storage_spilling_strategy_enum, ext_storage_spilling_strategy, SPILLING_STRATEGY_V2, NULL, NULL),
+    createIntConfig("ext-storage-throttle-band-start", NULL, MODIFIABLE_CONFIG, 0, 200, ext_storage_throttle_band_start, 100, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("ext-storage-throttle-band-end", NULL, MODIFIABLE_CONFIG, 0, 200, ext_storage_throttle_band_end, 120, INTEGER_CONFIG, NULL, NULL),
+
 
     /* Unsigned int configs */
     createUIntConfig("maxclients", NULL, MODIFIABLE_CONFIG, 1, UINT_MAX, server.maxclients, 10000, INTEGER_CONFIG, NULL, updateMaxclients),

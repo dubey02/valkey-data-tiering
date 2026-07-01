@@ -169,6 +169,10 @@ static struct config {
     int template_argc;
     sds *template_argv;
     int has_field_placeholders;
+    /* Zipfian access pattern */
+    int zipfian;          /* 0=uniform (default), 1=zipfian */
+    double zipfian_alpha; /* Zipfian exponent (default 1.0) */
+    double *zipfian_cdf;  /* Precomputed CDF table */
 } config;
 
 /* Locations of the placeholders __rand_int__, __rand_1st__,
@@ -479,6 +483,32 @@ void initPlaceholders(const char *cmd, size_t cmd_len) {
     return;
 }
 
+/* Zipfian distribution support */
+static void zipfianInit(void) {
+    if (!config.zipfian || config.keyspacelen == 0) return;
+    long n = config.keyspacelen;
+    config.zipfian_cdf = zmalloc(sizeof(double) * n);
+    double sum = 0.0;
+    for (long i = 0; i < n; i++) sum += 1.0 / pow((double)(i + 1), config.zipfian_alpha);
+    double cumulative = 0.0;
+    for (long i = 0; i < n; i++) {
+        cumulative += (1.0 / pow((double)(i + 1), config.zipfian_alpha)) / sum;
+        config.zipfian_cdf[i] = cumulative;
+    }
+}
+
+static uint64_t zipfianSample(void) {
+    double u = (double)random() / (double)RAND_MAX;
+    /* Binary search in CDF */
+    long lo = 0, hi = config.keyspacelen - 1;
+    while (lo < hi) {
+        long mid = (lo + hi) / 2;
+        if (config.zipfian_cdf[mid] < u) lo = mid + 1;
+        else hi = mid;
+    }
+    return (uint64_t)lo;
+}
+
 static void replacePlaceholder(const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter) {
     if (count == 0) return;
 
@@ -486,6 +516,8 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
     if (config.keyspacelen != 0) {
         if (config.sequential_replacement) {
             key = atomic_fetch_add_explicit(key_counter, 1, memory_order_relaxed);
+        } else if (config.zipfian) {
+            key = zipfianSample();
         } else {
             key = random();
         }
@@ -1787,6 +1819,10 @@ int parseOptions(int argc, char **argv) {
             config.datasize = atoi(argv[++i]);
             if (config.datasize < 1) config.datasize = 1;
             if (config.datasize > 1024 * 1024 * 1024) config.datasize = 1024 * 1024 * 1024;
+        } else if (!strcmp(argv[i], "--keysize")) {
+            if (lastarg) goto invalid;
+            config.keysize = atoi(argv[++i]);
+            if (config.keysize < 0) config.keysize = 0;
         } else if (!strcmp(argv[i], "-P")) {
             if (lastarg) goto invalid;
             config.pipeline = atoi(argv[++i]);
@@ -1803,6 +1839,11 @@ int parseOptions(int argc, char **argv) {
             if (config.keyspacelen < 0) config.keyspacelen = 0;
         } else if (!strcmp(argv[i], "--sequential")) {
             config.sequential_replacement = 1;
+        } else if (!strcmp(argv[i], "--zipfian")) {
+            config.zipfian = 1;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                config.zipfian_alpha = atof(argv[++i]);
+            }
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -2032,6 +2073,8 @@ usage:
         " --warmup <seconds> Run benchmark for specified warmup period before\n"
         "                    recording data\n"
         " -d <size>          Data size of SET/GET value in bytes (default 3)\n"
+        " --keysize <size>   Key size in bytes. Keys are left-padded with 'a' to reach\n"
+        "                    this size (default: no padding, key is 'key:' + 12 digits)\n"
         " --dbnum <db>       SELECT the specified db number (default 0)\n"
         " -3                 Start session in RESP3 protocol mode.\n"
         " --threads <num>    Enable multi-thread mode.\n"
@@ -2279,6 +2322,7 @@ int main(int argc, char **argv) {
     aeCreateTimeEvent(config.el, 1, showThroughput, NULL, NULL);
     config.keepalive = 1;
     config.datasize = 3;
+    config.keysize = 0;
     config.pipeline = 1;
     config.replace_placeholders = 0;
     config.keyspacelen = 0;
@@ -2552,6 +2596,12 @@ int main(int argc, char **argv) {
         len = sdslen(cmd_seq);
         /* adjust the datasize to the parsed command */
         config.datasize = len;
+        /* Build the Zipfian CDF for __rand_int__ key selection. The builtin-test
+         * path calls zipfianInit() later in main(), but this arbitrary-command
+         * branch returns before reaching it; without this call config.zipfian_cdf
+         * stays NULL and zipfianSample() segfaults when --zipfian is combined with
+         * a custom command (e.g. HGETALL key:__rand_int__). */
+        zipfianInit();
         do {
             benchmarkSequence(title, cmd_seq, len, seq_len);
         } while (config.loop);
@@ -2564,7 +2614,22 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* Build key template based on --keysize. If keysize is set, the key is
+     * padded with 'a' characters so the total key length equals keysize.
+     * e.g. --keysize 32 → "aaaaaaaaaaaaaaaaaaaa__rand_int__" (20 a's + 12 digits = 32) */
+    char key_template[256];
+    if (config.keysize > 0) {
+        int pad = config.keysize - (int)PLACEHOLDER_LEN;
+        if (pad < 0) pad = 0;
+        memset(key_template, 'a', pad);
+        memcpy(key_template + pad, "__rand_int__", PLACEHOLDER_LEN);
+        key_template[pad + PLACEHOLDER_LEN] = '\0';
+    } else {
+        snprintf(key_template, sizeof(key_template), "key%s:__rand_int__", tag);
+    }
+
     /* Run default benchmark suite. */
+    zipfianInit();
     data = zmalloc(config.datasize + 1);
     do {
         genBenchmarkRandomData(data, config.datasize);
@@ -2579,19 +2644,19 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("set")) {
-            len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+            len = valkeyFormatCommand(&cmd, "SET %s %s", key_template, data);
             benchmark("SET", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("get")) {
-            len = valkeyFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
+            len = valkeyFormatCommand(&cmd, "GET %s", key_template);
             benchmark("GET", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("incr")) {
-            len = valkeyFormatCommand(&cmd, "INCR counter%s:__rand_int__", tag);
+            len = valkeyFormatCommand(&cmd, "INCR %s", key_template);
             benchmark("INCR", cmd, len);
             free(cmd);
         }

@@ -34,6 +34,7 @@
 #include "bio.h"
 #include "script.h"
 #include "cluster_migrateslots.h"
+#include "ext_storage.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -51,15 +52,6 @@
  * inverse frequency means to evict keys with the least frequent accesses).
  *
  * Empty entries have the key pointer set to NULL. */
-#define EVPOOL_SIZE 16
-#define EVPOOL_CACHED_SDS_SIZE 255
-struct evictionPoolEntry {
-    unsigned long long idle; /* Object idle time (inverse frequency for LFU) */
-    sds key;                 /* Key name. */
-    sds cached;              /* Cached SDS object for key name. */
-    int dbid;                /* Key DB number. */
-    int slot;                /* Slot. */
-};
 
 static struct evictionPoolEntry *EvictionPoolLRU;
 
@@ -122,6 +114,12 @@ int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEn
         unsigned long long idle;
         robj *o = samples[j];
         sds key = objectGetKey(o);
+
+        /* Option 3: When populating the spill pool, skip keys not in ONLY_MEMORY state.
+         * This prevents non-spillable keys from polluting the pool. */
+        if (ext_storage_spill_pool_active && o->tiering_state != TIERING_STATE_ONLY_MEMORY) {
+            continue;
+        }
 
         /* Calculate the idle time according to the policy. This is called
          * idle just because the code initially handled LRU, but is in fact
@@ -377,6 +375,116 @@ static unsigned long evictionTimeLimitUs(void) {
     return ULONG_MAX; /* No limit to eviction time */
 }
 
+sds findBestEvictionCandidate(struct evictionPoolEntry *pool, int *bestdbid, int *bestslot) {
+    int j, k, i;
+    static unsigned int next_db = 0;
+    sds bestkey = NULL;
+    serverDb *db;
+
+    if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
+        server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+        while (bestkey == NULL) {
+            unsigned long total_keys = 0;
+
+            /* We don't want to make local-db choices when expiring keys,
+            * so to start populate the eviction pool sampling keys from
+            * every DB. */
+            for (i = 0; i < server.dbnum; i++) {
+                db = server.db[i];
+                if (db == NULL) continue;
+                kvstore *kvs;
+                if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                    kvs = db->keys;
+                } else {
+                    kvs = db->expires;
+                }
+                unsigned long sampled_keys = 0;
+                unsigned long current_db_keys = kvstoreSize(kvs);
+                if (current_db_keys == 0) continue;
+
+                total_keys += current_db_keys;
+                int l = kvstoreNumNonEmptyHashtables(kvs);
+                /* Do not exceed the number of non-empty slots when looping. */
+                while (l--) {
+                    sampled_keys += evictionPoolPopulate(db, kvs, pool);
+                    /* We have sampled enough keys in the current db, exit the loop. */
+                    if (sampled_keys >= (unsigned long)server.maxmemory_samples) break;
+                    /* If there are not a lot of keys in the current db, dict/s may be very
+                    * sparsely populated, exit the loop without meeting the sampling
+                    * requirement. */
+                    if (current_db_keys < (unsigned long)server.maxmemory_samples * 10) break;
+                }
+            }
+            if (!total_keys) break; /* No keys to evict. */
+
+            /* If the spill pool filter is active and the pool is still empty after
+             * sampling, all keys are in a non-spillable state (e.g. COPYING_TO_FLASH).
+             * Break to avoid spinning forever. */
+            if (ext_storage_spill_pool_active && pool[EVPOOL_SIZE - 1].key == NULL && pool[0].key == NULL) {
+                break;
+            }
+
+            /* Go backward from best to worst element to evict. */
+            for (k = EVPOOL_SIZE - 1; k >= 0; k--) {
+                if (pool[k].key == NULL) continue;
+                *bestdbid = pool[k].dbid;
+
+                kvstore *kvs;
+                if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                    kvs = server.db[*bestdbid]->keys;
+                } else {
+                    kvs = server.db[*bestdbid]->expires;
+                }
+                void *entry = NULL;
+
+                bool found = kvstoreHashtableFind(kvs, pool[k].slot, pool[k].key, &entry);
+
+                /* Remove the entry from the pool. */
+                if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
+                pool[k].key = NULL;
+                pool[k].idle = 0;
+
+                /* If the key exists, is our pick. Otherwise it is
+                * a ghost and we need to try the next element. */
+                if (found) {
+                    bestkey = objectGetKey((robj *)entry);
+                    *bestslot = pool[k].slot;
+                    break;
+                } else {
+                    /* Ghost... Iterate again. */
+                }
+            }
+        }
+    }
+    /* volatile-random and allkeys-random policy */
+    else if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM ||
+            server.maxmemory_policy == MAXMEMORY_VOLATILE_RANDOM) {
+        /* When evicting a random key, we try to evict a key for
+         * each DB, so we use the static 'next_db' variable to
+         * incrementally visit all DBs. */
+        for (i = 0; i < server.dbnum; i++) {
+            j = (++next_db) % server.dbnum;
+            db = server.db[j];
+            if (db == NULL) continue;
+            kvstore *kvs;
+            if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM) {
+                kvs = db->keys;
+            } else {
+                kvs = db->expires;
+            }
+            int slot = kvstoreGetFairRandomHashtableIndex(kvs);
+            if (slot == KVSTORE_INDEX_NOT_FOUND) continue; /* No keys in this DB. */
+            void *entry;
+            if (kvstoreHashtableRandomEntry(kvs, slot, &entry)) {
+                bestkey = objectGetKey((robj *)entry);
+                *bestdbid = j;
+                *bestslot = slot;
+            }
+        }
+    }
+    return bestkey;
+}
+
 /* Check that memory usage is within the current "maxmemory" limit.  If over
  * "maxmemory", attempt to free memory by evicting data (if it's safe to do so).
  *
@@ -415,7 +523,19 @@ int performEvictions(void) {
     int result = EVICT_FAIL;
 
     if (getMaxmemoryState(&mem_reported, NULL, &mem_tofree, NULL) == C_OK) {
-        result = EVICT_OK;
+    }
+
+    // If external storage is enabled, handle memory pressure via spilling — not eviction.
+    // This MUST run before the noeviction check, because with tiering + noeviction,
+    // we still spill (data-preserving) even though standard eviction is forbidden.
+    if (ext_data_enabled) {
+        processCompletedStorageRequestsAndSpillOldItemsAggressive();
+        int ts_result;
+        if (extStoragePerformEvictions(&ts_result)) {
+            result = (ts_result == C_OK) ? EVICT_OK : EVICT_FAIL;
+        } else {
+            result = EVICT_FAIL;
+        }
         goto update_metrics;
     }
 
@@ -425,123 +545,16 @@ int performEvictions(void) {
     }
 
     unsigned long eviction_time_limit_us = evictionTimeLimitUs();
-
     latencyStartMonitor(latency);
-
     monotime evictionTimer;
     elapsedStart(&evictionTimer);
-
-    /* Try to smoke-out bugs (server.also_propagate should be empty here) */
     serverAssert(server.also_propagate.numops == 0);
-    /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {
-        int j, k, i;
-        static unsigned int next_db = 0;
-        sds bestkey = NULL;
         int bestdbid;
         int bestslot;
         serverDb *db;
-        robj *valkey;
-
-        if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
-            server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
-            struct evictionPoolEntry *pool = EvictionPoolLRU;
-            while (bestkey == NULL) {
-                unsigned long total_keys = 0;
-
-                /* We don't want to make local-db choices when expiring keys,
-                 * so to start populate the eviction pool sampling keys from
-                 * every DB. */
-                for (i = 0; i < server.dbnum; i++) {
-                    db = server.db[i];
-                    if (db == NULL) continue;
-                    kvstore *kvs;
-                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
-                        kvs = db->keys;
-                    } else {
-                        kvs = db->expires;
-                    }
-                    unsigned long sampled_keys = 0;
-                    unsigned long current_db_keys = kvstoreSize(kvs);
-                    if (current_db_keys == 0) continue;
-
-                    total_keys += current_db_keys;
-                    int l = kvstoreNumNonEmptyHashtables(kvs);
-                    /* Do not exceed the number of non-empty slots when looping. */
-                    while (l--) {
-                        sampled_keys += evictionPoolPopulate(db, kvs, pool);
-                        /* We have sampled enough keys in the current db, exit the loop. */
-                        if (sampled_keys >= (unsigned long)server.maxmemory_samples) break;
-                        /* If there are not a lot of keys in the current db, dict/s may be very
-                         * sparsely populated, exit the loop without meeting the sampling
-                         * requirement. */
-                        if (current_db_keys < (unsigned long)server.maxmemory_samples * 10) break;
-                    }
-                }
-                if (!total_keys) break; /* No keys to evict. */
-
-                /* Go backward from best to worst element to evict. */
-                for (k = EVPOOL_SIZE - 1; k >= 0; k--) {
-                    if (pool[k].key == NULL) continue;
-                    bestdbid = pool[k].dbid;
-
-                    kvstore *kvs;
-                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
-                        kvs = server.db[bestdbid]->keys;
-                    } else {
-                        kvs = server.db[bestdbid]->expires;
-                    }
-                    void *entry = NULL;
-
-                    bool found = kvstoreHashtableFind(kvs, pool[k].slot, pool[k].key, &entry);
-
-                    /* Remove the entry from the pool. */
-                    if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
-                    pool[k].key = NULL;
-                    pool[k].idle = 0;
-
-                    /* If the key exists, is our pick. Otherwise it is
-                     * a ghost and we need to try the next element. */
-                    if (found) {
-                        valkey = entry;
-                        bestkey = objectGetKey(valkey);
-                        bestslot = pool[k].slot;
-                        break;
-                    } else {
-                        /* Ghost... Iterate again. */
-                    }
-                }
-            }
-        }
-
-        /* volatile-random and allkeys-random policy */
-        else if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM ||
-                 server.maxmemory_policy == MAXMEMORY_VOLATILE_RANDOM) {
-            /* When evicting a random key, we try to evict a key for
-             * each DB, so we use the static 'next_db' variable to
-             * incrementally visit all DBs. */
-            for (i = 0; i < server.dbnum; i++) {
-                j = (++next_db) % server.dbnum;
-                db = server.db[j];
-                if (db == NULL) continue;
-                kvstore *kvs;
-                if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM) {
-                    kvs = db->keys;
-                } else {
-                    kvs = db->expires;
-                }
-                int slot = kvstoreGetFairRandomHashtableIndex(kvs);
-                if (slot == KVSTORE_INDEX_NOT_FOUND) continue; /* No keys in this DB. */
-                void *entry;
-                if (kvstoreHashtableRandomEntry(kvs, slot, &entry)) {
-                    bestkey = objectGetKey((robj *)entry);
-                    bestdbid = j;
-                    bestslot = slot;
-                    break;
-                }
-            }
-        }
+        sds bestkey = findBestEvictionCandidate(EvictionPoolLRU, &bestdbid, &bestslot);
 
         /* Finally remove the selected key. */
         if (bestkey) {

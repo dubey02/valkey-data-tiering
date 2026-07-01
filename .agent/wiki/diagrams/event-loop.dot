@@ -1,0 +1,25 @@
+// Event-loop integration. Source: .agent/knowledge/data-flow-complete.md, ext_storage.c, server.c
+// Render: dot -Tpng event-loop.dot -o event-loop.png
+digraph event_loop {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fillcolor="#eef3fb", fontname="Helvetica", fontsize=10];
+    edge [fontname="Helvetica", fontsize=9];
+
+    read  [label="readQueryFromClient"];
+    thr   [label="throttle gate\nextStorageThrottle_shouldThrottle", fillcolor="#fff4d6"];
+    proc  [label="processCommand"];
+    pre   [label="preCommandExec\nkey on flash? block"];
+    call  [label="call()\nrecord latency"];
+    bs    [label="beforeSleep"];
+    drain [label="processCompletedStorageRequests\nunblock + restore values\n(ALL completions, never capped)", fillcolor="#dff5e1"];
+    spill [label="spillOldItems\nif used_memory > maxmemory"];
+    reexec[label="blockedBeforeSleep\nre-run pending commands"];
+    timer [label="1ms timer\nrefill tokens, release queued", fillcolor="#fff4d6"];
+
+    read -> thr -> proc -> pre;
+    pre -> call [label="ACCEPT"];
+    pre -> bs   [label="block", style=dashed];
+    call -> bs;
+    bs -> drain -> spill -> reexec;
+    timer -> thr [style=dashed];
+}

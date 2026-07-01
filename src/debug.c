@@ -28,6 +28,8 @@
  */
 
 #include "server.h"
+#include "ext_storage.h"
+#include "ext_storage_bridge.h"
 #include "util.h"
 #include "sha1.h" /* SHA1 is used for DEBUG DIGEST */
 #include "crc64.h"
@@ -151,15 +153,15 @@ void mixStringObjectDigest(unsigned char *digest, robj *o) {
  * will continue mixing this object digest to anything that was already
  * present. */
 void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o) {
-    uint32_t aux = htonl(objectGetType(o));
+    uint32_t aux = htonl(o->type);
     mixDigest(digest, &aux, sizeof(aux));
     long long expiretime = objectGetExpire(o);
     char buf[128];
 
     /* Save the key and associated value */
-    if (objectGetType(o) == OBJ_STRING) {
+    if (o->type == OBJ_STRING) {
         mixStringObjectDigest(digest, o);
-    } else if (objectGetType(o) == OBJ_LIST) {
+    } else if (o->type == OBJ_LIST) {
         listTypeIterator *li = listTypeInitIterator(o, 0, LIST_TAIL);
         listTypeEntry entry;
         while (listTypeNext(li, &entry)) {
@@ -168,7 +170,7 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
             decrRefCount(eleobj);
         }
         listTypeReleaseIterator(li);
-    } else if (objectGetType(o) == OBJ_SET) {
+    } else if (o->type == OBJ_SET) {
         setTypeIterator *si = setTypeInitIterator(o);
         sds sdsele;
         while ((sdsele = setTypeNextObject(si)) != NULL) {
@@ -176,10 +178,10 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
             sdsfree(sdsele);
         }
         setTypeReleaseIterator(si);
-    } else if (objectGetType(o) == OBJ_ZSET) {
+    } else if (o->type == OBJ_ZSET) {
         unsigned char eledigest[20];
 
-        if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+        if (o->encoding == OBJ_ENCODING_LISTPACK) {
             unsigned char *zl = objectGetVal(o);
             unsigned char *eptr, *sptr;
             unsigned char *vstr;
@@ -209,7 +211,7 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
                 xorDigest(digest, eledigest, 20);
                 zzlNext(zl, &eptr, &sptr);
             }
-        } else if (objectGetEncoding(o) == OBJ_ENCODING_SKIPLIST) {
+        } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = objectGetVal(o);
             hashtableIterator iter;
             hashtableInitIterator(&iter, zs->ht, 0);
@@ -229,7 +231,7 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
         } else {
             serverPanic("Unknown sorted set encoding");
         }
-    } else if (objectGetType(o) == OBJ_HASH) {
+    } else if (o->type == OBJ_HASH) {
         hashTypeIterator hi;
         hashTypeInitIterator(o, &hi);
         while (hashTypeNext(&hi) != C_ERR) {
@@ -246,7 +248,7 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
             xorDigest(digest, eledigest, 20);
         }
         hashTypeResetIterator(&hi);
-    } else if (objectGetType(o) == OBJ_STREAM) {
+    } else if (o->type == OBJ_STREAM) {
         streamIterator si;
         streamIteratorStart(&si, objectGetVal(o), NULL, NULL, 0);
         streamID id;
@@ -266,7 +268,7 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
             }
         }
         streamIteratorStop(&si);
-    } else if (objectGetType(o) == OBJ_MODULE) {
+    } else if (o->type == OBJ_MODULE) {
         ValkeyModuleDigest md = {{0}, {0}, keyobj, db->id};
         moduleValue *mv = objectGetVal(o);
         moduleType *mt = mv->type;
@@ -737,7 +739,7 @@ void debugCommand(client *c) {
 
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr)) == NULL) return;
 
-        if (objectGetEncoding(o) != OBJ_ENCODING_LISTPACK) {
+        if (o->encoding != OBJ_ENCODING_LISTPACK) {
             addReplyError(c, "Not a listpack encoded object.");
         } else {
             lpRepr(objectGetVal(o));
@@ -750,7 +752,7 @@ void debugCommand(client *c) {
 
         int full = 0;
         if (c->argc == 4) full = atoi(objectGetVal(c->argv[3]));
-        if (objectGetEncoding(o) != OBJ_ENCODING_QUICKLIST) {
+        if (o->encoding != OBJ_ENCODING_QUICKLIST) {
             addReplyError(c, "Not a quicklist encoded object.");
         } else {
             quicklistRepr(objectGetVal(o), full);
@@ -972,7 +974,7 @@ void debugCommand(client *c) {
 
         /* Get the hashtable reference from the object, if possible. */
         hashtable *ht = NULL;
-        switch (objectGetEncoding(o)) {
+        switch (o->encoding) {
         case OBJ_ENCODING_SKIPLIST: {
             zset *zs = objectGetVal(o);
             ht = zs->ht;
@@ -1070,6 +1072,53 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "client-enforce-reply-list") && c->argc == 3) {
         server.debug_client_enforce_reply_list = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc == 3) {
+        /* DEBUG SPILL <key> — manually spill a key to external storage */
+        if (!ext_data_enabled) {
+            addReplyError(c, "ext-storage-enabled is not set");
+            return;
+        }
+        sds key = objectGetVal(c->argv[2]);
+        serverDb *db = c->db;
+        dbEntry *entry = dbFind(db, key);
+        if (!entry) {
+            addReplyError(c, "key not found");
+            return;
+        }
+        if (objectIsTiered(entry)) {
+            addReplyError(c, "key already on flash");
+            return;
+        }
+        if (entry->encoding == OBJ_ENCODING_EMBSTR || entry->encoding == OBJ_ENCODING_INT || entry->hasembval) {
+            addReplyError(c, "key has embedded value (not spillable)");
+            return;
+        }
+        TieringState state = extStorageGetState(db, key);
+        if (state != TIERING_STATE_ONLY_MEMORY) {
+            addReplyErrorFormat(c, "key in state %d (expected ONLY_MEMORY=0)", (int)state);
+            return;
+        }
+        /* Borrowed value robj mirroring the real type/encoding so every object
+         * type (string/list/set/hash/zset/stream) serializes correctly. */
+        robj *keyobj = createStringObject(key, sdslen(key));
+        robj *value_copy = zmalloc(sizeof(robj));
+        memset(value_copy, 0, sizeof(robj));
+        value_copy->type = entry->type;
+        value_copy->encoding = entry->encoding;
+        value_copy->refcount = 1;
+        objectSetVal(value_copy, objectGetVal(entry));
+        long long expireMs = objectGetExpire(entry);
+        int rc = extStorageBridge_submitPut(db->id, keyobj, value_copy, expireMs);
+        if (rc != 0) {
+            decrRefCount(keyobj);
+            zfree(value_copy); /* borrowed — don't free the value it points to */
+            addReplyError(c, "spill submission rejected");
+            return;
+        }
+        extStorageSetState(db, key, TIERING_STATE_COPYING_TO_FLASH,
+            VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_WRITE);
+        total_items_spilling_to_ext_storage++;
+        addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "force-free-primary-async") && c->argc == 3) {
         server.debug_force_free_primary_async = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
@@ -1088,6 +1137,44 @@ void debugCommand(client *c) {
         } else {
             addReplyError(c, "No such client");
         }
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc == 3) {
+        /* DEBUG SPILL <key> — manually spill a key to external storage */
+        if (!ext_data_enabled) {
+            addReplyError(c, "ext-storage-enabled is not set");
+            return;
+        }
+        sds key = objectGetVal(c->argv[2]);
+        serverDb *db = c->db;
+        dbEntry *entry = dbFind(db, key);
+        if (!entry) {
+            addReplyError(c, "key not found");
+            return;
+        }
+        if (objectIsTiered(entry)) {
+            addReplyError(c, "key already on flash");
+            return;
+        }
+        TieringState state = extStorageGetState(db, key);
+        if (state != TIERING_STATE_ONLY_MEMORY) {
+            addReplyErrorFormat(c, "key in state %d (expected ONLY_MEMORY=0)", (int)state);
+            return;
+        }
+        /* Create robj copies and submit spill */
+        robj *keyobj = createStringObject(key, sdslen(key));
+        sds raw_value = (sds)objectGetVal(entry);
+        robj *value_copy = createStringObject(raw_value, sdslen(raw_value));
+        long long expireMs = objectGetExpire(entry);
+        int rc = extStorageBridge_submitPut(db->id, keyobj, value_copy, expireMs);
+        if (rc != 0) {
+            decrRefCount(keyobj);
+            decrRefCount(value_copy);
+            addReplyError(c, "spill submission rejected");
+            return;
+        }
+        extStorageSetState(db, key, TIERING_STATE_COPYING_TO_FLASH,
+            VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_WRITE);
+        total_items_spilling_to_ext_storage++;
+        addReply(c, shared.ok);
     } else if (!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;
@@ -1157,9 +1244,9 @@ void _serverAssertPrintClientInfo(const client *c) {
 }
 
 void serverLogObjectDebugInfo(const robj *o) {
-    serverLog(LL_WARNING, "Object type: %u", objectGetType(o));
-    serverLog(LL_WARNING, "Object encoding: %u", objectGetEncoding(o));
-    serverLog(LL_WARNING, "Object refcount: %d", objectGetRefcount(o));
+    serverLog(LL_WARNING, "Object type: %u", o->type);
+    serverLog(LL_WARNING, "Object encoding: %u", o->encoding);
+    serverLog(LL_WARNING, "Object refcount: %d", o->refcount);
 #if defined(UNSAFE_CRASH_REPORT) && UNSAFE_CRASH_REPORT
     /* This code is now disabled. o->ptr may be unreliable to print. in some
      * cases a ziplist could have already been freed by realloc, but not yet
@@ -1168,24 +1255,24 @@ void serverLogObjectDebugInfo(const robj *o) {
      * For some cases it may be ok to crash here again, but these could cause
      * invalid memory access which will bother valgrind and also possibly cause
      * random memory portion to be "leaked" into the logfile. */
-    if (objectGetType(o) == OBJ_STRING && sdsEncodedObject(o)) {
+    if (o->type == OBJ_STRING && sdsEncodedObject(o)) {
         serverLog(LL_WARNING, "Object raw string len: %zu", sdslen(o->ptr));
         if (sdslen(o->ptr) < 4096) {
             sds repr = sdscatrepr(sdsempty(), o->ptr, sdslen(o->ptr));
             serverLog(LL_WARNING, "Object raw string content: %s", repr);
             sdsfree(repr);
         }
-    } else if (objectGetType(o) == OBJ_LIST) {
+    } else if (o->type == OBJ_LIST) {
         serverLog(LL_WARNING, "List length: %d", (int)listTypeLength(o));
-    } else if (objectGetType(o) == OBJ_SET) {
+    } else if (o->type == OBJ_SET) {
         serverLog(LL_WARNING, "Set size: %d", (int)setTypeSize(o));
-    } else if (objectGetType(o) == OBJ_HASH) {
+    } else if (o->type == OBJ_HASH) {
         serverLog(LL_WARNING, "Hash size: %d", (int)hashTypeLength(o));
-    } else if (objectGetType(o) == OBJ_ZSET) {
+    } else if (o->type == OBJ_ZSET) {
         serverLog(LL_WARNING, "Sorted set size: %d", (int)zsetLength(o));
-        if (objectGetEncoding(o) == OBJ_ENCODING_SKIPLIST)
+        if (o->encoding == OBJ_ENCODING_SKIPLIST)
             serverLog(LL_WARNING, "Skiplist level: %d", (int)((const zset *)o->ptr)->zsl->level);
-    } else if (objectGetType(o) == OBJ_STREAM) {
+    } else if (o->type == OBJ_STREAM) {
         serverLog(LL_WARNING, "Stream size: %d", (int)streamLength(o));
     }
 #endif

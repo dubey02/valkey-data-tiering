@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>KEG — NKS Data Tiering Wiki Graph</title>
+<script>
+window.onerror = function (m, s, l, c, e) {
+  var d = document.createElement("pre");
+  d.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#f38ba8;color:#1e1e2e;padding:8px;margin:0;white-space:pre-wrap;font:12px monospace";
+  d.textContent = "JS error: " + m + " @" + l + ":" + c + (e && e.stack ? "\n" + e.stack : "");
+  (document.body || document.documentElement).appendChild(d);
+};
+</script>
+<script src="vendor/cytoscape.min.js"></script>
+<script src="vendor/marked.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, system-ui, sans-serif; background: #fafafa; }
+  #app { display: grid; grid-template-columns: 280px 1fr; height: 100vh; }
+  #sidebar { background: #1e1e2e; color: #cdd6f4; padding: 16px; overflow-y: auto; font-size: 13px; }
+  #sidebar h1 { margin: 0 0 8px; font-size: 16px; color: #fff; }
+  #sidebar h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #89b4fa; margin: 16px 0 6px; }
+  #sidebar label { display: block; margin: 4px 0; cursor: pointer; }
+  #sidebar input[type=checkbox] { margin-right: 6px; vertical-align: middle; }
+  #sidebar input[type=text] { width: 100%; padding: 6px; background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; box-sizing: border-box; }
+  #stats { font-size: 11px; color: #a6adc8; margin-top: 12px; line-height: 1.5; }
+  #stats b { color: #f9e2af; }
+  #cy { width: 100%; height: 100%; background: #fff; }
+  .edge-legend { display: flex; align-items: center; margin: 3px 0; font-size: 11px; }
+  .edge-legend .swatch { display: inline-block; width: 16px; height: 3px; margin-right: 6px; }
+  #info { position: absolute; bottom: 16px; right: 16px; background: #1e1e2e; color: #cdd6f4; padding: 12px; border-radius: 6px; max-width: 360px; font-size: 12px; line-height: 1.5; display: none; box-shadow: 0 4px 16px rgba(0,0,0,0.2); }
+  #info b { color: #f9e2af; }
+  #info code { background: #313244; padding: 1px 4px; border-radius: 3px; }
+  .mode-tab { display: inline-block; padding: 4px 10px; margin-right: 4px; background: #313244; border-radius: 4px 4px 0 0; cursor: pointer; font-size: 11px; }
+  .mode-tab.active { background: #89b4fa; color: #1e1e2e; font-weight: bold; }
+  .triage-issue { padding: 6px; margin: 4px 0; background: #313244; border-left: 3px solid #f38ba8; border-radius: 3px; font-size: 11px; }
+  .triage-issue.warn { border-left-color: #f9e2af; }
+  .triage-issue.info { border-left-color: #89b4fa; }
+  #doc { position: fixed; top: 0; right: 0; width: 46%; height: 100vh; background: #fff; box-shadow: -4px 0 16px rgba(0,0,0,0.25); display: none; z-index: 10000; overflow-y: auto; }
+  #doc-head { position: sticky; top: 0; background: #1e1e2e; color: #cdd6f4; padding: 10px 14px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
+  #doc-close { cursor: pointer; background: #f38ba8; color: #1e1e2e; border: none; border-radius: 4px; padding: 4px 10px; }
+  #doc-body { padding: 16px 22px; font-size: 14px; line-height: 1.55; color: #1e1e2e; }
+  #doc-body pre { background: #f4f4f8; padding: 10px; overflow-x: auto; border-radius: 4px; }
+  #doc-body img { max-width: 100%; }
+  #doc-body table { border-collapse: collapse; } #doc-body th, #doc-body td { border: 1px solid #ccc; padding: 4px 8px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h1>KEG — NKS Tiering Graph</h1>
+    <div>
+      <span class="mode-tab active" data-mode="graph">Graph</span>
+      <span class="mode-tab" data-mode="triage">Triage</span>
+    </div>
+
+    <div id="graph-controls">
+      <p style="font-size:11px;color:#a6adc8;margin:8px 0">Click a node to isolate it + its links. Click empty space to reset.</p>
+      <h2>Layout</h2>
+      <select id="layout" onchange="runLayout(this.value)" style="width:100%;padding:6px;background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4px">
+        <option value="cose">Force (organic)</option>
+        <option value="breadthfirst">Hierarchy</option>
+        <option value="concentric">Hubs in center</option>
+        <option value="circle">Circle</option>
+        <option value="grid">Grid</option>
+        <option value="columns">Columns by type</option>
+      </select>
+      <button onclick="runLayout(document.getElementById('layout').value)" style="margin-top:6px;width:100%;padding:6px;background:#89b4fa;color:#1e1e2e;border:none;border-radius:4px;cursor:pointer">↻ Re-run / Fit</button>
+
+      <h2>Search</h2>
+      <input type="text" id="search" placeholder="filter nodes by label…">
+
+      <h2>Edge kinds</h2>
+      <div id="edge-filters"></div>
+
+      <h2>Page types</h2>
+      <div id="type-filters"></div>
+
+      <h2>Tier</h2>
+      <div id="tier-filters"></div>
+    </div>
+
+    <div id="triage-controls" style="display: none;">
+      <h2>Issues</h2>
+      <div id="triage-list">Loading…</div>
+    </div>
+
+    <div id="stats"></div>
+  </div>
+  <div id="cy"></div>
+</div>
+<div id="info"></div>
+<div id="doc"><div id="doc-head"><span><button id="doc-back" onclick="docBack()" style="visibility:hidden;cursor:pointer;background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;margin-right:8px">← back</button><span id="doc-title"></span></span><button id="doc-close" onclick="document.getElementById('doc').style.display='none'">✕ close</button></div><div id="doc-body"></div></div>
+
+<script>
+const EDGE_COLORS = {
+  cites:           "#94e2d5",
+  depends_on:      "#89b4fa",
+  calls:           "#b4befe",
+  configures:      "#f5c2e7",
+  owns:            "#f9e2af",
+  contributed_to:  "#fab387",
+  contains:        "#a6e3a1",
+  implements:      "#cba6f7",
+  supersedes:      "#f38ba8",
+  contradicts:     "#f38ba8",
+  blocks:          "#eba0ac",
+  resolves:        "#a6e3a1",
+  mitigates:       "#74c7ec",
+  refers_to:       "#9399b2",
+};
+const TYPE_SHAPES = {
+  overview:   "ellipse",
+  component:  "rectangle",
+  interface:  "hexagon",
+  flow:       "diamond",
+  decision:   "pentagon",
+};
+const TIER_OPACITY = { fact: 1.0, working: 0.85, wisdom: 0.7, undefined: 0.6 };
+
+let cy, dataGlobal;
+
+async function load() {
+  if (typeof cytoscape === "undefined") {
+    document.body.innerHTML = "<pre style='padding:16px'>vendor/cytoscape.min.js did not load (cytoscape is undefined). Check the Network tab.</pre>";
+    return;
+  }
+  const res = await fetch("./edges.json");
+  if (!res.ok) {
+    document.body.innerHTML = "<pre style='padding:16px'>Could not load edges.json. Run:\n\n  python3 .agent/wiki/keg/keg_lint.py --json --out .agent/wiki/keg/viewer/edges.json\n\nfrom the package root, then refresh.</pre>";
+    return;
+  }
+  const data = await res.json();
+  dataGlobal = data;
+  buildGraph(data);
+  buildFilters(data);
+  buildStats(data);
+}
+
+function buildGraph(data) {
+  const elements = [];
+  for (const n of data.nodes) {
+    elements.push({ data: { id: n.id, label: n.label, type: n.type, tier: n.tier || "undefined", claim_count: n.claim_count || 1, status: n.status, migrated: n.migrated } });
+  }
+  for (const e of data.edges) {
+    elements.push({ data: { source: e.from, target: e.to, kind: e.kind, edge_source: e.source, needs_review: e.needs_review, note: e.note } });
+  }
+  cy = cytoscape({
+    container: document.getElementById("cy"),
+    elements,
+    layout: { name: "cose", animate: false, idealEdgeLength: 90, nodeRepulsion: 5000, padding: 30 },
+    style: [
+      { selector: "node", style: {
+          label: "data(label)",
+          "font-size": "10px",
+          "text-valign": "center",
+          "text-halign": "center",
+          "text-wrap": "wrap",
+          "text-max-width": "100px",
+          width: "mapData(claim_count, 0, 12, 30, 80)",
+          height: "mapData(claim_count, 0, 12, 30, 80)",
+          shape: ele => TYPE_SHAPES[ele.data("type")] || "ellipse",
+          "background-color": ele => ({
+            overview: "#fab387", component: "#89b4fa", interface: "#94e2d5",
+            flow: "#a6e3a1", decision: "#f9e2af",
+          }[ele.data("type")] || "#9399b2"),
+          "background-opacity": ele => TIER_OPACITY[ele.data("tier")],
+          color: "#1e1e2e",
+          "border-width": ele => ele.data("status") === "superseded" ? 0 : 1,
+          "border-color": "#1e1e2e",
+        }},
+      { selector: "node[status='superseded']", style: { opacity: 0.3 } },
+      { selector: "edge", style: {
+          width: 1.5,
+          "curve-style": "bezier",
+          "target-arrow-shape": "triangle",
+          "target-arrow-color": ele => EDGE_COLORS[ele.data("kind")] || "#9399b2",
+          "line-color": ele => EDGE_COLORS[ele.data("kind")] || "#9399b2",
+          "line-style": ele => ele.data("needs_review") ? "dashed" : "solid",
+          opacity: 0.6,
+        }},
+      { selector: "edge[kind='contradicts']", style: { width: 2, "line-style": "dashed" } },
+      { selector: ".faded", style: { opacity: 0.1 } },
+      { selector: ":selected", style: { "border-width": 3, "border-color": "#f9e2af", opacity: 1 } },
+    ],
+  });
+  cy.on("tap", "node", evt => { focusNeighborhood(evt.target); showInfo(evt.target); });
+  cy.on("tap", "edge", evt => showEdgeInfo(evt.target));
+  cy.on("tap", e => { if (e.target === cy) { clearFocus(); document.getElementById("info").style.display = "none"; } });
+}
+
+function focusNeighborhood(node) {
+  cy.elements().addClass("faded");
+  node.closedNeighborhood().removeClass("faded");
+}
+function clearFocus() {
+  cy.elements().removeClass("faded");
+  applyFilters();
+}
+function runLayout(name) {
+  let opts = { name, animate: true, animationDuration: 400, padding: 30, fit: true };
+  if (name === "cose") Object.assign(opts, { idealEdgeLength: 90, nodeRepulsion: 5000 });
+  else if (name === "breadthfirst") Object.assign(opts, { directed: true, spacingFactor: 1.2 });
+  else if (name === "concentric") Object.assign(opts, { minNodeSpacing: 40, concentric: n => n.degree(), levelWidth: () => 2 });
+  else if (name === "columns") {
+    const ORDER = { overview: 0, component: 1, interface: 2, flow: 3, decision: 4 };
+    const COL = 230, ROW = 56, counts = {}, idx = {}, pos = {};
+    cy.nodes().forEach(n => { const c = ORDER[n.data("type")] ?? 5; counts[c] = (counts[c] || 0) + 1; });
+    cy.nodes().forEach(n => {
+      const c = ORDER[n.data("type")] ?? 5;
+      const row = (idx[c] = idx[c] || 0, idx[c]++);
+      pos[n.id()] = { x: c * COL, y: (row - (counts[c] - 1) / 2) * ROW };
+    });
+    opts = { name: "preset", fit: true, padding: 20, positions: n => pos[n.id()] };
+  }
+  cy.layout(opts).run();
+}
+document.getElementById("doc-body").addEventListener("click", e => {
+  const a = e.target.closest("a");
+  if (!a) return;
+  const href = a.getAttribute("href") || "";
+  if (/\.md($|#)/.test(href)) {
+    e.preventDefault();
+    document.getElementById("doc").scrollTop = 0;
+    openPage(href.replace(/^\//, "").replace(/#.*$/, ""));
+  }
+});
+let docCur = null;
+const docHist = [];
+function docBack() {
+  if (!docHist.length) return;
+  document.getElementById("doc").scrollTop = 0;
+  openPage(docHist.pop(), false);
+}
+function openPage(id, record) {
+  if (record !== false && docCur && docCur !== id) docHist.push(docCur);
+  docCur = id;
+  document.getElementById("doc-back").style.visibility = docHist.length ? "visible" : "hidden";
+  const dir = id.includes("/") ? id.slice(0, id.lastIndexOf("/")) : "";
+  fetch("/" + id).then(r => r.ok ? r.text() : Promise.reject(r.status)).then(t => {
+    t = t.replace(/^---\n[\s\S]*?\n---\n/, "");                       // drop frontmatter
+    let html = marked.parse(t);
+    const prefix = dir ? `/${dir}/` : "/";
+    html = html.replace(/(src|href)="(?!https?:|\/|#)([^"]+)"/g, `$1="${prefix}$2"`); // relative -> root-absolute
+    document.getElementById("doc-title").textContent = id;
+    document.getElementById("doc-body").innerHTML = html;
+    document.getElementById("doc").style.display = "block";
+  }).catch(e => {
+    document.getElementById("doc-title").textContent = id;
+    document.getElementById("doc-body").innerHTML = "<p style='padding:16px'>Could not load <code>/" + id + "</code> (" + e + "). The server must be rooted at <code>.agent/wiki/</code>: <code>python3 -m http.server 8000 --bind 127.0.0.1 -d .agent/wiki</code>, opened via <code>/keg/viewer/index.html</code>.</p>";
+    document.getElementById("doc").style.display = "block";
+  });
+}
+
+function showInfo(node) {
+  const inb = node.connectedEdges(`[target="${node.id()}"]`).length;
+  const outb = node.connectedEdges(`[source="${node.id()}"]`).length;
+  document.getElementById("info").innerHTML = `
+    <button onclick="openPage('${node.id()}')" style="float:right;cursor:pointer;background:#89b4fa;color:#1e1e2e;border:none;border-radius:4px;padding:2px 8px">📄 Open page</button>
+    <b>${node.data("label")}</b>
+    <div>type: <code>${node.data("type")}</code></div>
+    <div>tier: <code>${node.data("tier") || "—"}</code></div>
+    <div>claims: <code>${node.data("claim_count") || "—"}</code></div>
+    <div>status: <code>${node.data("status")}</code></div>
+    <div>edges: <code>${inb} in / ${outb} out</code></div>
+    <div>migrated: <code>${node.data("migrated") ? "yes" : "no (body-link fallback)"}</code></div>
+    <div style="margin-top:6px;font-size:10px;color:#a6adc8">${node.id()}</div>
+  `;
+  document.getElementById("info").style.display = "block";
+}
+function showEdgeInfo(edge) {
+  document.getElementById("info").innerHTML = `
+    <b>${edge.source().data("label")} → ${edge.target().data("label")}</b>
+    <div>kind: <code>${edge.data("kind")}</code></div>
+    <div>source: <code>${edge.data("edge_source")}</code></div>
+    ${edge.data("needs_review") ? '<div style="color:#f9e2af">⚠ needs review</div>' : ""}
+    ${edge.data("note") ? `<div style="margin-top:4px;font-style:italic">${edge.data("note")}</div>` : ""}
+  `;
+  document.getElementById("info").style.display = "block";
+}
+
+function buildFilters(data) {
+  const kinds = [...new Set(data.edges.map(e => e.kind))].sort();
+  const ekRoot = document.getElementById("edge-filters");
+  for (const k of kinds) {
+    const lbl = document.createElement("label");
+    lbl.innerHTML = `<input type="checkbox" data-kind="${k}" checked>
+      <span class="edge-legend"><span class="swatch" style="background:${EDGE_COLORS[k] || "#9399b2"}"></span>${k}</span>`;
+    ekRoot.appendChild(lbl);
+    lbl.querySelector("input").onchange = applyFilters;
+  }
+  const types = [...new Set(data.nodes.map(n => n.type))].sort();
+  const tRoot = document.getElementById("type-filters");
+  for (const t of types) {
+    const lbl = document.createElement("label");
+    lbl.innerHTML = `<input type="checkbox" data-ptype="${t}" checked> ${t}`;
+    tRoot.appendChild(lbl);
+    lbl.querySelector("input").onchange = applyFilters;
+  }
+  for (const tier of ["fact", "working", "wisdom", "undefined"]) {
+    const lbl = document.createElement("label");
+    lbl.innerHTML = `<input type="checkbox" data-tier="${tier}" checked> ${tier}`;
+    document.getElementById("tier-filters").appendChild(lbl);
+    lbl.querySelector("input").onchange = applyFilters;
+  }
+  document.getElementById("search").oninput = applyFilters;
+}
+function applyFilters() {
+  const enabledKinds = new Set([...document.querySelectorAll("[data-kind]:checked")].map(e => e.dataset.kind));
+  const enabledTypes = new Set([...document.querySelectorAll("[data-ptype]:checked")].map(e => e.dataset.ptype));
+  const enabledTiers = new Set([...document.querySelectorAll("[data-tier]:checked")].map(e => e.dataset.tier));
+  const q = document.getElementById("search").value.toLowerCase();
+  cy.elements().removeClass("faded");
+  cy.nodes().forEach(n => {
+    const t = n.data("type");
+    const tier = n.data("tier") || "undefined";
+    const labelMatch = !q || n.data("label").toLowerCase().includes(q);
+    if (!enabledTypes.has(t) || !enabledTiers.has(tier) || !labelMatch) n.addClass("faded");
+  });
+  cy.edges().forEach(e => {
+    if (!enabledKinds.has(e.data("kind"))) { e.addClass("faded"); return; }
+    if (e.source().hasClass("faded") || e.target().hasClass("faded")) e.addClass("faded");
+  });
+}
+
+function buildStats(data) {
+  const migrated = data.nodes.filter(n => n.migrated).length;
+  const issues = countTriageIssues(data);
+  document.getElementById("stats").innerHTML = `
+    <b>${data.nodes.length}</b> pages · <b>${migrated}</b> migrated (${(migrated/data.nodes.length*100).toFixed(0)}%)<br>
+    <b>${data.edges.length}</b> edges<br>
+    <b>${issues.needsReview}</b> edges need review<br>
+    <b>${issues.draftPages}</b> draft pages<br>
+    <b>${issues.supersededPages}</b> superseded pages
+  `;
+  buildTriage(data, issues);
+}
+function countTriageIssues(data) {
+  return {
+    needsReview: data.edges.filter(e => e.needs_review).length,
+    draftPages: data.nodes.filter(n => n.status === "draft").length,
+    supersededPages: data.nodes.filter(n => n.status === "superseded").length,
+    unmigrated: data.nodes.filter(n => !n.migrated).length,
+  };
+}
+function buildTriage(data, counts) {
+  const root = document.getElementById("triage-list");
+  root.innerHTML = "";
+  if (counts.needsReview === 0 && counts.draftPages === 0 && counts.unmigrated === 0) {
+    root.innerHTML = "<div class='triage-issue info'>✓ No actionable issues</div>";
+    return;
+  }
+  if (counts.unmigrated > 0)
+    root.innerHTML += `<div class='triage-issue warn'>📋 ${counts.unmigrated} pages not yet migrated to typed edges (using body-link fallback)</div>`;
+  if (counts.needsReview > 0)
+    root.innerHTML += `<div class='triage-issue'>⚠️ ${counts.needsReview} edges marked needs_review</div>`;
+  if (counts.draftPages > 0)
+    root.innerHTML += `<div class='triage-issue warn'>📝 ${counts.draftPages} draft pages</div>`;
+  if (counts.supersededPages > 0)
+    root.innerHTML += `<div class='triage-issue info'>🗄 ${counts.supersededPages} superseded pages</div>`;
+}
+
+document.querySelectorAll(".mode-tab").forEach(tab => {
+  tab.onclick = () => {
+    document.querySelectorAll(".mode-tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    const mode = tab.dataset.mode;
+    document.getElementById("graph-controls").style.display = mode === "graph" ? "block" : "none";
+    document.getElementById("triage-controls").style.display = mode === "triage" ? "block" : "none";
+  };
+});
+
+load();
+</script>
+</body>
+</html>

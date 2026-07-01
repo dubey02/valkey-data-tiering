@@ -135,6 +135,10 @@ void lazyfreeResetStats(void) {
  * For lists the function returns the number of elements in the quicklist
  * representing the list. */
 size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
+    /* Tiered objects hold only an empty SDS placeholder — trivial to free.
+     * Must check before dispatching on obj->type, which would dereference
+     * the placeholder as a data structure pointer (SIGSEGV). */
+    if (objectIsTiered(obj)) return 1;
     if (obj->type == OBJ_LIST && obj->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklist *ql = objectGetVal(obj);
         return ql->len;

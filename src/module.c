@@ -69,6 +69,7 @@
 #include "io_threads.h"
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
+#include "ext_storage.h"
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -662,6 +663,311 @@ void *VM_PoolAlloc(ValkeyModuleCtx *ctx, size_t bytes) {
     return retval;
 }
 
+// Data tiering module subscription APIs
+typedef struct ValkeyModuleExternalStorageSubscriber {
+    ValkeyModule *module;
+    ValkeyModuleExternalStorageRequestCallback request_callback;
+    ValkeyModuleExternalStorageResponseCallback response_callback;
+    // Serialization callbacks for IO worker thread usage
+    ValkeyModuleSerializeKeyCallback serialize_key;
+    ValkeyModuleSerializeValueCallback serialize_value;
+    ValkeyModuleDeserializeKeyCallback deserialize_key;
+    ValkeyModuleDeserializeValueCallback deserialize_value;
+    ValkeyModuleFreeSerializedKeyCallback free_serialized_key;
+    ValkeyModuleFreeSerializedValueCallback free_serialized_value;
+    // Synchronous key existence check callback (bloom filter / index lookup)
+    ValkeyModuleKeyMayExistCallback key_may_exist;
+    // Metrics callback — returns a heap-allocated string with module metrics (caller frees with zfree)
+    char *(*get_metrics)(void);
+    void *priv_data;
+} ValkeyModuleExternalStorageSubscriber;
+
+static list *moduleExternalStorageSubscribers = NULL;
+
+int VM_SubscribeToExternalStorage(ValkeyModuleCtx *ctx, ValkeyModuleExternalStorageRequestCallback reqCallback,
+                                  ValkeyModuleExternalStorageResponseCallback resCallback) {
+    if (reqCallback == NULL || resCallback == NULL) return VALKEYMODULE_ERR;
+    ValkeyModuleExternalStorageSubscriber *sub = zmalloc(sizeof(*sub));
+    sub->module = ctx->module;
+    sub->request_callback = reqCallback;
+    sub->response_callback = resCallback;
+    // Set default serialization callbacks from ext_storage.c
+    sub->serialize_key = extStorageSerializeKey;
+    sub->serialize_value = extStorageSerializeValue;
+    sub->deserialize_key = extStorageDeserializeKey;
+    sub->deserialize_value = extStorageDeserializeValue;
+    sub->free_serialized_key = extStorageFreeSerializedKey;
+    sub->free_serialized_value = extStorageFreeSerializedValue;
+    sub->key_may_exist = NULL;
+    sub->priv_data = NULL;
+    if (moduleExternalStorageSubscribers == NULL) {
+        moduleExternalStorageSubscribers = listCreate();
+    }
+    listAddNodeTail(moduleExternalStorageSubscribers, sub);
+    return VALKEYMODULE_OK;
+}
+
+int VM_SubscribeToExternalStorageWithCallbacks(ValkeyModuleCtx *ctx,
+    ValkeyModuleExternalStorageRequestCallback reqCallback,
+    ValkeyModuleExternalStorageResponseCallback resCallback,
+    ValkeyModuleSerializeKeyCallback serializeKey,
+    ValkeyModuleSerializeValueCallback serializeValue,
+    ValkeyModuleDeserializeKeyCallback deserializeKey,
+    ValkeyModuleDeserializeValueCallback deserializeValue,
+    ValkeyModuleFreeSerializedKeyCallback freeSerializedKey,
+    ValkeyModuleFreeSerializedValueCallback freeSerializedValue) {
+    if (reqCallback == NULL || resCallback == NULL) return VALKEYMODULE_ERR;
+    ValkeyModuleExternalStorageSubscriber *sub = zmalloc(sizeof(*sub));
+    sub->module = ctx->module;
+    sub->request_callback = reqCallback;
+    sub->response_callback = resCallback;
+    sub->serialize_key = serializeKey;
+    sub->serialize_value = serializeValue;
+    sub->deserialize_key = deserializeKey;
+    sub->deserialize_value = deserializeValue;
+    sub->free_serialized_key = freeSerializedKey;
+    sub->free_serialized_value = freeSerializedValue;
+    sub->key_may_exist = NULL;
+    sub->priv_data = NULL;
+    if (moduleExternalStorageSubscribers == NULL) {
+        moduleExternalStorageSubscribers = listCreate();
+    }
+    listAddNodeTail(moduleExternalStorageSubscribers, sub);
+    return VALKEYMODULE_OK;
+}
+
+int VM_UnsubscribeFromExternalStorage(ValkeyModuleCtx *ctx) {
+    if (moduleExternalStorageSubscribers == NULL) return VALKEYMODULE_OK;
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        if (sub->module == ctx->module) {
+            listDelNode(moduleExternalStorageSubscribers, ln);
+            zfree(sub);
+            break;
+        }
+    }
+    return VALKEYMODULE_OK;
+}
+
+// Get the serialization callbacks for the current external storage subscriber.
+// Returns the callbacks via output parameters. Returns VALKEYMODULE_OK on success.
+int VM_GetExternalStorageSerializationCallbacks(ValkeyModuleCtx *ctx,
+    ValkeyModuleSerializeKeyCallback *serialize_key,
+    ValkeyModuleSerializeValueCallback *serialize_value,
+    ValkeyModuleDeserializeKeyCallback *deserialize_key,
+    ValkeyModuleDeserializeValueCallback *deserialize_value,
+    ValkeyModuleFreeSerializedKeyCallback *free_serialized_key,
+    ValkeyModuleFreeSerializedValueCallback *free_serialized_value) {
+    if (moduleExternalStorageSubscribers == NULL) return VALKEYMODULE_ERR;
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        if (sub->module == ctx->module) {
+            if (serialize_key) *serialize_key = sub->serialize_key;
+            if (serialize_value) *serialize_value = sub->serialize_value;
+            if (deserialize_key) *deserialize_key = sub->deserialize_key;
+            if (deserialize_value) *deserialize_value = sub->deserialize_value;
+            if (free_serialized_key) *free_serialized_key = sub->free_serialized_key;
+            if (free_serialized_value) *free_serialized_value = sub->free_serialized_value;
+            return VALKEYMODULE_OK;
+        }
+    }
+    return VALKEYMODULE_ERR;
+}
+
+// De-serialize the value object from its DUMP payload.
+void* VM_DeserializeDumpPayload(ValkeyModuleCtx *ctx, char *value, size_t length) {
+    UNUSED(ctx);
+    rio payload;
+    int type;
+    robj *value_obj = NULL;
+    sds value_sds = sdsnewlen(value, length);
+    rioInitWithBuffer(&payload, value_sds);
+
+    // Read object type
+    if ((type = rdbLoadType(&payload)) == -1) {
+        serverLog(LL_WARNING, "Error loading object type from storage Engine");
+        serverAssert(0);
+    }
+
+    // Read object value.
+    // TODO: This rdbLoadObject() method is not thread safe due to accessing the server
+    // config values, so we need to mutex guard it against server config changes.
+    if ((value_obj = rdbLoadObject(type, &payload, NULL, -1, NULL, RDBFLAGS_NONE, 0)) == NULL) {
+        serverLog(LL_WARNING, "Error loading object from storage Engine");
+        serverAssert(0);
+    }
+    sdsfree(value_sds);
+    return (void *)value_obj;
+}
+
+/* ---------------------------------------------------------------------------
+ * Pluggable Storage Backend Registration (new API)
+ *
+ * A module calls ValkeyModule_RegisterStorageBackend() to register a storageType
+ * struct. After registration, the engine uses the struct's function pointers
+ * directly — zero per-call overhead, same as native backends.
+ * ---------------------------------------------------------------------------*/
+#include "storage/storage.h"
+
+static void *module_registered_storage_type = NULL;
+
+int VM_RegisterStorageBackend(ValkeyModuleCtx *ctx, void *storage_type) {
+    (void)ctx;
+    if (storage_type == NULL) return VALKEYMODULE_ERR;
+    if (module_registered_storage_type != NULL) {
+        serverLog(LL_WARNING, "Module tried to register storage backend but one is already registered");
+        return VALKEYMODULE_ERR;
+    }
+    module_registered_storage_type = storage_type;
+    serverLog(LL_NOTICE, "Module registered storage backend: %s",
+              ((storageType *)storage_type)->name);
+    return VALKEYMODULE_OK;
+}
+
+/* Called by the bridge to check if a module registered a storage backend */
+int moduleHasRegisteredStorageBackend(void) {
+    return module_registered_storage_type != NULL;
+}
+
+/* Called by the bridge to get the module-registered storage backend */
+void *moduleGetRegisteredStorageBackend(void) {
+    return module_registered_storage_type;
+}
+
+// Fire an external storage event to the registered external storage modules.
+// Returns 0 if there are no external storage modules and this is a no-op,
+// returns VALKEYMODULE_OK if the request was accepted, VALKEYMODULE_ERR if rejected.
+int moduleFireExternalStorageEvent(ValkeyModuleExternalStorageMsg *msg) {
+    if (!moduleHasExternalStorageSubscribers()) {
+        return VALKEYMODULE_ERR;
+    }
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    int result = VALKEYMODULE_ERR;
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        ValkeyModuleCtx ctx;
+        moduleCreateContext(&ctx, sub->module, VALKEYMODULE_CTX_TEMP_CLIENT);
+        ctx.client->db = server.db[msg->db_id];
+        result = sub->request_callback(&ctx, msg->msg_type, msg->db_id, msg->key, msg->ttl, msg->value);
+        moduleFreeContext(&ctx);
+    }
+    return result;
+}
+
+// Get a batch of completed storage requests from registered external storage modules.
+// @param max: the max number of completed responses we can retrieve.
+// Returns the number of completed requests fetched.
+int moduleGetCompletedExternalStorageResponses(ValkeyModuleExternalStorageMsg **responses, int max) {
+    if (!moduleHasExternalStorageSubscribers()) {
+        return 0;
+    }
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    int num_completed_requests = 0;
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        ValkeyModuleCtx ctx;
+        moduleCreateContext(&ctx, sub->module, VALKEYMODULE_CTX_NONE);
+        for (int i = 0; i < max; i++) {
+            if (num_completed_requests >= max) break;
+            ValkeyModuleExternalStorageMsg *msg = sub->response_callback(&ctx);
+            if (msg != NULL) {
+                responses[num_completed_requests] = msg;
+                num_completed_requests++;
+            } else {
+                break; // No more completed responses for this module
+            }
+        }
+        moduleFreeContext(&ctx);
+    }
+    return num_completed_requests;
+}
+
+int moduleHasExternalStorageSubscribers(void) {
+    return moduleExternalStorageSubscribers != NULL && listLength(moduleExternalStorageSubscribers) > 0;
+}
+
+// Set the synchronous key existence check callback for the calling module's subscriber.
+int VM_SetExternalStorageKeyMayExistCallback(ValkeyModuleCtx *ctx, ValkeyModuleKeyMayExistCallback callback) {
+    if (moduleExternalStorageSubscribers == NULL) return VALKEYMODULE_ERR;
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        if (sub->module == ctx->module) {
+            sub->key_may_exist = callback;
+            return VALKEYMODULE_OK;
+        }
+    }
+    return VALKEYMODULE_ERR;
+}
+
+// Set the metrics callback for the calling module's subscriber.
+// The callback should return a zmalloc'd string with metrics in "key:value\r\n" format.
+int VM_SetExternalStorageMetricsCallback(ValkeyModuleCtx *ctx, char *(*callback)(void)) {
+    if (moduleExternalStorageSubscribers == NULL) return VALKEYMODULE_ERR;
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        if (sub->module == ctx->module) {
+            sub->get_metrics = callback;
+            return VALKEYMODULE_OK;
+        }
+    }
+    return VALKEYMODULE_ERR;
+}
+
+// Synchronous key existence check — called from ext_storage.c's keyBlocksClient().
+// Returns 1 if the key may exist on disk, 0 if definitely not.
+int moduleExternalStorageKeyMayExist(int db_id, const char *key, size_t key_len) {
+    if (!moduleHasExternalStorageSubscribers()) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        if (sub->key_may_exist != NULL) {
+            return sub->key_may_exist(db_id, key, key_len);
+        }
+    }
+    // No callback registered — assume key may exist (conservative)
+    return 1;
+}
+
+// Get module-side metrics string for INFO output.
+// Returns an sds string that the caller must sdsfree, or sdsempty() if no metrics.
+sds moduleGetExternalStorageMetrics(void) {
+    if (!moduleHasExternalStorageSubscribers()) return sdsempty();
+    listIter li;
+    listNode *ln;
+    listRewind(moduleExternalStorageSubscribers, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleExternalStorageSubscriber *sub = ln->value;
+        if (sub->get_metrics != NULL) {
+            char *metrics = sub->get_metrics();
+            if (metrics != NULL) {
+                sds result = sdsnew(metrics);
+                /* Module allocates with libc malloc, not zmalloc/jemalloc */
+                zlibc_free(metrics);
+                return result;
+            }
+        }
+    }
+    return sdsempty();
+}
+
 /* --------------------------------------------------------------------------
  * Helpers for modules API implementation
  * -------------------------------------------------------------------------- */
@@ -793,7 +1099,7 @@ int moduleCreateEmptyKey(ValkeyModuleKey *key, int type) {
 /* Frees key->iter and sets it to NULL. */
 static void moduleFreeKeyIterator(ValkeyModuleKey *key) {
     serverAssert(key->iter != NULL);
-    switch (objectGetType(key->value)) {
+    switch (key->value->type) {
     case OBJ_LIST: listTypeReleaseIterator(key->iter); break;
     case OBJ_STREAM:
         streamIteratorStop(key->iter);
@@ -808,7 +1114,7 @@ static void moduleFreeKeyIterator(ValkeyModuleKey *key) {
  * Frees list iterator and sets it to NULL. */
 static void moduleFreeListIterator(void *data) {
     ValkeyModuleKey *key = (ValkeyModuleKey *)data;
-    serverAssert(objectGetType(key->value) == OBJ_LIST);
+    serverAssert(key->value->type == OBJ_LIST);
     if (key->iter) moduleFreeKeyIterator(key);
 }
 
@@ -827,7 +1133,7 @@ int moduleDelKeyIfEmpty(ValkeyModuleKey *key) {
     int isempty;
     robj *o = key->value;
 
-    switch (objectGetType(o)) {
+    switch (o->type) {
     case OBJ_LIST: isempty = listTypeLength(o) == 0; break;
     case OBJ_SET: isempty = setTypeSize(o) == 0; break;
     case OBJ_ZSET: isempty = zsetLength(o) == 0; break;
@@ -4264,7 +4570,7 @@ static void moduleInitKey(ValkeyModuleKey *kp, ValkeyModuleCtx *ctx, robj *keyna
 
 /* Initialize the type-specific part of the key. Only when key has a value. */
 static void moduleInitKeyTypeSpecific(ValkeyModuleKey *key) {
-    switch (objectGetType(key->value)) {
+    switch (key->value->type) {
     case OBJ_ZSET: zsetKeyReset(key); break;
     case OBJ_STREAM: key->u.stream.signalready = 0; break;
     }
@@ -4340,7 +4646,7 @@ static void moduleCloseKey(ValkeyModuleKey *key) {
     if ((key->mode & VALKEYMODULE_WRITE) && signal) signalModifiedKey(key->ctx->client, key->db, key->key);
     if (key->value) {
         if (key->iter) moduleFreeKeyIterator(key);
-        switch (objectGetType(key->value)) {
+        switch (key->value->type) {
         case OBJ_ZSET: VM_ZsetRangeStop(key); break;
         case OBJ_STREAM:
             if (key->u.stream.signalready) /* One or more VM_StreamAdd() have been done. */
@@ -4366,7 +4672,7 @@ int VM_KeyType(ValkeyModuleKey *key) {
     if (key == NULL || key->value == NULL) return VALKEYMODULE_KEYTYPE_EMPTY;
     /* We map between defines so that we are free to change the internal
      * defines as desired. */
-    switch (objectGetType(key->value)) {
+    switch (key->value->type) {
     case OBJ_STRING: return VALKEYMODULE_KEYTYPE_STRING;
     case OBJ_LIST: return VALKEYMODULE_KEYTYPE_LIST;
     case OBJ_SET: return VALKEYMODULE_KEYTYPE_SET;
@@ -4385,7 +4691,7 @@ int VM_KeyType(ValkeyModuleKey *key) {
  * If the key pointer is NULL or the key is empty, zero is returned. */
 size_t VM_ValueLength(ValkeyModuleKey *key) {
     if (key == NULL || key->value == NULL) return 0;
-    switch (objectGetType(key->value)) {
+    switch (key->value->type) {
     case OBJ_STRING: return stringObjectLen(key->value);
     case OBJ_LIST: return listTypeLength(key->value);
     case OBJ_SET: return setTypeSize(key->value);
@@ -4584,11 +4890,11 @@ char *VM_StringDMA(ValkeyModuleKey *key, size_t *len, int mode) {
         return emptystring;
     }
 
-    if (objectGetType(key->value) != OBJ_STRING) return NULL;
+    if (key->value->type != OBJ_STRING) return NULL;
 
     /* For write access, and even for read access if the object is encoded,
      * we unshare the string (that has the side effect of decoding it). */
-    if ((mode & VALKEYMODULE_WRITE) || objectGetEncoding(key->value) != OBJ_ENCODING_RAW)
+    if ((mode & VALKEYMODULE_WRITE) || key->value->encoding != OBJ_ENCODING_RAW)
         key->value = dbUnshareStringValue(key->db, key->key, key->value);
 
     *len = sdslen(objectGetVal(key->value));
@@ -4609,7 +4915,7 @@ char *VM_StringDMA(ValkeyModuleKey *key, size_t *len, int mode) {
  * unless the new length value requested is zero. */
 int VM_StringTruncate(ValkeyModuleKey *key, size_t newlen) {
     if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
-    if (key->value && objectGetType(key->value) != OBJ_STRING) return VALKEYMODULE_ERR;
+    if (key->value && key->value->type != OBJ_STRING) return VALKEYMODULE_ERR;
     if (newlen > 512 * 1024 * 1024) return VALKEYMODULE_ERR;
 
     /* Empty key and new len set to 0. Just return VALKEYMODULE_OK without
@@ -4673,7 +4979,7 @@ int moduleListIteratorSeek(ValkeyModuleKey *key, long index, int mode) {
     if (!key) {
         errno = EINVAL;
         return 0;
-    } else if (!key->value || objectGetType(key->value) != OBJ_LIST) {
+    } else if (!key->value || key->value->type != OBJ_LIST) {
         errno = ENOTSUP;
         return 0;
     }
@@ -4731,7 +5037,7 @@ int VM_ListPush(ValkeyModuleKey *key, int where, ValkeyModuleString *ele) {
     if (!key || !ele) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
-    } else if (key->value != NULL && objectGetType(key->value) != OBJ_LIST) {
+    } else if (key->value != NULL && key->value->type != OBJ_LIST) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR;
     }
@@ -4741,7 +5047,7 @@ int VM_ListPush(ValkeyModuleKey *key, int where, ValkeyModuleString *ele) {
     }
 
     if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
-    if (key->value && objectGetType(key->value) != OBJ_LIST) return VALKEYMODULE_ERR;
+    if (key->value && key->value->type != OBJ_LIST) return VALKEYMODULE_ERR;
     if (key->iter) moduleFreeKeyIterator(key);
     if (key->value == NULL) moduleCreateEmptyKey(key, VALKEYMODULE_KEYTYPE_LIST);
     listTypeTryConversionAppend(key->value, &ele, 0, 0, moduleFreeListIterator, key);
@@ -4765,7 +5071,7 @@ ValkeyModuleString *VM_ListPop(ValkeyModuleKey *key, int where) {
     if (!key) {
         errno = EINVAL;
         return NULL;
-    } else if (key->value == NULL || objectGetType(key->value) != OBJ_LIST) {
+    } else if (key->value == NULL || key->value->type != OBJ_LIST) {
         errno = ENOTSUP;
         return NULL;
     } else if (!(key->mode & VALKEYMODULE_WRITE)) {
@@ -4830,7 +5136,7 @@ int VM_ListSet(ValkeyModuleKey *key, long index, ValkeyModuleString *value) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
     }
-    if (!key->value || objectGetType(key->value) != OBJ_LIST) {
+    if (!key->value || key->value->type != OBJ_LIST) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR;
     }
@@ -4868,11 +5174,11 @@ int VM_ListInsert(ValkeyModuleKey *key, long index, ValkeyModuleString *value) {
     } else if (key != NULL && key->value == NULL && (index == 0 || index == -1)) {
         /* Insert in empty key => push. */
         return VM_ListPush(key, VALKEYMODULE_LIST_TAIL, value);
-    } else if (key != NULL && key->value != NULL && objectGetType(key->value) == OBJ_LIST &&
+    } else if (key != NULL && key->value != NULL && key->value->type == OBJ_LIST &&
                (index == (long)listTypeLength(key->value) || index == -1)) {
         /* Insert after the last element => push tail. */
         return VM_ListPush(key, VALKEYMODULE_LIST_TAIL, value);
-    } else if (key != NULL && key->value != NULL && objectGetType(key->value) == OBJ_LIST &&
+    } else if (key != NULL && key->value != NULL && key->value->type == OBJ_LIST &&
                (index == 0 || index == -(long)listTypeLength(key->value) - 1)) {
         /* Insert before the first element => push head. */
         return VM_ListPush(key, VALKEYMODULE_LIST_HEAD, value);
@@ -4990,7 +5296,7 @@ int moduleZsetAddFlagsFromCoreFlags(int flags) {
 int VM_ZsetAdd(ValkeyModuleKey *key, double score, ValkeyModuleString *ele, int *flagsptr) {
     int in_flags = 0, out_flags = 0;
     if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
-    if (key->value && objectGetType(key->value) != OBJ_ZSET) return VALKEYMODULE_ERR;
+    if (key->value && key->value->type != OBJ_ZSET) return VALKEYMODULE_ERR;
     if (key->value == NULL) moduleCreateEmptyKey(key, VALKEYMODULE_KEYTYPE_ZSET);
     if (flagsptr) in_flags = moduleZsetAddFlagsToCoreFlags(*flagsptr);
     if (zsetAdd(key->value, score, objectGetVal(ele), in_flags, &out_flags, NULL) == 0) {
@@ -5018,7 +5324,7 @@ int VM_ZsetAdd(ValkeyModuleKey *key, double score, ValkeyModuleString *ele, int 
 int VM_ZsetIncrby(ValkeyModuleKey *key, double score, ValkeyModuleString *ele, int *flagsptr, double *newscore) {
     int in_flags = 0, out_flags = 0;
     if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
-    if (key->value && objectGetType(key->value) != OBJ_ZSET) return VALKEYMODULE_ERR;
+    if (key->value && key->value->type != OBJ_ZSET) return VALKEYMODULE_ERR;
     if (key->value == NULL) moduleCreateEmptyKey(key, VALKEYMODULE_KEYTYPE_ZSET);
     if (flagsptr) in_flags = moduleZsetAddFlagsToCoreFlags(*flagsptr);
     in_flags |= ZADD_IN_INCR;
@@ -5051,7 +5357,7 @@ int VM_ZsetIncrby(ValkeyModuleKey *key, double score, ValkeyModuleString *ele, i
  * Empty keys will be handled correctly by doing nothing. */
 int VM_ZsetRem(ValkeyModuleKey *key, ValkeyModuleString *ele, int *deleted) {
     if (!(key->mode & VALKEYMODULE_WRITE)) return VALKEYMODULE_ERR;
-    if (key->value && objectGetType(key->value) != OBJ_ZSET) return VALKEYMODULE_ERR;
+    if (key->value && key->value->type != OBJ_ZSET) return VALKEYMODULE_ERR;
     if (key->value != NULL && zsetDel(key->value, objectGetVal(ele))) {
         if (deleted) *deleted = 1;
         moduleDelKeyIfEmpty(key);
@@ -5071,7 +5377,7 @@ int VM_ZsetRem(ValkeyModuleKey *key, ValkeyModuleString *ele, int *deleted) {
  */
 int VM_ZsetScore(ValkeyModuleKey *key, ValkeyModuleString *ele, double *score) {
     if (key->value == NULL) return VALKEYMODULE_ERR;
-    if (objectGetType(key->value) != OBJ_ZSET) return VALKEYMODULE_ERR;
+    if (key->value->type != OBJ_ZSET) return VALKEYMODULE_ERR;
     if (zsetScore(key->value, objectGetVal(ele), score) == C_ERR) return VALKEYMODULE_ERR;
     return VALKEYMODULE_OK;
 }
@@ -5088,7 +5394,7 @@ void zsetKeyReset(ValkeyModuleKey *key) {
 
 /* Stop a sorted set iteration. */
 void VM_ZsetRangeStop(ValkeyModuleKey *key) {
-    if (!key->value || objectGetType(key->value) != OBJ_ZSET) return;
+    if (!key->value || key->value->type != OBJ_ZSET) return;
     /* Free resources if needed. */
     if (key->u.zset.type == VALKEYMODULE_ZSET_RANGE_LEX) zsetFreeLexRange(&key->u.zset.lrs);
     /* Setup sensible values so that misused iteration API calls when an
@@ -5099,7 +5405,7 @@ void VM_ZsetRangeStop(ValkeyModuleKey *key) {
 
 /* Return the "End of range" flag value to signal the end of the iteration. */
 int VM_ZsetRangeEndReached(ValkeyModuleKey *key) {
-    if (!key->value || objectGetType(key->value) != OBJ_ZSET) return 1;
+    if (!key->value || key->value->type != OBJ_ZSET) return 1;
     return key->u.zset.er;
 }
 
@@ -5110,7 +5416,7 @@ int VM_ZsetRangeEndReached(ValkeyModuleKey *key) {
  * otherwise the last. Return VALKEYMODULE_OK on success otherwise
  * VALKEYMODULE_ERR. */
 int zsetInitScoreRange(ValkeyModuleKey *key, double min, double max, int minex, int maxex, int first) {
-    if (!key->value || objectGetType(key->value) != OBJ_ZSET) return VALKEYMODULE_ERR;
+    if (!key->value || key->value->type != OBJ_ZSET) return VALKEYMODULE_ERR;
 
     VM_ZsetRangeStop(key);
     key->u.zset.type = VALKEYMODULE_ZSET_RANGE_SCORE;
@@ -5124,9 +5430,9 @@ int zsetInitScoreRange(ValkeyModuleKey *key, double min, double max, int minex, 
     zrs->minex = minex;
     zrs->maxex = maxex;
 
-    if (objectGetEncoding(key->value) == OBJ_ENCODING_LISTPACK) {
+    if (key->value->encoding == OBJ_ENCODING_LISTPACK) {
         key->u.zset.current = first ? zzlFirstInRange(objectGetVal(key->value), zrs) : zzlLastInRange(objectGetVal(key->value), zrs);
-    } else if (objectGetEncoding(key->value) == OBJ_ENCODING_SKIPLIST) {
+    } else if (key->value->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = objectGetVal(key->value);
         zskiplist *zsl = zs->zsl;
         key->u.zset.current = first ? zslNthInRange(zsl, zrs, 0, NULL) : zslNthInRange(zsl, zrs, -1, NULL);
@@ -5172,7 +5478,7 @@ int VM_ZsetLastInScoreRange(ValkeyModuleKey *key, double min, double max, int mi
  * Note that this function takes 'min' and 'max' in the same form of the
  * ZRANGEBYLEX command. */
 int zsetInitLexRange(ValkeyModuleKey *key, ValkeyModuleString *min, ValkeyModuleString *max, int first) {
-    if (!key->value || objectGetType(key->value) != OBJ_ZSET) return VALKEYMODULE_ERR;
+    if (!key->value || key->value->type != OBJ_ZSET) return VALKEYMODULE_ERR;
 
     VM_ZsetRangeStop(key);
     key->u.zset.er = 0;
@@ -5186,10 +5492,10 @@ int zsetInitLexRange(ValkeyModuleKey *key, ValkeyModuleString *min, ValkeyModule
      * otherwise we don't want the zlexrangespec to be freed. */
     key->u.zset.type = VALKEYMODULE_ZSET_RANGE_LEX;
 
-    if (objectGetEncoding(key->value) == OBJ_ENCODING_LISTPACK) {
+    if (key->value->encoding == OBJ_ENCODING_LISTPACK) {
         key->u.zset.current =
             first ? zzlFirstInLexRange(objectGetVal(key->value), zlrs) : zzlLastInLexRange(objectGetVal(key->value), zlrs);
-    } else if (objectGetEncoding(key->value) == OBJ_ENCODING_SKIPLIST) {
+    } else if (key->value->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = objectGetVal(key->value);
         zskiplist *zsl = zs->zsl;
         key->u.zset.current = first ? zslNthInLexRange(zsl, zlrs, 0) : zslNthInLexRange(zsl, zlrs, -1);
@@ -5229,9 +5535,9 @@ int VM_ZsetLastInLexRange(ValkeyModuleKey *key, ValkeyModuleString *min, ValkeyM
 ValkeyModuleString *VM_ZsetRangeCurrentElement(ValkeyModuleKey *key, double *score) {
     ValkeyModuleString *str;
 
-    if (!key->value || objectGetType(key->value) != OBJ_ZSET) return NULL;
+    if (!key->value || key->value->type != OBJ_ZSET) return NULL;
     if (key->u.zset.current == NULL) return NULL;
-    if (objectGetEncoding(key->value) == OBJ_ENCODING_LISTPACK) {
+    if (key->value->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *eptr, *sptr;
         eptr = key->u.zset.current;
         sds ele = lpGetObject(eptr);
@@ -5240,7 +5546,7 @@ ValkeyModuleString *VM_ZsetRangeCurrentElement(ValkeyModuleKey *key, double *sco
             *score = zzlGetScore(sptr);
         }
         str = createObject(OBJ_STRING, ele);
-    } else if (objectGetEncoding(key->value) == OBJ_ENCODING_SKIPLIST) {
+    } else if (key->value->encoding == OBJ_ENCODING_SKIPLIST) {
         zskiplistNode *ln = key->u.zset.current;
         if (score) *score = ln->score;
         sds ele = zslGetNodeElement(ln);
@@ -5256,10 +5562,10 @@ ValkeyModuleString *VM_ZsetRangeCurrentElement(ValkeyModuleKey *key, double *sco
  * a next element, 0 if we are already at the latest element or the range
  * does not include any item at all. */
 int VM_ZsetRangeNext(ValkeyModuleKey *key) {
-    if (!key->value || objectGetType(key->value) != OBJ_ZSET) return 0;
+    if (!key->value || key->value->type != OBJ_ZSET) return 0;
     if (!key->u.zset.type || !key->u.zset.current) return 0; /* No active iterator. */
 
-    if (objectGetEncoding(key->value) == OBJ_ENCODING_LISTPACK) {
+    if (key->value->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = objectGetVal(key->value);
         unsigned char *eptr = key->u.zset.current;
         unsigned char *next;
@@ -5290,7 +5596,7 @@ int VM_ZsetRangeNext(ValkeyModuleKey *key) {
             key->u.zset.current = next;
             return 1;
         }
-    } else if (objectGetEncoding(key->value) == OBJ_ENCODING_SKIPLIST) {
+    } else if (key->value->encoding == OBJ_ENCODING_SKIPLIST) {
         zskiplistNode *ln = key->u.zset.current, *next = ln->level[0].forward;
         if (next == NULL) {
             key->u.zset.er = 1;
@@ -5318,10 +5624,10 @@ int VM_ZsetRangeNext(ValkeyModuleKey *key) {
  * a previous element, 0 if we are already at the first element or the range
  * does not include any item at all. */
 int VM_ZsetRangePrev(ValkeyModuleKey *key) {
-    if (!key->value || objectGetType(key->value) != OBJ_ZSET) return 0;
+    if (!key->value || key->value->type != OBJ_ZSET) return 0;
     if (!key->u.zset.type || !key->u.zset.current) return 0; /* No active iterator. */
 
-    if (objectGetEncoding(key->value) == OBJ_ENCODING_LISTPACK) {
+    if (key->value->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *zl = objectGetVal(key->value);
         unsigned char *eptr = key->u.zset.current;
         unsigned char *prev;
@@ -5352,7 +5658,7 @@ int VM_ZsetRangePrev(ValkeyModuleKey *key) {
             key->u.zset.current = prev;
             return 1;
         }
-    } else if (objectGetEncoding(key->value) == OBJ_ENCODING_SKIPLIST) {
+    } else if (key->value->encoding == OBJ_ENCODING_SKIPLIST) {
         zskiplistNode *ln = key->u.zset.current, *prev = ln->backward;
         if (prev == NULL) {
             key->u.zset.er = 1;
@@ -5392,14 +5698,14 @@ int VM_ZsetRangePrev(ValkeyModuleKey *key) {
  *
  * The function receives the hash key, field name, buffer to share along with its size. */
 int VM_HashSetStringRef(ValkeyModuleKey *key, ValkeyModuleString *field, const char *buf, size_t len) {
-    if (!key || !key->value || objectGetType(key->value) != OBJ_HASH || !field || !buf) return VALKEYMODULE_ERR;
+    if (!key || !key->value || key->value->type != OBJ_HASH || !field || !buf) return VALKEYMODULE_ERR;
     return hashTypeUpdateAsStringRef(key->value, objectGetVal(field), buf, len);
 }
 
 /* Checks if the value of a hash entry is a shared string reference (stringRef).
  * The function receives the hash key and field name to perform the check against. */
 int VM_HashHasStringRef(ValkeyModuleKey *key, ValkeyModuleString *field) {
-    if (!key || !key->value || objectGetType(key->value) != OBJ_HASH) return VALKEYMODULE_ERR;
+    if (!key || !key->value || key->value->type != OBJ_HASH) return VALKEYMODULE_ERR;
     return hashTypeHasStringRef(key->value, objectGetVal(field));
 }
 /* Set the field of the specified hash field to the specified value.
@@ -5475,7 +5781,7 @@ int VM_HashSet(ValkeyModuleKey *key, int flags, ...) {
                            VALKEYMODULE_HASH_COUNT_ALL))) {
         errno = EINVAL;
         return 0;
-    } else if (key->value && objectGetType(key->value) != OBJ_HASH) {
+    } else if (key->value && key->value->type != OBJ_HASH) {
         errno = ENOTSUP;
         return 0;
     } else if (!(key->mode & VALKEYMODULE_WRITE)) {
@@ -5583,7 +5889,7 @@ int VM_HashSet(ValkeyModuleKey *key, int flags, ...) {
  */
 int VM_HashGet(ValkeyModuleKey *key, int flags, ...) {
     va_list ap;
-    if (key->value && objectGetType(key->value) != OBJ_HASH) return VALKEYMODULE_ERR;
+    if (key->value && key->value->type != OBJ_HASH) return VALKEYMODULE_ERR;
 
     va_start(ap, flags);
     while (1) {
@@ -5676,7 +5982,7 @@ int VM_StreamAdd(ValkeyModuleKey *key, int flags, ValkeyModuleStreamID *id, Valk
         (!(flags & VALKEYMODULE_STREAM_ADD_AUTOID) && !id)) { /* id required */
         errno = EINVAL;
         return VALKEYMODULE_ERR;
-    } else if (key->value && objectGetType(key->value) != OBJ_STREAM) {
+    } else if (key->value && key->value->type != OBJ_STREAM) {
         errno = ENOTSUP; /* wrong type */
         return VALKEYMODULE_ERR;
     } else if (!(key->mode & VALKEYMODULE_WRITE)) {
@@ -5751,7 +6057,7 @@ int VM_StreamDelete(ValkeyModuleKey *key, ValkeyModuleStreamID *id) {
     if (!key || !id) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP; /* wrong type */
         return VALKEYMODULE_ERR;
     } else if (!(key->mode & VALKEYMODULE_WRITE) || key->iter != NULL) {
@@ -5822,7 +6128,7 @@ int VM_StreamIteratorStart(ValkeyModuleKey *key, int flags, ValkeyModuleStreamID
     if (!key || (flags & ~(VALKEYMODULE_STREAM_ITERATOR_EXCLUSIVE | VALKEYMODULE_STREAM_ITERATOR_REVERSE))) {
         errno = EINVAL; /* key missing or invalid flags */
         return VALKEYMODULE_ERR;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR; /* not a stream */
     } else if (key->iter) {
@@ -5869,7 +6175,7 @@ int VM_StreamIteratorStop(ValkeyModuleKey *key) {
     if (!key) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR;
     } else if (!key->iter) {
@@ -5911,7 +6217,7 @@ int VM_StreamIteratorNextID(ValkeyModuleKey *key, ValkeyModuleStreamID *id, long
     if (!key) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR;
     } else if (!key->iter) {
@@ -5967,7 +6273,7 @@ int VM_StreamIteratorNextField(ValkeyModuleKey *key, ValkeyModuleString **field_
     if (!key) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR;
     } else if (!key->iter) {
@@ -6010,7 +6316,7 @@ int VM_StreamIteratorDelete(ValkeyModuleKey *key) {
     if (!key) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP;
         return VALKEYMODULE_ERR;
     } else if (!(key->mode & VALKEYMODULE_WRITE) || !key->iter) {
@@ -6047,7 +6353,7 @@ long long VM_StreamTrimByLength(ValkeyModuleKey *key, int flags, long long lengt
     if (!key || (flags & ~(VALKEYMODULE_STREAM_TRIM_APPROX)) || length < 0) {
         errno = EINVAL;
         return -1;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP;
         return -1;
     } else if (!(key->mode & VALKEYMODULE_WRITE)) {
@@ -6077,7 +6383,7 @@ long long VM_StreamTrimByID(ValkeyModuleKey *key, int flags, ValkeyModuleStreamI
     if (!key || (flags & ~(VALKEYMODULE_STREAM_TRIM_APPROX)) || !id) {
         errno = EINVAL;
         return -1;
-    } else if (!key->value || objectGetType(key->value) != OBJ_STREAM) {
+    } else if (!key->value || key->value->type != OBJ_STREAM) {
         errno = ENOTSUP;
         return -1;
     } else if (!(key->mode & VALKEYMODULE_WRITE)) {
@@ -6943,6 +7249,15 @@ static void moduleCallCommandHelper(ValkeyModuleCtx *ctx, client *c, robj **argv
     server.replication_allowed = prev_replication_allowed;
 
     if (c->flag.blocked) {
+        if (c->flag.deny_blocking) {
+            /* The module did not pass ALLOW_BLOCK — it does not expect the
+             * command to block. Unblock the client and return an error. */
+            c->flag.pending_command = 0;
+            unblockClient(c, 0);
+            addReplyError(c, "INUSE key is being processed.");
+            goto cleanup;
+        }
+
         /* Blocking commands are not allowed when calling commands in scripting engines. */
         serverAssert(!is_running_script);
         serverAssert(flags & VALKEYMODULE_CALL_ARGV_ALLOW_BLOCK);
@@ -12025,14 +12340,14 @@ static void moduleScanKeyHashtableCallback(void *privdata, void *entry) {
     robj *value = NULL;
     sds key = NULL;
 
-    if (objectGetType(o) == OBJ_SET) {
+    if (o->type == OBJ_SET) {
         key = entry;
         /* no value */
-    } else if (objectGetType(o) == OBJ_ZSET) {
+    } else if (o->type == OBJ_ZSET) {
         zskiplistNode *node = (zskiplistNode *)entry;
         key = zslGetNodeElement(node);
         value = createStringObjectFromLongDouble(node->score, 0);
-    } else if (objectGetType(o) == OBJ_HASH) {
+    } else if (o->type == OBJ_HASH) {
         key = entryGetField(entry);
         size_t val_len;
         char *val = entryGetValue(entry, &val_len);
@@ -12102,12 +12417,12 @@ int VM_ScanKey(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor, ValkeyModul
     }
     hashtable *ht = NULL;
     robj *o = key->value;
-    if (objectGetType(o) == OBJ_SET) {
-        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) ht = objectGetVal(o);
-    } else if (objectGetType(o) == OBJ_HASH) {
-        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) ht = objectGetVal(o);
-    } else if (objectGetType(o) == OBJ_ZSET) {
-        if (objectGetEncoding(o) == OBJ_ENCODING_SKIPLIST) ht = ((zset *)objectGetVal(o))->ht;
+    if (o->type == OBJ_SET) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) ht = objectGetVal(o);
+    } else if (o->type == OBJ_HASH) {
+        if (o->encoding == OBJ_ENCODING_HASHTABLE) ht = objectGetVal(o);
+    } else if (o->type == OBJ_ZSET) {
+        if (o->encoding == OBJ_ENCODING_SKIPLIST) ht = ((zset *)objectGetVal(o))->ht;
     } else {
         errno = EINVAL;
         return 0;
@@ -12124,7 +12439,7 @@ int VM_ScanKey(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor, ValkeyModul
             cursor->done = 1;
             ret = 0;
         }
-    } else if (objectGetType(o) == OBJ_SET) {
+    } else if (o->type == OBJ_SET) {
         setTypeIterator *si = setTypeInitIterator(o);
         sds sdsele;
         while ((sdsele = setTypeNextObject(si)) != NULL) {
@@ -12136,7 +12451,7 @@ int VM_ScanKey(ValkeyModuleKey *key, ValkeyModuleScanCursor *cursor, ValkeyModul
         cursor->cursor = 1;
         cursor->done = 1;
         ret = 0;
-    } else if (objectGetType(o) == OBJ_ZSET || objectGetType(o) == OBJ_HASH) {
+    } else if (o->type == OBJ_ZSET || o->type == OBJ_HASH) {
         unsigned char *p = lpSeek(objectGetVal(o), 0);
         unsigned char *vstr;
         unsigned int vlen;
@@ -14784,7 +15099,7 @@ int VM_GetTypeMethodVersion(void) {
  */
 int VM_ModuleTypeReplaceValue(ValkeyModuleKey *key, moduleType *mt, void *new_value, void **old_value) {
     if (!(key->mode & VALKEYMODULE_WRITE) || key->iter) return VALKEYMODULE_ERR;
-    if (!key->value || objectGetType(key->value) != OBJ_MODULE) return VALKEYMODULE_ERR;
+    if (!key->value || key->value->type != OBJ_MODULE) return VALKEYMODULE_ERR;
 
     moduleValue *mv = objectGetVal(key->value);
     if (mv->type != mt) return VALKEYMODULE_ERR;
@@ -15489,6 +15804,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(RdbStreamFree);
     REGISTER_API(RdbLoad);
     REGISTER_API(RdbSave);
+    REGISTER_API(DeserializeDumpPayload);
     REGISTER_API(RegisterScriptingEngine);
     REGISTER_API(UnregisterScriptingEngine);
     REGISTER_API(GetFunctionExecutionState);
@@ -15498,4 +15814,11 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(ScriptingEngineDebuggerFlushLogs);
     REGISTER_API(ScriptingEngineDebuggerProcessCommands);
     REGISTER_API(ACLCheckKeyPrefixPermissions);
+    REGISTER_API(SubscribeToExternalStorage);
+    REGISTER_API(SubscribeToExternalStorageWithCallbacks);
+    REGISTER_API(RegisterStorageBackend);
+    REGISTER_API(UnsubscribeFromExternalStorage);
+    REGISTER_API(GetExternalStorageSerializationCallbacks);
+    REGISTER_API(SetExternalStorageKeyMayExistCallback);
+    REGISTER_API(SetExternalStorageMetricsCallback);
 }

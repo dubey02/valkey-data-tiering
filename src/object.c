@@ -106,6 +106,7 @@ static robj *createUnembeddedObjectWithKeyAndExpire(int type, void *val, const_s
     objectSetType(o, type);
     objectSetEncoding(o, OBJ_ENCODING_RAW);
     o->refcount = 1;
+    o->tiering_state = 0;
     objectSetLRU(o, 0);
     o->hasembkey = has_embkey;
     o->hasembval = 0;
@@ -210,6 +211,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     objectSetType(o, OBJ_STRING);
     objectSetEncoding(o, OBJ_ENCODING_EMBSTR);
     o->refcount = 1;
+    o->tiering_state = 0;
     objectSetLRU(o, 0);
     o->hasexpire = (expire != EXPIRY_NONE);
     o->hasembkey = has_embkey;
@@ -658,15 +660,20 @@ void incrRefCount(robj *o) {
 void decrRefCount(robj *o) {
     if (objectGetRefcount(o) == 1) {
         if (objectGetVal(o) != NULL) {
-            switch (objectGetType(o)) {
-            case OBJ_STRING: freeStringObject(o); break;
-            case OBJ_LIST: freeListObject(o); break;
-            case OBJ_SET: freeSetObject(o); break;
-            case OBJ_ZSET: freeZsetObject(o); break;
-            case OBJ_HASH: freeHashObject(o); break;
-            case OBJ_MODULE: freeModuleObject(o); break;
-            case OBJ_STREAM: freeStreamObject(o); break;
-            default: serverPanic("Unknown object type"); break;
+            if (objectIsTiered(o)) {
+                /* Tiered entry: val_ptr is an empty SDS placeholder, free it. */
+                sdsfree((sds)objectGetVal(o));
+            } else {
+                switch (objectGetType(o)) {
+                case OBJ_STRING: freeStringObject(o); break;
+                case OBJ_LIST: freeListObject(o); break;
+                case OBJ_SET: freeSetObject(o); break;
+                case OBJ_ZSET: freeZsetObject(o); break;
+                case OBJ_HASH: freeHashObject(o); break;
+                case OBJ_MODULE: freeModuleObject(o); break;
+                case OBJ_STREAM: freeStreamObject(o); break;
+                default: serverPanic("Unknown object type"); break;
+                }
             }
         }
         zfree(o);
@@ -1210,6 +1217,7 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_SKIPLIST: return "skiplist";
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
+    case OBJ_ENCODING_TIERED: return "tiered";
     default: return "unknown";
     }
 }
@@ -1225,6 +1233,14 @@ char *strEncoding(int encoding) {
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     size_t elesize = 0, samples = 0;
     size_t asize = zmalloc_size((void *)o);
+
+    /* Tiered entries have their value on external storage. Only the robj
+     * shell and the empty SDS placeholder remain in memory. */
+    if (objectIsTiered(o)) {
+        void *placeholder = objectGetVal(o);
+        if (placeholder) asize += sdsAllocSize(placeholder);
+        return asize;
+    }
 
     if (objectGetType(o) == OBJ_STRING) {
         if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {

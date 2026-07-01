@@ -1,0 +1,22 @@
+[package]
+name = "rocksdb-tiering-module"
+version = "0.1.0"
+edition = "2021"
+description = "Valkey data tiering module — RocksDB storage backend with multi-threaded IO"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+enable-system-alloc = ["valkey-module/enable-system-alloc"]
+
+[dependencies]
+crossbeam-queue = "0.3"
+once_cell = "1"
+libc = "0.2"
+rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
+valkey-module = { path = "../valkeymodule-rs" }
+
+[dev-dependencies]
+tempfile = "3"
