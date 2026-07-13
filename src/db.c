@@ -40,6 +40,7 @@
 #include "vector.h"
 #include "expire.h"
 #include "crc16_slottable.h"
+#include "ext_storage.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -441,6 +442,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
 
     if (!keyfound) {
         dbAdd(db, key, valref);
+        extStorageMaybeFlashAdmit(c, db, objectGetKey(*valref));
     } else if (keyfound < 0) {
         dbAddInternal(db, key, valref, 1);
     } else {

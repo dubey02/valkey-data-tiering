@@ -9,10 +9,13 @@
 #include <string.h>
 #include <unistd.h>
 
-/* robj is defined in server.h; forward-declare it here to avoid pulling all of server.h */
+/* robj serialization/deserialization (from ext_storage.c) */
+extern int extStorageSerializeKey(void *key, char **serialized_key);
+extern int extStorageSerializeValue(void *value, char **serialized_value);
+extern void *extStorageDeserializeValue(char *value, int length);
+extern void extStorageFreeSerializedValue(void *value);
+extern void extStorageOnSpillSerialize(size_t bytes);
 typedef struct serverObject robj;
-
-/* Extern declarations for server functions needed by the IO thread */
 extern void decrRefCount(robj *o);
 
 /* In-memory hash table simulating FlashCache with async IO */
@@ -287,14 +290,13 @@ static storageStatus fc_put_async(void *opaque, uint32_t db_id,
 
 static storageStatus fc_get_async(void *opaque, uint32_t db_id,
                                    const void *key, size_t klen,
-                                   void *request_ctx) {
-    (void)klen; /* key is robj*, not raw bytes */
+                                   int flags, void *request_ctx) {
+    (void)flags; /* Mock backend: reads are always non-destructive (in-memory HT) */
     fcCtx *ctx = opaque;
     fcRequest *req = storage_malloc(sizeof(fcRequest));
     req->op = STORAGE_OP_GET; req->db_id = db_id;
     req->key = (void*)key;
-    req->value = NULL;
-    req->expire_ms = 0;
+    req->value = NULL; req->expire_ms = 0;
     req->request_ctx = request_ctx; req->next = NULL;
 
     pthread_mutex_lock(&ctx->req_lock);
@@ -313,8 +315,7 @@ static storageStatus fc_del_async(void *opaque, uint32_t db_id,
     fcRequest *req = storage_malloc(sizeof(fcRequest));
     req->op = STORAGE_OP_DEL; req->db_id = db_id;
     req->key = (void*)key;
-    req->value = NULL;
-    req->expire_ms = 0;
+    req->value = NULL; req->expire_ms = 0;
     req->request_ctx = request_ctx; req->next = NULL;
 
     pthread_mutex_lock(&ctx->req_lock);
@@ -331,6 +332,15 @@ static int fc_poll_completions(void *opaque, int max) {
     pthread_mutex_lock(&ctx->comp_lock);
     while (count < max && ctx->comp_tail != ctx->comp_head) {
         storageCompletion *c = &ctx->comp_ring[ctx->comp_tail];
+
+        /* Deserialize GET values on main thread (safe to call Valkey APIs) */
+        if (c->op_type == STORAGE_OP_GET && c->status == STORAGE_OK && c->value && c->vlen > 0) {
+            void *deserialized = extStorageDeserializeValue((char*)c->value, (int)c->vlen);
+            storage_free(c->value);
+            c->value = deserialized;
+            c->vlen = 0; /* Signal: value is now an robj* */
+        }
+
         if (ctx->completion_fn) ctx->completion_fn(c, ctx->completion_privdata);
         ctx->comp_tail = (ctx->comp_tail + 1) % FC_COMP_RING;
         count++;

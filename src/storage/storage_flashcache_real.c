@@ -56,6 +56,7 @@ typedef struct fcRequest {
     void *value_robj;
     int64_t expire_ms;
     void *request_ctx;
+    int get_flags;  /* STORAGE_GET_FLAG_NONE or STORAGE_GET_FLAG_PEEK */
 } fcRequest;
 
 typedef struct fcRealCtx {
@@ -228,9 +229,10 @@ static void *fc_io_worker(void *arg) {
                 char *key_bytes = NULL;
                 int key_len = extStorageSerializeKey(req.key_robj, &key_bytes);
                 if (key_len > 0) {
+                    int fc_mode = (req.get_flags & STORAGE_GET_FLAG_PEEK) ? FC_READ_PEEK : FC_READ;
                     flashcacheReturnCode rc = flashcacheGetItem(
                         req.db_id, key_bytes, (size_t)key_len,
-                        FC_READ, req.request_ctx, fc_get_callback);
+                        fc_mode, req.request_ctx, fc_get_callback);
                     if (rc != FC_OK) {
                         comp.status = STORAGE_ERR_REJECTED;
                         fc_comp_push(ctx, &comp);
@@ -409,11 +411,12 @@ static storageStatus fc_real_put_async(void *opaque, uint32_t db_id,
 
 static storageStatus fc_real_get_async(void *opaque, uint32_t db_id,
                                         const void *key, size_t klen,
-                                        void *request_ctx) {
+                                        int flags, void *request_ctx) {
     (void)klen;
     fcRealCtx *ctx = opaque;
     fcRequest req = {.op = STORAGE_OP_GET, .db_id = db_id, .key_robj = (void*)key,
-                     .value_robj = NULL, .expire_ms = 0, .request_ctx = request_ctx};
+                     .value_robj = NULL, .expire_ms = 0, .request_ctx = request_ctx,
+                     .get_flags = flags};
     fc_req_push(ctx, &req);
     return STORAGE_WOULDBLOCK;
 }

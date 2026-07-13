@@ -190,6 +190,17 @@ configEnum rdb_version_check_enum[] = {{"strict", RDB_VERSION_CHECK_STRICT},
                                        {"relaxed", RDB_VERSION_CHECK_RELAXED},
                                        {NULL, 0}};
 
+configEnum ext_storage_admission_policy_enum[] = {
+    {"dram", EXT_STORAGE_ADMISSION_DRAM},
+    {"flash", EXT_STORAGE_ADMISSION_FLASH},
+    {NULL, 0}};
+
+configEnum ext_storage_promotion_policy_enum[] = {
+    {"always", EXT_STORAGE_PROMOTION_ALWAYS},
+    {"never", EXT_STORAGE_PROMOTION_NEVER},
+    {"2hit-50k", EXT_STORAGE_PROMOTION_2HIT_50K},
+    {NULL, 0}};
+
 /* Output buffer limits presets. */
 clientBufferLimitsConfig clientBufferLimitsDefaults[CLIENT_TYPE_OBUF_COUNT] = {
     {0, 0, 0},                                 /* normal */
@@ -3427,6 +3438,8 @@ standardConfig static_configs[] = {
     createEnumConfig("log-format", NULL, MODIFIABLE_CONFIG, log_format_enum, server.log_format, LOG_FORMAT_LEGACY, NULL, NULL),
     createEnumConfig("log-timestamp-format", NULL, MODIFIABLE_CONFIG, log_timestamp_format_enum, server.log_timestamp_format, LOG_TIMESTAMP_LEGACY, NULL, NULL),
     createEnumConfig("rdb-version-check", NULL, MODIFIABLE_CONFIG, rdb_version_check_enum, server.rdb_version_check, RDB_VERSION_CHECK_STRICT, NULL, NULL),
+    createEnumConfig("ext-storage-admission-policy", NULL, MODIFIABLE_CONFIG, ext_storage_admission_policy_enum, ext_storage_admission_policy, EXT_STORAGE_ADMISSION_DRAM, NULL, NULL),
+    createEnumConfig("ext-storage-promotion-policy", NULL, MODIFIABLE_CONFIG, ext_storage_promotion_policy_enum, ext_storage_promotion_policy, EXT_STORAGE_PROMOTION_ALWAYS, NULL, NULL),
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases, 16, INTEGER_CONFIG, NULL, NULL),

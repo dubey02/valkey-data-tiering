@@ -218,7 +218,7 @@ storageStatus storageSubmitPut(uint32_t db_id, const void *key, size_t klen,
                                const void *value, size_t vlen,
                                int64_t expire_ms, void *request_ctx);
 storageStatus storageSubmitGet(uint32_t db_id, const void *key, size_t klen,
-                               void *request_ctx);
+                               int flags, void *request_ctx);
 storageStatus storageSubmitDel(uint32_t db_id, const void *key, size_t klen,
                                void *request_ctx);
 int storagePollCompletions(int max);

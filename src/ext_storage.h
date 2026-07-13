@@ -37,6 +37,20 @@ typedef enum {
 /* tieringStateEntry removed — state stored in robj->tiering_state (3 bits) */
 
 /* ---------------------------------------------------------------------------
+ * Policy constants
+ * ---------------------------------------------------------------------------*/
+#define EXT_STORAGE_ADMISSION_DRAM  0
+#define EXT_STORAGE_ADMISSION_FLASH 1
+
+#define EXT_STORAGE_PROMOTION_ALWAYS    0
+#define EXT_STORAGE_PROMOTION_NEVER     1
+#define EXT_STORAGE_PROMOTION_2HIT_50K  2
+
+/* Storage GET flags (duplicated from storage/storage.h for engine-level use) */
+#define STORAGE_GET_FLAG_NONE    0  /* Destructive read */
+#define STORAGE_GET_FLAG_PEEK    1  /* Non-destructive read */
+
+/* ---------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------------*/
 extern int ext_data_enabled;
@@ -68,6 +82,8 @@ sds genExternalStorageSnapshotInfoString(sds info);
 int extStoragePhysicalDbId(int logical_id);
 int extStorageLogicalDbId(int physical_id);
 void extStorageSwapDbIds(int id1, int id2);
+extern int ext_storage_admission_policy;
+extern int ext_storage_promotion_policy;
 extern int ext_storage_spill_pool_active;
 extern char *ext_storage_backend;
 extern char *ext_storage_path;
@@ -122,11 +138,17 @@ int processCompletedStorageRequestsAndSpillOldItemsAggressive(void);
 void processCompletedStorageRequests(void);
 sds genExternalStorageInfoString(sds info);
 
+/* Transient promotion: free values after processUnblockedClients completes */
+void extStorageFreeTransientValues(void);
+
 /* State machine API */
 TieringState extStorageGetState(serverDb *db, sds key);
 void extStorageSetState(serverDb *db, sds key, TieringState state, int inflight_op);
 void extStorageRemoveState(serverDb *db, sds key);
 int extStorageEvictFlashKey(serverDb *db, sds key);
+
+/* Flash admission: spill a just-created key immediately if policy is FLASH */
+void extStorageMaybeFlashAdmit(client *c, serverDb *db, sds key);
 
 /* Eviction override: returns 1 if tiered storage handled eviction decision,
  * 0 if standard eviction should proceed. Sets *result to EVICT_OK or EVICT_FAIL. */

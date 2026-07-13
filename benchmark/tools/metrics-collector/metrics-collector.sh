@@ -8,7 +8,7 @@ OUTFILE="${2:?Usage: $0 PORT OUTFILE [INTERVAL]}"
 INTERVAL="${3:-1}"
 CLI="${VALKEY_CLI:-valkey-cli}"
 
-HEADER="timestamp,used_memory,used_memory_rss,maxmemory,keyspace_hits,keyspace_misses,ops_per_sec,total_commands_delta,total_num_items_spilled_to_ext_storage,total_num_items_fetched_from_ext_storage,completion_read_ok,dram_value_hits,kbc_fetching_block,num_items_spilling_to_ext_storage,blocked_clients,cpu_user,cpu_sys,valkey_cpu_user,valkey_cpu_sys,valkey_cpu_total,asio_cpu_pct,disk_hit_pct,mem_hit_pct,mem_frag_ratio,disk_read_iops,disk_write_iops,disk_read_mb,disk_write_mb,disk_read_merges_ps,disk_write_merges_ps,disk_r_await_ms,disk_w_await_ms,disk_aqu_sz,disk_util_pct,disk_in_flight,disk_req_sz_kb,throttle_total_throttled,throttle_queued_clients,throttle_current_rate,throttle_allowed_tps,spill_submitted_count,spill_serialized_count,mean_spill_ram,inflight_spill_ram_bytes"
+HEADER="timestamp,used_memory,used_memory_rss,maxmemory,keyspace_hits,keyspace_misses,ops_per_sec,total_commands_delta,total_num_items_spilled_to_ext_storage,total_num_items_fetched_from_ext_storage,completion_read_ok,dram_value_hits,kbc_fetching_block,num_items_spilling_to_ext_storage,blocked_clients,flash_admit_writes,total_transient_promotions,transient_promotion_clients_served,permanent_promotions,cpu_user,cpu_sys,valkey_cpu_user,valkey_cpu_sys,valkey_cpu_total,asio_cpu_pct,disk_hit_pct,mem_hit_pct, mem_frag_ratio,disk_read_iops,disk_write_iops,disk_read_mb,disk_write_mb,disk_read_merges_ps,disk_write_merges_ps,disk_r_await_ms,disk_w_await_ms,disk_aqu_sz,disk_util_pct,disk_in_flight,disk_req_sz_kb,throttle_total_throttled,throttle_queued_clients,throttle_current_rate,throttle_allowed_tps,spill_submitted_count,spill_serialized_count,mean_spill_ram,inflight_spill_ram_bytes"
 echo "$HEADER" > "$OUTFILE"
 
 # Full raw INFO ALL snapshot per tick, appended to a sibling log so we can mine
@@ -143,6 +143,10 @@ while true; do
     kbc_fetching_block=$(get_info_field kbc_fetching_block); kbc_fetching_block=${kbc_fetching_block:-0}
     num_items_spilling_to_ext_storage=$(get_info_field num_items_spilling_to_ext_storage); num_items_spilling_to_ext_storage=${num_items_spilling_to_ext_storage:-0}
     blocked_clients=$(get_info_field blocked_clients)
+    flash_admit_writes=$(get_info_field flash_admit_writes); flash_admit_writes=${flash_admit_writes:-0}
+    total_transient_promotions=$(get_info_field total_transient_promotions); total_transient_promotions=${total_transient_promotions:-0}
+    transient_promotion_clients_served=$(get_info_field transient_promotion_clients_served); transient_promotion_clients_served=${transient_promotion_clients_served:-0}
+    permanent_promotions=$(get_info_field permanent_promotions); permanent_promotions=${permanent_promotions:-0}
     throttle_total_throttled=$(get_info_field throttle_total_throttled); throttle_total_throttled=${throttle_total_throttled:-0}
     throttle_queued_clients=$(get_info_field throttle_queued_clients); throttle_queued_clients=${throttle_queued_clients:-0}
     throttle_current_rate=$(get_info_field throttle_current_rate); throttle_current_rate=${throttle_current_rate:-0}
@@ -164,7 +168,7 @@ while true; do
         mem_hit_pct="0.0"
     fi
     mem_frag_ratio=$(get_info_field mem_fragmentation_ratio); mem_frag_ratio=${mem_frag_ratio:-0}
-    echo "${ts},${used_memory},${used_memory_rss},${maxmemory},${keyspace_hits},${keyspace_misses},${ops_per_sec},${total_commands_delta},${total_num_items_spilled_to_ext_storage},${total_num_items_fetched_from_ext_storage},${completion_read_ok},${dram_value_hits},${kbc_fetching_block},${num_items_spilling_to_ext_storage},${blocked_clients},${cpu_user},${cpu_sys},${valkey_cpu_user},${valkey_cpu_sys},${valkey_cpu_total},${asio_cpu_pct},${disk_hit_pct},${mem_hit_pct},${mem_frag_ratio},${disk_read_iops},${disk_write_iops},${disk_read_mb},${disk_write_mb},${disk_read_merges_ps},${disk_write_merges_ps},${disk_r_await_ms},${disk_w_await_ms},${disk_aqu_sz},${disk_util_pct},${disk_in_flight},${disk_req_sz_kb},${throttle_total_throttled},${throttle_queued_clients},${throttle_current_rate},${throttle_allowed_tps},${spill_submitted_count},${spill_serialized_count},${mean_spill_ram},${inflight_spill_ram_bytes}" >> "$OUTFILE"
+    echo "${ts},${used_memory},${used_memory_rss},${maxmemory},${keyspace_hits},${keyspace_misses},${ops_per_sec},${total_commands_delta},${total_num_items_spilled_to_ext_storage},${total_num_items_fetched_from_ext_storage},${completion_read_ok},${dram_value_hits},${kbc_fetching_block},${num_items_spilling_to_ext_storage},${blocked_clients},${flash_admit_writes},${total_transient_promotions},${transient_promotion_clients_served},${permanent_promotions},${cpu_user},${cpu_sys},${valkey_cpu_user},${valkey_cpu_sys},${valkey_cpu_total},${asio_cpu_pct},${disk_hit_pct},${mem_hit_pct},${mem_frag_ratio},${disk_read_iops},${disk_write_iops},${disk_read_mb},${disk_write_mb},${disk_read_merges_ps},${disk_write_merges_ps},${disk_r_await_ms},${disk_w_await_ms},${disk_aqu_sz},${disk_util_pct},${disk_in_flight},${disk_req_sz_kb},${throttle_total_throttled},${throttle_queued_clients},${throttle_current_rate},${throttle_allowed_tps},${spill_submitted_count},${spill_serialized_count},${mean_spill_ram},${inflight_spill_ram_bytes}" >> "$OUTFILE"
     # Append the full raw INFO ALL snapshot for this tick (timestamp-delimited).
     printf '===== INFO ALL @ %s =====\n%s\n\n' "$ts" "$INFO" >> "$INFO_DUMP"
     sleep "$INTERVAL"

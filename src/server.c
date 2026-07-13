@@ -1931,6 +1931,14 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     blockedBeforeSleep();
 
+    /* Free transient values from promotion='never' fetches.
+     * Must be AFTER blockedBeforeSleep() / processUnblockedClients() — all
+     * unblocked clients have re-executed their commands and read the transiently-
+     * installed values. Now revert dict entries to TIERED placeholders. */
+    if (ext_data_enabled) {
+        extStorageFreeTransientValues();
+    }
+
     /* Record cron time in beforeSleep, which is the sum of active-expire, active-defrag and all other
      * tasks done by cron and beforeSleep, but excluding read, write and AOF, that are counted by other
      * sets of metrics. */

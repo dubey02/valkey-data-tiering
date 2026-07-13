@@ -421,7 +421,17 @@ run_scenario() {
         fi
     fi
 
-    # Results dir
+    # ─── Policy knob injection ───
+    # If ADMISSION or PROMOTION are set (e.g. via SWEEP_ADMISSION / SWEEP_PROMOTION),
+    # append the corresponding --ext-storage-*-policy args to SERVER_EXTRA_ARGS.
+    if [[ -n "${ADMISSION:-}" ]]; then
+        SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-} --ext-storage-admission-policy $ADMISSION"
+    fi
+    if [[ -n "${PROMOTION:-}" ]]; then
+        SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-} --ext-storage-promotion-policy $PROMOTION"
+    fi
+
+    # Results dir: nest under sweep suffix when sweeping
     local RESULTS="$RUN_DIR/$SCENARIO/$CFG_NAME"
     if [[ -n "${_SWEEP_ACTIVE:-}" && -n "${_SWEEP_SUFFIX:-}" ]]; then
         RESULTS="$RUN_DIR/$SCENARIO/$CFG_NAME/$_SWEEP_SUFFIX"

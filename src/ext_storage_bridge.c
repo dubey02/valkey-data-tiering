@@ -146,7 +146,7 @@ int extStorageBridge_submitPut(int db_id, robj *key, robj *value, int64_t expire
 }
 
 /* Submit a GET (fetch from storage) */
-int extStorageBridge_submitGet(int db_id, sds key) {
+int extStorageBridge_submitGet(int db_id, sds key, int get_flags) {
     bridgeRequestCtx *ctx = zmalloc(sizeof(bridgeRequestCtx));
     ctx->op_type = STORAGE_OP_GET;
     ctx->db_id = db_id;
@@ -157,7 +157,7 @@ int extStorageBridge_submitGet(int db_id, sds key) {
     ctx->expire_ms = 0;
 
     robj *keyobj = createStringObject(key, sdslen(key));
-    storageStatus s = storageSubmitGet(db_id, (void*)keyobj, 0, ctx);
+    storageStatus s = storageSubmitGet(db_id, (void*)keyobj, 0, get_flags, ctx);
     if (s == STORAGE_WOULDBLOCK || s == STORAGE_OK) {
         return 0;
     }

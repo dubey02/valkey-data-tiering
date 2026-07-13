@@ -59,9 +59,9 @@ storageStatus storageSubmitPut(uint32_t db_id, const void *key, size_t klen,
 }
 
 storageStatus storageSubmitGet(uint32_t db_id, const void *key, size_t klen,
-                               void *request_ctx) {
+                               int flags, void *request_ctx) {
     if (server_storage->get_async) {
-        return server_storage->get_async(server_storage_ctx, db_id, key, klen, request_ctx);
+        return server_storage->get_async(server_storage_ctx, db_id, key, klen, flags, request_ctx);
     }
     return storageMiddlewareSubmit(STORAGE_OP_GET, db_id, key, klen,
                                    NULL, 0, 0, request_ctx);

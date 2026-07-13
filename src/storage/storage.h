@@ -39,6 +39,10 @@ typedef enum {
 #define STORAGE_OP_DEL 2
 #define STORAGE_OP_BARRIER 3  /* Drain barrier — no IO, just signals completion */
 
+/* GET flags — controls destructive vs non-destructive read */
+#define STORAGE_GET_FLAG_NONE    0  /* Destructive read: item removed after read (default) */
+#define STORAGE_GET_FLAG_PEEK    1  /* Non-destructive read: item stays on disk */
+
 /* Completion delivered from IO to main thread */
 typedef struct storageCompletion {
     void *request_ctx;
@@ -108,7 +112,7 @@ typedef struct storageType {
                                int64_t expire_ms, void *request_ctx);
     storageStatus (*get_async)(void *ctx, uint32_t db_id,
                                const void *key, size_t klen,
-                               void *request_ctx);
+                               int flags, void *request_ctx);
     storageStatus (*del_async)(void *ctx, uint32_t db_id,
                                const void *key, size_t klen,
                                void *request_ctx);
@@ -158,7 +162,7 @@ storageStatus storageSubmitPut(uint32_t db_id, const void *key, size_t klen,
                                const void *value, size_t vlen,
                                int64_t expire_ms, void *request_ctx);
 storageStatus storageSubmitGet(uint32_t db_id, const void *key, size_t klen,
-                               void *request_ctx);
+                               int flags, void *request_ctx);
 storageStatus storageSubmitDel(uint32_t db_id, const void *key, size_t klen,
                                void *request_ctx);
 int storagePollCompletions(int max);

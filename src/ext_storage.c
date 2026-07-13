@@ -92,6 +92,8 @@ static long long ext_storage_timer_id = AE_ERR;
 
 // Configuration parameters
 int ext_data_enabled = 0;
+int ext_storage_admission_policy = EXT_STORAGE_ADMISSION_DRAM;
+int ext_storage_promotion_policy = EXT_STORAGE_PROMOTION_ALWAYS;
 int items_spillover_batch_size = 10;
 char *ext_storage_backend = NULL;
 char *ext_storage_path = NULL;
@@ -139,6 +141,129 @@ long long total_items_deleted_from_ext_storage = 0;
 
 /* Flag: when set, evictionPoolPopulate skips non-ONLY_MEMORY keys */
 int ext_storage_spill_pool_active = 0;
+
+// Flash admission metrics
+long long flash_admit_writes = 0;        /* keys flash-admitted on first write */
+long long flash_admit_skipped_floor = 0; /* skipped: embedded/below spill floor */
+
+// Promotion policy metrics
+long long total_transient_promotions = 0;       /* fetches served transiently (promotion=never) */
+long long transient_promotion_clients_served = 0; /* total clients served via transient path */
+long long total_permanent_promotions = 0;       /* fetches that promoted to DRAM (promotion=always) */
+
+/* ---------------------------------------------------------------------------
+ * Transient Value Tracking (promotion='never')
+ *
+ * When promotion_policy == NEVER, fetched values are temporarily installed in
+ * the dict entry so lookupKey works during processUnblockedClients(), then
+ * reverted to TIERED placeholders in extStorageFreeTransientValues().
+ *
+ * Memory accounting: the transient value IS counted in zmalloc_used_memory()
+ * (it's installed in the dict), but its lifetime is <1 event-loop tick. The
+ * spill controller (spillFillToProjected) runs in the same beforeSleep call
+ * after completions, so transient keys ARE visible to it. spillItemAsync()
+ * guards against picking transient keys by checking the transient_values array.
+ * The key's tiering_state is set to ONLY_MEMORY during the transient window
+ * (so keyBlocksClient allows the re-executed GET).
+ * extStorageFreeTransientValues() restores ONLY_FLASH after serving.
+ * ---------------------------------------------------------------------------*/
+#define TRANSIENT_VALUES_MAX 256
+
+typedef struct transientValueEntry {
+    int db_id;
+    sds key;            /* sdsdup'd key for lookup */
+    void *orig_val;     /* saved original placeholder (empty sds) */
+    int orig_encoding;
+    int orig_type;
+} transientValueEntry;
+
+static transientValueEntry transient_values[TRANSIENT_VALUES_MAX];
+static int transient_values_count = 0;
+
+/* ---------------------------------------------------------------------------
+ * 2hit-50k Promotion Policy: Sliding-Window Tracker
+ *
+ * A fixed-capacity ring buffer of the last PROMOTION_2HIT_WINDOW_SIZE flash
+ * accesses (by full key, byte-exact) plus an sds-keyed dict mapping key →
+ * in-window occurrence count. Runs single-threaded on the main event loop
+ * (no locking needed).
+ *
+ * Ownership model: the ring and the dict each own INDEPENDENT sds dups of
+ * keys. The ring dups on push and sdsfree's on eviction. The dict dups on
+ * insert and frees its copy via entryDestructor (dictEntryDestructorSdsKey)
+ * on dictDelete. This decoupling prevents use-after-free when a ring entry
+ * is evicted while the dict still holds a reference with count > 1.
+ * ---------------------------------------------------------------------------*/
+#define PROMOTION_2HIT_WINDOW_SIZE 50000
+#define PROMOTION_2HIT_THRESHOLD   2
+
+static sds twohit_ring[PROMOTION_2HIT_WINDOW_SIZE];
+static size_t twohit_ring_head = 0;   /* next insert position */
+static size_t twohit_ring_fill = 0;   /* current fill (0..WINDOW_SIZE) */
+
+/* Dict type for twohit count map: sds key OWNED by the dict (independent copy
+ * from ring). entryDestructor frees the sds key and the dictEntry. */
+static dictType twohitCountDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = dictEntryDestructorSdsKey,
+};
+
+static dict *twohit_counts = NULL;  /* sds → uint64_t occurrence count */
+
+/* 2hit-50k metrics */
+long long promotion_filtered_onehit = 0;   /* 1st-hit served transiently */
+long long promotion_2hit_admitted = 0;     /* 2nd+ hit promoted permanently */
+
+/* Record a flash access to key in the sliding window tracker. */
+static void recordFlashAccess(sds key) {
+    /* If ring is full, evict oldest entry */
+    if (twohit_ring_fill == PROMOTION_2HIT_WINDOW_SIZE) {
+        sds oldest = twohit_ring[twohit_ring_head];
+        /* Decrement count for evicted key */
+        dictEntry *de = dictFind(twohit_counts, oldest);
+        if (de) {
+            uint64_t cnt = dictGetUnsignedIntegerVal(de);
+            if (cnt <= 1) {
+                /* Remove from dict (destructor frees dict's own key copy + entry) */
+                dictDelete(twohit_counts, oldest);
+            } else {
+                dictSetUnsignedIntegerVal(de, cnt - 1);
+            }
+        }
+        sdsfree(oldest);
+    } else {
+        twohit_ring_fill++;
+    }
+
+    /* Push new entry into ring (dup the key — ring owns it) */
+    sds dup = sdsdup(key);
+    twohit_ring[twohit_ring_head] = dup;
+    twohit_ring_head = (twohit_ring_head + 1) % PROMOTION_2HIT_WINDOW_SIZE;
+
+    /* Increment count in map (dict owns its own key copy) */
+    dictEntry *de = dictFind(twohit_counts, dup);
+    if (de) {
+        dictIncrUnsignedIntegerVal(de, 1);
+    } else {
+        /* Insert new entry: dup key for the map (independent from ring's copy) */
+        sds mapkey = sdsdup(dup);
+        dictEntry *new_de = dictAddRaw(twohit_counts, mapkey, NULL);
+        if (new_de) {
+            dictSetUnsignedIntegerVal(new_de, 1);
+        } else {
+            sdsfree(mapkey);
+        }
+    }
+}
+
+/* Query the in-window occurrence count for key (0 if absent). */
+static uint64_t getAccessCount(sds key) {
+    if (!twohit_counts) return 0;
+    dictEntry *de = dictFind(twohit_counts, key);
+    return de ? dictGetUnsignedIntegerVal(de) : 0;
+}
 
 // Memory pressure metrics (non-static: accessed from evict.c)
 long long oom_reject_write_count = 0;
@@ -409,6 +534,9 @@ void extStorage_init(void) {
 
     extStorageThrottle_init();
 
+    /* Initialize 2hit-50k sliding-window tracker */
+    twohit_counts = dictCreate(&twohitCountDictType);
+
     ext_storage_timer_id = aeCreateTimeEvent(server.el, 1, extStorageTimerCallback, NULL, NULL);
     if (ext_storage_timer_id == AE_ERR) {
         serverLog(LL_WARNING, "ext_storage: Failed to create timer event");
@@ -622,7 +750,10 @@ int preCommandExec(client *c) {
                             extStorageSetState(current_db, key_str, TIERING_STATE_ONLY_FLASH, 0);
                         }
                         /* Issue fetch for this key */
-                        int rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str);
+                        int get_flags = (ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_NEVER ||
+                                         ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_2HIT_50K)
+                                        ? STORAGE_GET_FLAG_PEEK : STORAGE_GET_FLAG_NONE;
+                        int rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str, get_flags);
                         if (rc == 0) {
                             extStorageSetState(current_db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
                                 VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
@@ -709,7 +840,10 @@ int preCommandExec(client *c) {
             if (is_delete_cmd) {
                 rc = extStorageBridge_submitDel(extStoragePhysicalDbId(current_db->id), key_str);
             } else {
-                rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str);
+                int get_flags = (ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_NEVER ||
+                                 ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_2HIT_50K)
+                                ? STORAGE_GET_FLAG_PEEK : STORAGE_GET_FLAG_NONE;
+                rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str, get_flags);
             }
 
             if (rc != 0) {
@@ -877,43 +1011,190 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                         }
                     }
 
-                    /* FATAL assertion: read must succeed (matching dt-poc behavior) */
                     completion_read_ok++;
-                    if (entry != NULL && objectIsTiered(entry)) {
-                        /* Restore value to existing entry. Free the tombstone
-                         * placeholder (empty sds) first. */
-                        void *placeholder = objectGetVal(entry);
-                        if (placeholder != NULL) sdsfree((sds)placeholder);
-                        if (new_value->hasembval) {
-                            /* EMBSTR: the value bytes live INSIDE new_value's own
-                             * allocation (objectGetVal returns a pointer into it).
-                             * Aliasing that pointer into the entry and then freeing
-                             * new_value would leave entry->val_ptr dangling — a
-                             * use-after-free that crashes on the next read once the
-                             * freed region is reused under allocation churn. Detach
-                             * into a standalone RAW sds the entry owns. Values that
-                             * embed (<=~115B here) are restored as RAW; correctness
-                             * over re-embedding. */
-                            objectSetVal(entry, sdsdup((sds)objectGetVal(new_value)));
-                            entry->encoding = OBJ_ENCODING_RAW;
-                            entry->type = new_value->type;
-                            decrRefCount(new_value);
+
+                    if (ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_NEVER) {
+                        /* --- TRANSIENT PROMOTION (promotion='never') ---
+                         * Install value temporarily so lookupKey works during
+                         * processUnblockedClients(). Track old placeholder so we
+                         * can revert after all blocked clients are served.
+                         * Key stays in ONLY_FLASH state (authoritative copy on disk).
+                         * Non-destructive read (PEEK) preserves the flash copy. */
+                        if (entry != NULL && objectIsTiered(entry)) {
+                            /* Save original placeholder for revert */
+                            if (transient_values_count < TRANSIENT_VALUES_MAX) {
+                                transientValueEntry *tv = &transient_values[transient_values_count++];
+                                tv->db_id = db_id;
+                                tv->key = sdsdup(key_name);
+                                tv->orig_val = objectGetVal(entry);
+                                tv->orig_encoding = entry->encoding;
+                                tv->orig_type = entry->type;
+                            } else {
+                                /* Overflow: free old placeholder (can't revert, fall through to permanent) */
+                                void *placeholder = objectGetVal(entry);
+                                if (placeholder != NULL) sdsfree((sds)placeholder);
+                            }
+                            /* Install fetched value so lookupKey returns it - EMBSTR-SAFE */
+                            if (new_value->hasembval) {
+                                /* EMBSTR: value bytes live INSIDE new_value's allocation.
+                                 * Must sdsdup to avoid UAF when new_value is freed. */
+                                objectSetVal(entry, sdsdup((sds)objectGetVal(new_value)));
+                                entry->encoding = OBJ_ENCODING_RAW;
+                                entry->type = new_value->type;
+                                decrRefCount(new_value);
+                            } else {
+                                /* RAW/INT/compound: safe to transfer pointer */
+                                objectSetVal(entry, objectGetVal(new_value));
+                                entry->encoding = new_value->encoding;
+                                entry->type = new_value->type;
+                                new_value->refcount = 0;
+                                zfree(new_value);
+                            }
+                        } else if (entry == NULL) {
+                            dbAdd(db, key, &new_value);
                         } else {
-                            /* RAW/INT string or compound (list/set/hash/zset/stream):
-                             * the value is a separate allocation (or an inline int),
-                             * so transfer the pointer and free only the robj wrapper. */
-                            objectSetVal(entry, objectGetVal(new_value));
-                            entry->encoding = new_value->encoding;
-                            entry->type = new_value->type;
-                            new_value->refcount = 0;
-                            zfree(new_value);
+                            decrRefCount(new_value);
                         }
-                    } else if (entry == NULL) {
-                        /* Key not in dict (bloom filter false positive or race) — add it */
-                        dbAdd(db, key, &new_value);
+                        if (msg->ttl > 0) {
+                            setExpire(NULL, db, key, msg->ttl);
+                        }
+                        total_items_fetched_from_ext_storage++;
+                        total_transient_promotions++;
+                        /* Transition: COPYING_TO_MEMORY → ONLY_MEMORY (transient).
+                         * Leave the key in ONLY_MEMORY so that when unblocked clients
+                         * re-execute GET, keyBlocksClient sees the non-tiered entry and
+                         * allows it without re-blocking/re-fetching.
+                         * extStorageFreeTransientValues() (called after processUnblockedClients)
+                         * reverts the value and sets state back to ONLY_FLASH. */
+                        extStorageRemoveState(db, key_name);
+                    } else if (ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_2HIT_50K) {
+                        /* --- 2HIT-50K PROMOTION ---
+                         * Record flash access in the sliding window; if this is
+                         * the key's >=2nd access within the last 50K flash fetches,
+                         * promote permanently (reuse 'always' path). Otherwise
+                         * serve transiently (reuse 'never' path verbatim). */
+                        recordFlashAccess(key_name);
+                        uint64_t access_count = getAccessCount(key_name);
+
+                        if (access_count >= PROMOTION_2HIT_THRESHOLD) {
+                            /* 2nd+ hit → PERMANENT promotion - EMBSTR-SAFE */
+                            if (entry != NULL && objectIsTiered(entry)) {
+                                void *placeholder = objectGetVal(entry);
+                                if (placeholder != NULL) sdsfree((sds)placeholder);
+                                if (new_value->hasembval) {
+                                    /* EMBSTR: value bytes live INSIDE new_value's allocation.
+                                     * Must sdsdup to avoid UAF when new_value is freed. */
+                                    objectSetVal(entry, sdsdup((sds)objectGetVal(new_value)));
+                                    entry->encoding = OBJ_ENCODING_RAW;
+                                    entry->type = new_value->type;
+                                    decrRefCount(new_value);
+                                } else {
+                                    /* RAW/INT/compound: safe to transfer pointer */
+                                    objectSetVal(entry, objectGetVal(new_value));
+                                    entry->encoding = new_value->encoding;
+                                    entry->type = new_value->type;
+                                    new_value->refcount = 0;
+                                    zfree(new_value);
+                                }
+                            } else if (entry == NULL) {
+                                dbAdd(db, key, &new_value);
+                            } else {
+                                decrRefCount(new_value);
+                            }
+                            if (msg->ttl > 0) {
+                                setExpire(NULL, db, key, msg->ttl);
+                            }
+                            total_items_fetched_from_ext_storage++;
+                            total_permanent_promotions++;
+                            promotion_2hit_admitted++;
+                            if (num_items_on_flash > 0) num_items_on_flash--;
+                            extStorageRemoveState(db, key_name); /* → ONLY_MEMORY */
+                        } else {
+                            /* 1st hit → TRANSIENT serve - EMBSTR-SAFE */
+                            if (entry != NULL && objectIsTiered(entry)) {
+                                if (transient_values_count < TRANSIENT_VALUES_MAX) {
+                                    transientValueEntry *tv = &transient_values[transient_values_count++];
+                                    tv->db_id = db_id;
+                                    tv->key = sdsdup(key_name);
+                                    tv->orig_val = objectGetVal(entry);
+                                    tv->orig_encoding = entry->encoding;
+                                    tv->orig_type = entry->type;
+                                } else {
+                                    void *placeholder = objectGetVal(entry);
+                                    if (placeholder != NULL) sdsfree((sds)placeholder);
+                                }
+                                if (new_value->hasembval) {
+                                    /* EMBSTR: value bytes live INSIDE new_value's allocation.
+                                     * Must sdsdup to avoid UAF when new_value is freed. */
+                                    objectSetVal(entry, sdsdup((sds)objectGetVal(new_value)));
+                                    entry->encoding = OBJ_ENCODING_RAW;
+                                    entry->type = new_value->type;
+                                    decrRefCount(new_value);
+                                } else {
+                                    /* RAW/INT/compound: safe to transfer pointer */
+                                    objectSetVal(entry, objectGetVal(new_value));
+                                    entry->encoding = new_value->encoding;
+                                    entry->type = new_value->type;
+                                    new_value->refcount = 0;
+                                    zfree(new_value);
+                                }
+                            } else if (entry == NULL) {
+                                dbAdd(db, key, &new_value);
+                            } else {
+                                decrRefCount(new_value);
+                            }
+                            if (msg->ttl > 0) {
+                                setExpire(NULL, db, key, msg->ttl);
+                            }
+                            total_items_fetched_from_ext_storage++;
+                            total_transient_promotions++;
+                            promotion_filtered_onehit++;
+                            extStorageRemoveState(db, key_name);
+                        }
                     } else {
-                        /* Key was overwritten (shouldn't happen since we block writes) */
-                        decrRefCount(new_value);
+                        /* --- PERMANENT PROMOTION (promotion='always', default) - EMBSTR-SAFE ---
+                         * Restore value to existing entry with upstream's UAF fix. */
+                        if (entry != NULL && objectIsTiered(entry)) {
+                            /* Free the tombstone placeholder (empty sds) first. */
+                            void *placeholder = objectGetVal(entry);
+                            if (placeholder != NULL) sdsfree((sds)placeholder);
+                            if (new_value->hasembval) {
+                                /* EMBSTR: the value bytes live INSIDE new_value's own
+                                 * allocation (objectGetVal returns a pointer into it).
+                                 * Aliasing that pointer into the entry and then freeing
+                                 * new_value would leave entry->val_ptr dangling — a
+                                 * use-after-free that crashes on the next read once the
+                                 * freed region is reused under allocation churn. Detach
+                                 * into a standalone RAW sds the entry owns. Values that
+                                 * embed (<=~115B here) are restored as RAW; correctness
+                                 * over re-embedding. */
+                                objectSetVal(entry, sdsdup((sds)objectGetVal(new_value)));
+                                entry->encoding = OBJ_ENCODING_RAW;
+                                entry->type = new_value->type;
+                                decrRefCount(new_value);
+                            } else {
+                                /* RAW/INT string or compound (list/set/hash/zset/stream):
+                                 * the value is a separate allocation (or an inline int),
+                                 * so transfer the pointer and free only the robj wrapper. */
+                                objectSetVal(entry, objectGetVal(new_value));
+                                entry->encoding = new_value->encoding;
+                                entry->type = new_value->type;
+                                new_value->refcount = 0;
+                                zfree(new_value);
+                            }
+                        } else if (entry == NULL) {
+                            /* Key not in dict (bloom filter false positive or race) — add it */
+                            dbAdd(db, key, &new_value);
+                        } else {
+                            decrRefCount(new_value);
+                        }
+                        if (msg->ttl > 0) {
+                            setExpire(NULL, db, key, msg->ttl);
+                        }
+                        total_items_fetched_from_ext_storage++;
+                        total_permanent_promotions++;
+                        if (num_items_on_flash > 0) num_items_on_flash--;
+                        extStorageRemoveState(db, key_name); /* → ONLY_MEMORY */
                     }
                     if (msg->ttl > 0) {
                         setExpire(NULL, db, key, msg->ttl);
@@ -1178,6 +1459,16 @@ static int spillItemAsync(sds key, int db_id) {
     TieringState state = extStorageGetState(db, key);
     if (state != TIERING_STATE_ONLY_MEMORY) return -1;
 
+    /* Skip keys that are transiently installed (promotion=never / 2hit-50k 1st hit).
+     * These keys are in ONLY_MEMORY temporarily — their value will be freed and
+     * reverted to a TIERED placeholder in extStorageFreeTransientValues(). Spilling
+     * them would cause the WRITE completion to find an unexpected state (ONLY_FLASH)
+     * after the transient revert, triggering the state assertion. */
+    for (int i = 0; i < transient_values_count; i++) {
+        if (transient_values[i].db_id == db_id &&
+            sdscmp(transient_values[i].key, key) == 0) return -1;
+    }
+
     if (!extStorageBridge_isReady()) return -1;
 
     /* Zero-copy spill: key is small (copy is fine), but value can be large.
@@ -1224,6 +1515,37 @@ static int spillItemAsync(sds key, int db_id) {
         VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_WRITE);
     consecutive_spill_failures = 0; /* Submission accepted — reset failure counter */
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * extStorageMaybeFlashAdmit — Flash admission on first-write CREATE
+ *
+ * Called from setKey() CREATE branch AFTER dbAdd installs the value.
+ * If admission policy is FLASH, immediately spills the just-created key
+ * via spillItemAsync (zero-copy borrow). spillItemAsync already handles all
+ * eligibility checks (embedded floor, state, refcount, bridge ready).
+ *
+ * Guards: skip for internal/replica/module writes and during loading.
+ * ---------------------------------------------------------------------------*/
+void extStorageMaybeFlashAdmit(client *c, serverDb *db, sds key) {
+    if (!ext_data_enabled) return;
+    if (ext_storage_admission_policy != EXT_STORAGE_ADMISSION_FLASH) return;
+
+    /* Skip internal writes: RDB load, replication, module API, NULL client */
+    if (server.loading) return;
+    if (!c) return;
+    if (c->flag.primary) return;
+    if (c->flag.module) return;
+
+    /* spillItemAsync checks isEmbeddedObject, state, refcount, bridge ready.
+     * If the value is below the embedded floor, it no-ops (returns -1). */
+    int rc = spillItemAsync(key, db->id);
+    if (rc == 0) {
+        flash_admit_writes++;
+    } else {
+        /* Most common reason: value is embedded (below spill floor) */
+        flash_admit_skipped_floor++;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1542,6 +1864,58 @@ int processCompletedStorageRequestsAndSpillOldItemsAggressive(void) {
 }
 
 /* ---------------------------------------------------------------------------
+ * extStorageFreeTransientValues — Revert transient promotions after clients served
+ *
+ * Called from beforeSleep() AFTER processUnblockedClients() has completed.
+ * At this point all blocked clients have re-executed their commands and read
+ * the transiently-installed value via lookupKey(). Now revert the dict entry
+ * back to the TIERED placeholder (empty sds + OBJ_ENCODING_TIERED).
+ *
+ * During the transient window (between completion handler and this function),
+ * the key's tiering_state is ONLY_MEMORY so that keyBlocksClient allows the
+ * re-executed GET to proceed without re-blocking. This function restores the
+ * state to ONLY_FLASH after reverting the placeholder.
+ *
+ * The transient window spans the same beforeSleep call (completions → spill →
+ * blockedBeforeSleep → this function). spillItemAsync guards against picking
+ * transient keys by checking the transient_values array.
+ * ---------------------------------------------------------------------------*/
+void extStorageFreeTransientValues(void) {
+    if (transient_values_count == 0) return;
+
+    for (int i = 0; i < transient_values_count; i++) {
+        transientValueEntry *tv = &transient_values[i];
+        serverDb *db = server.db[tv->db_id];
+        dbEntry *entry = dbFind(db, tv->key);
+
+        if (entry != NULL && !objectIsTiered(entry)) {
+            /* Entry still has the transient value — revert to placeholder.
+             * Free the transient value (the fetched data) and restore the
+             * original placeholder. Multiple clients on the same key were all
+             * served in processUnblockedClients() — free exactly once here. */
+            robj *tmp = createObject(entry->type, objectGetVal(entry));
+            tmp->encoding = entry->encoding;
+            decrRefCount(tmp); /* Frees the transient value data */
+
+            /* Restore TIERED placeholder */
+            entry->encoding = tv->orig_encoding;
+            entry->type = tv->orig_type;
+            objectSetVal(entry, tv->orig_val);
+            /* Transition back to ONLY_FLASH now that clients have been served */
+            extStorageSetState(db, tv->key, TIERING_STATE_ONLY_FLASH, 0);
+
+            transient_promotion_clients_served++; /* approximate: 1 per key */
+        } else {
+            /* Entry was deleted or already reverted (race/DEL during serve).
+             * Free the saved placeholder since we won't reinstall it. */
+            if (tv->orig_val != NULL) sdsfree((sds)tv->orig_val);
+        }
+        sdsfree(tv->key);
+    }
+    transient_values_count = 0;
+}
+
+/* ---------------------------------------------------------------------------
  * INFO string generation
  * ---------------------------------------------------------------------------*/
 
@@ -1683,6 +2057,24 @@ sds genExternalStorageInfoString(sds info) {
         info = sdscatsds(info, module_metrics);
     }
     sdsfree(module_metrics);
+
+    info = sdscatprintf(info,
+        "flash_admit_writes:%lld\r\n"
+        "flash_admit_skipped_floor:%lld\r\n"
+        "total_transient_promotions:%lld\r\n"
+        "transient_promotion_clients_served:%lld\r\n"
+        "total_permanent_promotions:%lld\r\n"
+        "promotion_filtered_onehit:%lld\r\n"
+        "promotion_2hit_admitted:%lld\r\n"
+        "twohit_window_distinct_keys:%lu\r\n",
+        flash_admit_writes,
+        flash_admit_skipped_floor,
+        total_transient_promotions,
+        transient_promotion_clients_served,
+        total_permanent_promotions,
+        promotion_filtered_onehit,
+        promotion_2hit_admitted,
+        (unsigned long)(twohit_counts ? dictSize(twohit_counts) : 0));
 
     info = genExternalStorageSnapshotInfoString(info);
     return info;

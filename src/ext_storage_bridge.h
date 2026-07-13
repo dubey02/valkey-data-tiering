@@ -20,7 +20,7 @@ int extStorageBridge_isReady(void);
 
 /* Submit operations (replace moduleFireExternalStorageEvent) */
 int extStorageBridge_submitPut(int db_id, robj *key, robj *value, int64_t expire_ms);
-int extStorageBridge_submitGet(int db_id, sds key);
+int extStorageBridge_submitGet(int db_id, sds key, int get_flags);
 int extStorageBridge_submitDel(int db_id, sds key);
 int extStorageBridge_flushDB(int db_id);
 int extStorageBridge_flushAll(void);
