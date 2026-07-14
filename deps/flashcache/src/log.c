@@ -433,12 +433,18 @@ static flashcacheReturnCode logReadFromIndexEntry(flashcacheLog *log, indexEntry
             char *item = index_entry->item_entry.staging_buffer_entry->item;
             extractValueFromSerializedItem(item, &value, &value_len);
 
-            // Serialized item is not deleted when the staging buffer entry is deleted because
-            // extracted value is a pointer in item. Also staging buffer needs to be deleted after
-            // deleting index entry as the deletion uses the staging buffer.
             stagingBufferEntry *staging_buffer_entry = index_entry->item_entry.staging_buffer_entry;
-            deleteItemAndFreeKey(log, dbid, key, key_len, index_entry);
-            deleteEntryFromStagingBuffer(log, staging_buffer_entry, 0);
+            if (read_type != FC_READ_PEEK) {
+                // Serialized item is not deleted when the staging buffer entry is deleted because
+                // extracted value is a pointer in item. Also staging buffer needs to be deleted after
+                // deleting index entry as the deletion uses the staging buffer.
+                deleteItemAndFreeKey(log, dbid, key, key_len, index_entry);
+                deleteEntryFromStagingBuffer(log, staging_buffer_entry, 0);
+            } else {
+                if (key != NULL) {
+                    fcFree(key);
+                }
+            }
 
             // Completion callback is called after cleaning up internal
             // state so that if the callback calls another Flashcache API,
@@ -446,7 +452,7 @@ static flashcacheReturnCode logReadFromIndexEntry(flashcacheLog *log, indexEntry
             // `completion_callback` will be NULL in case when request is generated internally
             // in FlashCache. For e.g. Delete command in FDB file.
             if (completion_callback != NULL) {
-                if (read_type == FC_READ && (value == NULL || value_len == 0)) {
+                if ((read_type == FC_READ || read_type == FC_READ_PEEK) && (value == NULL || value_len == 0)) {
                     flashcacheLogger(FC_LL_WARNING, "logReadFromIndexEntry: "
                         "Unexpected a NULL or empty value in the staging buffer. "
                         "This likely indicates a FlashCache read miss.\n"
@@ -462,7 +468,9 @@ static flashcacheReturnCode logReadFromIndexEntry(flashcacheLog *log, indexEntry
                 }
                 completion_callback(request_context, value, value_len, 0);
             }
-            fcFree(item);
+            if (read_type != FC_READ_PEEK) {
+                fcFree(item);
+            }
 
             return FC_OK;
         }
@@ -1029,7 +1037,7 @@ flashcacheReturnCode logWrite(flashcacheLog *log, uint32_t dbid, char const *key
 flashcacheReturnCode logRead(flashcacheLog *log, uint32_t dbid, char const *key, size_t key_len,
         flashcacheReadTypes read_type, void *request_context, flashcache_get_item_callback completion_callback) {
     flashcacheAssert(dbid < log->num_databases);
-    if (read_type == FC_READ) {
+    if (read_type == FC_READ || read_type == FC_READ_PEEK) {
         log->metrics.num_read_request++;
     } else {
         log->metrics.num_delete_request++;
@@ -1227,12 +1235,18 @@ flashcacheReturnCode logRunCronTasks(flashcacheLog *log) {
                             completion_callback, num_pages_required_to_read_item);
                     goto finish_processing_request;
                 }
-                snapshotManagerAddExpeditedItem(log_offset, item, total_len);
-                // Value has isn't necessary for DEL replication commands (it can safely be NULL within length 0)
-                snapshotManagerAddReplicationCommandIfRequired(log_offset, dbid, key, key_len,
-                                                                value, value_len, log->crc_function);
-                deleteItemAndFreeKey(log, dbid, key, key_len, index_entry);
-                decrementAllocatedLogSize(log, dbid, total_len);
+                if (read_type != FC_READ_PEEK) {
+                    snapshotManagerAddExpeditedItem(log_offset, item, total_len);
+                    // Value has isn't necessary for DEL replication commands (it can safely be NULL within length 0)
+                    snapshotManagerAddReplicationCommandIfRequired(log_offset, dbid, key, key_len,
+                                                                    value, value_len, log->crc_function);
+                    deleteItemAndFreeKey(log, dbid, key, key_len, index_entry);
+                    decrementAllocatedLogSize(log, dbid, total_len);
+                } else {
+                    if (key != NULL) {
+                        fcFree(key);
+                    }
+                }
                 // Completion callback is called after cleaning up internal
                 // state so that if the callback calls another Flashcache API,
                 // there is no side effect due to the uncleaned state.
@@ -1248,6 +1262,8 @@ flashcacheReturnCode logRunCronTasks(flashcacheLog *log) {
                             should_add_item_to_rdb = 1;
                             log->metrics.item_bytes_moved_from_disk_during_threadsave += key_len + value_len;
                         }
+                    } else if (read_type == FC_READ_PEEK) {
+                        /* Non-destructive: no snapshot side-effects */
                     } else {
                         if (is_item_in_ts_snapshot_range) {
                             log->metrics.item_bytes_deleted_from_disk_during_threadsave +=

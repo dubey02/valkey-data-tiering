@@ -257,7 +257,8 @@ typedef enum {
 
 typedef enum {
     FC_READ,
-    FC_DELETE
+    FC_DELETE,
+    FC_READ_PEEK
 } flashcacheReadTypes;
 
 typedef enum {

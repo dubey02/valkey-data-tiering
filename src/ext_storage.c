@@ -1196,12 +1196,6 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                         if (num_items_on_flash > 0) num_items_on_flash--;
                         extStorageRemoveState(db, key_name); /* → ONLY_MEMORY */
                     }
-                    if (msg->ttl > 0) {
-                        setExpire(NULL, db, key, msg->ttl);
-                    }
-                    total_items_fetched_from_ext_storage++;
-                    if (num_items_on_flash > 0) num_items_on_flash--;
-                    extStorageRemoveState(db, key_name); /* → ONLY_MEMORY */
                 } else if (msg->status == VALKEYMODULE_EXTERNAL_STORAGE_READ_RETRY) {
                     /* Transient backpressure (FlashCache read queue full), NOT a
                      * miss: the value is still on flash and the index entry is
@@ -1212,7 +1206,7 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                      * (KEY_STATE_BUG wedge). The resubmit replaces this in-flight
                      * fetch, so the in-flight count is left unchanged. */
                     completion_read_retry++;
-                    extStorageBridge_submitGet(db_id, key_name); /* submitGet sdsdup's the key */
+                    extStorageBridge_submitGet(db_id, key_name, STORAGE_GET_FLAG_NONE); /* submitGet sdsdup's the key */
                     decrRefCount(key);
                     zfree(msg);
                     return;
