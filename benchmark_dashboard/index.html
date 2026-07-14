@@ -64,6 +64,18 @@
     </div>
   </div>
 
+  <!-- Scenario: Policy Matrix (admission x promotion, policy-matrix-allfixes-20260714) -->
+  <div class="scenario-view" id="scenario-policymatrix">
+    <div class="top-bar" id="pm-dataset-selector"></div>
+    <div class="layout">
+      <aside class="sidebar" id="pm-sidebar"></aside>
+      <main class="main">
+        <div class="kpi-row" id="pm-kpi-row"></div>
+        <div class="chart-grid" id="pm-chart-grid"></div>
+      </main>
+    </div>
+  </div>
+
   <!-- Scenario: Value Sizes (stub) -->
   <div class="scenario-view" id="scenario-valuesizes">
     <div class="top-bar" id="vs-dataset-selector"></div>
@@ -203,6 +215,7 @@
 // ============================================================
 const SCENARIOS = [
   { id: 'policies', label: 'Policies' },
+  { id: 'policymatrix', label: 'Policy Matrix' },
   { id: 'valuesizes', label: 'Value Sizes' },
   { id: 'flashcache', label: 'FlashCache Layer' },
 ];
@@ -402,6 +415,153 @@ function renderKPIs(){
     kpiRow.appendChild(kpi);});
 }
 loadAll();
+
+// ============================================================
+// POLICY MATRIX SCENARIO (admission x promotion, run policy-matrix-allfixes-20260714)
+// ============================================================
+(function initPolicyMatrix(){
+  const PM_DIR = 'data/policy/';
+  const PM_DATASETS = [
+    { file:'admission-dram-promotion-always.csv',    label:'dram+always',    color:'#0ea5e9' },
+    { file:'admission-dram-promotion-never.csv',     label:'dram+never',     color:'#f97316' },
+    { file:'admission-dram-promotion-2hit-50k.csv',  label:'dram+2hit-50k',  color:'#8b5cf6' },
+    { file:'admission-flash-promotion-always.csv',   label:'flash+always',   color:'#10b981' },
+    { file:'admission-flash-promotion-never.csv',    label:'flash+never',    color:'#ef4444' },
+    { file:'admission-flash-promotion-2hit-50k.csv', label:'flash+2hit-50k', color:'#eab308' },
+  ];
+  const PM_METRICS = METRICS; // same columns as policies metrics.csv
+  const PM_GROUPS = {
+    'Throughput': ['ops_per_sec','total_commands_delta','keyspace_hits','keyspace_misses'],
+    'Memory': ['used_memory','used_memory_rss','maxmemory','mem_frag_ratio'],
+    'Tiering': ['total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','num_items_spilling_to_ext_storage','completion_read_ok','dram_value_hits','kbc_fetching_block','flash_admit_writes'],
+    'Promotion': ['total_transient_promotions','transient_promotion_clients_served','permanent_promotions'],
+    'CPU': ['cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct'],
+    'Disk': ['disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb','disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms','disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb','disk_hit_pct'],
+    'Throttle': ['throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps','blocked_clients'],
+    'Spill Pipeline': ['spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'],
+    'Latency (client)': ['_pm_client_get_latency','_pm_client_set_latency'],
+    'Latency (server)': ['_pm_server_latency'],
+  };
+  const PM_DEFAULT = new Set(['ops_per_sec','used_memory','disk_util_pct',
+    'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
+    'total_transient_promotions','permanent_promotions','_pm_client_get_latency','_pm_client_set_latency','_pm_server_latency']);
+
+  let pmLoaded = {};
+  let pmLatency = {get:{},set:{},server:{}};
+  let pmActive = new Set(PM_DATASETS.map(d=>d.file));
+  let pmVisible = new Set(PM_DEFAULT);
+  let pmCharts = {};
+
+  // Dataset selector
+  const sel = document.getElementById('pm-dataset-selector');
+  PM_DATASETS.forEach(ds=>{
+    const lbl=document.createElement('label');lbl.style.borderLeft=`3px solid ${ds.color}`;
+    const cb=document.createElement('input');cb.type='checkbox';cb.checked=pmActive.has(ds.file);
+    cb.onchange=()=>{if(cb.checked)pmActive.add(ds.file);else pmActive.delete(ds.file);renderPM();};
+    lbl.appendChild(cb);lbl.append(ds.label);sel.appendChild(lbl);
+  });
+
+  // Sidebar
+  const sb = document.getElementById('pm-sidebar');
+  const br = document.createElement('div');br.className='btn-row';
+  const ba=document.createElement('button');ba.textContent='All';
+  ba.onclick=()=>{pmVisible=new Set([...PM_METRICS,'_pm_client_get_latency','_pm_client_set_latency','_pm_server_latency']);syncPM();updatePMVis();};
+  const bn=document.createElement('button');bn.textContent='None';bn.onclick=()=>{pmVisible.clear();syncPM();updatePMVis();};
+  const bd=document.createElement('button');bd.textContent='Default';bd.onclick=()=>{pmVisible=new Set(PM_DEFAULT);syncPM();updatePMVis();};
+  br.append(ba,bn,bd);sb.appendChild(br);
+  const pmCBs={};
+  Object.entries(PM_GROUPS).forEach(([group,fields])=>{
+    const div=document.createElement('div');div.className='group';
+    const h=document.createElement('h3');h.textContent=group;div.appendChild(h);
+    fields.forEach(f=>{
+      const lbl=document.createElement('label');
+      const cb=document.createElement('input');cb.type='checkbox';cb.checked=pmVisible.has(f);
+      cb.onchange=()=>{if(cb.checked)pmVisible.add(f);else pmVisible.delete(f);updatePMVis();};
+      pmCBs[f]=cb;lbl.appendChild(cb);lbl.append(f.replace(/_/g,' ').replace(/^_pm /,''));div.appendChild(lbl);
+    });
+    sb.appendChild(div);
+  });
+  function syncPM(){Object.entries(pmCBs).forEach(([f,cb])=>cb.checked=pmVisible.has(f));}
+  function updatePMVis(){document.querySelectorAll('#pm-chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',pmVisible.has(el.dataset.metric));});}
+
+  // Build charts
+  const grid = document.getElementById('pm-chart-grid');
+  PM_METRICS.forEach(m=>{
+    const card=document.createElement('div');
+    card.className='chart-card'+(m==='ops_per_sec'?' wide':'')+(pmVisible.has(m)?' visible':'');
+    card.dataset.metric=m;
+    card.innerHTML=`<h3>${m.replace(/_/g,' ')}</h3><canvas id="pm-chart-${m}"></canvas>`;
+    grid.appendChild(card);
+    pmCharts[m]=new Chart(document.getElementById('pm-chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+  [['_pm_client_get_latency','Client GET Latency (ms)'],['_pm_client_set_latency','Client SET Latency (ms)'],['_pm_server_latency','Server-side Latency (µs)']].forEach(([m,title])=>{
+    const card=document.createElement('div');card.className='chart-card wide'+(pmVisible.has(m)?' visible':'');card.dataset.metric=m;
+    card.innerHTML=`<h3>${title}</h3><canvas id="pm-chart${m}"></canvas>`;grid.appendChild(card);
+    pmCharts[m]=new Chart(document.getElementById('pm-chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+
+  // Load data
+  async function loadPM(){
+    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
+      Papa.parse(PM_DIR+ds.file,{download:true,header:true,dynamicTyping:true,
+        complete:r=>{pmLoaded[ds.file]=r.data.filter(row=>row.timestamp);resolve();},error:()=>resolve()});
+    })));
+    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
+      const base=ds.file.replace('.csv','');
+      Papa.parse(PM_DIR+base+'-get-latency.csv',{download:true,header:true,dynamicTyping:true,
+        complete:r=>{if(r.data[0])pmLatency.get[ds.file]=r.data[0];resolve();},error:()=>resolve()});
+    })));
+    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
+      const base=ds.file.replace('.csv','');
+      Papa.parse(PM_DIR+base+'-set-latency.csv',{download:true,header:true,dynamicTyping:true,
+        complete:r=>{if(r.data[0])pmLatency.set[ds.file]=r.data[0];resolve();},error:()=>resolve()});
+    })));
+    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
+      const base=ds.file.replace('.csv','');
+      fetch(PM_DIR+base+'-server-latency.txt').then(r=>r.text()).then(txt=>{
+        const parsed={};
+        txt.trim().split('\n').forEach(line=>{const m=line.match(/^latency_percentiles_usec_(\w+):(.+)/);if(m){const vals={};m[2].split(',').forEach(p=>{const[k,v]=p.split('=');vals[k]=parseFloat(v);});parsed[m[1]]=vals;}});
+        pmLatency.server[ds.file]=parsed;resolve();
+      }).catch(()=>resolve());
+    })));
+    renderPM();
+  }
+
+  function renderPM(){
+    PM_METRICS.forEach(m=>{
+      const chart=pmCharts[m];const datasets=[];let maxLen=0;
+      PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLoaded[ds.file])return;
+        const rows=pmLoaded[ds.file];maxLen=Math.max(maxLen,rows.length);
+        datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
+      chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
+    });
+    const latFields=['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms'];
+    [['_pm_client_get_latency',pmLatency.get],['_pm_client_set_latency',pmLatency.set]].forEach(([key,src])=>{
+      const chart=pmCharts[key];const datasets=[];
+      PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!src[ds.file])return;const row=src[ds.file];
+        datasets.push({label:ds.label,data:latFields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+      chart.data.labels=latFields.map(f=>f.replace('_latency_ms','').replace('_',' '));chart.data.datasets=datasets;chart.update();
+    });
+    // Server latency bars
+    {
+      const chart=pmCharts['_pm_server_latency'];const pctiles=['p50','p90','p99','p99.9'];const cmds=['get','set'];
+      const labels=[];cmds.forEach(cmd=>pctiles.forEach(p=>labels.push(`${cmd} ${p}`)));
+      const datasets=[];
+      PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLatency.server[ds.file])return;const srv=pmLatency.server[ds.file];
+        const data=[];cmds.forEach(cmd=>pctiles.forEach(p=>data.push(srv[cmd]?.[p]||0)));
+        datasets.push({label:ds.label,data,backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+      chart.data.labels=labels;chart.data.datasets=datasets;chart.update();
+    }
+    // KPIs
+    const kpi=document.getElementById('pm-kpi-row');kpi.innerHTML='';
+    PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLoaded[ds.file])return;
+      const steady=pmLoaded[ds.file].slice(10);const avg=steady.reduce((s,r)=>s+(r.ops_per_sec||0),0)/(steady.length||1);
+      const el=document.createElement('div');el.className='kpi';
+      el.innerHTML=`<div class="value" style="color:${ds.color}">${(avg/1000).toFixed(1)}K</div><div class="label">${ds.label} ops/s</div>`;
+      kpi.appendChild(el);});
+  }
+  loadPM();
+})();
 
 // ============================================================
 // VALUE SIZES SCENARIO (real data from size-sweep)
