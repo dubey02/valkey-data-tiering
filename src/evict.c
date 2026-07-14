@@ -523,6 +523,8 @@ int performEvictions(void) {
     int result = EVICT_FAIL;
 
     if (getMaxmemoryState(&mem_reported, NULL, &mem_tofree, NULL) == C_OK) {
+        result = EVICT_OK;
+        goto update_metrics;
     }
 
     // If external storage is enabled, handle memory pressure via spilling — not eviction.

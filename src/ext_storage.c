@@ -1206,7 +1206,16 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                      * (KEY_STATE_BUG wedge). The resubmit replaces this in-flight
                      * fetch, so the in-flight count is left unchanged. */
                     completion_read_retry++;
-                    extStorageBridge_submitGet(db_id, key_name, STORAGE_GET_FLAG_NONE); /* submitGet sdsdup's the key */
+                    {
+                        /* Preserve the PEEK flag on resubmit: for transient-
+                         * promotion policies (never / 2hit-50k) the original
+                         * fetch was non-destructive; retrying with FLAG_NONE
+                         * would destructively consume the flash copy. */
+                        int retry_flags = (ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_NEVER ||
+                                           ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_2HIT_50K)
+                                          ? STORAGE_GET_FLAG_PEEK : STORAGE_GET_FLAG_NONE;
+                        extStorageBridge_submitGet(db_id, key_name, retry_flags); /* submitGet sdsdup's the key */
+                    }
                     decrRefCount(key);
                     zfree(msg);
                     return;
@@ -1639,31 +1648,30 @@ int extStoragePerformEvictions(int *result) {
         return 1;
     }
 
-    /* Over maxmemory (projected) but under 1.2x hard cap.
-     * The throttle zone [1.0x, 1.2x] handles back-pressure via the bytes-
-     * throttle. We should NEVER reject writes in this zone — the throttle
-     * slows incoming traffic and spilling drains memory. Rejecting here
-     * would be premature since the hard cap hasn't been breached.
-     *
-     * Track a metric for observability: if no spillable items exist, the
-     * spill mechanism can't help and we're relying purely on the throttle
-     * to prevent reaching the hard cap. This is a sign of a degenerate
-     * workload (all values already on flash, only metadata in memory). */
-    if (total_items_spilling_to_ext_storage == 0) {
-        long long total_keys = 0;
-        for (int i = 0; i < server.dbnum; i++) {
-            if (server.db[i]) total_keys += kvstoreSize(server.db[i]->keys);
-        }
-        long long spillable_keys = total_keys - num_items_on_flash;
-        if (spillable_keys <= 0) {
-            /* Metric only — no spillable items exist (all on flash or in-flight).
-             * The throttle is the sole back-pressure mechanism in this state. */
-            no_spillable_items_count++;
-        }
+    /* Over maxmemory. Check if we have spillable items (matching dt-poc's hasSpillableItems).
+     * hasSpillableItems = (items in LRU > 0) || (items currently spilling > 0) */
+    if (total_items_spilling_to_ext_storage > 0) {
+        /* Items are in-flight to disk — they'll free memory on completion */
+        *result = C_OK;
+        return 1;
     }
 
-    /* Always OK below hard cap — throttle handles back-pressure */
-    *result = C_OK;
+    /* Cheap check: if DBSIZE > num_items_on_flash, there are keys with values
+     * in memory that could potentially be spilled. Avoids expensive sampling. */
+    long long total_keys = 0;
+    for (int i = 0; i < server.dbnum; i++) {
+        if (server.db[i]) total_keys += kvstoreSize(server.db[i]->keys);
+    }
+    if (total_keys > num_items_on_flash) {
+        /* There are items in memory that could be spilled */
+        *result = C_OK;
+        return 1;
+    }
+
+    /* No spillable items and nothing in-flight — truly out of capacity.
+     * This is isOverMaxmemoryAndNoSpillableItems() in dt-poc. */
+    no_spillable_items_count++;
+    *result = C_ERR;
     return 1;
 }
 
