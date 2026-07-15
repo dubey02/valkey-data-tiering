@@ -24,7 +24,6 @@
     .tab-bar button{padding:.7rem 1.5rem;background:none;border:none;color:var(--muted);font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
     .tab-bar button:hover{color:var(--text)}
     .tab-bar button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
-    .tab-bar button.disabled{opacity:.3;cursor:not-allowed}
     /* Dataset selector bar */
     .top-bar{padding:.5rem 1.5rem;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;flex-shrink:0}
     .top-bar label{display:flex;align-items:center;gap:.3rem;background:var(--surface);border:1px solid var(--border);padding:.25rem .6rem;border-radius:4px;font-size:.75rem;cursor:pointer}
@@ -154,13 +153,12 @@ const DATA_PATH = 'benchmark_dashboard/data';
 // The dashboard dynamically shows/hides tabs based on the selected branch.
 const BRANCH_MANIFESTS = {
   unstable: {
-    scenarios: ['policies', 'policymatrix', 'valuesizes', 'flashcache'],
-    // Policy matrix data lives in data/policy/ subdir on unstable
-    policyMatrixPath: 'benchmark_dashboard/data/policy',
+    scenarios: ['policies', 'valuesizes', 'flashcache'],
   },
   policies: {
-    scenarios: ['policies', 'valuesizes', 'flashcache'],
-    // No policy matrix on this branch
+    scenarios: ['policies', 'policymatrix', 'valuesizes', 'flashcache'],
+    // Policy matrix data lives in data/policy/ subdir on policies branch
+    policyMatrixPath: 'benchmark_dashboard/data/policy',
   },
   xdk: {
     scenarios: ['policies', 'valuesizes', 'flashcache'],
@@ -193,14 +191,13 @@ function buildTabs() {
   tabBar.innerHTML = '';
   const manifest = BRANCH_MANIFESTS[currentBranch] || { scenarios: ['policies'] };
   ALL_SCENARIOS.forEach(s => {
+    const available = manifest.scenarios.includes(s.id);
+    if (!available) return; // hide tabs not in manifest
     const btn = document.createElement('button');
     btn.textContent = s.label;
     btn.dataset.scenario = s.id;
-    const available = manifest.scenarios.includes(s.id);
-    if (!available) { btn.classList.add('disabled'); btn.title = `Not available on ${currentBranch}`; }
-    if (s.id === currentScenario && available) btn.classList.add('active');
+    if (s.id === currentScenario) btn.classList.add('active');
     btn.onclick = () => {
-      if (!available) return;
       currentScenario = s.id;
       document.querySelectorAll('.scenario-view').forEach(v => v.classList.remove('active'));
       document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
