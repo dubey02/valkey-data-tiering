@@ -306,6 +306,117 @@ All benchmarks: 4M keys, 512B values, 1GB maxmemory, 8GB FlashCache, allkeys-lru
 
 ---
 
+## Monitoring Metrics
+
+Data tiering exposes a dedicated `INFO ext_storage` section with metrics for monitoring tiering effectiveness. These are the same metrics captured by our benchmarking tool (`benchmark/tools/metrics-collector/metrics-collector.sh`) at 1-second granularity.
+
+### Hit Rate Metrics
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `dram_value_hits` | INFO ext_storage | Commands served from DRAM (includes re-executions after fetch) |
+| `completion_read_ok` | INFO ext_storage | Values fetched from flash (disk hits) |
+| `completion_read_miss` | INFO ext_storage | Flash lookups that returned nothing (key was GC'd from flash) |
+| `keyspace_hits` | INFO stats | Standard keyspace hits |
+| `keyspace_misses` | INFO stats | Standard keyspace misses |
+
+**Derived hit rates** (used in benchmarks):
+- **Memory hit %** = `(dram_value_hits - completion_read_ok) / dram_value_hits × 100`
+- **Disk hit %** = `completion_read_ok / dram_value_hits × 100`
+- Both sum to 100% among value-accessing commands
+
+Higher memory hit % = hot data staying in DRAM effectively. Rising disk hit % = working set exceeds available DRAM.
+
+### Throughput & RPS Metrics
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `instantaneous_ops_per_sec` | INFO stats | Overall request throughput |
+| `total_commands_processed` | INFO stats | Lifetime command count (compute delta for rate) |
+| `throttle_allowed_tps` | INFO ext_storage | Current allowed ops/sec under memory pressure |
+| `throttle_current_rate` | INFO ext_storage | Throttle ratio (0.0 = no throttle, 1.0 = fully throttled) |
+| `throttle_total_throttled` | INFO ext_storage | Cumulative throttled client count |
+| `throttle_queued_clients` | INFO ext_storage | Clients currently queued by throttler |
+
+If `throttle_current_rate > 0`, the engine is slowing writes to prevent OOM.
+
+### Latency Metrics
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `latency_percentiles_usec_<cmd>` | INFO latencystats | Per-command p50/p99/p99.9 latency (µs) |
+| `kbc_fetching_block` | INFO ext_storage | Commands that blocked waiting for async flash read |
+| `kbc_spilling_block` | INFO ext_storage | Commands that blocked because key was mid-spill |
+| `completion_read_retry` | INFO ext_storage | Transient read rejections re-issued |
+
+Per-command latency histograms naturally reflect tiering impact — commands hitting flash show higher tail latency (p99) compared to pure DRAM hits.
+
+### Memory Metrics
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `used_memory` | INFO memory | Logical memory used by engine (bytes) |
+| `used_memory_rss` | INFO memory | Resident set size (physical memory) |
+| `maxmemory` | INFO memory | Configured memory limit |
+| `mem_fragmentation_ratio` | INFO memory | RSS / used_memory (jemalloc fragmentation) |
+| `mean_spill_ram` | INFO ext_storage | EMA of in-flight spill memory footprint |
+| `inflight_spill_ram_bytes` | INFO ext_storage | Current bytes in spill pipeline |
+
+### Disk I/O Metrics
+
+Captured from `/sys/block/*/stat` (NVMe device):
+
+| Metric | Description |
+|--------|-------------|
+| `disk_read_iops` / `disk_write_iops` | Read/Write IOPS per second |
+| `disk_read_mb` / `disk_write_mb` | Read/Write throughput (MB/s) |
+| `disk_r_await_ms` / `disk_w_await_ms` | Average read/write latency (ms per I/O) |
+| `disk_aqu_sz` | Average queue depth |
+| `disk_util_pct` | Disk utilization % (capped at 100) |
+| `disk_in_flight` | I/Os currently in flight |
+
+### CPU Metrics
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `cpu_user` / `cpu_sys` | /proc/stat | System-wide CPU % |
+| `valkey_cpu_user` / `valkey_cpu_sys` | INFO cpu | Main thread CPU % |
+| `asio_cpu_pct` | /proc/PID/task | FlashCache IO worker thread CPU % (`fc_io_worker`) |
+
+### Spill Pipeline Metrics
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `total_num_items_spilled_to_ext_storage` | INFO ext_storage | Lifetime items spilled to flash |
+| `total_num_items_fetched_from_ext_storage` | INFO ext_storage | Lifetime items fetched from flash |
+| `num_items_on_flash` | INFO ext_storage | Current tiered item count |
+| `num_items_spilling_to_ext_storage` | INFO ext_storage | Items currently in-flight spilling |
+| `spill_submitted_count` | INFO ext_storage | Spills submitted to IO thread |
+| `spill_serialized_count` | INFO ext_storage | Spills serialized on IO thread |
+| `blocked_clients` | INFO clients | Clients currently blocked (includes fetch waits) |
+
+### FlashCache Backend Metrics
+
+| Metric | Source | Description |
+|--------|--------|-------------|
+| `fc_num_disk_reads` / `fc_num_disk_writes` | INFO ext_storage | Flash I/O operation count |
+| `fc_total_disk_read_bytes` / `fc_total_disk_write_bytes` | INFO ext_storage | Flash I/O volume |
+| `fc_num_items_evicted` | INFO ext_storage | Items evicted from flash by GC |
+| `fc_active_memory_bytes` | INFO ext_storage | FlashCache internal memory usage |
+| `fc_num_retryable_disk_errors` | INFO ext_storage | Disk error count (health signal) |
+
+### Quick Example
+
+```bash
+# Check tiering effectiveness
+./src/valkey-cli INFO ext_storage | grep -E "dram_value_hits|completion_read_ok|throttle_current_rate|num_items_on_flash"
+
+# Per-command latency with tiering
+./src/valkey-cli INFO latencystats | grep -E "get|set"
+```
+
+---
+
 ## What's Not Yet Covered (In Progress / Design Phase)
 
 ### Persistence (P1)
