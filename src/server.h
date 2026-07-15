@@ -1202,6 +1202,11 @@ typedef struct ClientFlags {
     uint64_t keyspace_notified : 1;        /* Indicates that a keyspace notification was triggered during the execution of the
                                               current command. */
     uint64_t argv_borrowed : 1;            /* The argv array and its elements are borrowed from the caller (VM_CallArgv) and must not be freed. */
+    uint64_t throttle_released : 1;        /* Ext-storage throttle: client was just released from the throttle queue;
+                                              its next readQueryFromClient skips the throttle check. Dedicated bit —
+                                              MUST NOT reuse pending_command, which the blocking machinery owns
+                                              ("parsed command in argv"); overloading it corrupted blocked-client
+                                              re-execution and let writes bypass the tiering key-block gate. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */

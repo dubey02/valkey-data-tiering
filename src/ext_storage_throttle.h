@@ -6,7 +6,7 @@
 
 /*
  * Token bucket client throttler for external storage (key-spilling).
- * Similar to dt-poc's amzThrottle but simplified for the POC.
+ * Similar to dt-poc's the throttle path but simplified for the POC.
  *
  * When memory pressure is high, clients are queued instead of processed.
  * A timer event periodically refills tokens and releases queued clients.

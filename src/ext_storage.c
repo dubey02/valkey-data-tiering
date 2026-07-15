@@ -1283,7 +1283,7 @@ int extStorageEvictFlashKey(serverDb *db, sds key) {
  * Returns 1 if tiered storage handled the eviction decision (caller should
  * NOT proceed with standard eviction). Sets *result to C_OK or C_ERR.
  *
- * Logic (matching dt-poc's isOverMaxmemoryAndNoSpillableItems):
+ * Logic:
  * - If memory <= maxmemory → C_OK (no eviction needed)
  * - If there are spillable items (in LRU pool or in-flight) → C_OK
  * - If no spillable items exist → C_ERR (truly out of capacity, reject writes)

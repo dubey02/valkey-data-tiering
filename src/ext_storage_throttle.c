@@ -7,7 +7,7 @@
 /*
  * Token bucket client throttler for external storage (flash-tiering).
  *
- * Matches dt-poc's amzThrottle pattern:
+ * Matches dt-poc's the throttle path pattern:
  * - Dynamic max TPS derived from measured command execution latency
  * - Proportional throttle: allowed_tps = max_tps * (1 - throttle_rate)
  * - No fixed TPS floor — throttle can go as low as needed
@@ -52,7 +52,10 @@ static void tb_init(TokenBucket *tb, double tps) {
 }
 
 static void tb_setRate(TokenBucket *tb, double tps) {
-    if (tps < 1.0) tps = 1.0; /* Never go to zero — would deadlock */
+    /* tps == 0 is legal: no tokens accrue, nothing is admitted. This cannot
+     * deadlock because throttleTimerProc re-evaluates the rate every tick;
+     * as drain frees memory the rate recovers and releases resume. */
+    if (tps < 0.0) tps = 0.0;
     tb->tokens_per_ms = tps / 1000.0;
     tb->max_tokens = tps / 1000.0 * 50;
     /* Don't let existing tokens exceed new max */
@@ -118,11 +121,24 @@ void readQueryFromClient(connection *conn);
 static long long throttleTimerProc(struct aeEventLoop *el, long long id, void *data) {
     UNUSED(el); UNUSED(id); UNUSED(data);
 
+    /* Re-evaluate the throttle rate HERE, not just in shouldThrottle. With no
+     * minimum-TPS floor the rate can reach 0, at which point every client is
+     * queued and no commands execute — so shouldThrottle (the only other
+     * adjustRate call site) never runs. Without this, a 0-TPS state would be
+     * permanent even after drain frees memory. The timer is the guaranteed
+     * heartbeat that notices memory falling and re-opens admission. */
+    if (ext_storage_throttling_strategy == THROTTLING_STRATEGY_V1)
+        extStorageThrottle_adjustRate();
+    else
+        extStorageThrottle_adjustRateV2();
+
     tb_refill(&ts.bucket);
 
     int released = 0;
     while (listLength(ts.client_queue) > 0 && released < THROTTLE_MAX_RELEASE_PER_TICK) {
-        if (!tb_tryConsume(&ts.bucket)) break;
+        /* If throttling disengaged (memory back under band start), flush the
+         * queue unconditionally — the bucket may hold stale zero tokens. */
+        if (ts.is_throttling && !tb_tryConsume(&ts.bucket)) break;
 
         listNode *ln = listFirst(ts.client_queue);
         client *c = listNodeValue(ln);
@@ -130,8 +146,10 @@ static long long throttleTimerProc(struct aeEventLoop *el, long long id, void *d
         ts.total_released++;
         released++;
 
-        /* Mark client so the next readQueryFromClient call skips throttle. */
-        c->flag.pending_command = 1;
+        /* Mark client so the next readQueryFromClient call skips throttle.
+         * Dedicated bit — NOT pending_command, which the blocking machinery
+         * owns; overloading it froze clients and bypassed the kbc gate. */
+        c->flag.throttle_released = 1;
 
         /* Re-install read handler */
         if (c->conn) {
@@ -313,10 +331,14 @@ void extStorageThrottle_adjustRateV2(void) {
     } else {
         ts.is_throttling = 1;
         /* allowed_tps = max_tps * (1 - throttle_rate)
-         * rate ramps linearly across [band_start, band_end] × maxmemory (defaults: 1.0x, 1.2x); at rate=1.0
-         * throttle to ~1% of max TPS (1.2x is also the OOM hard-cap reject point). */
-        double new_tps = ts.measured_max_tps * (1.0 - rate * 0.99);
-        if (new_tps < 1000.0) new_tps = 1000.0; /* Absolute minimum: 1K TPS to avoid deadlock */
+         * rate ramps linearly across [band_start, band_end] × maxmemory (defaults: 1.0x, 1.2x);
+         * at rate=1.0 (band end / OOM hard-cap point) admission goes to ZERO.
+         * NO minimum-TPS floor: for large values (500KB+) even 1-2K TPS is
+         * ~0.5-1 GB/s of ingress, which blows straight through the hard cap.
+         * A zero rate cannot deadlock because throttleTimerProc re-runs this
+         * function every tick — when drain lowers memory below band end, the
+         * rate rises and queued clients are released. */
+        double new_tps = ts.measured_max_tps * (1.0 - rate);
         ts.allowed_tps = new_tps;
         tb_setRate(&ts.bucket, new_tps);
     }
@@ -337,13 +359,29 @@ int extStorageThrottle_shouldThrottle(client *c) {
             extStorageThrottle_adjustRateV2();
     }
 
-    if (!ts.is_throttling) return 0;
-
-    /* Skip throttle for clients that were just released from the queue. */
-    if (c->flag.pending_command) {
-        c->flag.pending_command = 0;
+    if (!ts.is_throttling) {
+        c->flag.throttle_released = 0; /* consume even when disengaged — never leak the marker */
         return 0;
     }
+
+    /* Skip throttle for clients that were just released from the queue.
+     * Dedicated flag (NOT pending_command — that belongs to the blocking
+     * machinery and overloading it corrupted blocked-client state). */
+    if (c->flag.throttle_released) {
+        c->flag.throttle_released = 0;
+        return 0;
+    }
+
+    /* Never throttle connections that haven't executed a key-touching
+     * command: fresh connections (lastcmd == NULL — e.g. a monitoring CLI
+     * about to send its first INFO) and admin/introspection connections
+     * (INFO, PING, CONFIG, CLIENT — no key specs). The throttle polices
+     * KEYSPACE ingress; queueing monitoring connections blinds
+     * observability exactly when pressure is highest — critical now that
+     * allowed_tps can reach 0 (an INFO poll queued at 0 TPS starves until
+     * memory drains). Ingress leak is bounded: a keyspace client gets at
+     * most one unthrottled read before its first command sets lastcmd. */
+    if (c->lastcmd == NULL || c->lastcmd->key_specs_num == 0) return 0;
 
     /* If there are already queued clients, new clients must queue too (FIFO fairness) */
     if (listLength(ts.client_queue) > 0) {
