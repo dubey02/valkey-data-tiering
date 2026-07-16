@@ -3,800 +3,90 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Valkey Data Tiering — Benchmark Report</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5"></script>
+  <title>Valkey Data Tiering — Benchmark Dashboard</title>
   <style>
-    :root { --bg:#1a1a2e;--surface:#16213e;--border:#0f3460;--text:#e4e4e4;--muted:#a0a0b0;--accent:#0ea5e9; }
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;height:100vh}
-    /* Scenario tab bar */
-    .tab-bar{display:flex;gap:0;border-bottom:2px solid var(--border);flex-shrink:0;background:var(--surface)}
-    .tab-bar button{padding:.7rem 1.5rem;background:none;border:none;color:var(--muted);font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
-    .tab-bar button:hover{color:var(--text)}
-    .tab-bar button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
-    /* Dataset selector bar */
-    .top-bar{padding:.5rem 1.5rem;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;flex-shrink:0}
-    .top-bar label{display:flex;align-items:center;gap:.3rem;background:var(--surface);border:1px solid var(--border);padding:.25rem .6rem;border-radius:4px;font-size:.75rem;cursor:pointer}
-    .top-bar label:hover{border-color:var(--accent)}
-    .top-bar input[type="checkbox"]{accent-color:var(--accent)}
-    .layout{display:flex;flex:1;overflow:hidden}
-    /* Sidebar */
-    .sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;padding:.5rem}
-    .sidebar h3{font-size:.75rem;color:var(--muted);padding:.4rem .3rem;text-transform:uppercase;letter-spacing:.05em}
-    .sidebar label{display:flex;align-items:center;gap:.3rem;padding:.2rem .3rem;font-size:.72rem;cursor:pointer;border-radius:3px}
-    .sidebar label:hover{background:var(--border)}
-    .sidebar input[type="checkbox"]{accent-color:var(--accent);width:13px;height:13px}
-    .sidebar .group{margin-bottom:.8rem}
-    .sidebar .btn-row{display:flex;gap:.3rem;padding:.3rem;margin-bottom:.5rem}
-    .sidebar button{font-size:.68rem;padding:.2rem .5rem;background:var(--bg);border:1px solid var(--border);color:var(--muted);border-radius:3px;cursor:pointer}
-    .sidebar button:hover{color:var(--text);border-color:var(--accent)}
-    /* Main content */
-    .main{flex:1;overflow-y:auto;padding:1.5rem}
-    .kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.8rem;margin-bottom:1.2rem}
-    .kpi{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.6rem;text-align:center}
-    .kpi .value{font-size:1.2rem;font-weight:700;color:var(--accent)}
-    .kpi .label{font-size:.68rem;color:var(--muted);margin-top:.15rem}
-    .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}
-    .chart-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem;display:none}
-    .chart-card.visible{display:block}
-    .chart-card.wide{grid-column:1/-1}
-    .chart-card h3{font-size:.78rem;color:var(--muted);margin-bottom:.4rem}
-    canvas{width:100%!important;max-height:240px}
-    .scenario-view{display:none;flex-direction:column;flex:1;overflow:hidden}
-    .scenario-view.active{display:flex}
-    @media(max-width:1000px){.chart-grid{grid-template-columns:1fr}.sidebar{width:180px}}
+    * { box-sizing:border-box; margin:0; padding:0 }
+    body { font-family:system-ui,sans-serif; background:#1a1a2e; color:#e4e4e4; height:100vh; display:flex; flex-direction:column; overflow:hidden }
+    .navbar { display:flex; align-items:center; gap:1rem; padding:.5rem 1.5rem; background:#0d1117; border-bottom:1px solid #0f3460; flex-shrink:0; z-index:100 }
+    .navbar .title { font-size:.85rem; font-weight:600; color:#e4e4e4 }
+    .navbar .title span { color:#0ea5e9 }
+    .navbar select { background:#16213e; color:#e4e4e4; border:1px solid #0f3460; padding:.35rem .7rem; border-radius:4px; font-size:.8rem; cursor:pointer }
+    .navbar select:hover { border-color:#0ea5e9 }
+    .navbar .status { font-size:.7rem; color:#a0a0b0; margin-left:auto }
+    .navbar .status.loading { color:#f97316 }
+    .navbar .status.error { color:#ef4444 }
+    .navbar .status.ok { color:#10b981 }
+    #view-frame { flex:1; border:none; width:100%; background:#1a1a2e }
+    .error-box { flex:1; display:flex; align-items:center; justify-content:center; color:#a0a0b0; flex-direction:column; gap:.5rem }
+    .error-box a { color:#0ea5e9 }
   </style>
 </head>
 <body>
-  <!-- Scenario tabs -->
-  <div class="tab-bar" id="tab-bar"></div>
 
-  <!-- Scenario: Policies -->
-  <div class="scenario-view active" id="scenario-policies">
-    <div class="top-bar" id="dataset-selector"></div>
-    <div class="layout">
-      <aside class="sidebar" id="sidebar"></aside>
-      <main class="main">
-        <div class="kpi-row" id="kpi-row"></div>
-        <div class="chart-grid" id="chart-grid"></div>
-      </main>
-    </div>
-  </div>
+  <nav class="navbar">
+    <div class="title"><span>Valkey</span> Data Tiering Benchmarks</div>
+    <label style="font-size:.75rem;color:#a0a0b0">Branch:</label>
+    <select id="branch-select">
+      <option value="unstable">unstable</option>
+      <option value="policies">policies</option>
+    </select>
+    <span class="status" id="status"></span>
+  </nav>
 
-  <!-- Scenario: Policy Matrix (admission x promotion, policy-matrix-allfixes-20260714) -->
-  <div class="scenario-view" id="scenario-policymatrix">
-    <div class="top-bar" id="pm-dataset-selector"></div>
-    <div class="layout">
-      <aside class="sidebar" id="pm-sidebar"></aside>
-      <main class="main">
-        <div class="kpi-row" id="pm-kpi-row"></div>
-        <div class="chart-grid" id="pm-chart-grid"></div>
-      </main>
-    </div>
-  </div>
-
-  <!-- Scenario: Value Sizes (stub) -->
-  <div class="scenario-view" id="scenario-valuesizes">
-    <div class="top-bar" id="vs-dataset-selector"></div>
-    <div class="layout">
-      <aside class="sidebar" id="vs-sidebar"></aside>
-      <main class="main">
-        <div class="kpi-row" id="vs-kpi-row"></div>
-        <div class="chart-grid" id="vs-chart-grid"></div>
-      </main>
-    </div>
-  </div>
-
-  <!-- Scenario: FlashCache Layer -->
-  <div class="scenario-view" id="scenario-flashcache">
-    <main class="main" style="overflow-y:auto;padding:1.5rem 2rem">
-      <div style="max-width:1100px;margin:0 auto">
-        <div style="margin-bottom:1.5rem">
-          <h2 style="font-size:1rem;color:var(--accent);margin-bottom:.3rem">FlashCache Standalone Benchmarks</h2>
-          <p style="font-size:.75rem;color:var(--muted)">Instance: r7gd.4xlarge (108.129.72.72, eu-west-1c) · NVMe 885 GB · gcc 11 -O2 aarch64 · 2026-07-01</p>
-        </div>
-
-        <!-- KPI summary cards -->
-        <div class="kpi-row" style="grid-template-columns:repeat(6,1fr);margin-bottom:1.8rem" id="fc-kpi-row">
-          <div class="kpi"><div class="value">524K</div><div class="label">Peak Read TPS</div></div>
-          <div class="kpi"><div class="value">1.16M</div><div class="label">Peak Write TPS</div></div>
-          <div class="kpi"><div class="value">655K</div><div class="label">Peak Combined</div></div>
-          <div class="kpi"><div class="value">90.6%</div><div class="label">IO Efficiency</div></div>
-          <div class="kpi"><div class="value">749 MB/s</div><div class="label">Fill Bandwidth</div></div>
-          <div class="kpi"><div class="value">1.0–3.7×</div><div class="label">Write Amp Range</div></div>
-        </div>
-
-        <!-- Run Summary Table -->
-        <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:1rem;margin-bottom:1.5rem">
-          <h3 style="font-size:.8rem;color:var(--muted);margin-bottom:.6rem">Run Summary</h3>
-          <table style="width:100%;border-collapse:collapse;font-size:.75rem">
-            <thead>
-              <tr style="border-bottom:1px solid var(--border)">
-                <th style="text-align:left;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Run</th>
-                <th style="text-align:left;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Config</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Read TPS</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Write TPS</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Combined</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Write Amp</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">IO Eff.</th>
-                <th style="text-align:left;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Bottleneck</th>
-              </tr>
-            </thead>
-            <tbody id="fc-run-table"></tbody>
-          </table>
-        </div>
-
-        <!-- Charts row: IOPS comparison + Size Sweep -->
-        <div class="chart-grid" style="grid-template-columns:1fr 1fr;margin-bottom:1.5rem">
-          <div class="chart-card visible">
-            <h3>Read TPS by Run</h3>
-            <canvas id="fc-chart-runs"></canvas>
-          </div>
-          <div class="chart-card visible">
-            <h3>IO Efficiency vs fio Baseline (d=121)</h3>
-            <canvas id="fc-chart-efficiency"></canvas>
-          </div>
-        </div>
-
-        <div class="chart-grid" style="grid-template-columns:1fr 1fr;margin-bottom:1.5rem">
-          <div class="chart-card visible">
-            <h3>Size Sweep — Read TPS by Value Size</h3>
-            <canvas id="fc-chart-sizesweep"></canvas>
-          </div>
-          <div class="chart-card visible">
-            <h3>Size Sweep — FC Efficiency vs fio (d=32)</h3>
-            <canvas id="fc-chart-sizesweep-eff"></canvas>
-          </div>
-        </div>
-
-        <div class="chart-grid" style="grid-template-columns:1fr;margin-bottom:1.5rem">
-          <div class="chart-card visible wide">
-            <h3>Fill Performance — Write TPS by Value Size</h3>
-            <canvas id="fc-chart-fill"></canvas>
-          </div>
-        </div>
-
-        <!-- Size sweep detail table -->
-        <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:1rem;margin-bottom:1.5rem">
-          <h3 style="font-size:.8rem;color:var(--muted);margin-bottom:.6rem">FC-T3: Size Sweep Detail (prefer_new_item, 4:1 R/W)</h3>
-          <table style="width:100%;border-collapse:collapse;font-size:.75rem">
-            <thead>
-              <tr style="border-bottom:1px solid var(--border)">
-                <th style="text-align:left;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Value Size</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Read TPS</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Write TPS</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Read BW</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">fio Baseline (d=32)</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">FC Efficiency</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td style="padding:.35rem .6rem">512B</td><td style="text-align:right;padding:.35rem .6rem">59,910</td><td style="text-align:right;padding:.35rem .6rem">14,977</td><td style="text-align:right;padding:.35rem .6rem">270 MB/s</td><td style="text-align:right;padding:.35rem .6rem">331,194</td><td style="text-align:right;padding:.35rem .6rem;color:#f97316">18%</td></tr>
-              <tr><td style="padding:.35rem .6rem">1 KB</td><td style="text-align:right;padding:.35rem .6rem">86,702</td><td style="text-align:right;padding:.35rem .6rem">21,675</td><td style="text-align:right;padding:.35rem .6rem">461 MB/s</td><td style="text-align:right;padding:.35rem .6rem">317,023</td><td style="text-align:right;padding:.35rem .6rem;color:#f97316">27%</td></tr>
-              <tr><td style="padding:.35rem .6rem">4 KB</td><td style="text-align:right;padding:.35rem .6rem">107,824</td><td style="text-align:right;padding:.35rem .6rem">26,956</td><td style="text-align:right;padding:.35rem .6rem">1,175 MB/s</td><td style="text-align:right;padding:.35rem .6rem">237,794</td><td style="text-align:right;padding:.35rem .6rem;color:#10b981">45%</td></tr>
-              <tr><td style="padding:.35rem .6rem">100 KB</td><td style="text-align:right;padding:.35rem .6rem">16,118</td><td style="text-align:right;padding:.35rem .6rem">4,029</td><td style="text-align:right;padding:.35rem .6rem">617 MB/s</td><td style="text-align:right;padding:.35rem .6rem">12,929</td><td style="text-align:right;padding:.35rem .6rem;color:#0ea5e9">125%</td></tr>
-              <tr><td style="padding:.35rem .6rem">1 MB</td><td style="text-align:right;padding:.35rem .6rem">2,027</td><td style="text-align:right;padding:.35rem .6rem">506</td><td style="text-align:right;padding:.35rem .6rem">605 MB/s</td><td style="text-align:right;padding:.35rem .6rem">1,241</td><td style="text-align:right;padding:.35rem .6rem;color:#0ea5e9">163%</td></tr>
-            </tbody>
-          </table>
-          <p style="font-size:.68rem;color:var(--muted);margin-top:.5rem">Optimal value size: 1–4 KB. Large values (100KB+) exceed fio baseline due to batched sequential writes.</p>
-        </div>
-
-        <!-- Fill perf table -->
-        <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:1rem">
-          <h3 style="font-size:.8rem;color:var(--muted);margin-bottom:.6rem">Fill Performance (sequential log writes)</h3>
-          <table style="width:100%;border-collapse:collapse;font-size:.75rem">
-            <thead>
-              <tr style="border-bottom:1px solid var(--border)">
-                <th style="text-align:left;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Item Size</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Write TPS (peak)</th>
-                <th style="text-align:right;padding:.4rem .6rem;color:var(--muted);font-size:.68rem">Write BW</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td style="padding:.35rem .6rem">512B</td><td style="text-align:right;padding:.35rem .6rem;color:var(--accent)">1,158,000</td><td style="text-align:right;padding:.35rem .6rem">749 MB/s</td></tr>
-              <tr><td style="padding:.35rem .6rem">1 KB</td><td style="text-align:right;padding:.35rem .6rem">~900,000</td><td style="text-align:right;padding:.35rem .6rem">~880 MB/s</td></tr>
-              <tr><td style="padding:.35rem .6rem">4 KB</td><td style="text-align:right;padding:.35rem .6rem">~600,000</td><td style="text-align:right;padding:.35rem .6rem">~600 MB/s</td></tr>
-              <tr><td style="padding:.35rem .6rem">100 KB</td><td style="text-align:right;padding:.35rem .6rem">~30,000</td><td style="text-align:right;padding:.35rem .6rem">~600 MB/s</td></tr>
-              <tr><td style="padding:.35rem .6rem">512 KB</td><td style="text-align:right;padding:.35rem .6rem">1,088</td><td style="text-align:right;padding:.35rem .6rem">577 MB/s</td></tr>
-              <tr><td style="padding:.35rem .6rem">1 MB</td><td style="text-align:right;padding:.35rem .6rem">~600</td><td style="text-align:right;padding:.35rem .6rem">600 MB/s</td></tr>
-              <tr><td style="padding:.35rem .6rem">5 MB</td><td style="text-align:right;padding:.35rem .6rem">115</td><td style="text-align:right;padding:.35rem .6rem">577 MB/s</td></tr>
-            </tbody>
-          </table>
-          <p style="font-size:.68rem;color:var(--muted);margin-top:.5rem">Fill rate is always bandwidth-limited at 577–749 MB/s regardless of item size.</p>
-        </div>
-      </div>
-    </main>
-  </div>
+  <iframe id="view-frame"></iframe>
 
 <script>
-// ============================================================
-// SCENARIO TAB SYSTEM
-// ============================================================
-const SCENARIOS = [
-  { id: 'policies', label: 'Policies' },
-  { id: 'policymatrix', label: 'Policy Matrix' },
-  { id: 'valuesizes', label: 'Value Sizes' },
-  { id: 'flashcache', label: 'FlashCache Layer' },
-];
+const OWNER = 'dubey02';
+const REPO = 'valkey-data-tiering';
+const VIEW_PATH = 'benchmark_dashboard/view.html';
 
-const tabBar = document.getElementById('tab-bar');
-SCENARIOS.forEach(s => {
-  const btn = document.createElement('button');
-  btn.textContent = s.label;
-  btn.dataset.scenario = s.id;
-  if (s.id === 'policies') btn.classList.add('active');
-  btn.onclick = () => {
-    document.querySelectorAll('.scenario-view').forEach(v => v.classList.remove('active'));
-    document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
-    document.getElementById('scenario-' + s.id).classList.add('active');
-    btn.classList.add('active');
-  };
-  tabBar.appendChild(btn);
-});
-
-// ============================================================
-// POLICIES SCENARIO (real data)
-// ============================================================
-const DATA_DIR = 'data/';
-const DATASETS = [
-  { file: 'zipfian-80-20.csv', label: 'Zipfian 80/20', color: '#0ea5e9' },
-  { file: 'uniform-80-20.csv', label: 'Uniform 80/20', color: '#f97316' },
-  { file: 'balanced-50-50.csv', label: 'Balanced 50/50', color: '#8b5cf6' },
-  { file: 'zipfian-ttl-120.csv', label: 'Zipfian TTL=120', color: '#10b981' },
-  { file: 'size-sweep-500kb.csv', label: '500KB Values', color: '#ef4444' },
-  { file: 'size-sweep-500.csv', label: '500B (old sweep)', color: '#64748b' },
-];
-
-const METRICS = [
-  'used_memory','used_memory_rss','maxmemory','keyspace_hits','keyspace_misses',
-  'ops_per_sec','total_commands_delta',
-  'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
-  'completion_read_ok','dram_value_hits','kbc_fetching_block',
-  'num_items_spilling_to_ext_storage','blocked_clients',
-  'flash_admit_writes','total_transient_promotions','transient_promotion_clients_served',
-  'permanent_promotions',
-  'cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct',
-  'disk_hit_pct','mem_frag_ratio',
-  'disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb',
-  'disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms',
-  'disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb',
-  'throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps',
-  'spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'
-];
-
-const GROUPS = {
-  'Throughput': ['ops_per_sec','total_commands_delta','keyspace_hits','keyspace_misses'],
-  'Memory': ['used_memory','used_memory_rss','maxmemory','mem_frag_ratio'],
-  'Tiering': ['total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','num_items_spilling_to_ext_storage','completion_read_ok','dram_value_hits','kbc_fetching_block','flash_admit_writes'],
-  'Promotion': ['total_transient_promotions','transient_promotion_clients_served','permanent_promotions'],
-  'CPU': ['cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct'],
-  'Disk': ['disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb','disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms','disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb','disk_hit_pct'],
-  'Throttle': ['throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps','blocked_clients'],
-  'Spill Pipeline': ['spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'],
-  'Latency (client)': ['_client_get_latency','_client_set_latency'],
-  'Latency (server)': ['_server_latency'],
-};
-
-const DEFAULT_VISIBLE = new Set([
-  'ops_per_sec','used_memory','disk_util_pct',
-  'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
-  'blocked_clients','valkey_cpu_total','_client_get_latency','_client_set_latency','_server_latency'
-]);
-
-let loaded = {};
-let latencyData = { get:{}, set:{}, server:{} };
-let charts = {};
-let activeDatasets = new Set(['zipfian-80-20.csv','uniform-80-20.csv','balanced-50-50.csv']);
-let visibleCharts = new Set(DEFAULT_VISIBLE);
-
-const chartOpts = {
-  responsive:true, animation:false, interaction:{intersect:false,mode:'index'},
-  plugins:{legend:{labels:{color:'#a0a0b0',boxWidth:10,font:{size:10}}}},
-  scales:{
-    x:{ticks:{color:'#a0a0b0',maxTicksLimit:15},grid:{color:'#0f3460'}},
-    y:{ticks:{color:'#a0a0b0'},grid:{color:'#0f3460'}},
-  }
-};
-
-// Build dataset selector
-const selectorEl = document.getElementById('dataset-selector');
-DATASETS.forEach(ds => {
-  const lbl = document.createElement('label');
-  lbl.style.borderLeft = `3px solid ${ds.color}`;
-  const cb = document.createElement('input'); cb.type='checkbox'; cb.checked=activeDatasets.has(ds.file);
-  cb.onchange = () => { if(cb.checked) activeDatasets.add(ds.file); else activeDatasets.delete(ds.file); renderAll(); };
-  lbl.appendChild(cb); lbl.append(ds.label); selectorEl.appendChild(lbl);
-});
-
-// Build sidebar
-const sidebar = document.getElementById('sidebar');
-const btnRow = document.createElement('div'); btnRow.className='btn-row';
-const btnAll = document.createElement('button'); btnAll.textContent='All';
-btnAll.onclick=()=>{visibleCharts=new Set([...METRICS,'_client_get_latency','_client_set_latency','_server_latency']);syncSidebar();updateVisibility();};
-const btnNone = document.createElement('button'); btnNone.textContent='None';
-btnNone.onclick=()=>{visibleCharts.clear();syncSidebar();updateVisibility();};
-const btnDef = document.createElement('button'); btnDef.textContent='Default';
-btnDef.onclick=()=>{visibleCharts=new Set(DEFAULT_VISIBLE);syncSidebar();updateVisibility();};
-btnRow.append(btnAll,btnNone,btnDef); sidebar.appendChild(btnRow);
-
-const sidebarCBs = {};
-Object.entries(GROUPS).forEach(([group,fields]) => {
-  const div = document.createElement('div'); div.className='group';
-  const h = document.createElement('h3'); h.textContent=group; div.appendChild(h);
-  fields.forEach(f => {
-    const lbl = document.createElement('label');
-    const cb = document.createElement('input'); cb.type='checkbox'; cb.checked=visibleCharts.has(f);
-    cb.onchange=()=>{if(cb.checked)visibleCharts.add(f);else visibleCharts.delete(f);updateVisibility();};
-    sidebarCBs[f]=cb; lbl.appendChild(cb); lbl.append(f.replace(/_/g,' ').replace(/^_/,'')); div.appendChild(lbl);
-  });
-  sidebar.appendChild(div);
-});
-function syncSidebar(){Object.entries(sidebarCBs).forEach(([f,cb])=>cb.checked=visibleCharts.has(f));}
-function updateVisibility(){document.querySelectorAll('#chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',visibleCharts.has(el.dataset.metric));});}
-
-// Build chart cards
-const chartGrid = document.getElementById('chart-grid');
-function makeCard(id,title,metric,wide,container){
-  const card=document.createElement('div');
-  card.className='chart-card'+(wide?' wide':'')+(visibleCharts.has(metric)?' visible':'');
-  card.dataset.metric=metric;
-  card.innerHTML=`<h3>${title}</h3><canvas id="${id}"></canvas>`;
-  (container||chartGrid).appendChild(card); return card;
+function rawUrl(branch) {
+  return `https://raw.githubusercontent.com/${OWNER}/${REPO}/${branch}/${VIEW_PATH}`;
 }
-METRICS.forEach(m=>{
-  makeCard('chart-'+m, m.replace(/_/g,' '), m, m==='ops_per_sec');
-  charts[m]=new Chart(document.getElementById('chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
-});
-['_client_get_latency','_client_set_latency','_server_latency'].forEach(m=>{
-  const title = m==='_client_get_latency'?'Client GET Latency (ms)':m==='_client_set_latency'?'Client SET Latency (ms)':'Server-side Latency (µs)';
-  makeCard('chart'+m,title,m,true);
-  charts[m]=new Chart(document.getElementById('chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
-});
 
-// Load & render
-async function loadAll(){
-  await Promise.all(DATASETS.map(ds=>new Promise(resolve=>{
-    Papa.parse(DATA_DIR+ds.file,{download:true,header:true,dynamicTyping:true,
-      complete:r=>{loaded[ds.file]=r.data.filter(row=>row.timestamp);resolve();},error:()=>resolve()});
-  })));
-  await Promise.all(DATASETS.map(ds=>new Promise(resolve=>{
-    const base=ds.file.replace('.csv','');
-    Papa.parse(DATA_DIR+base+'-get-latency.csv',{download:true,header:true,dynamicTyping:true,
-      complete:r=>{if(r.data[0])latencyData.get[ds.file]=r.data[0];resolve();},error:()=>resolve()});
-  })));
-  await Promise.all(DATASETS.map(ds=>new Promise(resolve=>{
-    const base=ds.file.replace('.csv','');
-    Papa.parse(DATA_DIR+base+'-set-latency.csv',{download:true,header:true,dynamicTyping:true,
-      complete:r=>{if(r.data[0])latencyData.set[ds.file]=r.data[0];resolve();},error:()=>resolve()});
-  })));
-  await Promise.all(DATASETS.map(ds=>new Promise(resolve=>{
-    const base=ds.file.replace('.csv','');
-    fetch(DATA_DIR+base+'-server-latency.txt').then(r=>r.text()).then(txt=>{
-      const parsed={};
-      txt.trim().split('\n').forEach(line=>{const m=line.match(/^latency_percentiles_usec_(\w+):(.+)/);if(m){const vals={};m[2].split(',').forEach(p=>{const[k,v]=p.split('=');vals[k]=parseFloat(v);});parsed[m[1]]=vals;}});
-      latencyData.server[ds.file]=parsed;resolve();
-    }).catch(()=>resolve());
-  })));
-  renderAll();
-}
-function renderAll(){
-  METRICS.forEach(m=>{
-    const chart=charts[m];const datasets=[];let maxLen=0;
-    DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!loaded[ds.file])return;const rows=loaded[ds.file];maxLen=Math.max(maxLen,rows.length);
-      datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
-    chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
-  });
-  renderLatencyBar('_client_get_latency',latencyData.get,['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms']);
-  renderLatencyBar('_client_set_latency',latencyData.set,['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms']);
-  renderServerLatency(); renderKPIs();
-}
-function renderLatencyBar(key,data,fields){
-  const chart=charts[key];const datasets=[];
-  DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!data[ds.file])return;const row=data[ds.file];
-    datasets.push({label:ds.label,data:fields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
-  chart.data.labels=fields.map(f=>f.replace('_latency_ms','').replace('_',' '));chart.data.datasets=datasets;chart.update();
-}
-function renderServerLatency(){
-  const chart=charts['_server_latency'];const pctiles=['p50','p90','p99','p99.9'];const cmds=['get','set'];
-  const labels=[];cmds.forEach(cmd=>pctiles.forEach(p=>labels.push(`${cmd} ${p}`)));
-  const datasets=[];
-  DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!latencyData.server[ds.file])return;const srv=latencyData.server[ds.file];
-    const data=[];cmds.forEach(cmd=>pctiles.forEach(p=>data.push(srv[cmd]?.[p]||0)));
-    datasets.push({label:ds.label,data,backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
-  chart.data.labels=labels;chart.data.datasets=datasets;chart.update();
-}
-function renderKPIs(){
-  const kpiRow=document.getElementById('kpi-row');kpiRow.innerHTML='';
-  DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!loaded[ds.file])return;
-    const steady=loaded[ds.file].slice(10);const avg=steady.reduce((s,r)=>s+(r.ops_per_sec||0),0)/(steady.length||1);
-    const kpi=document.createElement('div');kpi.className='kpi';
-    kpi.innerHTML=`<div class="value" style="color:${ds.color}">${(avg/1000).toFixed(1)}K</div><div class="label">${ds.label} ops/s</div>`;
-    kpiRow.appendChild(kpi);});
-}
-loadAll();
+const branchSelect = document.getElementById('branch-select');
+const frame = document.getElementById('view-frame');
+const status = document.getElementById('status');
 
-// ============================================================
-// POLICY MATRIX SCENARIO (admission x promotion, run policy-matrix-allfixes-20260714)
-// ============================================================
-(function initPolicyMatrix(){
-  const PM_DIR = 'data/policy/';
-  const PM_DATASETS = [
-    { file:'admission-dram-promotion-always.csv',    label:'dram+always',    color:'#0ea5e9' },
-    { file:'admission-dram-promotion-never.csv',     label:'dram+never',     color:'#f97316' },
-    { file:'admission-dram-promotion-2hit-50k.csv',  label:'dram+2hit-50k',  color:'#8b5cf6' },
-    { file:'admission-flash-promotion-always.csv',   label:'flash+always',   color:'#10b981' },
-    { file:'admission-flash-promotion-never.csv',    label:'flash+never',    color:'#ef4444' },
-    { file:'admission-flash-promotion-2hit-50k.csv', label:'flash+2hit-50k', color:'#eab308' },
-  ];
-  const PM_METRICS = METRICS; // same columns as policies metrics.csv
-  const PM_GROUPS = {
-    'Throughput': ['ops_per_sec','total_commands_delta','keyspace_hits','keyspace_misses'],
-    'Memory': ['used_memory','used_memory_rss','maxmemory','mem_frag_ratio'],
-    'Tiering': ['total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','num_items_spilling_to_ext_storage','completion_read_ok','dram_value_hits','kbc_fetching_block','flash_admit_writes'],
-    'Promotion': ['total_transient_promotions','transient_promotion_clients_served','permanent_promotions'],
-    'CPU': ['cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct'],
-    'Disk': ['disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb','disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms','disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb','disk_hit_pct'],
-    'Throttle': ['throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps','blocked_clients'],
-    'Spill Pipeline': ['spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'],
-    'Latency (client)': ['_pm_client_get_latency','_pm_client_set_latency'],
-    'Latency (server)': ['_pm_server_latency'],
-  };
-  const PM_DEFAULT = new Set(['ops_per_sec','used_memory','disk_util_pct',
-    'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
-    'total_transient_promotions','permanent_promotions','_pm_client_get_latency','_pm_client_set_latency','_pm_server_latency']);
+async function loadBranch(branch) {
+  status.textContent = 'Loading...';
+  status.className = 'status loading';
 
-  let pmLoaded = {};
-  let pmLatency = {get:{},set:{},server:{}};
-  let pmActive = new Set(PM_DATASETS.map(d=>d.file));
-  let pmVisible = new Set(PM_DEFAULT);
-  let pmCharts = {};
-
-  // Dataset selector
-  const sel = document.getElementById('pm-dataset-selector');
-  PM_DATASETS.forEach(ds=>{
-    const lbl=document.createElement('label');lbl.style.borderLeft=`3px solid ${ds.color}`;
-    const cb=document.createElement('input');cb.type='checkbox';cb.checked=pmActive.has(ds.file);
-    cb.onchange=()=>{if(cb.checked)pmActive.add(ds.file);else pmActive.delete(ds.file);renderPM();};
-    lbl.appendChild(cb);lbl.append(ds.label);sel.appendChild(lbl);
-  });
-
-  // Sidebar
-  const sb = document.getElementById('pm-sidebar');
-  const br = document.createElement('div');br.className='btn-row';
-  const ba=document.createElement('button');ba.textContent='All';
-  ba.onclick=()=>{pmVisible=new Set([...PM_METRICS,'_pm_client_get_latency','_pm_client_set_latency','_pm_server_latency']);syncPM();updatePMVis();};
-  const bn=document.createElement('button');bn.textContent='None';bn.onclick=()=>{pmVisible.clear();syncPM();updatePMVis();};
-  const bd=document.createElement('button');bd.textContent='Default';bd.onclick=()=>{pmVisible=new Set(PM_DEFAULT);syncPM();updatePMVis();};
-  br.append(ba,bn,bd);sb.appendChild(br);
-  const pmCBs={};
-  Object.entries(PM_GROUPS).forEach(([group,fields])=>{
-    const div=document.createElement('div');div.className='group';
-    const h=document.createElement('h3');h.textContent=group;div.appendChild(h);
-    fields.forEach(f=>{
-      const lbl=document.createElement('label');
-      const cb=document.createElement('input');cb.type='checkbox';cb.checked=pmVisible.has(f);
-      cb.onchange=()=>{if(cb.checked)pmVisible.add(f);else pmVisible.delete(f);updatePMVis();};
-      pmCBs[f]=cb;lbl.appendChild(cb);lbl.append(f.replace(/_/g,' ').replace(/^_pm /,''));div.appendChild(lbl);
-    });
-    sb.appendChild(div);
-  });
-  function syncPM(){Object.entries(pmCBs).forEach(([f,cb])=>cb.checked=pmVisible.has(f));}
-  function updatePMVis(){document.querySelectorAll('#pm-chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',pmVisible.has(el.dataset.metric));});}
-
-  // Build charts
-  const grid = document.getElementById('pm-chart-grid');
-  PM_METRICS.forEach(m=>{
-    const card=document.createElement('div');
-    card.className='chart-card'+(m==='ops_per_sec'?' wide':'')+(pmVisible.has(m)?' visible':'');
-    card.dataset.metric=m;
-    card.innerHTML=`<h3>${m.replace(/_/g,' ')}</h3><canvas id="pm-chart-${m}"></canvas>`;
-    grid.appendChild(card);
-    pmCharts[m]=new Chart(document.getElementById('pm-chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
-  });
-  [['_pm_client_get_latency','Client GET Latency (ms)'],['_pm_client_set_latency','Client SET Latency (ms)'],['_pm_server_latency','Server-side Latency (µs)']].forEach(([m,title])=>{
-    const card=document.createElement('div');card.className='chart-card wide'+(pmVisible.has(m)?' visible':'');card.dataset.metric=m;
-    card.innerHTML=`<h3>${title}</h3><canvas id="pm-chart${m}"></canvas>`;grid.appendChild(card);
-    pmCharts[m]=new Chart(document.getElementById('pm-chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
-  });
-
-  // Load data
-  async function loadPM(){
-    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
-      Papa.parse(PM_DIR+ds.file,{download:true,header:true,dynamicTyping:true,
-        complete:r=>{pmLoaded[ds.file]=r.data.filter(row=>row.timestamp);resolve();},error:()=>resolve()});
-    })));
-    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
-      const base=ds.file.replace('.csv','');
-      Papa.parse(PM_DIR+base+'-get-latency.csv',{download:true,header:true,dynamicTyping:true,
-        complete:r=>{if(r.data[0])pmLatency.get[ds.file]=r.data[0];resolve();},error:()=>resolve()});
-    })));
-    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
-      const base=ds.file.replace('.csv','');
-      Papa.parse(PM_DIR+base+'-set-latency.csv',{download:true,header:true,dynamicTyping:true,
-        complete:r=>{if(r.data[0])pmLatency.set[ds.file]=r.data[0];resolve();},error:()=>resolve()});
-    })));
-    await Promise.all(PM_DATASETS.map(ds=>new Promise(resolve=>{
-      const base=ds.file.replace('.csv','');
-      fetch(PM_DIR+base+'-server-latency.txt').then(r=>r.text()).then(txt=>{
-        const parsed={};
-        txt.trim().split('\n').forEach(line=>{const m=line.match(/^latency_percentiles_usec_(\w+):(.+)/);if(m){const vals={};m[2].split(',').forEach(p=>{const[k,v]=p.split('=');vals[k]=parseFloat(v);});parsed[m[1]]=vals;}});
-        pmLatency.server[ds.file]=parsed;resolve();
-      }).catch(()=>resolve());
-    })));
-    renderPM();
+  try {
+    const resp = await fetch(rawUrl(branch));
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} — branch may not have view.html yet`);
+    const html = await resp.text();
+    frame.srcdoc = html;
+    status.textContent = branch;
+    status.className = 'status ok';
+  } catch (e) {
+    status.textContent = `Error: ${e.message}`;
+    status.className = 'status error';
   }
 
-  function renderPM(){
-    PM_METRICS.forEach(m=>{
-      const chart=pmCharts[m];const datasets=[];let maxLen=0;
-      PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLoaded[ds.file])return;
-        const rows=pmLoaded[ds.file];maxLen=Math.max(maxLen,rows.length);
-        datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
-      chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
-    });
-    const latFields=['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms'];
-    [['_pm_client_get_latency',pmLatency.get],['_pm_client_set_latency',pmLatency.set]].forEach(([key,src])=>{
-      const chart=pmCharts[key];const datasets=[];
-      PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!src[ds.file])return;const row=src[ds.file];
-        datasets.push({label:ds.label,data:latFields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
-      chart.data.labels=latFields.map(f=>f.replace('_latency_ms','').replace('_',' '));chart.data.datasets=datasets;chart.update();
-    });
-    // Server latency bars
-    {
-      const chart=pmCharts['_pm_server_latency'];const pctiles=['p50','p90','p99','p99.9'];const cmds=['get','set'];
-      const labels=[];cmds.forEach(cmd=>pctiles.forEach(p=>labels.push(`${cmd} ${p}`)));
-      const datasets=[];
-      PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLatency.server[ds.file])return;const srv=pmLatency.server[ds.file];
-        const data=[];cmds.forEach(cmd=>pctiles.forEach(p=>data.push(srv[cmd]?.[p]||0)));
-        datasets.push({label:ds.label,data,backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
-      chart.data.labels=labels;chart.data.datasets=datasets;chart.update();
-    }
-    // KPIs
-    const kpi=document.getElementById('pm-kpi-row');kpi.innerHTML='';
-    PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLoaded[ds.file])return;
-      const steady=pmLoaded[ds.file].slice(10);const avg=steady.reduce((s,r)=>s+(r.ops_per_sec||0),0)/(steady.length||1);
-      const el=document.createElement('div');el.className='kpi';
-      el.innerHTML=`<div class="value" style="color:${ds.color}">${(avg/1000).toFixed(1)}K</div><div class="label">${ds.label} ops/s</div>`;
-      kpi.appendChild(el);});
+  // Update URL without reload
+  const url = new URL(window.location);
+  url.searchParams.set('branch', branch);
+  history.replaceState(null, '', url);
+}
+
+branchSelect.onchange = () => loadBranch(branchSelect.value);
+
+// Receive data-loading status from the embedded view
+window.addEventListener('message', e => {
+  if (e.data && e.data.type === 'view-status') {
+    status.textContent = e.data.text;
+    status.className = 'status ' + (e.data.cls || '');
   }
-  loadPM();
-})();
+});
 
-// ============================================================
-// VALUE SIZES SCENARIO (real data from size-sweep)
-// ============================================================
-(function initValueSizes(){
-  const VS_DATASETS = [
-    { file:'size-sweep-500.csv', label:'500B', color:'#0ea5e9' },
-    { file:'size-sweep-5000.csv', label:'5KB', color:'#8b5cf6' },
-    { file:'size-sweep-500000.csv', label:'500KB', color:'#f97316' },
-    { file:'size-sweep-5000000.csv', label:'5MB', color:'#ef4444' },
-  ];
-  // Same metrics as policies CSV (minus policy-specific fields not present)
-  const VS_METRICS = [
-    'used_memory','used_memory_rss','maxmemory','keyspace_hits','keyspace_misses',
-    'ops_per_sec','total_commands_delta',
-    'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
-    'completion_read_ok','dram_value_hits','kbc_fetching_block',
-    'num_items_spilling_to_ext_storage','blocked_clients',
-    'cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct',
-    'disk_hit_pct','mem_frag_ratio',
-    'disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb',
-    'disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms',
-    'disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb',
-    'throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps',
-    'spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'
-  ];
-  const VS_GROUPS = {
-    'Throughput':['ops_per_sec','total_commands_delta','keyspace_hits','keyspace_misses'],
-    'Memory':['used_memory','used_memory_rss','maxmemory','mem_frag_ratio'],
-    'Tiering':['total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','num_items_spilling_to_ext_storage','completion_read_ok','dram_value_hits','kbc_fetching_block'],
-    'CPU':['cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct'],
-    'Disk':['disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb','disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms','disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb','disk_hit_pct'],
-    'Throttle':['throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps','blocked_clients'],
-    'Spill Pipeline':['spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'],
-    'Latency (client)':['_vs_client_get_latency','_vs_client_set_latency'],
-  };
-  const VS_DEFAULT = new Set(['ops_per_sec','used_memory','disk_util_pct','total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','blocked_clients','valkey_cpu_total','_vs_client_get_latency','_vs_client_set_latency']);
-
-  let vsLoaded = {};
-  let vsLatency = {get:{},set:{}};
-  let vsActive = new Set(VS_DATASETS.map(d=>d.file));
-  let vsVisible = new Set(VS_DEFAULT);
-  let vsCharts = {};
-
-  // Dataset selector
-  const sel = document.getElementById('vs-dataset-selector');
-  VS_DATASETS.forEach(ds=>{
-    const lbl=document.createElement('label');lbl.style.borderLeft=`3px solid ${ds.color}`;
-    const cb=document.createElement('input');cb.type='checkbox';cb.checked=vsActive.has(ds.file);
-    cb.onchange=()=>{if(cb.checked)vsActive.add(ds.file);else vsActive.delete(ds.file);renderVS();};
-    lbl.appendChild(cb);lbl.append(ds.label);sel.appendChild(lbl);
-  });
-
-  // Sidebar
-  const sb = document.getElementById('vs-sidebar');
-  const br = document.createElement('div');br.className='btn-row';
-  const ba=document.createElement('button');ba.textContent='All';
-  ba.onclick=()=>{vsVisible=new Set([...VS_METRICS,'_vs_client_get_latency','_vs_client_set_latency']);syncVS();updateVSVis();};
-  const bn=document.createElement('button');bn.textContent='None';bn.onclick=()=>{vsVisible.clear();syncVS();updateVSVis();};
-  const bd=document.createElement('button');bd.textContent='Default';bd.onclick=()=>{vsVisible=new Set(VS_DEFAULT);syncVS();updateVSVis();};
-  br.append(ba,bn,bd);sb.appendChild(br);
-  const vsCBs={};
-  Object.entries(VS_GROUPS).forEach(([group,fields])=>{
-    const div=document.createElement('div');div.className='group';
-    const h=document.createElement('h3');h.textContent=group;div.appendChild(h);
-    fields.forEach(f=>{
-      const lbl=document.createElement('label');
-      const cb=document.createElement('input');cb.type='checkbox';cb.checked=vsVisible.has(f);
-      cb.onchange=()=>{if(cb.checked)vsVisible.add(f);else vsVisible.delete(f);updateVSVis();};
-      vsCBs[f]=cb;lbl.appendChild(cb);lbl.append(f.replace(/_/g,' ').replace(/^_vs /,''));div.appendChild(lbl);
-    });
-    sb.appendChild(div);
-  });
-  function syncVS(){Object.entries(vsCBs).forEach(([f,cb])=>cb.checked=vsVisible.has(f));}
-  function updateVSVis(){document.querySelectorAll('#vs-chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',vsVisible.has(el.dataset.metric));});}
-
-  // Build charts
-  const grid = document.getElementById('vs-chart-grid');
-  VS_METRICS.forEach(m=>{
-    const card=document.createElement('div');
-    card.className='chart-card'+(m==='ops_per_sec'?' wide':'')+(vsVisible.has(m)?' visible':'');
-    card.dataset.metric=m;
-    card.innerHTML=`<h3>${m.replace(/_/g,' ')}</h3><canvas id="vs-chart-${m}"></canvas>`;
-    grid.appendChild(card);
-    vsCharts[m]=new Chart(document.getElementById('vs-chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
-  });
-  // Latency bar charts
-  ['_vs_client_get_latency','_vs_client_set_latency'].forEach(m=>{
-    const title=m.includes('get')?'Client GET Latency (ms)':'Client SET Latency (ms)';
-    const card=document.createElement('div');card.className='chart-card wide'+(vsVisible.has(m)?' visible':'');card.dataset.metric=m;
-    card.innerHTML=`<h3>${title}</h3><canvas id="vs-chart${m}"></canvas>`;grid.appendChild(card);
-    vsCharts[m]=new Chart(document.getElementById('vs-chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
-  });
-
-  // Load data
-  async function loadVS(){
-    await Promise.all(VS_DATASETS.map(ds=>new Promise(resolve=>{
-      Papa.parse(DATA_DIR+ds.file,{download:true,header:true,dynamicTyping:true,
-        complete:r=>{vsLoaded[ds.file]=r.data.filter(row=>row.timestamp);resolve();},error:()=>resolve()});
-    })));
-    await Promise.all(VS_DATASETS.map(ds=>new Promise(resolve=>{
-      const base=ds.file.replace('.csv','');
-      Papa.parse(DATA_DIR+base+'-get-latency.csv',{download:true,header:true,dynamicTyping:true,
-        complete:r=>{if(r.data[0])vsLatency.get[ds.file]=r.data[0];resolve();},error:()=>resolve()});
-    })));
-    await Promise.all(VS_DATASETS.map(ds=>new Promise(resolve=>{
-      const base=ds.file.replace('.csv','');
-      Papa.parse(DATA_DIR+base+'-set-latency.csv',{download:true,header:true,dynamicTyping:true,
-        complete:r=>{if(r.data[0])vsLatency.set[ds.file]=r.data[0];resolve();},error:()=>resolve()});
-    })));
-    renderVS();
-  }
-
-  function renderVS(){
-    VS_METRICS.forEach(m=>{
-      const chart=vsCharts[m];const datasets=[];let maxLen=0;
-      VS_DATASETS.forEach(ds=>{if(!vsActive.has(ds.file)||!vsLoaded[ds.file])return;
-        const rows=vsLoaded[ds.file];maxLen=Math.max(maxLen,rows.length);
-        datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
-      chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
-    });
-    // Client latency bars
-    const latFields=['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms'];
-    ['_vs_client_get_latency','_vs_client_set_latency'].forEach(key=>{
-      const src=key.includes('get')?vsLatency.get:vsLatency.set;
-      const chart=vsCharts[key];const datasets=[];
-      VS_DATASETS.forEach(ds=>{if(!vsActive.has(ds.file)||!src[ds.file])return;const row=src[ds.file];
-        datasets.push({label:ds.label,data:latFields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
-      chart.data.labels=latFields.map(f=>f.replace('_latency_ms','').replace('_',' '));chart.data.datasets=datasets;chart.update();
-    });
-    // KPIs
-    const kpi=document.getElementById('vs-kpi-row');kpi.innerHTML='';
-    VS_DATASETS.forEach(ds=>{if(!vsActive.has(ds.file)||!vsLoaded[ds.file])return;
-      const steady=vsLoaded[ds.file].slice(5);const avg=steady.reduce((s,r)=>s+(r.ops_per_sec||0),0)/(steady.length||1);
-      const k=document.createElement('div');k.className='kpi';
-      k.innerHTML=`<div class="value" style="color:${ds.color}">${(avg/1000).toFixed(1)}K</div><div class="label">${ds.label} ops/s</div>`;
-      kpi.appendChild(k);});
-  }
-  loadVS();
-})();
-
-// ============================================================
-// FLASHCACHE LAYER SCENARIO (static data)
-// ============================================================
-(function initFlashCache(){
-  const FC_RUNS = [
-    { id:'FC-T1', config:'512B, prefer_new, 4:1 R/W', readTPS:59444, writeTPS:14861, combined:74304, writeAmp:'1.84×', ioEff:'10.3%', bottleneck:'FC cron (single-threaded)', color:'#64748b' },
-    { id:'FC-T2', config:'512B, prefer_old, 32GB DB', readTPS:523890, writeTPS:130972, combined:654862, writeAmp:'1.65×', ioEff:'90.6%', bottleneck:'Near device limit', color:'#0ea5e9' },
-    { id:'FC-T4', config:'512B, 2GB, 1:1 R/W, GC stress', readTPS:119700, writeTPS:119700, combined:239400, writeAmp:'2.8–3.7×', ioEff:'20.7%', bottleneck:'GC bandwidth contention', color:'#f97316' },
-    { id:'FC-T5', config:'512B, 8GB, 1:1 R/W, prefer_old', readTPS:145500, writeTPS:145500, combined:291000, writeAmp:'1.0×', ioEff:'25.2%', bottleneck:'Pre-GC ceiling', color:'#8b5cf6' },
-  ];
-
-  // Populate run table
-  const tbody = document.getElementById('fc-run-table');
-  FC_RUNS.forEach(r=>{
-    const tr=document.createElement('tr');tr.style.borderBottom='1px solid var(--border)';
-    tr.innerHTML=`
-      <td style="padding:.35rem .6rem;font-weight:600;color:${r.color}">${r.id}</td>
-      <td style="padding:.35rem .6rem">${r.config}</td>
-      <td style="text-align:right;padding:.35rem .6rem">${r.readTPS.toLocaleString()}</td>
-      <td style="text-align:right;padding:.35rem .6rem">${r.writeTPS.toLocaleString()}</td>
-      <td style="text-align:right;padding:.35rem .6rem;font-weight:600">${r.combined.toLocaleString()}</td>
-      <td style="text-align:right;padding:.35rem .6rem">${r.writeAmp}</td>
-      <td style="text-align:right;padding:.35rem .6rem">${r.ioEff}</td>
-      <td style="padding:.35rem .6rem;color:var(--muted)">${r.bottleneck}</td>`;
-    tbody.appendChild(tr);
-  });
-
-  // Chart: Read TPS by run
-  new Chart(document.getElementById('fc-chart-runs'),{
-    type:'bar',
-    data:{
-      labels:FC_RUNS.map(r=>r.id),
-      datasets:[
-        {label:'Read TPS',data:FC_RUNS.map(r=>r.readTPS),backgroundColor:FC_RUNS.map(r=>r.color+'cc'),borderColor:FC_RUNS.map(r=>r.color),borderWidth:1},
-        {label:'Write TPS',data:FC_RUNS.map(r=>r.writeTPS),backgroundColor:FC_RUNS.map(r=>r.color+'66'),borderColor:FC_RUNS.map(r=>r.color),borderWidth:1},
-      ]
-    },
-    options:{...chartOpts,plugins:{...chartOpts.plugins,legend:{labels:{color:'#a0a0b0',boxWidth:10,font:{size:10}}}}}
-  });
-
-  // Chart: IO Efficiency
-  const fioBaseline = 578529;
-  new Chart(document.getElementById('fc-chart-efficiency'),{
-    type:'bar',
-    data:{
-      labels:FC_RUNS.map(r=>r.id),
-      datasets:[
-        {label:'FC Read TPS',data:FC_RUNS.map(r=>r.readTPS),backgroundColor:'#0ea5e9cc',borderColor:'#0ea5e9',borderWidth:1},
-        {label:'fio Baseline (578K)',data:FC_RUNS.map(()=>fioBaseline),type:'line',borderColor:'#ef4444',borderDash:[5,3],pointRadius:0,borderWidth:2,fill:false},
-      ]
-    },
-    options:{...chartOpts,scales:{...chartOpts.scales,y:{...chartOpts.scales.y,title:{display:true,text:'IOPS',color:'#a0a0b0'}}}}
-  });
-
-  // Chart: Size sweep read TPS
-  const sizeSweepLabels = ['512B','1KB','4KB','100KB','1MB'];
-  const sizeSweepRead = [59910,86702,107824,16118,2027];
-  const sizeSweepFio = [331194,317023,237794,12929,1241];
-  new Chart(document.getElementById('fc-chart-sizesweep'),{
-    type:'bar',
-    data:{
-      labels:sizeSweepLabels,
-      datasets:[
-        {label:'FC Read TPS',data:sizeSweepRead,backgroundColor:'#0ea5e9cc',borderColor:'#0ea5e9',borderWidth:1},
-        {label:'fio Baseline (d=32)',data:sizeSweepFio,backgroundColor:'#ef444466',borderColor:'#ef4444',borderWidth:1},
-      ]
-    },
-    options:{...chartOpts,scales:{...chartOpts.scales,y:{...chartOpts.scales.y,type:'logarithmic',title:{display:true,text:'TPS (log)',color:'#a0a0b0'}}}}
-  });
-
-  // Chart: Size sweep efficiency %
-  const sizeSweepEff = [18,27,45,125,163];
-  new Chart(document.getElementById('fc-chart-sizesweep-eff'),{
-    type:'bar',
-    data:{
-      labels:sizeSweepLabels,
-      datasets:[{label:'FC Efficiency %',data:sizeSweepEff,backgroundColor:sizeSweepEff.map(v=>v>=100?'#10b981cc':'#f97316cc'),borderColor:sizeSweepEff.map(v=>v>=100?'#10b981':'#f97316'),borderWidth:1}]
-    },
-    options:{...chartOpts,scales:{...chartOpts.scales,y:{...chartOpts.scales.y,title:{display:true,text:'% of fio baseline',color:'#a0a0b0'}}},
-      plugins:{...chartOpts.plugins,annotation:{annotations:{line100:{type:'line',yMin:100,yMax:100,borderColor:'#a0a0b0',borderDash:[4,4],borderWidth:1}}}}}
-  });
-
-  // Chart: Fill performance
-  const fillLabels = ['512B','1KB','4KB','100KB','512KB','1MB','5MB'];
-  const fillTPS = [1158000,900000,600000,30000,1088,600,115];
-  new Chart(document.getElementById('fc-chart-fill'),{
-    type:'bar',
-    data:{
-      labels:fillLabels,
-      datasets:[{label:'Write TPS (fill)',data:fillTPS,backgroundColor:'#8b5cf6cc',borderColor:'#8b5cf6',borderWidth:1}]
-    },
-    options:{...chartOpts,scales:{...chartOpts.scales,y:{...chartOpts.scales.y,type:'logarithmic',title:{display:true,text:'TPS (log)',color:'#a0a0b0'}}}}
-  });
-})();
+// Init from URL param or default to unstable
+const params = new URLSearchParams(window.location.search);
+const initBranch = params.get('branch') || 'unstable';
+if ([...branchSelect.options].some(o => o.value === initBranch)) {
+  branchSelect.value = initBranch;
+}
+loadBranch(branchSelect.value);
 </script>
 </body>
 </html>

@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Valkey Data Tiering — Benchmarks (unstable)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5"></script>
+  <style>
+    :root { --bg:#1a1a2e;--surface:#16213e;--border:#0f3460;--text:#e4e4e4;--muted:#a0a0b0;--accent:#0ea5e9; }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;height:100vh}
+    .branch-bar label{font-size:.75rem;color:var(--muted)}
+    .branch-bar select{background:var(--surface);color:var(--text);border:1px solid var(--border);padding:.3rem .6rem;border-radius:4px;font-size:.78rem;cursor:pointer}
+    .branch-bar select:hover{border-color:var(--accent)}
+    .branch-bar .status{font-size:.7rem;color:var(--muted);margin-left:auto}
+    .branch-bar .status.loading{color:#f97316}
+    .branch-bar .status.error{color:#ef4444}
+    .branch-bar .status.ok{color:#10b981}
+    /* Scenario tab bar */
+    .tab-bar{display:flex;gap:0;border-bottom:2px solid var(--border);flex-shrink:0;background:var(--surface)}
+    .tab-bar button{padding:.7rem 1.5rem;background:none;border:none;color:var(--muted);font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
+    .tab-bar button:hover{color:var(--text)}
+    .tab-bar button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+    /* Dataset selector bar */
+    .top-bar{padding:.5rem 1.5rem;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;flex-shrink:0}
+    .top-bar label{display:flex;align-items:center;gap:.3rem;background:var(--surface);border:1px solid var(--border);padding:.25rem .6rem;border-radius:4px;font-size:.75rem;cursor:pointer}
+    .top-bar label:hover{border-color:var(--accent)}
+    .top-bar input[type="checkbox"]{accent-color:var(--accent)}
+    .layout{display:flex;flex:1;overflow:hidden}
+    /* Sidebar */
+    .sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;padding:.5rem}
+    .sidebar h3{font-size:.75rem;color:var(--muted);padding:.4rem .3rem;text-transform:uppercase;letter-spacing:.05em}
+    .sidebar label{display:flex;align-items:center;gap:.3rem;padding:.2rem .3rem;font-size:.72rem;cursor:pointer;border-radius:3px}
+    .sidebar label:hover{background:var(--border)}
+    .sidebar input[type="checkbox"]{accent-color:var(--accent);width:13px;height:13px}
+    .sidebar .group{margin-bottom:.8rem}
+    .sidebar .btn-row{display:flex;gap:.3rem;padding:.3rem;margin-bottom:.5rem}
+    .sidebar button{font-size:.68rem;padding:.2rem .5rem;background:var(--bg);border:1px solid var(--border);color:var(--muted);border-radius:3px;cursor:pointer}
+    .sidebar button:hover{color:var(--text);border-color:var(--accent)}
+    /* Main content */
+    .main{flex:1;overflow-y:auto;padding:1.5rem}
+    .kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.8rem;margin-bottom:1.2rem}
+    .kpi{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.6rem;text-align:center}
+    .kpi .value{font-size:1.2rem;font-weight:700;color:var(--accent)}
+    .kpi .label{font-size:.68rem;color:var(--muted);margin-top:.15rem}
+    .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}
+    .chart-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem;display:none}
+    .chart-card.visible{display:block}
+    .chart-card.wide{grid-column:1/-1}
+    .chart-card h3{font-size:.78rem;color:var(--muted);margin-bottom:.4rem}
+    canvas{width:100%!important;max-height:240px}
+    .scenario-view{display:none;flex-direction:column;flex:1;overflow:hidden}
+    .scenario-view.active{display:flex}
+    .no-data{display:flex;align-items:center;justify-content:center;flex:1;color:var(--muted);font-size:.9rem;font-style:italic}
+    @media(max-width:1000px){.chart-grid{grid-template-columns:1fr}.sidebar{width:180px}}
+  </style>
+</head>
+<body>
+
+  <!-- Scenario tabs -->
+  <div class="tab-bar" id="tab-bar"></div>
+
+  <!-- Scenario: Policies -->
+  <div class="scenario-view" id="scenario-policies">
+    <div class="top-bar" id="dataset-selector"></div>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="main">
+        <div class="kpi-row" id="kpi-row"></div>
+        <div class="chart-grid" id="chart-grid"></div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Scenario: Policy Matrix -->
+  <div class="scenario-view" id="scenario-policymatrix">
+    <div class="top-bar" id="pm-dataset-selector"></div>
+    <div class="layout">
+      <aside class="sidebar" id="pm-sidebar"></aside>
+      <main class="main">
+        <div class="kpi-row" id="pm-kpi-row"></div>
+        <div class="chart-grid" id="pm-chart-grid"></div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Scenario: Value Sizes -->
+  <div class="scenario-view" id="scenario-valuesizes">
+    <div class="top-bar" id="vs-dataset-selector"></div>
+    <div class="layout">
+      <aside class="sidebar" id="vs-sidebar"></aside>
+      <main class="main">
+        <div class="kpi-row" id="vs-kpi-row"></div>
+        <div class="chart-grid" id="vs-chart-grid"></div>
+      </main>
+    </div>
+  </div>
+
+  <!-- Scenario: FlashCache Layer -->
+  <div class="scenario-view" id="scenario-flashcache">
+    <main class="main" style="overflow-y:auto;padding:1.5rem 2rem">
+      <div style="max-width:1100px;margin:0 auto">
+        <div style="margin-bottom:1.5rem">
+          <h2 style="font-size:1rem;color:var(--accent);margin-bottom:.3rem">FlashCache Standalone Benchmarks</h2>
+          <p style="font-size:.75rem;color:var(--muted)">Instance: r7gd.4xlarge · NVMe 885 GB · gcc 11 -O2 aarch64</p>
+        </div>
+        <div class="kpi-row" style="grid-template-columns:repeat(6,1fr);margin-bottom:1.8rem">
+          <div class="kpi"><div class="value">524K</div><div class="label">Peak Read TPS</div></div>
+          <div class="kpi"><div class="value">1.16M</div><div class="label">Peak Write TPS</div></div>
+          <div class="kpi"><div class="value">655K</div><div class="label">Peak Combined</div></div>
+          <div class="kpi"><div class="value">90.6%</div><div class="label">IO Efficiency</div></div>
+          <div class="kpi"><div class="value">749 MB/s</div><div class="label">Fill Bandwidth</div></div>
+          <div class="kpi"><div class="value">1.0–3.7×</div><div class="label">Write Amp Range</div></div>
+        </div>
+        <div class="chart-grid" style="grid-template-columns:1fr 1fr;margin-bottom:1.5rem">
+          <div class="chart-card visible"><h3>Read TPS by Run</h3><canvas id="fc-chart-runs"></canvas></div>
+          <div class="chart-card visible"><h3>IO Efficiency vs fio Baseline (d=121)</h3><canvas id="fc-chart-efficiency"></canvas></div>
+        </div>
+        <div class="chart-grid" style="grid-template-columns:1fr 1fr;margin-bottom:1.5rem">
+          <div class="chart-card visible"><h3>Size Sweep — Read TPS by Value Size</h3><canvas id="fc-chart-sizesweep"></canvas></div>
+          <div class="chart-card visible"><h3>Size Sweep — FC Efficiency vs fio (d=32)</h3><canvas id="fc-chart-sizesweep-eff"></canvas></div>
+        </div>
+        <div class="chart-grid" style="grid-template-columns:1fr;margin-bottom:1.5rem">
+          <div class="chart-card visible wide"><h3>Fill Performance — Write TPS by Value Size</h3><canvas id="fc-chart-fill"></canvas></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+<script>
+// ============================================================
+// CONFIGURATION: GitHub raw content base URL + branch manifests
+// ============================================================
+const GITHUB_OWNER = 'dubey02';
+const GITHUB_REPO = 'valkey-data-tiering';
+const DATA_PATH = 'benchmark_dashboard/data';
+
+// This branch's available scenarios (self-contained — no cross-branch manifest needed)
+const MY_SCENARIOS = ['policies', 'valuesizes', 'flashcache'];
+
+function rawUrl(branch, path) {
+  return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${branch}/${path}`;
+}
+
+// ============================================================
+// STATE
+// ============================================================
+const currentBranch = 'unstable';
+let currentScenario = 'policies';
+
+// ============================================================
+// SCENARIO TAB SYSTEM
+// ============================================================
+const ALL_SCENARIOS = [
+  { id: 'policies', label: 'Policies' },
+  { id: 'policymatrix', label: 'Policy Matrix' },
+  { id: 'valuesizes', label: 'Value Sizes' },
+  { id: 'flashcache', label: 'FlashCache Layer' },
+];
+
+const tabBar = document.getElementById('tab-bar');
+
+function buildTabs() {
+  tabBar.innerHTML = '';
+  const manifest = { scenarios: MY_SCENARIOS };
+  ALL_SCENARIOS.forEach(s => {
+    const available = manifest.scenarios.includes(s.id);
+    if (!available) return; // hide tabs not in manifest
+    const btn = document.createElement('button');
+    btn.textContent = s.label;
+    btn.dataset.scenario = s.id;
+    if (s.id === currentScenario) btn.classList.add('active');
+    btn.onclick = () => {
+      currentScenario = s.id;
+      document.querySelectorAll('.scenario-view').forEach(v => v.classList.remove('active'));
+      document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
+      document.getElementById('scenario-' + s.id).classList.add('active');
+      btn.classList.add('active');
+    };
+    tabBar.appendChild(btn);
+  });
+  // Ensure current scenario is valid for the branch
+  if (!manifest.scenarios.includes(currentScenario)) {
+    currentScenario = manifest.scenarios[0] || 'policies';
+  }
+  document.querySelectorAll('.scenario-view').forEach(v => v.classList.remove('active'));
+  document.getElementById('scenario-' + currentScenario).classList.add('active');
+  tabBar.querySelector(`[data-scenario="${currentScenario}"]`)?.classList.add('active');
+}
+
+// ============================================================
+// BRANCH SELECTOR
+// ============================================================
+// Status element removed (navbar lives in parent index.html) — null-safe no-op
+function setStatus(text, cls) {
+  // Report status up to the parent navbar if embedded in the loader iframe
+  try { parent.postMessage({ type: 'view-status', text, cls }, '*'); } catch (e) {}
+}
+
+// ============================================================
+// SHARED CHART OPTIONS
+// ============================================================
+const chartOpts = {
+  responsive:true, animation:false, interaction:{intersect:false,mode:'index'},
+  plugins:{legend:{labels:{color:'#a0a0b0',boxWidth:10,font:{size:10}}}},
+  scales:{
+    x:{ticks:{color:'#a0a0b0',maxTicksLimit:15},grid:{color:'#0f3460'}},
+    y:{ticks:{color:'#a0a0b0'},grid:{color:'#0f3460'}},
+  }
+};
+
+// ============================================================
+// HELPER: fetch CSV via raw GitHub
+// ============================================================
+function fetchCsv(branch, filePath) {
+  return new Promise(resolve => {
+    const url = rawUrl(branch, filePath);
+    Papa.parse(url, {
+      download: true, header: true, dynamicTyping: true,
+      complete: r => resolve(r.data.filter(row => row.timestamp || Object.values(row).some(v => v !== null))),
+      error: () => resolve([])
+    });
+  });
+}
+
+function fetchText(branch, filePath) {
+  return fetch(rawUrl(branch, filePath)).then(r => {
+    if (!r.ok) return '';
+    return r.text();
+  }).catch(() => '');
+}
+
+// ============================================================
+// POLICIES SCENARIO
+// ============================================================
+const DATASETS = [
+  { file: 'zipfian-80-20.csv', label: 'Zipfian 80/20', color: '#0ea5e9' },
+  { file: 'uniform-80-20.csv', label: 'Uniform 80/20', color: '#f97316' },
+  { file: 'balanced-50-50.csv', label: 'Balanced 50/50', color: '#8b5cf6' },
+  { file: 'zipfian-ttl-120.csv', label: 'Zipfian TTL=120', color: '#10b981' },
+  { file: 'size-sweep-500kb.csv', label: '500KB Values', color: '#ef4444' },
+  { file: 'size-sweep-500.csv', label: '500B (old sweep)', color: '#64748b' },
+];
+
+const METRICS = [
+  'used_memory','used_memory_rss','maxmemory','keyspace_hits','keyspace_misses',
+  'ops_per_sec','total_commands_delta',
+  'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
+  'completion_read_ok','dram_value_hits','kbc_fetching_block',
+  'num_items_spilling_to_ext_storage','blocked_clients',
+  'flash_admit_writes','total_transient_promotions','transient_promotion_clients_served',
+  'permanent_promotions',
+  'cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct',
+  'disk_hit_pct','mem_frag_ratio',
+  'disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb',
+  'disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms',
+  'disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb',
+  'throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps',
+  'spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'
+];
+
+const GROUPS = {
+  'Throughput': ['ops_per_sec','total_commands_delta','keyspace_hits','keyspace_misses'],
+  'Memory': ['used_memory','used_memory_rss','maxmemory','mem_frag_ratio'],
+  'Tiering': ['total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','num_items_spilling_to_ext_storage','completion_read_ok','dram_value_hits','kbc_fetching_block','flash_admit_writes'],
+  'Promotion': ['total_transient_promotions','transient_promotion_clients_served','permanent_promotions'],
+  'CPU': ['cpu_user','cpu_sys','valkey_cpu_user','valkey_cpu_sys','valkey_cpu_total','asio_cpu_pct'],
+  'Disk': ['disk_read_iops','disk_write_iops','disk_read_mb','disk_write_mb','disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms','disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb','disk_hit_pct'],
+  'Throttle': ['throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps','blocked_clients'],
+  'Spill Pipeline': ['spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'],
+  'Latency (client)': ['_client_get_latency','_client_set_latency'],
+  'Latency (server)': ['_server_latency'],
+};
+
+const DEFAULT_VISIBLE = new Set([
+  'ops_per_sec','used_memory','disk_util_pct',
+  'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
+  'blocked_clients','valkey_cpu_total','_client_get_latency','_client_set_latency','_server_latency'
+]);
+
+let loaded = {};
+let latencyData = { get:{}, set:{}, server:{} };
+let charts = {};
+let activeDatasets = new Set(['zipfian-80-20.csv','uniform-80-20.csv','balanced-50-50.csv']);
+let visibleCharts = new Set(DEFAULT_VISIBLE);
+
+// Build dataset selector
+const selectorEl = document.getElementById('dataset-selector');
+DATASETS.forEach(ds => {
+  const lbl = document.createElement('label');
+  lbl.style.borderLeft = `3px solid ${ds.color}`;
+  const cb = document.createElement('input'); cb.type='checkbox'; cb.checked=activeDatasets.has(ds.file);
+  cb.onchange = () => { if(cb.checked) activeDatasets.add(ds.file); else activeDatasets.delete(ds.file); renderPolicies(); };
+  lbl.appendChild(cb); lbl.append(ds.label); selectorEl.appendChild(lbl);
+});
+
+// Build sidebar
+const sidebar = document.getElementById('sidebar');
+const btnRow = document.createElement('div'); btnRow.className='btn-row';
+const btnAll = document.createElement('button'); btnAll.textContent='All';
+btnAll.onclick=()=>{visibleCharts=new Set([...METRICS,'_client_get_latency','_client_set_latency','_server_latency']);syncSidebar();updateVisibility();};
+const btnNone = document.createElement('button'); btnNone.textContent='None';
+btnNone.onclick=()=>{visibleCharts.clear();syncSidebar();updateVisibility();};
+const btnDef = document.createElement('button'); btnDef.textContent='Default';
+btnDef.onclick=()=>{visibleCharts=new Set(DEFAULT_VISIBLE);syncSidebar();updateVisibility();};
+btnRow.append(btnAll,btnNone,btnDef); sidebar.appendChild(btnRow);
+
+const sidebarCBs = {};
+Object.entries(GROUPS).forEach(([group,fields]) => {
+  const div = document.createElement('div'); div.className='group';
+  const h = document.createElement('h3'); h.textContent=group; div.appendChild(h);
+  fields.forEach(f => {
+    const lbl = document.createElement('label');
+    const cb = document.createElement('input'); cb.type='checkbox'; cb.checked=visibleCharts.has(f);
+    cb.onchange=()=>{if(cb.checked)visibleCharts.add(f);else visibleCharts.delete(f);updateVisibility();};
+    sidebarCBs[f]=cb; lbl.appendChild(cb); lbl.append(f.replace(/_/g,' ').replace(/^_/,'')); div.appendChild(lbl);
+  });
+  sidebar.appendChild(div);
+});
+function syncSidebar(){Object.entries(sidebarCBs).forEach(([f,cb])=>cb.checked=visibleCharts.has(f));}
+function updateVisibility(){document.querySelectorAll('#chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',visibleCharts.has(el.dataset.metric));});}
+
+// Build chart cards
+const chartGrid = document.getElementById('chart-grid');
+METRICS.forEach(m=>{
+  const card=document.createElement('div');
+  card.className='chart-card'+(m==='ops_per_sec'?' wide':'')+(visibleCharts.has(m)?' visible':'');
+  card.dataset.metric=m;
+  card.innerHTML=`<h3>${m.replace(/_/g,' ')}</h3><canvas id="chart-${m}"></canvas>`;
+  chartGrid.appendChild(card);
+  charts[m]=new Chart(document.getElementById('chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
+});
+['_client_get_latency','_client_set_latency','_server_latency'].forEach(m=>{
+  const title = m==='_client_get_latency'?'Client GET Latency (ms)':m==='_client_set_latency'?'Client SET Latency (ms)':'Server-side Latency (µs)';
+  const card=document.createElement('div');card.className='chart-card wide'+(visibleCharts.has(m)?' visible':'');card.dataset.metric=m;
+  card.innerHTML=`<h3>${title}</h3><canvas id="chart${m}"></canvas>`;
+  chartGrid.appendChild(card);
+  charts[m]=new Chart(document.getElementById('chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
+});
+
+async function loadPolicies() {
+  const branch = currentBranch;
+  loaded = {}; latencyData = {get:{},set:{},server:{}};
+  await Promise.all(DATASETS.map(async ds => {
+    loaded[ds.file] = await fetchCsv(branch, `${DATA_PATH}/${ds.file}`);
+  }));
+  await Promise.all(DATASETS.map(async ds => {
+    const base = ds.file.replace('.csv','');
+    const rows = await fetchCsv(branch, `${DATA_PATH}/${base}-get-latency.csv`);
+    if(rows[0]) latencyData.get[ds.file] = rows[0];
+  }));
+  await Promise.all(DATASETS.map(async ds => {
+    const base = ds.file.replace('.csv','');
+    const rows = await fetchCsv(branch, `${DATA_PATH}/${base}-set-latency.csv`);
+    if(rows[0]) latencyData.set[ds.file] = rows[0];
+  }));
+  await Promise.all(DATASETS.map(async ds => {
+    const base = ds.file.replace('.csv','');
+    const txt = await fetchText(branch, `${DATA_PATH}/${base}-server-latency.txt`);
+    if(txt) {
+      const parsed={};
+      txt.trim().split('\n').forEach(line=>{const m=line.match(/^latency_percentiles_usec_(\w+):(.+)/);if(m){const vals={};m[2].split(',').forEach(p=>{const[k,v]=p.split('=');vals[k]=parseFloat(v);});parsed[m[1]]=vals;}});
+      latencyData.server[ds.file]=parsed;
+    }
+  }));
+  renderPolicies();
+}
+
+function renderPolicies(){
+  METRICS.forEach(m=>{
+    const chart=charts[m];const datasets=[];let maxLen=0;
+    DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!loaded[ds.file]||!loaded[ds.file].length)return;const rows=loaded[ds.file];maxLen=Math.max(maxLen,rows.length);
+      datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
+    chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
+  });
+  renderLatencyBar('_client_get_latency',latencyData.get,['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms']);
+  renderLatencyBar('_client_set_latency',latencyData.set,['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms']);
+  renderServerLatency(); renderKPIs();
+}
+function renderLatencyBar(key,data,fields){
+  const chart=charts[key];const datasets=[];
+  DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!data[ds.file])return;const row=data[ds.file];
+    datasets.push({label:ds.label,data:fields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+  chart.data.labels=fields.map(f=>f.replace('_latency_ms','').replace('_',' '));chart.data.datasets=datasets;chart.update();
+}
+function renderServerLatency(){
+  const chart=charts['_server_latency'];const pctiles=['p50','p90','p99','p99.9'];const cmds=['get','set'];
+  const labels=[];cmds.forEach(cmd=>pctiles.forEach(p=>labels.push(`${cmd} ${p}`)));
+  const datasets=[];
+  DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!latencyData.server[ds.file])return;const srv=latencyData.server[ds.file];
+    const data=[];cmds.forEach(cmd=>pctiles.forEach(p=>data.push(srv[cmd]?.[p]||0)));
+    datasets.push({label:ds.label,data,backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+  chart.data.labels=labels;chart.data.datasets=datasets;chart.update();
+}
+function renderKPIs(){
+  const kpiRow=document.getElementById('kpi-row');kpiRow.innerHTML='';
+  DATASETS.forEach(ds=>{if(!activeDatasets.has(ds.file)||!loaded[ds.file]||!loaded[ds.file].length)return;
+    const steady=loaded[ds.file].slice(10);const avg=steady.reduce((s,r)=>s+(r.ops_per_sec||0),0)/(steady.length||1);
+    const kpi=document.createElement('div');kpi.className='kpi';
+    kpi.innerHTML=`<div class="value" style="color:${ds.color}">${(avg/1000).toFixed(1)}K</div><div class="label">${ds.label} ops/s</div>`;
+    kpiRow.appendChild(kpi);});
+}
+
+// ============================================================
+// POLICY MATRIX SCENARIO
+// ============================================================
+const PM_DATASETS = [
+  { file:'admission-dram-promotion-always.csv',    label:'dram+always',    color:'#0ea5e9' },
+  { file:'admission-dram-promotion-never.csv',     label:'dram+never',     color:'#f97316' },
+  { file:'admission-dram-promotion-2hit-50k.csv',  label:'dram+2hit-50k',  color:'#8b5cf6' },
+  { file:'admission-flash-promotion-always.csv',   label:'flash+always',   color:'#10b981' },
+  { file:'admission-flash-promotion-never.csv',    label:'flash+never',    color:'#ef4444' },
+  { file:'admission-flash-promotion-2hit-50k.csv', label:'flash+2hit-50k', color:'#eab308' },
+];
+
+let pmLoaded={}, pmLatency={get:{},set:{},server:{}}, pmCharts={};
+let pmActive = new Set(PM_DATASETS.map(d=>d.file));
+let pmVisible = new Set(['ops_per_sec','used_memory','disk_util_pct','total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','total_transient_promotions','permanent_promotions','_pm_client_get_latency','_pm_client_set_latency','_pm_server_latency']);
+
+// Build PM UI
+(function buildPMUI(){
+  const sel = document.getElementById('pm-dataset-selector');
+  PM_DATASETS.forEach(ds=>{
+    const lbl=document.createElement('label');lbl.style.borderLeft=`3px solid ${ds.color}`;
+    const cb=document.createElement('input');cb.type='checkbox';cb.checked=pmActive.has(ds.file);
+    cb.onchange=()=>{if(cb.checked)pmActive.add(ds.file);else pmActive.delete(ds.file);renderPM();};
+    lbl.appendChild(cb);lbl.append(ds.label);sel.appendChild(lbl);
+  });
+  const sb = document.getElementById('pm-sidebar');
+  const br = document.createElement('div');br.className='btn-row';
+  const ba=document.createElement('button');ba.textContent='All';ba.onclick=()=>{pmVisible=new Set([...METRICS,'_pm_client_get_latency','_pm_client_set_latency','_pm_server_latency']);syncPMSB();updatePMVis();};
+  const bn=document.createElement('button');bn.textContent='None';bn.onclick=()=>{pmVisible.clear();syncPMSB();updatePMVis();};
+  const bd=document.createElement('button');bd.textContent='Default';bd.onclick=()=>{pmVisible=new Set(['ops_per_sec','used_memory','_pm_client_get_latency','_pm_client_set_latency','_pm_server_latency']);syncPMSB();updatePMVis();};
+  br.append(ba,bn,bd);sb.appendChild(br);
+  const pmCBs={};
+  const PM_GROUPS = {...GROUPS, 'Latency (client)':['_pm_client_get_latency','_pm_client_set_latency'], 'Latency (server)':['_pm_server_latency']};
+  Object.entries(PM_GROUPS).forEach(([group,fields])=>{
+    const div=document.createElement('div');div.className='group';
+    const h=document.createElement('h3');h.textContent=group;div.appendChild(h);
+    fields.forEach(f=>{
+      const lbl=document.createElement('label');
+      const cb=document.createElement('input');cb.type='checkbox';cb.checked=pmVisible.has(f);
+      cb.onchange=()=>{if(cb.checked)pmVisible.add(f);else pmVisible.delete(f);updatePMVis();};
+      pmCBs[f]=cb;lbl.appendChild(cb);lbl.append(f.replace(/_/g,' ').replace(/^_pm /,''));div.appendChild(lbl);
+    });
+    sb.appendChild(div);
+  });
+  window._pmCBs=pmCBs;
+  function syncPMSB(){Object.entries(pmCBs).forEach(([f,cb])=>cb.checked=pmVisible.has(f));}
+  window._syncPMSB=syncPMSB;
+  function updatePMVis(){document.querySelectorAll('#pm-chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',pmVisible.has(el.dataset.metric));});}
+  window._updatePMVis=updatePMVis;
+
+  const grid = document.getElementById('pm-chart-grid');
+  METRICS.forEach(m=>{
+    const card=document.createElement('div');card.className='chart-card'+(m==='ops_per_sec'?' wide':'')+(pmVisible.has(m)?' visible':'');card.dataset.metric=m;
+    card.innerHTML=`<h3>${m.replace(/_/g,' ')}</h3><canvas id="pm-chart-${m}"></canvas>`;grid.appendChild(card);
+    pmCharts[m]=new Chart(document.getElementById('pm-chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+  [['_pm_client_get_latency','Client GET Latency (ms)'],['_pm_client_set_latency','Client SET Latency (ms)'],['_pm_server_latency','Server-side Latency (µs)']].forEach(([m,title])=>{
+    const card=document.createElement('div');card.className='chart-card wide'+(pmVisible.has(m)?' visible':'');card.dataset.metric=m;
+    card.innerHTML=`<h3>${title}</h3><canvas id="pm-chart${m}"></canvas>`;grid.appendChild(card);
+    pmCharts[m]=new Chart(document.getElementById('pm-chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+})();
+
+async function loadPolicyMatrix() {
+  if (!MY_SCENARIOS.includes('policymatrix')) return;
+  const basePath = `${DATA_PATH}/policy`;
+  pmLoaded={}; pmLatency={get:{},set:{},server:{}};
+  await Promise.all(PM_DATASETS.map(async ds=>{
+    pmLoaded[ds.file] = await fetchCsv(currentBranch, `${basePath}/${ds.file}`);
+  }));
+  await Promise.all(PM_DATASETS.map(async ds=>{
+    const base=ds.file.replace('.csv','');
+    const rows = await fetchCsv(currentBranch, `${basePath}/${base}-get-latency.csv`);
+    if(rows[0]) pmLatency.get[ds.file]=rows[0];
+  }));
+  await Promise.all(PM_DATASETS.map(async ds=>{
+    const base=ds.file.replace('.csv','');
+    const rows = await fetchCsv(currentBranch, `${basePath}/${base}-set-latency.csv`);
+    if(rows[0]) pmLatency.set[ds.file]=rows[0];
+  }));
+  await Promise.all(PM_DATASETS.map(async ds=>{
+    const base=ds.file.replace('.csv','');
+    const txt = await fetchText(currentBranch, `${basePath}/${base}-server-latency.txt`);
+    if(txt){const parsed={};txt.trim().split('\n').forEach(line=>{const m=line.match(/^latency_percentiles_usec_(\w+):(.+)/);if(m){const vals={};m[2].split(',').forEach(p=>{const[k,v]=p.split('=');vals[k]=parseFloat(v);});parsed[m[1]]=vals;}});pmLatency.server[ds.file]=parsed;}
+  }));
+  renderPM();
+}
+
+function renderPM(){
+  METRICS.forEach(m=>{
+    const chart=pmCharts[m];if(!chart)return;const datasets=[];let maxLen=0;
+    PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLoaded[ds.file]||!pmLoaded[ds.file].length)return;
+      const rows=pmLoaded[ds.file];maxLen=Math.max(maxLen,rows.length);
+      datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
+    chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
+  });
+  const latFields=['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms'];
+  [['_pm_client_get_latency',pmLatency.get],['_pm_client_set_latency',pmLatency.set]].forEach(([key,src])=>{
+    const chart=pmCharts[key];if(!chart)return;const datasets=[];
+    PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!src[ds.file])return;const row=src[ds.file];
+      datasets.push({label:ds.label,data:latFields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+    chart.data.labels=latFields.map(f=>f.replace('_latency_ms','').replace('_',' '));chart.data.datasets=datasets;chart.update();
+  });
+  {const chart=pmCharts['_pm_server_latency'];if(chart){const pctiles=['p50','p90','p99','p99.9'];const cmds=['get','set'];
+    const labels=[];cmds.forEach(cmd=>pctiles.forEach(p=>labels.push(`${cmd} ${p}`)));const datasets=[];
+    PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLatency.server[ds.file])return;const srv=pmLatency.server[ds.file];
+      const data=[];cmds.forEach(cmd=>pctiles.forEach(p=>data.push(srv[cmd]?.[p]||0)));
+      datasets.push({label:ds.label,data,backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+    chart.data.labels=labels;chart.data.datasets=datasets;chart.update();}}
+  const kpi=document.getElementById('pm-kpi-row');kpi.innerHTML='';
+  PM_DATASETS.forEach(ds=>{if(!pmActive.has(ds.file)||!pmLoaded[ds.file]||!pmLoaded[ds.file].length)return;
+    const steady=pmLoaded[ds.file].slice(10);const avg=steady.reduce((s,r)=>s+(r.ops_per_sec||0),0)/(steady.length||1);
+    const el=document.createElement('div');el.className='kpi';
+    el.innerHTML=`<div class="value" style="color:${ds.color}">${(avg/1000).toFixed(1)}K</div><div class="label">${ds.label} ops/s</div>`;
+    kpi.appendChild(el);});
+}
+
+// ============================================================
+// VALUE SIZES SCENARIO
+// ============================================================
+const VS_DATASETS = [
+  { file:'size-sweep-500.csv', label:'500B', color:'#0ea5e9' },
+  { file:'size-sweep-5000.csv', label:'5KB', color:'#8b5cf6' },
+  { file:'size-sweep-500000.csv', label:'500KB', color:'#f97316' },
+  { file:'size-sweep-5000000.csv', label:'5MB', color:'#ef4444' },
+];
+let vsLoaded={}, vsLatency={get:{},set:{}}, vsCharts={};
+let vsActive = new Set(VS_DATASETS.map(d=>d.file));
+let vsVisible = new Set(['ops_per_sec','used_memory','disk_util_pct','total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','blocked_clients','valkey_cpu_total','_vs_client_get_latency','_vs_client_set_latency']);
+
+(function buildVSUI(){
+  const sel = document.getElementById('vs-dataset-selector');
+  VS_DATASETS.forEach(ds=>{
+    const lbl=document.createElement('label');lbl.style.borderLeft=`3px solid ${ds.color}`;
+    const cb=document.createElement('input');cb.type='checkbox';cb.checked=vsActive.has(ds.file);
+    cb.onchange=()=>{if(cb.checked)vsActive.add(ds.file);else vsActive.delete(ds.file);renderVS();};
+    lbl.appendChild(cb);lbl.append(ds.label);sel.appendChild(lbl);
+  });
+  const sb = document.getElementById('vs-sidebar');
+  const br = document.createElement('div');br.className='btn-row';
+  const ba=document.createElement('button');ba.textContent='All';ba.onclick=()=>{vsVisible=new Set([...METRICS,'_vs_client_get_latency','_vs_client_set_latency']);syncVSSB();updateVSVis();};
+  const bn=document.createElement('button');bn.textContent='None';bn.onclick=()=>{vsVisible.clear();syncVSSB();updateVSVis();};
+  const bd=document.createElement('button');bd.textContent='Default';bd.onclick=()=>{vsVisible=new Set(['ops_per_sec','used_memory','_vs_client_get_latency','_vs_client_set_latency']);syncVSSB();updateVSVis();};
+  br.append(ba,bn,bd);sb.appendChild(br);
+  const vsCBs={};
+  const VS_GROUPS = {...GROUPS, 'Latency (client)':['_vs_client_get_latency','_vs_client_set_latency']};
+  delete VS_GROUPS['Latency (server)'];
+  Object.entries(VS_GROUPS).forEach(([group,fields])=>{
+    const div=document.createElement('div');div.className='group';
+    const h=document.createElement('h3');h.textContent=group;div.appendChild(h);
+    fields.forEach(f=>{
+      const lbl=document.createElement('label');
+      const cb=document.createElement('input');cb.type='checkbox';cb.checked=vsVisible.has(f);
+      cb.onchange=()=>{if(cb.checked)vsVisible.add(f);else vsVisible.delete(f);updateVSVis();};
+      vsCBs[f]=cb;lbl.appendChild(cb);lbl.append(f.replace(/_/g,' ').replace(/^_vs /,''));div.appendChild(lbl);
+    });
+    sb.appendChild(div);
+  });
+  function syncVSSB(){Object.entries(vsCBs).forEach(([f,cb])=>cb.checked=vsVisible.has(f));}
+  window._syncVSSB=syncVSSB;
+  function updateVSVis(){document.querySelectorAll('#vs-chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',vsVisible.has(el.dataset.metric));});}
+  window._updateVSVis=updateVSVis;
+
+  const grid = document.getElementById('vs-chart-grid');
+  METRICS.forEach(m=>{
+    const card=document.createElement('div');card.className='chart-card'+(m==='ops_per_sec'?' wide':'')+(vsVisible.has(m)?' visible':'');card.dataset.metric=m;
+    card.innerHTML=`<h3>${m.replace(/_/g,' ')}</h3><canvas id="vs-chart-${m}"></canvas>`;grid.appendChild(card);
+    vsCharts[m]=new Chart(document.getElementById('vs-chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+  ['_vs_client_get_latency','_vs_client_set_latency'].forEach(m=>{
+    const title=m.includes('get')?'Client GET Latency (ms)':'Client SET Latency (ms)';
+    const card=document.createElement('div');card.className='chart-card wide'+(vsVisible.has(m)?' visible':'');card.dataset.metric=m;
+    card.innerHTML=`<h3>${title}</h3><canvas id="vs-chart${m}"></canvas>`;grid.appendChild(card);
+    vsCharts[m]=new Chart(document.getElementById('vs-chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+})();
+
+async function loadValueSizes(){
+  vsLoaded={};vsLatency={get:{},set:{}};
+  await Promise.all(VS_DATASETS.map(async ds=>{
+    vsLoaded[ds.file] = await fetchCsv(currentBranch, `${DATA_PATH}/${ds.file}`);
+  }));
+  await Promise.all(VS_DATASETS.map(async ds=>{
+    const base=ds.file.replace('.csv','');
+    const rows = await fetchCsv(currentBranch, `${DATA_PATH}/${base}-get-latency.csv`);
+    if(rows[0]) vsLatency.get[ds.file]=rows[0];
+  }));
+  await Promise.all(VS_DATASETS.map(async ds=>{
+    const base=ds.file.replace('.csv','');
+    const rows = await fetchCsv(currentBranch, `${DATA_PATH}/${base}-set-latency.csv`);
+    if(rows[0]) vsLatency.set[ds.file]=rows[0];
+  }));
+  renderVS();
+}
+
+function renderVS(){
+  METRICS.forEach(m=>{
+    const chart=vsCharts[m];if(!chart)return;const datasets=[];let maxLen=0;
+    VS_DATASETS.forEach(ds=>{if(!vsActive.has(ds.file)||!vsLoaded[ds.file]||!vsLoaded[ds.file].length)return;
+      const rows=vsLoaded[ds.file];maxLen=Math.max(maxLen,rows.length);
+      datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
+    chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
+  });
+  const latFields=['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms'];
+  ['_vs_client_get_latency','_vs_client_set_latency'].forEach(key=>{
+    const src=key.includes('get')?vsLatency.get:vsLatency.set;
+    const chart=vsCharts[key];if(!chart)return;const datasets=[];
+    VS_DATASETS.forEach(ds=>{if(!vsActive.has(ds.file)||!src[ds.file])return;const row=src[ds.file];
+      datasets.push({label:ds.label,data:latFields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+    chart.data.labels=latFields.map(f=>f.replace('_latency_ms','').replace('_',' '));chart.data.datasets=datasets;chart.update();
+  });
+  const kpi=document.getElementById('vs-kpi-row');kpi.innerHTML='';
+  VS_DATASETS.forEach(ds=>{if(!vsActive.has(ds.file)||!vsLoaded[ds.file]||!vsLoaded[ds.file].length)return;
+    const steady=vsLoaded[ds.file].slice(5);const avg=steady.reduce((s,r)=>s+(r.ops_per_sec||0),0)/(steady.length||1);
+    const k=document.createElement('div');k.className='kpi';
+    k.innerHTML=`<div class="value" style="color:${ds.color}">${(avg/1000).toFixed(1)}K</div><div class="label">${ds.label} ops/s</div>`;
+    kpi.appendChild(k);});
+}
+
+// ============================================================
+// FLASHCACHE LAYER (static — always available)
+// ============================================================
+(function initFlashCache(){
+  const FC_RUNS = [
+    { id:'FC-T1', config:'512B, prefer_new, 4:1 R/W', readTPS:59444, writeTPS:14861, combined:74304, writeAmp:'1.84×', ioEff:'10.3%', bottleneck:'FC cron (single-threaded)', color:'#64748b' },
+    { id:'FC-T2', config:'512B, prefer_old, 32GB DB', readTPS:523890, writeTPS:130972, combined:654862, writeAmp:'1.65×', ioEff:'90.6%', bottleneck:'Near device limit', color:'#0ea5e9' },
+    { id:'FC-T4', config:'512B, 2GB, 1:1 R/W, GC stress', readTPS:119700, writeTPS:119700, combined:239400, writeAmp:'2.8–3.7×', ioEff:'20.7%', bottleneck:'GC bandwidth contention', color:'#f97316' },
+    { id:'FC-T5', config:'512B, 8GB, 1:1 R/W, prefer_old', readTPS:145500, writeTPS:145500, combined:291000, writeAmp:'1.0×', ioEff:'25.2%', bottleneck:'Pre-GC ceiling', color:'#8b5cf6' },
+  ];
+  new Chart(document.getElementById('fc-chart-runs'),{type:'bar',data:{labels:FC_RUNS.map(r=>r.id),datasets:[{label:'Read TPS',data:FC_RUNS.map(r=>r.readTPS),backgroundColor:FC_RUNS.map(r=>r.color+'cc'),borderColor:FC_RUNS.map(r=>r.color),borderWidth:1},{label:'Write TPS',data:FC_RUNS.map(r=>r.writeTPS),backgroundColor:FC_RUNS.map(r=>r.color+'66'),borderColor:FC_RUNS.map(r=>r.color),borderWidth:1}]},options:chartOpts});
+  const fioBaseline=578529;
+  new Chart(document.getElementById('fc-chart-efficiency'),{type:'bar',data:{labels:FC_RUNS.map(r=>r.id),datasets:[{label:'FC Read TPS',data:FC_RUNS.map(r=>r.readTPS),backgroundColor:'#0ea5e9cc',borderColor:'#0ea5e9',borderWidth:1},{label:'fio Baseline (578K)',data:FC_RUNS.map(()=>fioBaseline),type:'line',borderColor:'#ef4444',borderDash:[5,3],pointRadius:0,borderWidth:2,fill:false}]},options:chartOpts});
+  const szLabels=['512B','1KB','4KB','100KB','1MB'],szRead=[59910,86702,107824,16118,2027],szFio=[331194,317023,237794,12929,1241];
+  new Chart(document.getElementById('fc-chart-sizesweep'),{type:'bar',data:{labels:szLabels,datasets:[{label:'FC Read TPS',data:szRead,backgroundColor:'#0ea5e9cc',borderColor:'#0ea5e9',borderWidth:1},{label:'fio Baseline (d=32)',data:szFio,backgroundColor:'#ef444466',borderColor:'#ef4444',borderWidth:1}]},options:{...chartOpts,scales:{...chartOpts.scales,y:{...chartOpts.scales.y,type:'logarithmic'}}}});
+  const szEff=[18,27,45,125,163];
+  new Chart(document.getElementById('fc-chart-sizesweep-eff'),{type:'bar',data:{labels:szLabels,datasets:[{label:'FC Efficiency %',data:szEff,backgroundColor:szEff.map(v=>v>=100?'#10b981cc':'#f97316cc'),borderColor:szEff.map(v=>v>=100?'#10b981':'#f97316'),borderWidth:1}]},options:chartOpts});
+  const fillLabels=['512B','1KB','4KB','100KB','512KB','1MB','5MB'],fillTPS=[1158000,900000,600000,30000,1088,600,115];
+  new Chart(document.getElementById('fc-chart-fill'),{type:'bar',data:{labels:fillLabels,datasets:[{label:'Write TPS (fill)',data:fillTPS,backgroundColor:'#8b5cf6cc',borderColor:'#8b5cf6',borderWidth:1}]},options:{...chartOpts,scales:{...chartOpts.scales,y:{...chartOpts.scales.y,type:'logarithmic'}}}});
+})();
+
+// ============================================================
+// LOAD ALL DATA FOR CURRENT BRANCH
+// ============================================================
+async function loadAllData() {
+  setStatus('Loading...', 'loading');
+  try {
+    await Promise.all([loadPolicies(), loadPolicyMatrix(), loadValueSizes()]);
+    setStatus(`Loaded from ${currentBranch}`, 'ok');
+  } catch(e) {
+    setStatus(`Error: ${e.message}`, 'error');
+  }
+}
+
+
+
+buildTabs();
+loadAllData();
+</script>
+</body>
+</html>
