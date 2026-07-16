@@ -42,6 +42,7 @@ void extStorageThrottle_removeClient(client *c);
 
 /* Get metrics for INFO output. */
 long long extStorageThrottle_getThrottledCount(void);
+int extStorageThrottle_tryAdmitFetch(void); /* per-command flash-read gate: 0 = defer fetch submission */
 long long extStorageThrottle_getQueuedClients(void);
 double extStorageThrottle_getCurrentRate(void);
 double extStorageThrottle_getAllowedTps(void);

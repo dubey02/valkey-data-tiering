@@ -564,6 +564,99 @@ static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_del
 
 
 /* ---------------------------------------------------------------------------
+ * Deferred fetch queue — flash-read throttle gate
+ *
+ * A fetch-promotion materializes a full value in RAM, but historically it
+ * submitted unconditionally once the client's command was admitted — so N
+ * blocked clients could land N × value_size bytes of promotions while
+ * allowed_tps was 0 (the 500k-min0 run: sustained 1.25x, peak 1.344x).
+ * Mature tiered-storage engines close this by throttling flash-reads
+ * per-command — reads served from memory are not throttled; flash reads
+ * ARE gated.
+ *
+ * Mechanism: at fetch-submit time, consult extStorageThrottle_tryAdmitFetch().
+ * If denied, transition the key to COPYING_TO_MEMORY as usual (so concurrent
+ * clients block without duplicate submits — the state machine is unchanged)
+ * but do NOT submit; queue {db_id, key} instead. The drain, called from the
+ * beforeSleep/timer completion pump, submits queued fetches as tokens free up.
+ * DELETEs are never deferred (they free memory; delaying them is inverted
+ * control).
+ * ---------------------------------------------------------------------------*/
+
+typedef struct deferredFetch {
+    int db_id;
+    sds key;
+} deferredFetch;
+
+static list *deferred_fetch_queue = NULL;   /* of deferredFetch* */
+static long long fetch_deferred_count = 0;         /* total deferrals */
+static long long fetch_deferred_drained_count = 0; /* deferrals later submitted */
+static long long fetch_deferred_dropped_count = 0; /* entries invalidated before submit */
+
+/* Submit a READ fetch for an ONLY_FLASH key, or defer it if the throttle
+ * denies admission. Returns 0 if the client should block on the key (fetch
+ * in flight OR deferred), -1 if the backend rejected the submit (caller
+ * undoes the block, matching the pre-existing reject path). */
+static int extStorageSubmitOrDeferFetch(serverDb *db, sds key_str) {
+    if (!extStorageThrottle_tryAdmitFetch()) {
+        /* DEFER: state transition exactly as if submitted — concurrent clients
+         * see COPYING_TO_MEMORY and just block; only the drain submits later. */
+        extStorageSetState(db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
+            VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
+        if (!deferred_fetch_queue) deferred_fetch_queue = listCreate();
+        deferredFetch *df = zmalloc(sizeof(*df));
+        df->db_id = db->id;
+        df->key = sdsdup(key_str);
+        listAddNodeTail(deferred_fetch_queue, df);
+        fetch_deferred_count++;
+        return 0;
+    }
+    int rc = extStorageBridge_submitGet(extStoragePhysicalDbId(db->id), key_str);
+    if (rc != 0) return -1;
+    extStorageSetState(db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
+        VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
+    total_items_fetching_from_ext_storage++;
+    return 0;
+}
+
+/* Drain deferred fetches as throttle tokens become available. Called from the
+ * completion pump (beforeSleep + 1ms timer). Bounded per call. Entries whose
+ * key state changed (deleted, flushed, settled by another path) are dropped —
+ * and their blocked waiters woken, since no IO completion will ever arrive. */
+static void extStorageDrainDeferredFetches(void) {
+    if (!deferred_fetch_queue) return;
+    int budget = 64;
+    while (listLength(deferred_fetch_queue) > 0 && budget-- > 0) {
+        listNode *ln = listFirst(deferred_fetch_queue);
+        deferredFetch *df = listNodeValue(ln);
+        serverDb *db = &server.db[df->db_id];
+
+        /* Validity first (do not burn a token on a dead entry). */
+        if (extStorageGetState(db, df->key) != TIERING_STATE_COPYING_TO_MEMORY) {
+            robj *keyobj = createStringObject(df->key, sdslen(df->key));
+            unblockClientsInUseOnKey(keyobj);
+            decrRefCount(keyobj);
+            listDelNode(deferred_fetch_queue, ln);
+            sdsfree(df->key);
+            zfree(df);
+            fetch_deferred_dropped_count++;
+            continue;
+        }
+
+        if (!extStorageThrottle_tryAdmitFetch()) break; /* no token — retry next pump */
+
+        if (extStorageBridge_submitGet(extStoragePhysicalDbId(df->db_id), df->key) != 0) break; /* backend throttled — retry next pump */
+
+        total_items_fetching_from_ext_storage++;
+        fetch_deferred_drained_count++;
+        listDelNode(deferred_fetch_queue, ln);
+        sdsfree(df->key);
+        zfree(df);
+    }
+}
+
+
+/* ---------------------------------------------------------------------------
  * preCommandExec — Block client if key state requires it
  *
  * For keys in ONLY_FLASH: issues READ (for GET/SET) or DELETE (for DEL) to module.
@@ -621,13 +714,9 @@ int preCommandExec(client *c) {
                         if (state == TIERING_STATE_ONLY_MEMORY) {
                             extStorageSetState(current_db, key_str, TIERING_STATE_ONLY_FLASH, 0);
                         }
-                        /* Issue fetch for this key */
-                        int rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str);
-                        if (rc == 0) {
-                            extStorageSetState(current_db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
-                                VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
-                            total_items_fetching_from_ext_storage++;
-                        } else {
+                        /* Issue fetch for this key (throttle-gated; may defer) */
+                        int rc = extStorageSubmitOrDeferFetch(current_db, key_str);
+                        if (rc != 0) {
                             num_keys_to_block--;
                         }
                     }
@@ -707,9 +796,15 @@ int preCommandExec(client *c) {
 
             int rc;
             if (is_delete_cmd) {
+                /* DELETEs are never deferred: they free memory. */
                 rc = extStorageBridge_submitDel(extStoragePhysicalDbId(current_db->id), key_str);
+                if (rc == 0) {
+                    extStorageSetState(current_db, key_str, TIERING_STATE_COPYING_TO_MEMORY, msg_type);
+                }
             } else {
-                rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str);
+                /* READ (promotion): throttle-gated, may defer. On success or
+                 * deferral the state is COPYING_TO_MEMORY and rc == 0. */
+                rc = extStorageSubmitOrDeferFetch(current_db, key_str);
             }
 
             if (rc != 0) {
@@ -718,12 +813,6 @@ int preCommandExec(client *c) {
                     is_delete_cmd ? "DELETE" : "READ", key_str);
                 hashtableAdd(current_db->keys_confirmed_absent, sdsdup(key_str));
                 num_keys_to_block--;
-            } else {
-                /* Transition: ONLY_FLASH → COPYING_TO_MEMORY */
-                extStorageSetState(current_db, key_str, TIERING_STATE_COPYING_TO_MEMORY, msg_type);
-                if (msg_type == VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ) {
-                    total_items_fetching_from_ext_storage++;
-                }
             }
         }
         /* For COPYING_TO_FLASH, COPYING_TO_MEMORY, PENDING_EVICT:
@@ -1524,6 +1613,7 @@ int processCompletedStorageRequestsAndSpillOldItems(void) {
     if (server.maxmemory == 0) return 0;
 
     processCompletedStorageRequests();
+    extStorageDrainDeferredFetches(); /* submit throttle-deferred fetches as tokens free up */
     if (ext_storage_spilling_strategy == SPILLING_STRATEGY_V1)
         return spillItemCountBeforeSleep();
     return spillFillToProjected();
@@ -1536,6 +1626,7 @@ int processCompletedStorageRequestsAndSpillOldItemsAggressive(void) {
     if (server.maxmemory == 0) return 0;
 
     processCompletedStorageRequests();
+    extStorageDrainDeferredFetches();
     if (ext_storage_spilling_strategy == SPILLING_STRATEGY_V1)
         return spillItemCountAggressive();
     return spillFillToProjected();
@@ -1568,6 +1659,10 @@ sds genExternalStorageInfoString(sds info) {
         "kbc_confirmed_absent:%lld\r\n"
         "kbc_key_may_exist_false:%lld\r\n"
         "kbc_key_may_exist_true:%lld\r\n"
+        "fetch_deferred:%lld\r\n"
+        "fetch_deferred_drained:%lld\r\n"
+        "fetch_deferred_dropped:%lld\r\n"
+        "fetch_deferred_pending:%lld\r\n"
         "completion_batches:%lld\r\n"
         "completion_read_ok:%lld\r\n"
         "completion_read_miss:%lld\r\n"
@@ -1609,6 +1704,10 @@ sds genExternalStorageInfoString(sds info) {
         kbc_confirmed_absent_count,
         kbc_key_may_exist_false_count,
         kbc_key_may_exist_true_count,
+        fetch_deferred_count,
+        fetch_deferred_drained_count,
+        fetch_deferred_dropped_count,
+        (long long)(deferred_fetch_queue ? listLength(deferred_fetch_queue) : 0),
         completion_batches_processed,
         completion_read_ok,
         completion_read_miss,

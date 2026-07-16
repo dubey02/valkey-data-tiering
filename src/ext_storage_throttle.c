@@ -427,6 +427,22 @@ void extStorageThrottle_removeClient(client *c) {
 }
 
 long long extStorageThrottle_getThrottledCount(void) { return ts.total_throttled; }
+
+/* per-command flash-read gate predicate (see the reference implementation its tiered-storage module:
+ * the rate-adjustment path throttles memory-generating commands INCLUDING
+ * reads that go to flash — "we don't throttle reads that are in memory only").
+ * A fetch-promotion materializes a full value in RAM, so it must compete for
+ * the same TPS budget as admitted commands. Called at fetch-submit time; when
+ * it returns 0 the fetch is DEFERRED (client stays kbc-blocked, fetch queued,
+ * drained by the beforeSleep/timer pump as tokens free up). This closes the
+ * last ungated ingress path: previously an already-admitted client's fetch
+ * submitted regardless of throttle state, so N clients × value_size bytes of
+ * promotions could land while allowed_tps was 0. */
+int extStorageThrottle_tryAdmitFetch(void) {
+    if (!ts.is_throttling) return 1;
+    tb_refill(&ts.bucket);
+    return tb_tryConsume(&ts.bucket);
+}
 long long extStorageThrottle_getQueuedClients(void) { return (long long)listLength(ts.client_queue); }
 double extStorageThrottle_getCurrentRate(void) { return ts.throttle_rate; }
 double extStorageThrottle_getAllowedTps(void) { return ts.allowed_tps; }
