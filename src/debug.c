@@ -1097,8 +1097,10 @@ void debugCommand(client *c) {
             addReplyError(c, "key already on flash");
             return;
         }
-        if (entry->encoding == OBJ_ENCODING_EMBSTR || entry->encoding == OBJ_ENCODING_INT || entry->hasembval) {
-            addReplyError(c, "key has embedded value (not spillable)");
+        /* Skip INT-encoded strings: the integer lives in the pointer slot itself,
+         * so spilling reclaims nothing.  EMBSTR/embedded values ARE spillable. */
+        if (entry->encoding == OBJ_ENCODING_INT) {
+            addReplyError(c, "key has INT-encoded value (not spillable)");
             return;
         }
         TieringState state = extStorageGetState(db, key);

@@ -37,6 +37,7 @@ proc get_debug_object_field {key field} {
 
 start_server [list tags {"ext-storage"} overrides [list \
     ext-storage-enabled yes \
+    ext-storage-backend flashcache-mock \
     maxmemory 50mb \
     maxmemory-policy allkeys-lru \
     enable-debug-command local \

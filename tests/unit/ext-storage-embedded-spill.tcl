@@ -35,6 +35,7 @@ proc wait_for_spill_count {expected_min {timeout 5000}} {
 
 start_server [list tags {"ext-storage"} overrides [list \
     ext-storage-enabled yes \
+    ext-storage-backend flashcache-mock \
     maxmemory 50mb \
     maxmemory-policy allkeys-lru \
     enable-debug-command local \
@@ -98,12 +99,19 @@ start_server [list tags {"ext-storage"} overrides [list \
 
         set mem_after [get_info_field "used_memory"]
         set increase [expr {$mem_after - $mem_before}]
-        # With reclamation: per-key increase ~ 56 bytes (mock overhead - savings).
-        # Without reclamation (old buggy code): per-key increase ~ 130 bytes.
-        # Assert increase is bounded: < 100 bytes/key = 50000 total.
-        # This proves tombstone is smaller than keeping the full embstr.
+        # NOTE: aggregate used_memory / keys conflates mock-backend bookkeeping
+        # with the tombstone swap. This repo's flashcache-mock copies the full
+        # key+value bytes per entry (fcEntry + key copy + value copy ~= 112 B/key),
+        # unlike the private repo's 0-byte-blob mock the original <100 threshold
+        # was calibrated against.
+        # Measured here: WITH reclamation ~104 B/key (mock 112 - tombstone saving);
+        # WITHOUT reclamation: ~128 B/key (104 + 24 B/key not reclaimed, from the
+        # 80 B entry -> 48+8 B tombstone delta measured by alloc-measure).
+        # Threshold 120 sits between and still discriminates. The exact tombstone
+        # footprint (80 B entry -> 48+8 B) is asserted directly by
+        # ext-storage-alloc-measure.tcl via per-key allocation probes.
         set per_key [expr {$increase / $num_keys}]
-        assert {$per_key < 100}
+        assert {$per_key < 120}
         # Also verify all completions fired
         set write_ok [get_info_field "completion_write_ok"]
         assert {$write_ok >= $target}
