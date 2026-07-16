@@ -104,11 +104,15 @@ ifeq ($(SANITIZER),address)
 	MALLOC=libc
 	CFLAGS+=-fsanitize=address -fno-sanitize-recover=all -fno-omit-frame-pointer
 	LDFLAGS+=-fsanitize=address
+	# libflashcache.a is compiled against jemalloc; forward its je_* calls
+	# to libc so the sanitizer sees every allocation.
+	JEMALLOC_SHIM_OBJ=storage/jemalloc_shim.o
 else
 ifeq ($(SANITIZER),undefined)
 	MALLOC=libc
 	CFLAGS+=-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
 	LDFLAGS+=-fsanitize=undefined
+	JEMALLOC_SHIM_OBJ=storage/jemalloc_shim.o
 else
 ifeq ($(SANITIZER),thread)
 	CFLAGS+=-fsanitize=thread -fno-sanitize-recover=all -fno-omit-frame-pointer
@@ -513,6 +517,7 @@ ENGINE_SERVER_OBJ = \
     storage/storage_middleware.o \
     storage/storage_mock.o \
     storage/storage_flashcache_real.o \
+    $(JEMALLOC_SHIM_OBJ) \
     fifo.o \
     functions.o \
     geo.o \

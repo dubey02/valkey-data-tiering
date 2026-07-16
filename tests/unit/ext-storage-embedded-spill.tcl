@@ -33,9 +33,22 @@ proc wait_for_spill_count {expected_min {timeout 5000}} {
     }
 }
 
+if {[info exists ::env(EXT_STORAGE_BACKEND)]} {
+    set _backend $::env(EXT_STORAGE_BACKEND)
+} else {
+    set _backend "flashcache-mock"
+}
+if {[info exists ::env(EXT_STORAGE_PATH)]} {
+    set _path $::env(EXT_STORAGE_PATH)
+} else {
+    set _path "/tmp/valkey-flash-embspill-[pid].db"
+}
+
 start_server [list tags {"ext-storage"} overrides [list \
     ext-storage-enabled yes \
-    ext-storage-backend flashcache-mock \
+    ext-storage-backend $_backend \
+    ext-storage-path $_path \
+    ext-storage-capacity-mb 256 \
     maxmemory 50mb \
     maxmemory-policy allkeys-lru \
     enable-debug-command local \

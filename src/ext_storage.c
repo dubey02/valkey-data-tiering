@@ -599,8 +599,10 @@ int preCommandExec(client *c) {
             if (msg_type == VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ) {
                 dbEntry *entry = dbFind(current_db, key_str);
                 if (entry) {
-                    robj *val = objectGetVal(entry);
-                    long long expire_ms = objectGetExpire(val);
+                    /* NOTE: objectGetExpire takes the entry robj (expire is embedded
+                     * in the entry), NOT the value pointer. Passing objectGetVal()
+                     * here read the hasexpire bit out of bounds of the value sds. */
+                    long long expire_ms = objectGetExpire(entry);
                     if (expire_ms > 0 && expire_ms < mstime() && !server.loading) {
                         msg_type = VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_DELETE;
                         is_delete_cmd = true;  /* treat as delete for the rest of this iteration */
@@ -795,7 +797,7 @@ void processCompletedStorageRequests(void) {
                     /* Check if key expired while being fetched — don't promote,
                      * just delete. Avoids wasted memory from promoting a dead value. */
                     if (entry != NULL) {
-                        long long expire_ms = objectGetExpire(objectGetVal(entry));
+                        long long expire_ms = objectGetExpire(entry);
                         if (expire_ms > 0 && expire_ms < (long long)mstime() && !server.loading) {
                             decrRefCount(new_value);
                             robj keyobj;
@@ -914,7 +916,7 @@ void processCompletedStorageRequests(void) {
                     initStaticStringObject(keyobj, key_name);
                     /* Check if this was an expiry-triggered delete — if key has
                      * an expired TTL, use the proper expiry propagation path. */
-                    long long expire_ms = objectGetExpire(objectGetVal(entry));
+                    long long expire_ms = objectGetExpire(entry);
                     if (expire_ms > 0 && expire_ms < mstime()) {
                         deleteExpiredKeyAndPropagate(db, &keyobj);
                     } else {
