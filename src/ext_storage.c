@@ -629,7 +629,7 @@ static void extStorageDrainDeferredFetches(void) {
     while (listLength(deferred_fetch_queue) > 0 && budget-- > 0) {
         listNode *ln = listFirst(deferred_fetch_queue);
         deferredFetch *df = listNodeValue(ln);
-        serverDb *db = &server.db[df->db_id];
+        serverDb *db = server.db[df->db_id];
 
         /* Validity first (do not burn a token on a dead entry). */
         if (extStorageGetState(db, df->key) != TIERING_STATE_COPYING_TO_MEMORY) {
