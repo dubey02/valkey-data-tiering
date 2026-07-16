@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Valkey Data Tiering — Benchmarks (unstable)</title>
+  <title>Valkey Data Tiering — Benchmarks (policies)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5"></script>
   <style>
@@ -137,7 +137,7 @@ const GITHUB_REPO = 'valkey-data-tiering';
 const DATA_PATH = 'benchmark_dashboard/data';
 
 // This branch's available scenarios (self-contained — no cross-branch manifest needed)
-const MY_SCENARIOS = ['policies', 'valuesizes', 'flashcache'];
+const MY_SCENARIOS = ['policymatrix', 'flashcache'];
 
 function rawUrl(branch, path) {
   return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${branch}/${path}`;
@@ -146,8 +146,8 @@ function rawUrl(branch, path) {
 // ============================================================
 // STATE
 // ============================================================
-const currentBranch = 'unstable';
-let currentScenario = 'policies';
+const currentBranch = 'policies';
+let currentScenario = 'policymatrix';
 
 // ============================================================
 // SCENARIO TAB SYSTEM
