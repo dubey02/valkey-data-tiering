@@ -128,6 +128,18 @@
     </main>
   </div>
 
+  <!-- Scenario: Tiering Latency -->
+  <div class="scenario-view" id="scenario-tieringlatency">
+    <div class="top-bar" id="tl-dataset-selector"></div>
+    <div class="layout">
+      <aside class="sidebar" id="tl-sidebar"></aside>
+      <main class="main">
+        <div class="kpi-row" id="tl-kpi-row"></div>
+        <div class="chart-grid" id="tl-chart-grid"></div>
+      </main>
+    </div>
+  </div>
+
 <script>
 // ============================================================
 // CONFIGURATION: GitHub raw content base URL + branch manifests
@@ -137,7 +149,7 @@ const GITHUB_REPO = 'valkey-data-tiering';
 const DATA_PATH = 'benchmark_dashboard/data';
 
 // This branch's available scenarios (self-contained — no cross-branch manifest needed)
-const MY_SCENARIOS = ['policies', 'valuesizes', 'flashcache'];
+const MY_SCENARIOS = ['policies', 'valuesizes', 'flashcache', 'tieringlatency'];
 
 function rawUrl(branch, path) {
   return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${branch}/${path}`;
@@ -146,7 +158,7 @@ function rawUrl(branch, path) {
 // ============================================================
 // STATE
 // ============================================================
-const currentBranch = 'unstable';
+const currentBranch = 'benchmark';
 let currentScenario = 'policies';
 
 // ============================================================
@@ -157,6 +169,7 @@ const ALL_SCENARIOS = [
   { id: 'policymatrix', label: 'Policy Matrix' },
   { id: 'valuesizes', label: 'Value Sizes' },
   { id: 'flashcache', label: 'FlashCache Layer' },
+  { id: 'tieringlatency', label: 'Tiering Latency' },
 ];
 
 const tabBar = document.getElementById('tab-bar');
@@ -643,12 +656,128 @@ function renderVS(){
 })();
 
 // ============================================================
+// TIERING LATENCY SCENARIO (data/tiering-latency/, run tiering-latency-0716)
+// ============================================================
+const TL_DATASETS = [
+  { file:'idle.csv',             label:'idle (string)',    color:'#0ea5e9' },
+  { file:'idle-notier.csv',      label:'idle-notier',      color:'#64748b' },
+  { file:'idle-hash.csv',        label:'idle-hash',        color:'#f97316' },
+  { file:'idle-hash-notier.csv', label:'idle-hash-notier', color:'#a8a29e' },
+  { file:'slam.csv',             label:'slam (1M flash)',  color:'#8b5cf6' },
+  { file:'slam-notier.csv',      label:'slam-notier',      color:'#10b981' },
+];
+
+let tlLoaded={}, tlLatency={client:{},server:{}}, tlCharts={};
+let tlActive = new Set(TL_DATASETS.map(d=>d.file));
+let tlVisible = new Set(['ops_per_sec','used_memory','total_num_items_fetched_from_ext_storage','disk_read_iops','_tl_client_latency','_tl_server_latency']);
+
+(function initTLUI(){
+  // Dataset selector
+  const sel = document.getElementById('tl-dataset-selector');
+  TL_DATASETS.forEach(ds=>{
+    const lbl=document.createElement('label');lbl.className='ds-toggle';
+    const cb=document.createElement('input');cb.type='checkbox';cb.checked=true;
+    cb.onchange=()=>{if(cb.checked)tlActive.add(ds.file);else tlActive.delete(ds.file);renderTL();};
+    lbl.appendChild(cb);
+    const sw=document.createElement('span');sw.className='swatch';sw.style.background=ds.color;lbl.appendChild(sw);
+    lbl.append(ds.label);sel.appendChild(lbl);
+  });
+
+  // Sidebar (metric groups + latency)
+  const sb = document.getElementById('tl-sidebar');
+  const br = document.createElement('div');br.className='btn-row';
+  const ba=document.createElement('button');ba.textContent='All';ba.onclick=()=>{tlVisible=new Set([...METRICS,'_tl_client_latency','_tl_server_latency']);syncTLSB();updateTLVis();};
+  const bn=document.createElement('button');bn.textContent='None';bn.onclick=()=>{tlVisible.clear();syncTLSB();updateTLVis();};
+  const bd=document.createElement('button');bd.textContent='Default';bd.onclick=()=>{tlVisible=new Set(['ops_per_sec','used_memory','total_num_items_fetched_from_ext_storage','disk_read_iops','_tl_client_latency','_tl_server_latency']);syncTLSB();updateTLVis();};
+  br.append(ba,bn,bd);sb.appendChild(br);
+  const tlCBs={};
+  const TL_GROUPS = {...GROUPS, 'Latency (client)':['_tl_client_latency'], 'Latency (server)':['_tl_server_latency']};
+  Object.entries(TL_GROUPS).forEach(([group,fields])=>{
+    const div=document.createElement('div');div.className='group';
+    const h=document.createElement('h3');h.textContent=group;div.appendChild(h);
+    fields.forEach(f=>{
+      const lbl=document.createElement('label');
+      const cb=document.createElement('input');cb.type='checkbox';cb.checked=tlVisible.has(f);
+      cb.onchange=()=>{if(cb.checked)tlVisible.add(f);else tlVisible.delete(f);updateTLVis();};
+      tlCBs[f]=cb;lbl.appendChild(cb);lbl.append(f.replace(/_/g,' ').replace(/^_tl /,''));div.appendChild(lbl);
+    });
+    sb.appendChild(div);
+  });
+  function syncTLSB(){Object.entries(tlCBs).forEach(([f,cb])=>cb.checked=tlVisible.has(f));}
+  function updateTLVis(){document.querySelectorAll('#tl-chart-grid .chart-card').forEach(el=>{el.classList.toggle('visible',tlVisible.has(el.dataset.metric));});}
+
+  // Chart cards
+  const grid = document.getElementById('tl-chart-grid');
+  METRICS.forEach(m=>{
+    const card=document.createElement('div');card.className='chart-card'+(m==='ops_per_sec'?' wide':'')+(tlVisible.has(m)?' visible':'');card.dataset.metric=m;
+    card.innerHTML=`<h3>${m.replace(/_/g,' ')}</h3><canvas id="tl-chart-${m}"></canvas>`;grid.appendChild(card);
+    tlCharts[m]=new Chart(document.getElementById('tl-chart-'+m),{type:'line',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+  [['_tl_client_latency','Client GET Latency — trace-replay (ms)'],['_tl_server_latency','Server-side GET Latency (µs)']].forEach(([m,title])=>{
+    const card=document.createElement('div');card.className='chart-card wide'+(tlVisible.has(m)?' visible':'');card.dataset.metric=m;
+    card.innerHTML=`<h3>${title}</h3><canvas id="tl-chart${m}"></canvas>`;grid.appendChild(card);
+    tlCharts[m]=new Chart(document.getElementById('tl-chart'+m),{type:'bar',data:{labels:[],datasets:[]},options:chartOpts});
+  });
+})();
+
+async function loadTieringLatency() {
+  if (!MY_SCENARIOS.includes('tieringlatency')) return;
+  const basePath = `${DATA_PATH}/tiering-latency`;
+  tlLoaded={}; tlLatency={client:{},server:{}};
+  await Promise.all(TL_DATASETS.map(async ds=>{
+    tlLoaded[ds.file] = await fetchCsv(currentBranch, `${basePath}/${ds.file}`);
+  }));
+  await Promise.all(TL_DATASETS.map(async ds=>{
+    const base=ds.file.replace('.csv','');
+    const rows = await fetchCsv(currentBranch, `${basePath}/${base}-latency.csv`);
+    if(rows[0]) tlLatency.client[ds.file]=rows[0];
+  }));
+  await Promise.all(TL_DATASETS.map(async ds=>{
+    const base=ds.file.replace('.csv','');
+    const txt = await fetchText(currentBranch, `${basePath}/${base}-server-latency.txt`);
+    if(txt){const parsed={};txt.trim().split('\n').forEach(line=>{const m=line.match(/^latency_percentiles_usec_([\w|]+):(.+)/);if(m){const vals={};m[2].split(',').forEach(p=>{const[k,v]=p.split('=');vals[k]=parseFloat(v);});parsed[m[1]]=vals;}});tlLatency.server[ds.file]=parsed;}
+  }));
+  renderTL();
+}
+
+function renderTL(){
+  METRICS.forEach(m=>{
+    const chart=tlCharts[m];if(!chart)return;const datasets=[];let maxLen=0;
+    TL_DATASETS.forEach(ds=>{if(!tlActive.has(ds.file)||!tlLoaded[ds.file]||!tlLoaded[ds.file].length)return;
+      const rows=tlLoaded[ds.file];maxLen=Math.max(maxLen,rows.length);
+      datasets.push({label:ds.label,data:rows.map(r=>r[m]||0),borderColor:ds.color,tension:.2,pointRadius:0,borderWidth:1.5});});
+    chart.data.labels=Array.from({length:maxLen},(_,i)=>i+1);chart.data.datasets=datasets;chart.update();
+  });
+  // Client latency (trace-replay percentiles per config)
+  {const chart=tlCharts['_tl_client_latency'];if(chart){
+    const latFields=['p50_latency_ms','p99_latency_ms','p999_latency_ms','p100_latency_ms'];
+    const datasets=[];
+    TL_DATASETS.forEach(ds=>{if(!tlActive.has(ds.file)||!tlLatency.client[ds.file])return;const row=tlLatency.client[ds.file];
+      datasets.push({label:ds.label,data:latFields.map(f=>parseFloat(row[f])||0),backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+    chart.data.labels=['p50','p99','p99.9','p100'];chart.data.datasets=datasets;chart.update();}}
+  // Server latency (INFO latencystats GET)
+  {const chart=tlCharts['_tl_server_latency'];if(chart){
+    const pctiles=['p50','p99','p99.9','p100'];const datasets=[];
+    TL_DATASETS.forEach(ds=>{if(!tlActive.has(ds.file)||!tlLatency.server[ds.file])return;const srv=tlLatency.server[ds.file];
+      const data=pctiles.map(p=>srv.get?.[p]||0);
+      datasets.push({label:ds.label,data,backgroundColor:ds.color+'cc',borderColor:ds.color,borderWidth:1});});
+    chart.data.labels=pctiles.map(p=>`get ${p}`);chart.data.datasets=datasets;chart.update();}}
+  // KPIs: throughput per active config
+  const kpi=document.getElementById('tl-kpi-row');kpi.innerHTML='';
+  TL_DATASETS.forEach(ds=>{if(!tlActive.has(ds.file)||!tlLatency.client[ds.file])return;
+    const t=parseFloat(tlLatency.client[ds.file].throughput_ops)||0;
+    const el=document.createElement('div');el.className='kpi';
+    el.innerHTML=`<div class="value" style="color:${ds.color}">${t>=1000?(t/1000).toFixed(1)+'K':t}</div><div class="label">${ds.label} ops/s</div>`;
+    kpi.appendChild(el);});
+}
+
+// ============================================================
 // LOAD ALL DATA FOR CURRENT BRANCH
 // ============================================================
 async function loadAllData() {
   setStatus('Loading...', 'loading');
   try {
-    await Promise.all([loadPolicies(), loadPolicyMatrix(), loadValueSizes()]);
+    await Promise.all([loadPolicies(), loadPolicyMatrix(), loadValueSizes(), loadTieringLatency()]);
     setStatus(`Loaded from ${currentBranch}`, 'ok');
   } catch(e) {
     setStatus(`Error: ${e.message}`, 'error');
