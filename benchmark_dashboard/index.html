@@ -83,9 +83,10 @@ window.addEventListener('message', e => {
 // Init from URL param or default to unstable
 const params = new URLSearchParams(window.location.search);
 const initBranch = params.get('branch') || 'unstable';
-if ([...branchSelect.options].some(o => o.value === initBranch)) {
-  branchSelect.value = initBranch;
+if (![...branchSelect.options].some(o => o.value === initBranch)) {
+  branchSelect.add(new Option(initBranch, initBranch));
 }
+branchSelect.value = initBranch;
 loadBranch(branchSelect.value);
 </script>
 </body>
