@@ -24,6 +24,7 @@ void extStorageThrottle_init(void);
 /* Check if a client should be throttled. Returns 1 if client was queued
  * (command should be rejected/deferred), 0 if client can proceed. */
 int extStorageThrottle_shouldThrottle(client *c);
+int extStorageThrottle_gateCommand(client *c); /* parity post-parse gate: 1 = command parked, caller must CMD_FILTER_REJECT */
 
 /* Adjust the throttle rate based on current memory pressure.
  * Called periodically (e.g., every 10 commands or from timer).

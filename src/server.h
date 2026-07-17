@@ -1207,6 +1207,9 @@ typedef struct ClientFlags {
                                               MUST NOT reuse pending_command, which the blocking machinery owns
                                               ("parsed command in argv"); overloading it corrupted blocked-client
                                               re-execution and let writes bypass the tiering key-block gate. */
+    uint64_t throttle_parked : 1;          /* Ext-storage throttle: client's parsed command is parked in
+                                              the throttle queue (BLOCKED_POSTPONE). Guards against double-queueing if
+                                              an external path (e.g. CLIENT PAUSE transitions) unblocks it first. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */

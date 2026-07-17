@@ -111,6 +111,7 @@ typedef enum {
 extern int ext_storage_throttling_strategy;
 extern int ext_storage_spilling_strategy;
 extern int ext_storage_throttle_band_start;
+extern int ext_storage_hard_cap_oom_reject;
 extern int ext_storage_throttle_band_end;
 
 void extStorage_init(void);

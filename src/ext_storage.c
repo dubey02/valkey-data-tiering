@@ -111,6 +111,9 @@ long long ext_storage_buffered_write_flush_threshold = 1024 * 1024; /* 1MB flush
 int ext_storage_throttling_strategy = THROTTLING_STRATEGY_V2;
 int ext_storage_spilling_strategy   = SPILLING_STRATEGY_V2;
 int ext_storage_throttle_band_start = 100; /* 1.0x maxmemory */
+int ext_storage_hard_cap_oom_reject = 0;   /* OFF: writes wait in the
+                                            * throttle queue, never rejected while
+                                            * spillable items exist */
 int ext_storage_throttle_band_end   = 120; /* 1.2x maxmemory */
 
 /* Dynamic spill concurrency cap — used ONLY by the legacy ITEM_COUNT spill strategy.
@@ -663,8 +666,60 @@ static void extStorageDrainDeferredFetches(void) {
  * For keys in COPYING_TO_FLASH/COPYING_TO_MEMORY/PENDING_EVICT: just blocks.
  * ---------------------------------------------------------------------------*/
 
+/* ---------------------------------------------------------------------------
+ * Throttle eligibility. A command is
+ * throttle-eligible iff it can GROW memory:
+ *   - memory-generating commands (CMD_DENYOOM: SET etc.; EVAL/EVALSHA;
+ *     EXEC whose queued commands include a DENYOOM command)
+ *   - READONLY commands touching a flash-resident key (the fetch-promotion
+ *     materializes value_size bytes)
+ * Everything else — DRAM-hit reads, DEL/UNLINK, admin/introspection — flows
+ * at full speed even at rate 0. This is the property our old connection-level
+ * gate lacked: it queued whole sockets, starving cheap reads and monitoring.
+ * ---------------------------------------------------------------------------*/
+static int extStorageCmdEligibleForThrottle(client *c) {
+    /* Exempt internal/fake clients, replication, and AOF loading. */
+    if (!c->conn) return 0;
+    if (c->flag.primary || c->flag.replica) return 0;
+
+    /* Memory-generating commands. */
+    if (c->cmd->flags & CMD_DENYOOM) return 1;
+    if (c->cmd->proc == evalCommand || c->cmd->proc == evalShaCommand) return 1;
+    if (c->cmd->proc == execCommand && c->mstate && (c->mstate->cmd_flags & CMD_DENYOOM)) return 1;
+
+    /* Flash reads: READONLY command whose key would block (fetch needed or
+     * IO already in flight for it). */
+    if (c->cmd->flags & CMD_READONLY) {
+        getKeysResult result;
+        initGetKeysResult(&result);
+        int num_keys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+        int eligible = 0;
+        for (int i = 0; i < num_keys; i++) {
+            sds key_str = objectGetVal(c->argv[result.keys[i].pos]);
+            TieringState st = extStorageGetState(c->db, key_str);
+            if (st == TIERING_STATE_ONLY_FLASH || st == TIERING_STATE_COPYING_TO_MEMORY ||
+                st == TIERING_STATE_PENDING_EVICT) {
+                eligible = 1;
+                break;
+            }
+        }
+        getKeysFreeResult(&result);
+        return eligible;
+    }
+    return 0;
+}
+
 int preCommandExec(client *c) {
     if (!ext_data_enabled) return CMD_FILTER_ACCEPT;
+
+    /* THROTTLE GATE (V2): post-parse, per-command, BEFORE the kbc
+     * fetch path — a parked flash-read never submits its fetch, so promotions
+     * are token-paced at the source. */
+    if (ext_storage_throttling_strategy != THROTTLING_STRATEGY_V1 &&
+        extStorageCmdEligibleForThrottle(c) &&
+        extStorageThrottle_gateCommand(c)) {
+        return CMD_FILTER_REJECT; /* parked: command stays parsed in argv */
+    }
 
     /* NOTE: Completions are processed from beforeSleep() and the 1ms timer,
      * NOT here. Processing completions here causes a race: a spill completion
@@ -1388,15 +1443,19 @@ int extStoragePerformEvictions(int *result) {
 
     size_t used_memory = zmalloc_used_memory();
 
-    /* Hard memory cap FIRST: if raw used_memory > 1.2x maxmemory, reject writes
-     * unconditionally — being this far over the cap means the spill rate is NOT
-     * keeping up with the write rate. This check MUST precede the projected
-     * (Smith-predictor) short-circuit below: projected = used - in-flight-credit,
-     * and if that credit is inflated (e.g. stalled/dropped WRITE completions that
-     * never drain inflight_spill_ram_bytes) projected stays pinned <= maxmemory
-     * while raw used runs away unbounded. Evaluating the hard cap first guarantees
-     * the OOM reject fires regardless of the projected credit. */
-    if (used_memory > server.maxmemory + (server.maxmemory / 5)) {
+    /* Hard memory cap (OPTIONAL, default OFF): if raw
+     * used_memory > 1.2x maxmemory, reject writes unconditionally.
+     * the reference implementation has NO such reject — while spillable items exist a
+     * write is never refused, it waits in the throttle queue instead
+     * (the tiered-storage path fails only when over maxmemory with
+     * nothing spillable, or out of disk). The reject wall is what killed SET
+     * clients and forced populate retry loops in min0/fetchgate runs; with it
+     * off, pressure becomes queue wait time. Peak memory is then bounded by
+     * closed-loop slop (clients x value_size above the band) rather than by
+     * refusal. Re-enable via ext-storage-hard-cap-oom-reject for experiments
+     * that need the hard wall. */
+    if (ext_storage_hard_cap_oom_reject &&
+        used_memory > server.maxmemory + (server.maxmemory / 5)) {
         memory_hard_cap_exceeded_count++;
         oom_reject_write_count++;
         *result = C_ERR;
@@ -1412,16 +1471,10 @@ int extStoragePerformEvictions(int *result) {
         return 1;
     }
 
-    /* Over maxmemory (projected) but under 1.2x hard cap.
-     * The throttle zone [1.0x, 1.2x] handles back-pressure via the bytes-
-     * throttle. We should NEVER reject writes in this zone — the throttle
-     * slows incoming traffic and spilling drains memory. Rejecting here
-     * would be premature since the hard cap hasn't been breached.
-     *
-     * Track a metric for observability: if no spillable items exist, the
-     * spill mechanism can't help and we're relying purely on the throttle
-     * to prevent reaching the hard cap. This is a sign of a degenerate
-     * workload (all values already on flash, only metadata in memory). */
+    /* Over maxmemory (projected) but under the (optional) hard cap.
+     * Writes are rejected ONLY on true capacity exhaustion —
+     * over maxmemory with NOTHING spillable and nothing in flight. Otherwise the throttle provides
+     * the back-pressure and spilling drains memory. */
     if (total_items_spilling_to_ext_storage == 0) {
         long long total_keys = 0;
         for (int i = 0; i < server.dbnum; i++) {
@@ -1429,9 +1482,11 @@ int extStoragePerformEvictions(int *result) {
         }
         long long spillable_keys = total_keys - num_items_on_flash;
         if (spillable_keys <= 0) {
-            /* Metric only — no spillable items exist (all on flash or in-flight).
-             * The throttle is the sole back-pressure mechanism in this state. */
+            /* Nothing can lower memory: reject the write (true out-of-capacity). */
             no_spillable_items_count++;
+            oom_reject_write_count++;
+            *result = C_ERR;
+            return 1;
         }
     }
 

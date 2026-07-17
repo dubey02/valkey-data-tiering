@@ -88,7 +88,8 @@ static int tb_tryConsume(TokenBucket *tb) {
 
 typedef struct {
     TokenBucket bucket;
-    list *client_queue;
+    list *client_queue;        /* V1 (legacy pre-parse) queue: connections whose read handler is off */
+    list *parked_queue;        /* V2 (parity) queue: clients with a fully PARSED command parked in argv */
     long long timer_event_id;
     double allowed_tps;
     double measured_max_tps;   /* Derived from min command latency */
@@ -134,6 +135,34 @@ static long long throttleTimerProc(struct aeEventLoop *el, long long id, void *d
 
     tb_refill(&ts.bucket);
 
+    /* parity release (V2): pop parked clients and unblock them via the
+     * core machinery — unblockClient(c, 1) removes the BLOCKED_POSTPONE state
+     * and queues the client for reprocessing; beforeSleep re-executes the
+     * parked command (pending_command) through the normal path, where the
+     * gate admits it via the throttle_released marker. One token per parked
+     * command, work bounded per tick like its 10ms release budget. */
+    monotime release_start;
+    elapsedStart(&release_start);
+    while (ts.parked_queue && listLength(ts.parked_queue) > 0 &&
+           elapsedUs(release_start) < 10000 /* 10ms, per mature tiered stores */) {
+        if (ts.is_throttling && !tb_tryConsume(&ts.bucket)) break;
+
+        listNode *ln = listFirst(ts.parked_queue);
+        client *c = listNodeValue(ln);
+        listDelNode(ts.parked_queue, ln);
+        ts.total_released++;
+
+        if (!c->flag.throttle_parked) continue; /* already unblocked externally
+                                                   (e.g. pause transition) */
+        c->flag.throttle_parked = 0;
+
+        /* The gate re-runs when the command re-executes; mark the client so
+         * it passes without a second token charge. */
+        c->flag.throttle_released = 1;
+        unblockClient(c, 1);
+    }
+
+    /* Legacy V1 release: re-install read handlers at token pace. */
     int released = 0;
     while (listLength(ts.client_queue) > 0 && released < THROTTLE_MAX_RELEASE_PER_TICK) {
         /* If throttling disengaged (memory back under band start), flush the
@@ -146,9 +175,6 @@ static long long throttleTimerProc(struct aeEventLoop *el, long long id, void *d
         ts.total_released++;
         released++;
 
-        /* Mark client so the next readQueryFromClient call skips throttle.
-         * Dedicated bit — NOT pending_command, which the blocking machinery
-         * owns; overloading it froze clients and bypassed the kbc gate. */
         c->flag.throttle_released = 1;
 
         /* Re-install read handler */
@@ -157,7 +183,8 @@ static long long throttleTimerProc(struct aeEventLoop *el, long long id, void *d
         }
     }
 
-    if (listLength(ts.client_queue) > 0) {
+    if (listLength(ts.client_queue) > 0 ||
+        (ts.parked_queue && listLength(ts.parked_queue) > 0)) {
         return THROTTLE_TIMER_MS; /* Keep timer alive */
     }
 
@@ -172,6 +199,7 @@ static long long throttleTimerProc(struct aeEventLoop *el, long long id, void *d
 void extStorageThrottle_init(void) {
     tb_init(&ts.bucket, THROTTLE_ABSOLUTE_MAX_TPS);
     ts.client_queue = listCreate();
+    ts.parked_queue = listCreate();
     ts.timer_event_id = AE_ERR;
     ts.allowed_tps = THROTTLE_ABSOLUTE_MAX_TPS;
     ts.measured_max_tps = THROTTLE_ABSOLUTE_MAX_TPS;
@@ -359,6 +387,13 @@ int extStorageThrottle_shouldThrottle(client *c) {
             extStorageThrottle_adjustRateV2();
     }
 
+    /* mature tiered stores PARITY (V2): the pre-parse socket gate is DISABLED. mature tiered stores throttles
+     * post-parse, per-command (the throttle path from the command
+     * path), so DRAM-hit reads, DELs, and admin commands flow at full speed
+     * even at rate 0. The V2 gate lives in extStorageThrottle_gateCommand(),
+     * called from preCommandExec with the parsed command in hand. */
+    if (ext_storage_throttling_strategy != THROTTLING_STRATEGY_V1) return 0;
+
     if (!ts.is_throttling) {
         c->flag.throttle_released = 0; /* consume even when disengaged — never leak the marker */
         return 0;
@@ -424,6 +459,78 @@ void extStorageThrottle_removeClient(client *c) {
             break;
         }
     }
+    if (ts.parked_queue) {
+        listRewind(ts.parked_queue, &li);
+        while ((ln = listNext(&li))) {
+            if (listNodeValue(ln) == c) {
+                /* No break: an externally-unblocked-then-reparked client can
+                 * have duplicate entries; purge them all. */
+                listDelNode(ts.parked_queue, ln);
+            }
+        }
+        c->flag.throttle_parked = 0;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * parity command gate (V2)
+ *
+ * Called from preCommandExec with the PARSED command in argv. The caller has
+ * already established the command is throttle-eligible (memory-generating or
+ * a flash-read — see extStorageCmdEligibleForThrottle in ext_storage.c).
+ * Park/release mechanism:
+ *   - queue empty + token available  -> consume, admit
+ *   - otherwise                      -> PARK: pending_command=1 (the command
+ *     stays parsed in argv), read handler off, FIFO queue; the throttle timer
+ *     releases parked commands at token pace by EXECUTING them directly.
+ * Returns 1 if the command was parked (caller must CMD_FILTER_REJECT),
+ * 0 if admitted.
+ * -------------------------------------------------------------------------- */
+int extStorageThrottle_gateCommand(client *c) {
+    /* Rate re-evaluation cadence shared with the (disabled) pre-parse path. */
+    ts.commands_since_adjust++;
+    if (ts.commands_since_adjust >= THROTTLE_ADJUST_INTERVAL) {
+        ts.commands_since_adjust = 0;
+        extStorageThrottle_adjustRateV2();
+    }
+
+    /* Client just released by the timer: it already paid its token there. */
+    if (c->flag.throttle_released) {
+        c->flag.throttle_released = 0;
+        return 0;
+    }
+
+    if (!ts.is_throttling) return 0;
+
+    /* FIFO fairness: if commands are already parked, new eligible commands
+     * park behind them even if a token is momentarily available. */
+    if (ts.parked_queue && listLength(ts.parked_queue) > 0) goto park;
+
+    tb_refill(&ts.bucket);
+    if (tb_tryConsume(&ts.bucket)) return 0; /* Admitted */
+
+park:
+    ts.total_throttled++;
+    /* Park via the core blocking machinery — the SAME primitive CLIENT PAUSE
+     * uses (BLOCKED_POSTPONE = "blocked by processCommand, re-try later"):
+     *   - pending_command=1 marks the parsed command in argv for re-execution
+     *   - blockPostponeClient sets flag.blocked, so commandProcessed() SKIPS
+     *     resetClient() and argv survives (a bare pending_command flag does
+     *     NOT survive: commandProcessed resets un-blocked clients, silently
+     *     discarding the parked command — first-cut bug, clients wedged)
+     * Release = unblockClient(c, 1): removes from postponed list, queues for
+     * reprocessing in beforeSleep (processPendingCommandAndInputBuffer). */
+    c->flag.pending_command = 1;
+    c->flag.throttle_parked = 1;
+    blockPostponeClient(c);
+    if (!ts.parked_queue) ts.parked_queue = listCreate();
+    listAddNodeTail(ts.parked_queue, c);
+
+    if (ts.timer_event_id == AE_ERR) {
+        ts.timer_event_id = aeCreateTimeEvent(
+            server.el, THROTTLE_TIMER_MS, throttleTimerProc, NULL, NULL);
+    }
+    return 1;
 }
 
 long long extStorageThrottle_getThrottledCount(void) { return ts.total_throttled; }
@@ -439,10 +546,18 @@ long long extStorageThrottle_getThrottledCount(void) { return ts.total_throttled
  * submitted regardless of throttle state, so N clients × value_size bytes of
  * promotions could land while allowed_tps was 0. */
 int extStorageThrottle_tryAdmitFetch(void) {
+    /* mature tiered stores PARITY: the flash-read COMMAND already paid a token at the command
+     * gate (extStorageThrottle_gateCommand) — charging its fetch a second
+     * token would halve read admission. mature tiered stores submits the fetch of an admitted
+     * command unconditionally; we keep the deferral machinery as a safety net
+     * only for the full-halt window (rate == 1.0, allowed_tps == 0), bounding
+     * promotion floods while the bucket is hard-closed. */
     if (!ts.is_throttling) return 1;
-    tb_refill(&ts.bucket);
-    return tb_tryConsume(&ts.bucket);
+    return ts.allowed_tps > 0.0;
 }
-long long extStorageThrottle_getQueuedClients(void) { return (long long)listLength(ts.client_queue); }
+long long extStorageThrottle_getQueuedClients(void) {
+    return (long long)listLength(ts.client_queue) +
+           (long long)(ts.parked_queue ? listLength(ts.parked_queue) : 0);
+}
 double extStorageThrottle_getCurrentRate(void) { return ts.throttle_rate; }
 double extStorageThrottle_getAllowedTps(void) { return ts.allowed_tps; }

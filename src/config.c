@@ -3492,6 +3492,7 @@ standardConfig static_configs[] = {
     createEnumConfig("ext-storage-throttling-strategy", NULL, MODIFIABLE_CONFIG, ext_storage_throttling_strategy_enum, ext_storage_throttling_strategy, THROTTLING_STRATEGY_V2, NULL, NULL),
     createEnumConfig("ext-storage-spilling-strategy", NULL, MODIFIABLE_CONFIG, ext_storage_spilling_strategy_enum, ext_storage_spilling_strategy, SPILLING_STRATEGY_V2, NULL, NULL),
     createIntConfig("ext-storage-throttle-band-start", NULL, MODIFIABLE_CONFIG, 0, 200, ext_storage_throttle_band_start, 100, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("ext-storage-hard-cap-oom-reject", NULL, MODIFIABLE_CONFIG, ext_storage_hard_cap_oom_reject, 0, NULL, NULL),
     createIntConfig("ext-storage-throttle-band-end", NULL, MODIFIABLE_CONFIG, 0, 200, ext_storage_throttle_band_end, 120, INTEGER_CONFIG, NULL, NULL),
 
 
