@@ -593,29 +593,50 @@ typedef struct deferredFetch {
 
 static list *deferred_fetch_queue = NULL;   /* of deferredFetch* */
 static long long fetch_deferred_count = 0;         /* total deferrals */
+static long long fetch_submit_rejected_count = 0;   /* backend-rejected submits routed to deferral */
 static long long fetch_deferred_drained_count = 0; /* deferrals later submitted */
 static long long fetch_deferred_dropped_count = 0; /* entries invalidated before submit */
 
-/* Submit a READ fetch for an ONLY_FLASH key, or defer it if the throttle
- * denies admission. Returns 0 if the client should block on the key (fetch
- * in flight OR deferred), -1 if the backend rejected the submit (caller
- * undoes the block, matching the pre-existing reject path). */
+/* Queue a fetch for later submission. The key transitions to
+ * COPYING_TO_MEMORY exactly as if the fetch were in flight (concurrent
+ * clients block without duplicate submits); the drain, called from the
+ * beforeSleep/timer completion pump, performs the actual submit. */
+static void extStorageDeferFetch(serverDb *db, sds key_str) {
+    extStorageSetState(db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
+        VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
+    if (!deferred_fetch_queue) deferred_fetch_queue = listCreate();
+    deferredFetch *df = zmalloc(sizeof(*df));
+    df->db_id = db->id;
+    df->key = sdsdup(key_str);
+    listAddNodeTail(deferred_fetch_queue, df);
+    fetch_deferred_count++;
+}
+
+/* Submit a READ fetch for an ONLY_FLASH key, or defer it. Two defer causes:
+ *   - throttle halt window (allowed_tps == 0)
+ *   - BACKEND rejection (FlashCache read/write-throttled under saturation).
+ *     Previously a backend reject UNDID the client's block
+ *     (keys_confirmed_absent + num_keys_to_block--), and when every key of
+ *     the command was rejected, preCommandExec fell through to
+ *     CMD_FILTER_ACCEPT — the command then executed against the
+ *     flash-resident key and served the TOMBSTONE PLACEHOLDER as the value.
+ *     Only reachable when FlashCache rejects (saturated backend — observed
+ *     remotely as 1.86M 'Spill failed' warnings; never triggers on an idle
+ *     local backend), matching the remote-only GET client death in
+ *     500k-ecrparity-0717. Deferral keeps the client blocked and retries
+ *     the submit from the pump when the backend recovers.
+ * Always returns 0: the client should block on the key. */
 static int extStorageSubmitOrDeferFetch(serverDb *db, sds key_str) {
     if (!extStorageThrottle_tryAdmitFetch()) {
-        /* DEFER: state transition exactly as if submitted — concurrent clients
-         * see COPYING_TO_MEMORY and just block; only the drain submits later. */
-        extStorageSetState(db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
-            VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
-        if (!deferred_fetch_queue) deferred_fetch_queue = listCreate();
-        deferredFetch *df = zmalloc(sizeof(*df));
-        df->db_id = db->id;
-        df->key = sdsdup(key_str);
-        listAddNodeTail(deferred_fetch_queue, df);
-        fetch_deferred_count++;
+        extStorageDeferFetch(db, key_str);
         return 0;
     }
     int rc = extStorageBridge_submitGet(extStoragePhysicalDbId(db->id), key_str);
-    if (rc != 0) return -1;
+    if (rc != 0) {
+        fetch_submit_rejected_count++;
+        extStorageDeferFetch(db, key_str);
+        return 0;
+    }
     extStorageSetState(db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
         VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
     total_items_fetching_from_ext_storage++;
@@ -1715,6 +1736,7 @@ sds genExternalStorageInfoString(sds info) {
         "kbc_key_may_exist_false:%lld\r\n"
         "kbc_key_may_exist_true:%lld\r\n"
         "fetch_deferred:%lld\r\n"
+        "fetch_submit_rejected:%lld\r\n"
         "fetch_deferred_drained:%lld\r\n"
         "fetch_deferred_dropped:%lld\r\n"
         "fetch_deferred_pending:%lld\r\n"
@@ -1760,6 +1782,7 @@ sds genExternalStorageInfoString(sds info) {
         kbc_key_may_exist_false_count,
         kbc_key_may_exist_true_count,
         fetch_deferred_count,
+        fetch_submit_rejected_count,
         fetch_deferred_drained_count,
         fetch_deferred_dropped_count,
         (long long)(deferred_fetch_queue ? listLength(deferred_fetch_queue) : 0),
