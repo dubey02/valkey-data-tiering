@@ -83,6 +83,19 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 robj *lookupKey(serverDb *db, robj *key, int flags) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
     robj *val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+    /* Data tiering: mid-execution access to a non-resident value. Contexts
+     * that cannot block-and-re-execute (Lua/EXEC-inner commands run at
+     * execution_nesting > 1; explicit opt-in via LOOKUP_SYNCFETCH, e.g.
+     * SORT BY/GET pattern keys) fetch synchronously, then re-find — the
+     * fetch replaces the placeholder allocation. A placeholder left behind
+     * (flash miss / pending deletion) is reported as a normal key miss. */
+    if (val && ext_data_enabled &&
+        ((flags & LOOKUP_SYNCFETCH) || server.execution_nesting > 1) &&
+        (objectIsTiered(val) || val->tiering_state != TIERING_STATE_ONLY_MEMORY)) {
+        extStorageSyncFetch(db, objectGetVal(key));
+        val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
+        if (val && objectIsTiered(val)) val = NULL;
+    }
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
          * inconsistent with the primary. We forbid it on readonly replicas, but
@@ -479,6 +492,11 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
     void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, objectGetVal(key), &pos);
     if (ref != NULL) {
         robj *val = *ref;
+        /* Data tiering: capture pending-deletion before removal. This entry was
+         * kept alive by the flash-delete completion solely so THIS delete could
+         * happen in command context; waiters blocked by KBC on PENDING_DELETION
+         * must be released once the entry is actually gone. */
+        int was_pending_deletion = (val->tiering_state == TIERING_STATE_PENDING_DELETION);
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
         incrRefCount(val);
@@ -511,6 +529,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         } else {
             decrRefCount(val);
         }
+
+        /* Data tiering: release clients queued behind the drained DEL. */
+        if (was_pending_deletion) unblockClientsInUseOnKey(key);
 
         return 1;
     } else {
@@ -1873,6 +1894,15 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
 
 /* SWAPDB db1 db2 */
 void swapdbCommand(client *c) {
+    /* Data tiering: flash-resident values are stored keyed by db id, and
+     * in-flight IO completions carry db ids. SWAPDB would leave flash data
+     * addressed under the pre-swap db (fetches miss => data unreachable).
+     * Refuse while tiering is enabled. */
+    if (ext_data_enabled) {
+        addReplyError(c, "SWAPDB is not supported with data tiering enabled "
+                         "(flash-resident values are addressed by database id)");
+        return;
+    }
     int id1, id2;
 
     /* Not allowed in cluster mode: atomicity cross shards is challenging in cluster mode. */

@@ -113,8 +113,12 @@ robj *lookupKeyByPattern(serverDb *db, robj *pattern, robj *subst) {
     memcpy(k + prefixlen + sublen, p + 1, postfixlen);
     decrRefCount(subst); /* Incremented by decodeObject() */
 
-    /* Lookup substituted key */
-    o = lookupKeyRead(db, keyobj);
+    /* Lookup substituted key. LOOKUP_SYNCFETCH: pattern-resolved keys are
+     * unknown to the pre-execution tiering filter (they derive from the
+     * sorted collection's elements at runtime); a flash-resident weight/GET
+     * key is fetched synchronously here. Without this, the TIERED
+     * placeholder reaches the scoring path and crashes. */
+    o = lookupKeyReadWithFlags(db, keyobj, LOOKUP_SYNCFETCH);
     if (o == NULL) goto noobj;
 
     if (fieldobj) {

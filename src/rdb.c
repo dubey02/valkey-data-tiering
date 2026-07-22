@@ -34,6 +34,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "ext_storage.h"
 #include "lzf.h" /* LZF compression library */
 #include "zipmap.h"
 #include "endianconv.h"
@@ -1638,6 +1639,21 @@ int rdbSaveToFile(const char *filename) {
 
 /* Save the DB on disk. Return C_ERR on error, C_OK on success. */
 int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    /* Data tiering: refuse to write a snapshot that silently drops
+     * flash-resident values (covers auto-save, SHUTDOWN save, DEBUG RELOAD;
+     * the command-level gates give clients a descriptive error first).
+     * Rate-limited log: serverCron retries failed saves every cycle. */
+    if (ext_data_enabled && num_items_on_flash > 0) {
+        static mstime_t last_log = 0;
+        if (mstime() - last_log > 60000) {
+            serverLog(LL_WARNING,
+                "Refusing RDB save: %lld values reside on external storage and "
+                "would be silently lost (data tiering limitation)", num_items_on_flash);
+            last_log = mstime();
+        }
+        errno = EPERM;
+        return C_ERR;
+    }
     char tmpfile[256];
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
 
@@ -3942,6 +3958,16 @@ void saveCommand(client *c) {
         return;
     }
 
+    /* Data tiering: RDB does not yet serialize flash-resident values — the
+     * placeholder would be written and the data silently lost on reload.
+     * Fail loudly instead of producing a lossy snapshot. */
+    if (ext_data_enabled && num_items_on_flash > 0) {
+        addReplyError(c, "SAVE is not supported while values reside on external "
+                         "storage (data tiering): the snapshot would silently lose "
+                         "flash-resident values");
+        return;
+    }
+
     server.stat_rdb_saves++;
 
     rdbSaveInfo rsi, *rsiptr;
@@ -3981,6 +4007,14 @@ void bgsaveCommand(client *c) {
             addReplyErrorObject(c, shared.syntaxerr);
             return;
         }
+    }
+
+    /* Data tiering: see saveCommand — refuse to write a lossy snapshot. */
+    if (ext_data_enabled && num_items_on_flash > 0) {
+        addReplyError(c, "BGSAVE is not supported while values reside on external "
+                         "storage (data tiering): the snapshot would silently lose "
+                         "flash-resident values");
+        return;
     }
 
     rdbSaveInfo rsi, *rsiptr;

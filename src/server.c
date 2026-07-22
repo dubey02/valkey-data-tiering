@@ -4756,7 +4756,14 @@ int processCommand(client *c) {
             for (int i = 0; i < chk_num; i++) {
                 sds chk_key = objectGetVal(c->argv[chk_result.keys[i].pos]);
                 dbEntry *chk_entry = dbFind(c->db, chk_key);
-                if (chk_entry && objectIsTiered(chk_entry)) {
+                /* PENDING_DELETION is exempt: the entry legitimately keeps its
+                 * TIERED placeholder while the drained DEL/UNLINK re-executes
+                 * (preCommandExec already vetted the command against it). Without
+                 * this exemption the re-run/return below silently drops the DEL:
+                 * the re-run ACCEPTS again, so no block is installed and no reply
+                 * is ever sent. */
+                if (chk_entry && objectIsTiered(chk_entry) &&
+                    chk_entry->tiering_state != TIERING_STATE_PENDING_DELETION) {
                     serverLog(LL_WARNING, "TIERED_SAFETY: key %s is TIERED after preCommandExec allowed cmd=%s, re-running preCommandExec",
                         chk_key, c->cmd->declared_name);
                     getKeysFreeResult(&chk_result);

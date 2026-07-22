@@ -661,6 +661,19 @@ void debugCommand(client *c) {
             addReplyErrorObject(c, shared.nokeyerr);
             return;
         }
+
+        /* Data tiering: the value is an sds placeholder — rdbSavedObjectLen
+         * (and type-specific inspection) would assert on the TIERED encoding.
+         * Report tiering-aware info instead. */
+        if (objectIsTiered(val)) {
+            sds ts = sdsempty();
+            ts = sdscatprintf(ts, "Value at:%p refcount:%d encoding:tiered "
+                                  "tiering_state:%d value_on_external_storage:1",
+                              (void *)val, val->refcount, (int)val->tiering_state);
+            addReplyStatusLength(c, ts, sdslen(ts));
+            sdsfree(ts);
+            return;
+        }
         strenc = strEncoding(val->encoding);
 
         char extra[138] = {0};

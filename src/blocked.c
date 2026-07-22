@@ -942,6 +942,25 @@ void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {
     }
 }
 
+/* Returns 1 if any client blocked-in-use on this key has a pending DEL or
+ * UNLINK command. Used by data tiering's PENDING_DELETION handling to detect
+ * whether the deleting client is still alive (orphan detection): if the
+ * client that initiated an optimized flash delete disconnects before its
+ * command re-executes, the pending-deletion entry must be finished inline by
+ * whoever touches the key next. */
+int blockedInUseClientWithPendingDeleteExists(robj *key) {
+    list *blockedClientsList = keyToClients_getBlockedClientsList(key);
+    if (blockedClientsList == NULL) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(blockedClientsList, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+        if (c->cmd && (c->cmd->proc == delCommand || c->cmd->proc == unlinkCommand)) return 1;
+    }
+    return 0;
+}
+
 /* Unblock clients blocked on the given key.
  *
  * A client is fully unblocked only when it has no remaining keys in its

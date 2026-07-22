@@ -28,6 +28,10 @@ typedef enum {
     TIERING_STATE_ONLY_FLASH = 2,        /* Value on disk (encoding=TIERED) */
     TIERING_STATE_COPYING_TO_MEMORY = 3, /* Fetch or delete in-flight from flash */
     TIERING_STATE_PENDING_EVICT = 4,     /* Eviction requested during fetch */
+    TIERING_STATE_PENDING_DELETION = 5,  /* Flash copy deleted for a client DEL;
+                                          * entry retained so the re-executed
+                                          * DEL removes it with full command-
+                                          * layer side effects */
 } TieringState;
 
 /* tieringStateEntry removed — state stored in robj->tiering_state (3 bits) */
@@ -36,6 +40,13 @@ typedef enum {
  * Public API
  * ---------------------------------------------------------------------------*/
 extern int ext_data_enabled;
+extern long long num_items_on_flash; /* values currently on external storage */
+
+/* Mid-execution synchronous fetch (.agent/knowledge/sync-fetch-design.md).
+ * Drives the IO for `key` to completion on the calling (main) thread, deferring
+ * other keys' completions. On return the key is either resident or absent —
+ * caller must re-find the entry. Never times out. */
+void extStorageSyncFetch(serverDb *db, sds key);
 extern int ext_storage_spill_pool_active;
 extern char *ext_storage_backend;
 extern char *ext_storage_path;

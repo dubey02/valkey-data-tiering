@@ -13269,7 +13269,27 @@ void moduleNotifyKeyUnlink(robj *key, robj *val, int dbid, int flags) {
     KeyInfo info = {dbid, key, val, VALKEYMODULE_READ};
     moduleFireServerEvent(VALKEYMODULE_EVENT_KEY, subevent, &info);
 
-    if (val->type == OBJ_MODULE) {
+    /* Data tiering: when the value is on external storage, objectGetVal()
+     * returns the empty-SDS placeholder installed at spill time — NOT a
+     * moduleValue. Casting it below reads a garbage moduleType pointer and
+     * crashes (SIGSEGV). The type tag alone cannot be trusted for tiered
+     * entries; it is preserved so TYPE/OBJECT answer without a fetch.
+     *
+     * What we deliberately DO NOT do here for tiered module keys:
+     *  - We do NOT call the owning type's unlink/unlink2 callback. Its
+     *    contract hands the module a pointer to its live in-memory object,
+     *    which was already destroyed at spill time (the module received its
+     *    free callback then). There is no valid value to pass, and fetching
+     *    from flash just to notify would cost a disk read per delete.
+     *  - We do NOT synthesize a NULL-value unlink call: existing modules
+     *    dereference the value unconditionally.
+     * The generic KEY_DELETED/EXPIRED/EVICTED server event above DOES still
+     * fire for tiered keys, and keyspace notifications are unaffected — so
+     * event-subscribing modules (e.g. valkey-search's index tracking) still
+     * observe the deletion. No flagship module (valkey-json, valkey-bloom,
+     * valkey-search) registers unlink today. A tiering-aware module API
+     * (opt-in unlink accepting a non-resident value) is future work. */
+    if (val->type == OBJ_MODULE && !objectIsTiered(val)) {
         moduleValue *mv = objectGetVal(val);
         moduleType *mt = mv->type;
         /* We prefer to use the enhanced version. */

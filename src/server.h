@@ -821,7 +821,7 @@ struct serverObject {
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
-    unsigned tiering_state : 3; /* TieringState (0-4), default 0 = ONLY_MEMORY */
+    unsigned tiering_state : 3; /* TieringState (0-5), default 0 = ONLY_MEMORY */
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *val_ptr; /* Not always present. Use objectGetVal(obj) and
                     * objectSetVal(obj, val) instead. */
@@ -3759,6 +3759,8 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs);
 #define LOOKUP_NOSTATS (1 << 2)  /* Don't update keyspace hits/misses counters. */
 #define LOOKUP_WRITE (1 << 3)    /* Delete expired keys even in replicas. */
 #define LOOKUP_NOEXPIRE (1 << 4) /* Avoid deleting lazy expired keys. */
+#define LOOKUP_SYNCFETCH (1 << 5) /* Data tiering: synchronously fetch a flash-resident \
+                                   * value mid-execution (see sync-fetch-design.md). */
 #define LOOKUP_NOEFFECTS \
     (LOOKUP_NONOTIFY | LOOKUP_NOSTATS | LOOKUP_NOTOUCH | LOOKUP_NOEXPIRE) /* Avoid any effects from fetching the key */
 
@@ -3899,6 +3901,7 @@ void blockClientShutdown(client *c);
 void blockPostponeClient(client *c);
 void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]);
 void unblockClientsInUseOnKey(robj *key);
+int blockedInUseClientWithPendingDeleteExists(robj *key);
 void unblockClientsInUseOnAllKeys(void);
 void blockClientForReplicaAck(client *c, mstime_t timeout, long long offset, int numreplicas, int numlocal);
 void replicationRequestAckFromReplicas(void);

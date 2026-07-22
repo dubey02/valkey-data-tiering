@@ -213,6 +213,15 @@ static long long kbc_in_memory_count = 0;
 static long long kbc_spilling_block_count = 0;
 static long long kbc_fetching_block_count = 0;
 static long long kbc_pending_evict_block_count = 0;
+static long long kbc_pending_deletion_block_count = 0; /* blocked because a DEL is draining */
+
+/* ---- Synchronous fetch (mid-execution) ---- */
+static list *deferred_completions = NULL; /* other keys' completions polled out during a sync fetch */
+static long long sync_fetch_count = 0;
+static long long sync_fetch_miss_count = 0;
+static long long sync_fetch_wait_us_total = 0;
+static long long sync_fetch_wait_us_max = 0;
+static long long sync_fetch_deferred_count = 0;
 static long long kbc_confirmed_absent_count = 0;
 static long long kbc_key_may_exist_false_count = 0;
 static long long kbc_key_may_exist_true_count = 0;
@@ -398,7 +407,7 @@ static bool isEmbeddedObject(dbEntry *o) {
  * Side effect: may issue a READ or DELETE request to the module.
  * ---------------------------------------------------------------------------*/
 
-static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd) {
+static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_delete_cmd) {
     kbc_total_calls++;
 
     TieringState state = extStorageGetState(db, key);
@@ -436,6 +445,34 @@ static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd) {
         /* Eviction pending — block all commands */
         kbc_pending_evict_block_count++;
         return 1;
+
+    case TIERING_STATE_PENDING_DELETION: {
+        /* Flash copy already deleted on behalf of a client DEL (internal-TS
+         * style optimized delete). The entry is retained so the re-executed
+         * DEL performs the keyspace removal itself with full command-layer
+         * side effects: reply count, signalModifiedKey (WATCH), keyspace
+         * "del" notification, and dirty++. DEL/UNLINK pass through; all
+         * other commands wait until the DEL drains (the db.c delete hook
+         * unblocks them). */
+        if (is_delete_cmd) return 0;
+        robj pd_keyobj;
+        initStaticStringObject(pd_keyobj, key);
+        if (!blockedInUseClientWithPendingDeleteExists(&pd_keyobj)) {
+            /* Orphaned: the deleting client vanished before re-executing.
+             * Finish the deletion inline with the command-layer side effects
+             * it would have produced, then let this command proceed against
+             * the post-delete keyspace. dbDelete's pending-deletion hook
+             * unblocks any other waiters. */
+            if (dbDelete(db, &pd_keyobj)) {
+                signalModifiedKey(NULL, db, &pd_keyobj);
+                notifyKeyspaceEvent(NOTIFY_GENERIC, "del", &pd_keyobj, db->id);
+                server.dirty++;
+            }
+            return 0;
+        }
+        kbc_pending_deletion_block_count++;
+        return 1;
+    }
 
     case TIERING_STATE_ONLY_FLASH:
         /* Value on disk — need to fetch (for GET/SET) or delete (for DEL/eviction) */
@@ -524,7 +561,7 @@ int preCommandExec(client *c) {
 
             for (int j = 0; j < mc_num_keys; j++) {
                 sds key_str = objectGetVal(mc->argv[mc_keys[j].pos]);
-                if (keyBlocksClient(current_db, key_str, mc_is_write)) {
+                if (keyBlocksClient(current_db, key_str, mc_is_write, false)) {
                     blocking_keys[num_keys_to_block++] = mc->argv[mc_keys[j].pos];
 
                     TieringState state = extStorageGetState(current_db, key_str);
@@ -572,7 +609,7 @@ int preCommandExec(client *c) {
     for (int i = 0; i < num_keys; i++) {
         sds key_str = objectGetVal(c->argv[keys[i].pos]);
 
-        if (!keyBlocksClient(current_db, key_str, is_write_cmd)) {
+        if (!keyBlocksClient(current_db, key_str, is_write_cmd, is_delete_cmd)) {
             continue;
         }
 
@@ -605,8 +642,12 @@ int preCommandExec(client *c) {
             if (msg_type == VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ) {
                 dbEntry *entry = dbFind(current_db, key_str);
                 if (entry) {
-                    robj *val = objectGetVal(entry);
-                    long long expire_ms = objectGetExpire(val);
+                    /* Expire lives on the ENTRY robj. objectGetVal(entry) is the
+                     * tiered placeholder sds — passing it to objectGetExpire
+                     * reads garbage robj bitfields (heap-dependent), which could
+                     * fabricate an "expired" verdict and silently convert this
+                     * READ into a DELETE (flaky key loss). */
+                    long long expire_ms = objectGetExpire(entry);
                     if (expire_ms > 0 && expire_ms < mstime() && !server.loading) {
                         msg_type = VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_DELETE;
                         is_delete_cmd = true;  /* treat as delete for the rest of this iteration */
@@ -655,18 +696,11 @@ int preCommandExec(client *c) {
  * Handles READ, WRITE, and DELETE completions with proper state transitions.
  * ---------------------------------------------------------------------------*/
 
-void processCompletedStorageRequests(void) {
-    int total_processed = 0;
-    int next_batch_size;
-
-    while ((next_batch_size = extStorageBridge_pollCompletions(
-                completed_storage_requests,
-                COMPLETED_STORAGE_REQUESTS_PROCESSING_BATCH_SIZE)) > 0) {
-
-        completion_batches_processed++;
-
-        for (int j = 0; j < next_batch_size; j++) {
-            ValkeyModuleExternalStorageMsg *msg = completed_storage_requests[j];
+/* Process a single completion message. Extracted from the batch loop so
+ * extStorageSyncFetch can drive an individual key's completion mid-command.
+ * Consumes the message (frees msg and its key ref). */
+static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
+    {
             int db_id = msg->db_id;
             robj *key = (robj*)msg->key;
             sds key_name = (sds)objectGetVal(key);
@@ -776,7 +810,9 @@ void processCompletedStorageRequests(void) {
                     /* Check if key expired while being fetched — don't promote,
                      * just delete. Avoids wasted memory from promoting a dead value. */
                     if (entry != NULL) {
-                        long long expire_ms = objectGetExpire(objectGetVal(entry));
+                        /* Entry carries the expire; objectGetVal(entry) is the placeholder
+                     * sds — see the KBC-site comment (garbage-expire key loss). */
+                    long long expire_ms = objectGetExpire(entry);
                         if (expire_ms > 0 && expire_ms < (long long)mstime() && !server.loading) {
                             decrRefCount(new_value);
                             robj keyobj;
@@ -846,13 +882,25 @@ void processCompletedStorageRequests(void) {
                     extStorageBridge_submitGet(db_id, key_name); /* submitGet sdsdup's the key */
                     decrRefCount(key);
                     zfree(msg);
-                    continue;
+                    return;
                 } else {
-                    /* Value not found on disk — mark as confirmed absent */
+                    /* Value not found on disk — the flash copy is gone (FC GC
+                     * eviction, or a cross-db inconsistency). Mark confirmed
+                     * absent AND delete the placeholder entry: leaving a TIERED
+                     * entry with its state cleared wedges KBC into an infinite
+                     * resubmit-miss loop (the defensive ONLY_MEMORY+tiered
+                     * branch re-marks it ONLY_FLASH forever). Live-reproduced
+                     * via SWAPDB; also reachable via real FlashCache GC. */
                     completion_read_miss++;
                     if (num_items_on_flash > 0) num_items_on_flash--;
                     hashtableAdd(db->keys_confirmed_absent, sdsdup(key_name));
                     extStorageRemoveState(db, key_name);
+                    dbEntry *miss_entry = dbFind(db, key_name);
+                    if (miss_entry != NULL && objectIsTiered(miss_entry)) {
+                        robj miss_keyobj;
+                        initStaticStringObject(miss_keyobj, key_name);
+                        dbDelete(db, &miss_keyobj);
+                    }
                 }
                 total_items_fetching_from_ext_storage--;
                 break;
@@ -877,22 +925,38 @@ void processCompletedStorageRequests(void) {
                     break;
                 }
 
-                /* ONLY_FLASH, COPYING_TO_MEMORY, or PENDING_EVICT — proceed with deletion.
+                /* ONLY_FLASH, COPYING_TO_MEMORY, or PENDING_EVICT — flash copy is gone.
                  * COPYING_TO_MEMORY here means our DEL completed (we set it in submitDel). */
                 dbEntry *entry = dbFind(db, key_name);
+                int entry_kept_pending_deletion = 0;
                 if (entry != NULL) {
                     robj keyobj;
                     initStaticStringObject(keyobj, key_name);
                     /* Check if this was an expiry-triggered delete — if key has
                      * an expired TTL, use the proper expiry propagation path. */
-                    long long expire_ms = objectGetExpire(objectGetVal(entry));
+                    /* Entry carries the expire; objectGetVal(entry) is the placeholder
+                     * sds — see the KBC-site comment (garbage-expire key loss). */
+                    long long expire_ms = objectGetExpire(entry);
                     if (expire_ms > 0 && expire_ms < mstime()) {
                         deleteExpiredKeyAndPropagate(db, &keyobj);
+                    } else if (state == TIERING_STATE_COPYING_TO_MEMORY) {
+                        /* Client-initiated DEL (submitDel set COPYING_TO_MEMORY).
+                         * Do NOT remove the entry here — the blocked client's DEL
+                         * re-executes after unblock and must find the entry so
+                         * the command layer produces the correct reply count,
+                         * signalModifiedKey (WATCH), keyspace "del" notification,
+                         * and dirty++. Mark PENDING_DELETION: KBC lets DEL/UNLINK
+                         * through and blocks everything else until the DEL drains
+                         * (mirrors internal TS MSG_TYPE_DELETE_KEY handling). */
+                        extStorageSetState(db, key_name, TIERING_STATE_PENDING_DELETION, 0);
+                        entry_kept_pending_deletion = 1;
                     } else {
+                        /* GC eviction / PENDING_EVICT: no client is waiting on a
+                         * reply — remove the entry directly. */
                         dbDelete(db, &keyobj);
                     }
                 }
-                extStorageRemoveState(db, key_name);
+                if (!entry_kept_pending_deletion) extStorageRemoveState(db, key_name);
                 completion_delete_ok++;
                 total_items_deleted_from_ext_storage++;
                 if (num_items_on_flash > 0) num_items_on_flash--;
@@ -907,10 +971,130 @@ void processCompletedStorageRequests(void) {
             unblockClientsInUseOnKey(key);
             decrRefCount(key);
             zfree(msg);
+    }
+}
+
+void processCompletedStorageRequests(void) {
+    int next_batch_size;
+
+    /* Completions deferred by extStorageSyncFetch run FIRST: they were polled
+     * out of the bridge during a sync fetch and precede anything still queued
+     * (arrival-order preservation; per-key order is safe regardless because
+     * each key has at most one in-flight operation). */
+    if (deferred_completions) {
+        listNode *ln;
+        while ((ln = listFirst(deferred_completions)) != NULL) {
+            ValkeyModuleExternalStorageMsg *dmsg = listNodeValue(ln);
+            listDelNode(deferred_completions, ln);
+            processOneCompletion(dmsg);
+        }
+    }
+
+    while ((next_batch_size = extStorageBridge_pollCompletions(
+                completed_storage_requests,
+                COMPLETED_STORAGE_REQUESTS_PROCESSING_BATCH_SIZE)) > 0) {
+        completion_batches_processed++;
+        for (int j = 0; j < next_batch_size; j++) {
+            processOneCompletion(completed_storage_requests[j]);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * extStorageSyncFetch — mid-execution synchronous fetch
+ * Design: .agent/knowledge/sync-fetch-design.md
+ *
+ * Called from lookupKey() when a non-resident key is accessed in a context
+ * that cannot block-and-re-execute (Lua/EXEC-inner commands, SORT BY/GET
+ * pattern resolution, module OpenKey). Stalls the main thread until the
+ * key's IO resolves, processing ONLY this key's completions; other keys'
+ * completions are deferred to preserve keyspace isolation for the running
+ * command (a spill completion processed mid-command could free memory the
+ * command still references).
+ *
+ * Deliberately never times out: callers cannot roll back partial execution
+ * (a Lua script may already have applied writes).
+ * ---------------------------------------------------------------------------*/
+void extStorageSyncFetch(serverDb *db, sds key) {
+    if (!ext_data_enabled) return;
+
+    monotime start = getMonotonicUs();
+    long long next_warn_us = 5000000; /* warn every 5s while stalled */
+    int backoff_us = 0;
+
+    while (1) {
+        dbEntry *entry = dbFind(db, key);
+        if (entry == NULL) goto done_absent; /* deleted / never existed */
+
+        TieringState state = extStorageGetState(db, key);
+        if (state == TIERING_STATE_ONLY_MEMORY) {
+            if (!objectIsTiered(entry)) goto done_resident;
+            /* TIERED encoding with no state entry — normalize and fetch. */
+            extStorageSetState(db, key, TIERING_STATE_ONLY_FLASH, 0);
+            state = TIERING_STATE_ONLY_FLASH;
+        }
+        if (state == TIERING_STATE_PENDING_DELETION) goto done_absent; /* logically deleted */
+
+        if (state == TIERING_STATE_ONLY_FLASH) {
+            if (extStorageBridge_submitGet(db->id, key) == 0) {
+                extStorageSetState(db, key, TIERING_STATE_COPYING_TO_MEMORY,
+                                   VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
+                total_items_fetching_from_ext_storage++;
+            }
+            /* submit rejected (throttled): fall through, drain, retry */
+        }
+        /* COPYING_TO_FLASH / COPYING_TO_MEMORY / PENDING_EVICT: an operation
+         * is in flight — wait for ITS completion. For COPYING_TO_FLASH the
+         * value is still in RAM, but the caller may mutate it while the IO
+         * thread serializes it; waiting for the spill is the race-free
+         * choice (then fetch back). */
+
+        /* Selective drain: process our key's completions, defer the rest. */
+        int n = extStorageBridge_pollCompletions(
+            completed_storage_requests, COMPLETED_STORAGE_REQUESTS_PROCESSING_BATCH_SIZE);
+        int progressed = 0;
+        int our_read_missed = 0;
+        for (int j = 0; j < n; j++) {
+            ValkeyModuleExternalStorageMsg *m = completed_storage_requests[j];
+            sds mk = (sds)objectGetVal((robj *)m->key);
+            if (sdslen(mk) == sdslen(key) && memcmp(mk, key, sdslen(key)) == 0) {
+                long long miss_before = completion_read_miss;
+                processOneCompletion(m);
+                progressed = 1;
+                if (completion_read_miss > miss_before) our_read_missed = 1;
+            } else {
+                if (!deferred_completions) deferred_completions = listCreate();
+                listAddNodeTail(deferred_completions, m);
+                sync_fetch_deferred_count++;
+            }
+        }
+        if (our_read_missed) goto done_absent; /* value gone from flash (GC) */
+
+        if (progressed) {
+            backoff_us = 0; /* state advanced — re-evaluate immediately */
+        } else {
+            if (backoff_us < 200) backoff_us += 50;
+            usleep(backoff_us);
         }
 
-        total_processed += next_batch_size;
+        long long elapsed = (long long)(getMonotonicUs() - start);
+        if (elapsed > next_warn_us) {
+            serverLog(LL_WARNING,
+                "extStorageSyncFetch stalled %llds waiting for key IO (state=%d)"
+                " — backend slow or wedged",
+                (long long)(elapsed / 1000000), (int)extStorageGetState(db, key));
+            next_warn_us += 5000000;
+        }
     }
+
+done_absent:
+    sync_fetch_miss_count++;
+    /* fall through */
+done_resident: ;
+    long long waited = (long long)(getMonotonicUs() - start);
+    sync_fetch_count++;
+    sync_fetch_wait_us_total += waited;
+    if (waited > sync_fetch_wait_us_max) sync_fetch_wait_us_max = waited;
 }
 
 
@@ -1315,6 +1499,12 @@ sds genExternalStorageInfoString(sds info) {
         "kbc_spilling_block:%lld\r\n"
         "kbc_fetching_block:%lld\r\n"
         "kbc_pending_evict_block:%lld\r\n"
+        "kbc_pending_deletion_block:%lld\r\n"
+        "sync_fetch_count:%lld\r\n"
+        "sync_fetch_miss_count:%lld\r\n"
+        "sync_fetch_wait_us_total:%lld\r\n"
+        "sync_fetch_wait_us_max:%lld\r\n"
+        "sync_fetch_deferred_completions:%lld\r\n"
         "kbc_confirmed_absent:%lld\r\n"
         "kbc_key_may_exist_false:%lld\r\n"
         "kbc_key_may_exist_true:%lld\r\n"
@@ -1350,6 +1540,12 @@ sds genExternalStorageInfoString(sds info) {
         kbc_spilling_block_count,
         kbc_fetching_block_count,
         kbc_pending_evict_block_count,
+        kbc_pending_deletion_block_count,
+        sync_fetch_count,
+        sync_fetch_miss_count,
+        sync_fetch_wait_us_total,
+        sync_fetch_wait_us_max,
+        sync_fetch_deferred_count,
         kbc_confirmed_absent_count,
         kbc_key_may_exist_false_count,
         kbc_key_may_exist_true_count,
