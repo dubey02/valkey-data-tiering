@@ -77,7 +77,7 @@ int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx) 
             if (state == TIERING_STATE_ONLY_FLASH) {
                 /* Key is on flash — issue async delete. The completion handler
                  * will call deleteExpiredKeyAndPropagate when delete completes. */
-                extStorageBridge_submitDel(db->id, key);
+                extStorageBridge_submitDel(extStoragePhysicalDbId(db->id), key);
                 extStorageSetState(db, key, TIERING_STATE_COPYING_TO_MEMORY,
                     VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_DELETE);
                 return 0;  /* not deleted yet — will complete async */

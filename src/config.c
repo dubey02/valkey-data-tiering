@@ -2617,6 +2617,23 @@ static int updateExtStorageFcConfig(const char **err) {
     return 1;
 }
 
+static int updateMaxmemoryPolicy(const char **err) {
+    /* Data tiering: spill victim selection supports only allkeys-lru,
+     * allkeys-lfu, and noeviction (volatile-* needs flash-aware sampling
+     * from the expires index - not implemented). The same rule is enforced
+     * at init (which disables tiering); this guards runtime CONFIG SET,
+     * which previously bypassed the check silently. */
+    if (ext_data_enabled && extStorageIsInitialized() &&
+        server.maxmemory_policy != MAXMEMORY_ALLKEYS_LRU &&
+        server.maxmemory_policy != MAXMEMORY_ALLKEYS_LFU &&
+        server.maxmemory_policy != MAXMEMORY_NO_EVICTION) {
+        *err = "maxmemory-policy must be allkeys-lru, allkeys-lfu, or noeviction "
+               "while data tiering (ext-storage-enabled) is active";
+        return 0;
+    }
+    return 1;
+}
+
 static int updateMaxmemory(const char **err) {
     UNUSED(err);
     if (server.maxmemory) {
@@ -3395,7 +3412,7 @@ standardConfig static_configs[] = {
     createEnumConfig("syslog-facility", NULL, IMMUTABLE_CONFIG, syslog_facility_enum, server.syslog_facility, LOG_LOCAL0, NULL, NULL),
     createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, NULL),
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
-    createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
+    createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, updateMaxmemoryPolicy),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, updateAppendFsync),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, 0, NULL, NULL),

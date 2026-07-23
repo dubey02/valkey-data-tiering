@@ -40,6 +40,7 @@ typedef enum {
  * Public API
  * ---------------------------------------------------------------------------*/
 extern int ext_data_enabled;
+extern int ext_storage_debug_pause_completions; /* DEBUG EXT-STORAGE-PAUSE-COMPLETIONS (tests only) */
 extern long long num_items_on_flash; /* values currently on external storage */
 
 /* Mid-execution synchronous fetch (.agent/knowledge/sync-fetch-design.md).
@@ -47,6 +48,12 @@ extern long long num_items_on_flash; /* values currently on external storage */
  * other keys' completions. On return the key is either resident or absent —
  * caller must re-find the entry. Never times out. */
 void extStorageSyncFetch(serverDb *db, sds key);
+
+int extStorageIsInitialized(void);
+/* SWAPDB db-id indirection (see ext_storage.c). */
+int extStoragePhysicalDbId(int logical_id);
+int extStorageLogicalDbId(int physical_id);
+void extStorageSwapDbIds(int id1, int id2);
 extern int ext_storage_spill_pool_active;
 extern char *ext_storage_backend;
 extern char *ext_storage_path;

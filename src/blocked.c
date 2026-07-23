@@ -961,6 +961,36 @@ int blockedInUseClientWithPendingDeleteExists(robj *key) {
     return 0;
 }
 
+/* Returns 1 if any blocked-in-use client with a pending DEL or UNLINK
+ * targets database id1 or id2. Used by SWAPDB's data-tiering guard: a
+ * blocked DEL re-executes against its logical db index after its flash
+ * delete completes, so swapping that db's contents underneath it would
+ * make the re-executed DEL reply about — or delete from — the wrong
+ * keyspace. SWAPDB is rejected while such a client exists (reject-and-
+ * retry, mirroring internal TS's preCall SWAPDB handling). */
+int blockedInUseDelClientExistsForDbs(int id1, int id2) {
+    if (inuse_key_to_clients == NULL) return 0;
+    hashtableIterator iter;
+    void *next;
+    hashtableInitIterator(&iter, inuse_key_to_clients, 0);
+    while (hashtableNext(&iter, &next)) {
+        keyToClientsEntry *entry = next;
+        listIter li;
+        listNode *ln;
+        listRewind(entry->clients, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *c = listNodeValue(ln);
+            if (c->cmd && (c->cmd->proc == delCommand || c->cmd->proc == unlinkCommand) &&
+                (c->db->id == id1 || c->db->id == id2)) {
+                hashtableCleanupIterator(&iter);
+                return 1;
+            }
+        }
+    }
+    hashtableCleanupIterator(&iter);
+    return 0;
+}
+
 /* Unblock clients blocked on the given key.
  *
  * A client is fully unblocked only when it has no remaining keys in its

@@ -318,6 +318,48 @@ static long long extStorageTimerCallback(struct aeEventLoop *eventLoop, long lon
 }
 
 /* ---------------------------------------------------------------------------
+ * SWAPDB support: db-id indirection
+ *
+ * Flash records and in-flight IO messages are addressed by a PHYSICAL db id
+ * that follows a keyspace across SWAPDB. The server.db[] index used in
+ * command context is the LOGICAL id. Identity-mapped at init; SWAPDB swaps
+ * the two mapping entries, so:
+ *   - new submissions for a logical db reach the flash namespace its
+ *     keyspace has always used, and
+ *   - completions tagged with a physical id route back to whichever logical
+ *     db currently owns that keyspace (correct even for IO in flight across
+ *     the swap, because dbSwapDatabases moves the entries - and their
+ *     tiering-state bits - together with the keyspace).
+ * ---------------------------------------------------------------------------*/
+static int *logical_to_physical_db = NULL;
+static int *physical_to_logical_db = NULL;
+
+/* True once extStorage_init completed successfully (post config load). */
+int extStorageIsInitialized(void) {
+    return logical_to_physical_db != NULL;
+}
+
+int extStoragePhysicalDbId(int logical_id) {
+    if (!logical_to_physical_db) return logical_id;
+    return logical_to_physical_db[logical_id];
+}
+
+int extStorageLogicalDbId(int physical_id) {
+    if (!physical_to_logical_db) return physical_id;
+    return physical_to_logical_db[physical_id];
+}
+
+void extStorageSwapDbIds(int id1, int id2) {
+    if (!logical_to_physical_db) return;
+    int p1 = logical_to_physical_db[id1];
+    int p2 = logical_to_physical_db[id2];
+    logical_to_physical_db[id1] = p2;
+    logical_to_physical_db[id2] = p1;
+    physical_to_logical_db[p1] = id2;
+    physical_to_logical_db[p2] = id1;
+}
+
+/* ---------------------------------------------------------------------------
  * Initialization
  * ---------------------------------------------------------------------------*/
 
@@ -339,6 +381,14 @@ void extStorage_init(void) {
     }
 
     serverLog(LL_NOTICE, "Initializing the external storage (state machine v3)...");
+
+    /* Identity-map the SWAPDB db-id indirection. */
+    logical_to_physical_db = zmalloc(sizeof(int) * server.dbnum);
+    physical_to_logical_db = zmalloc(sizeof(int) * server.dbnum);
+    for (int i = 0; i < server.dbnum; i++) {
+        logical_to_physical_db[i] = i;
+        physical_to_logical_db[i] = i;
+    }
 
     /* Initialize the pluggable storage backend */
     const char *backend = "flashcache"; /* Default: real FlashCache */
@@ -572,7 +622,7 @@ int preCommandExec(client *c) {
                             extStorageSetState(current_db, key_str, TIERING_STATE_ONLY_FLASH, 0);
                         }
                         /* Issue fetch for this key */
-                        int rc = extStorageBridge_submitGet(current_db->id, key_str);
+                        int rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str);
                         if (rc == 0) {
                             extStorageSetState(current_db, key_str, TIERING_STATE_COPYING_TO_MEMORY,
                                 VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
@@ -657,9 +707,9 @@ int preCommandExec(client *c) {
 
             int rc;
             if (is_delete_cmd) {
-                rc = extStorageBridge_submitDel(current_db->id, key_str);
+                rc = extStorageBridge_submitDel(extStoragePhysicalDbId(current_db->id), key_str);
             } else {
-                rc = extStorageBridge_submitGet(current_db->id, key_str);
+                rc = extStorageBridge_submitGet(extStoragePhysicalDbId(current_db->id), key_str);
             }
 
             if (rc != 0) {
@@ -701,10 +751,12 @@ int preCommandExec(client *c) {
  * Consumes the message (frees msg and its key ref). */
 static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
     {
-            int db_id = msg->db_id;
+            int db_id = msg->db_id; /* PHYSICAL id (storage namespace) */
             robj *key = (robj*)msg->key;
             sds key_name = (sds)objectGetVal(key);
-            serverDb *db = server.db[db_id];
+            /* Route to whichever logical db currently owns this physical
+             * flash namespace (identity unless SWAPDB ran; see indirection). */
+            serverDb *db = server.db[extStorageLogicalDbId(db_id)];
 
             switch (msg->msg_type) {
 
@@ -974,8 +1026,16 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
     }
 }
 
+/* Debug-only: when set (DEBUG EXT-STORAGE-PAUSE-COMPLETIONS 1), completion
+ * processing is skipped, holding submitted flash operations (and the clients
+ * blocked on them) in flight. Used by tests to deterministically exercise
+ * in-flight windows (e.g. the SWAPDB pending-DEL guard). */
+int ext_storage_debug_pause_completions = 0;
+
 void processCompletedStorageRequests(void) {
     int next_batch_size;
+
+    if (ext_storage_debug_pause_completions) return;
 
     /* Completions deferred by extStorageSyncFetch run FIRST: they were polled
      * out of the bridge during a sync fetch and precede anything still queued
@@ -1036,7 +1096,7 @@ void extStorageSyncFetch(serverDb *db, sds key) {
         if (state == TIERING_STATE_PENDING_DELETION) goto done_absent; /* logically deleted */
 
         if (state == TIERING_STATE_ONLY_FLASH) {
-            if (extStorageBridge_submitGet(db->id, key) == 0) {
+            if (extStorageBridge_submitGet(extStoragePhysicalDbId(db->id), key) == 0) {
                 extStorageSetState(db, key, TIERING_STATE_COPYING_TO_MEMORY,
                                    VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
                 total_items_fetching_from_ext_storage++;
@@ -1142,7 +1202,7 @@ static int spillItemAsync(sds key, int db_id) {
     /* hasembval=0, hasembkey=0, hasexpire=0 already from memset */
     objectSetVal(value_ref, raw_value); /* Points to ORIGINAL value — no copy! */
 
-    int rc = extStorageBridge_submitPut(db_id, key_ref, value_ref, expireMs);
+    int rc = extStorageBridge_submitPut(extStoragePhysicalDbId(db_id), key_ref, value_ref, expireMs);
 
     if (rc != 0) {
         decrRefCount(key_ref);
@@ -1182,7 +1242,7 @@ int extStorageEvictFlashKey(serverDb *db, sds key) {
     switch (state) {
     case TIERING_STATE_ONLY_FLASH: {
         /* Send async DELETE to flash */
-        int rc = extStorageBridge_submitDel(db->id, key);
+        int rc = extStorageBridge_submitDel(extStoragePhysicalDbId(db->id), key);
 
         if (rc != 0) {
             return -1;

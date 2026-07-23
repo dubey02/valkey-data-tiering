@@ -26,7 +26,7 @@ Legend: ✅ works · ⚠️ works with caveats · ❌ broken (bug, fixable) ·
 | metadata-reading keyed | TTL, OBJECT ENCODING/FREQ, MEMORY USAGE, TYPE | ⚠️ | Work, but **fetch the whole value back to DRAM** (promotion side effect). IO-amplifying for pure-metadata reads; candidate optimization: answer from entry metadata without fetch |
 | keyspace iteration | KEYS, SCAN (incl. TYPE filter), RANDOMKEY, DBSIZE | ✅ | Key names + type live in the entry; values not dereferenced. Live-tested |
 | flush | FLUSHDB, FLUSHALL | ✅ | Flash side flushed via `extStorageBridge_flushDB/All`. Live-tested |
-| SWAPDB | | 🚫 gated | Flash values are addressed by db id — swap strands them (fetch miss). Live-proven: pre-gate, post-swap fetch missed and wedged KBC in an infinite resubmit loop. Now errors cleanly |
+| SWAPDB | | ✅ SUPPORTED (2026-07-22) | db-id indirection: flash records + in-flight IO use a PHYSICAL id that follows the keyspace across swaps; completions reverse-route physical→logical. Correct even with IO in flight across the swap. Pending-DEL guard (2026-07-23, mirrors internal TS preCall): SWAPDB is rejected with "SWAPDB unable to complete...please retry" while a blocked-in-use DEL/UNLINK client targets either db — the re-executed DEL would otherwise reply against the swapped-in keyspace (wrong reply 0 / wrong-key delete). Non-DEL blocked clients (fetches) do NOT trip the guard. Detection: blockedInUseDelClientExistsForDbs() in blocked.c. Test helper: DEBUG EXT-STORAGE-PAUSE-COMPLETIONS holds completions to exercise in-flight windows deterministically. Tests: ext-storage-swapdb.tcl |
 | transactions | MULTI/EXEC/DISCARD/WATCH | ✅ | EXEC path KBC-checks all queued commands' keys; WATCH invalidation on flash DEL live-tested |
 | scripting, declared keys | EVAL/EVALSHA/FCALL with KEYS[] | ✅ | Live-tested (strlen on flash key = correct) |
 | scripting, undeclared keys | EVAL touching keys not in KEYS[] | ✅ FIXED | Synchronous fetch primitive (`extStorageSyncFetch`, auto-triggered at execution_nesting > 1). Root cause of old wrong data: `stringObjectLen` counted digits of the placeholder POINTER; GET returned addReply's defensive error bytes. Tests: ext-storage-sync-fetch.tcl |
@@ -89,6 +89,11 @@ Legend: ✅ works · ⚠️ works with caveats · ❌ broken (bug, fixable) ·
     nowhere. Cleanup candidate.
 13. **Module OpenKey on tiered key** (P0 gap): sync-fetch Phase 2 wires
     extStorageSyncFetch into ValkeyModule_OpenKey.
+14. ~~SWAPDB gated~~ SUPPORTED 2026-07-22 via logical→physical db-id
+    indirection (extStoragePhysicalDbId/LogicalDbId/SwapDbIds); gate removed.
+15. ~~volatile-* runtime CONFIG SET bypass~~ FIXED 2026-07-22:
+    updateMaxmemoryPolicy apply-guard rejects unsupported policies while
+    tiering is initialized (init-time rule now also enforced at runtime).
 
 ## Testing status
 

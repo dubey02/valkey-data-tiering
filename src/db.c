@@ -861,7 +861,7 @@ void flushdbCommand(client *c) {
      * This drains all in-flight IO and wipes the flash index, preventing
      * crashes from deleting keys mid-spill. */
     if (ext_data_enabled) {
-        extStorageBridge_flushDB(c->db->id);
+        extStorageBridge_flushDB(extStoragePhysicalDbId(c->db->id));
     }
 
     /* flushdb should not flush the functions */
@@ -1894,15 +1894,6 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
 
 /* SWAPDB db1 db2 */
 void swapdbCommand(client *c) {
-    /* Data tiering: flash-resident values are stored keyed by db id, and
-     * in-flight IO completions carry db ids. SWAPDB would leave flash data
-     * addressed under the pre-swap db (fetches miss => data unreachable).
-     * Refuse while tiering is enabled. */
-    if (ext_data_enabled) {
-        addReplyError(c, "SWAPDB is not supported with data tiering enabled "
-                         "(flash-resident values are addressed by database id)");
-        return;
-    }
     int id1, id2;
 
     /* Not allowed in cluster mode: atomicity cross shards is challenging in cluster mode. */
@@ -1916,11 +1907,28 @@ void swapdbCommand(client *c) {
 
     if (getIntFromObjectOrReply(c, c->argv[2], &id2, "invalid second DB index") != C_OK) return;
 
+    /* Data tiering: reject the swap while a DEL of a flash-resident key is
+     * in flight on either database (client blocked-in-use, waiting for its
+     * flash delete to complete). The blocked DEL re-executes against its
+     * logical db index after unblock; swapping the contents underneath it
+     * would make it reply 0 (orphaning a PENDING_DELETION placeholder in
+     * the other db) or delete a same-named key from the swapped-in
+     * keyspace. Reject-and-retry sidesteps the class entirely (mirrors
+     * internal TS preCall SWAPDB handling). */
+    if (ext_data_enabled && blockedInUseDelClientExistsForDbs(id1, id2)) {
+        addReplyError(c, "SWAPDB unable to complete, a DEL of a flash-resident key is in progress - please retry");
+        return;
+    }
+
     /* Swap... */
     if (dbSwapDatabases(id1, id2) == C_ERR) {
         addReplyError(c, "DB index is out of range");
         return;
     } else {
+        /* Data tiering: swap the logical->physical db-id mapping so flash
+         * records (and IO in flight) keep resolving to the keyspace that
+         * owns them (see ext_storage.c indirection). */
+        if (ext_data_enabled) extStorageSwapDbIds(id1, id2);
         ValkeyModuleSwapDbInfo si = {VALKEYMODULE_SWAPDBINFO_VERSION, id1, id2};
         moduleFireServerEvent(VALKEYMODULE_EVENT_SWAPDB, 0, &si);
         server.dirty++;

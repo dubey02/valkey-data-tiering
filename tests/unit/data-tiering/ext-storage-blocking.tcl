@@ -143,12 +143,11 @@ start_server [list tags {"ext-storage" "ext-storage-blocking"} overrides [list \
         }
     }
 
-    test {SWAPDB is refused while tiering is enabled} {
-        # Flash data is addressed by db id; SWAPDB would strand flash-resident
-        # values under the pre-swap db (fetch miss => unreachable data).
-        # Live-reproduced before the gate: post-swap fetch missed and (before
-        # the read-miss fix) wedged KBC in an infinite resubmit loop.
-        assert_error "*not supported with data tiering*" {r swapdb 0 1}
+    test {SWAPDB works with tiering (db-id indirection)} {
+        # Full coverage in ext-storage-swapdb.tcl; this asserts the command
+        # is no longer gated (it was, before the indirection landed).
+        assert_equal {OK} [r swapdb 0 1]
+        r swapdb 0 1 ;# restore
     }
 
     test {DEBUG OBJECT on flash-resident key reports tiering info without crashing} {

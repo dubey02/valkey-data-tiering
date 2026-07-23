@@ -3902,6 +3902,7 @@ void blockPostponeClient(client *c);
 void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]);
 void unblockClientsInUseOnKey(robj *key);
 int blockedInUseClientWithPendingDeleteExists(robj *key);
+int blockedInUseDelClientExistsForDbs(int id1, int id2);
 void unblockClientsInUseOnAllKeys(void);
 void blockClientForReplicaAck(client *c, mstime_t timeout, long long offset, int numreplicas, int numlocal);
 void replicationRequestAckFromReplicas(void);

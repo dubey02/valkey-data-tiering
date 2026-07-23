@@ -1085,6 +1085,15 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "client-enforce-reply-list") && c->argc == 3) {
         server.debug_client_enforce_reply_list = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "ext-storage-pause-completions") && c->argc == 3) {
+        /* DEBUG EXT-STORAGE-PAUSE-COMPLETIONS <0|1> — hold flash completions
+         * (and clients blocked on them) in flight. Tests only. */
+        if (!ext_data_enabled) {
+            addReplyError(c, "ext-storage-enabled is not set");
+            return;
+        }
+        ext_storage_debug_pause_completions = atoi(objectGetVal(c->argv[2]));
+        addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc == 3) {
         /* DEBUG SPILL <key> — manually spill a key to external storage */
         if (!ext_data_enabled) {
@@ -1121,7 +1130,7 @@ void debugCommand(client *c) {
         value_copy->refcount = 1;
         objectSetVal(value_copy, objectGetVal(entry));
         long long expireMs = objectGetExpire(entry);
-        int rc = extStorageBridge_submitPut(db->id, keyobj, value_copy, expireMs);
+        int rc = extStorageBridge_submitPut(extStoragePhysicalDbId(db->id), keyobj, value_copy, expireMs);
         if (rc != 0) {
             decrRefCount(keyobj);
             zfree(value_copy); /* borrowed — don't free the value it points to */
@@ -1177,7 +1186,7 @@ void debugCommand(client *c) {
         sds raw_value = (sds)objectGetVal(entry);
         robj *value_copy = createStringObject(raw_value, sdslen(raw_value));
         long long expireMs = objectGetExpire(entry);
-        int rc = extStorageBridge_submitPut(db->id, keyobj, value_copy, expireMs);
+        int rc = extStorageBridge_submitPut(extStoragePhysicalDbId(db->id), keyobj, value_copy, expireMs);
         if (rc != 0) {
             decrRefCount(keyobj);
             decrRefCount(value_copy);
