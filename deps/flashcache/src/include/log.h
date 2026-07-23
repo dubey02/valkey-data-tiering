@@ -428,4 +428,12 @@ void logFlushStagingBufferIfRequired(flashcacheLog *log, size_t threshold);
 // Completes Threadsave Replication
 void logCompleteThreadsaveReplication(flashcacheLog *log);
 
+// Snapshot support: pause/resume the GC iterator (see logRunCronTasks)
+void logSetGcPaused(int paused);
+int logGetGcPaused(void);
+
+// Snapshot support: synchronous, fork-child-safe item read (no async IO)
+flashcacheReturnCode logForkChildReadItem(struct flashcacheLog *log, uint32_t dbid,
+        char const *key, size_t key_len, char **out_item, size_t *out_len);
+
 #endif  // __FLASHCACHE_LOG_H

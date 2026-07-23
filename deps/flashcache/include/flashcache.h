@@ -95,6 +95,19 @@ void flashcacheLoadSnapshot(char const *snapshot_filename,
  * on the data being fetched from flash. The expectation from the caller
  * to invoke this API after every GetItem or PutItem request.
  */
+/* Snapshot support: pause/resume the garbage collector. While paused,
+ * on-flash item offsets are stable (writes still append at the log tail),
+ * making it safe for a fork()ed snapshot child to pread frozen offsets. */
+void flashcacheSetGcPaused(int paused);
+int flashcacheGetGcPaused(void);
+
+/* Snapshot support: synchronous, fork-child-safe single-item read. Walks the
+ * (CoW) index and reads with pread(2) -- never touches the async IO ring.
+ * Returns FC_OK with a malloc'd *out_item (header+key+value; caller frees),
+ * or FC_ERR_CATCH_ALL. */
+flashcacheReturnCode flashcacheForkChildReadItem(uint32_t dbid, char const *key,
+        size_t key_len, char **out_item, size_t *out_len);
+
 flashcacheReturnCode flashcacheRunCronTasks();
 
 /*!\brief Returns the value associated with the specified metric */

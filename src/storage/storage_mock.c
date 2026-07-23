@@ -53,6 +53,9 @@ typedef struct fcCtx {
 
     pthread_t worker;
     volatile int shutdown;
+    /* Snapshot support: park the worker (outside locks) around fork(). */
+    volatile int snap_hold;
+    volatile int snap_held;
     storageCompletionFn completion_fn;
     void *completion_privdata;
 } fcCtx;
@@ -86,9 +89,21 @@ extern size_t objectComputeSize(void *key, void *value, int samples, int dbid);
 static void *fc_worker(void *arg) {
     fcCtx *ctx = arg;
     while (1) {
+        /* Snapshot support: park with NO locks held so a fork() in the main
+         * thread inherits free mutexes (a mutex held at fork deadlocks any
+         * child that later locks it). */
+        if (ctx->snap_hold) {
+            ctx->snap_held = 1;
+            while (ctx->snap_hold && !ctx->shutdown) usleep(50);
+            ctx->snap_held = 0;
+        }
         pthread_mutex_lock(&ctx->req_lock);
-        while (!ctx->req_head && !ctx->shutdown)
+        while (!ctx->req_head && !ctx->shutdown && !ctx->snap_hold)
             pthread_cond_wait(&ctx->req_cond, &ctx->req_lock);
+        if (ctx->snap_hold) {
+            pthread_mutex_unlock(&ctx->req_lock);
+            continue; /* go park at the top */
+        }
         if (ctx->shutdown && !ctx->req_head) {
             pthread_mutex_unlock(&ctx->req_lock);
             break;
@@ -324,6 +339,60 @@ static int fc_poll_completions(void *opaque, int max) {
     return count;
 }
 
+/* ---------------------------------------------------------------------------
+ * Snapshot support (see storage.h)
+ * ---------------------------------------------------------------------------*/
+static void fc_snapshot_hold(void *vctx) {
+    fcCtx *ctx = vctx;
+    ctx->snap_hold = 1;
+    /* Wake the worker if it is blocked on the request cond var. */
+    pthread_mutex_lock(&ctx->req_lock);
+    pthread_cond_broadcast(&ctx->req_cond);
+    pthread_mutex_unlock(&ctx->req_lock);
+    while (!ctx->snap_held) usleep(50);
+}
+
+static void fc_snapshot_release(void *vctx) {
+    fcCtx *ctx = vctx;
+    ctx->snap_hold = 0;
+}
+
+static void fc_gc_pause(void *vctx, int paused) {
+    /* The mock has no GC: nothing relocates stored bytes. */
+    (void)vctx; (void)paused;
+}
+
+/* Fork-child-safe read: plain hashtable lookup. Safe because the worker is
+ * guaranteed parked (holding no locks) at fork time, so the (duplicated)
+ * mutex in the child is free. Uses malloc, not zmalloc. */
+static storageStatus fc_fork_read(void *vctx, uint32_t db_id,
+                                  const void *key, size_t klen,
+                                  void **value, size_t *vlen) {
+    fcCtx *ctx = vctx;
+    uint32_t bucket = fc_hash(db_id, key, klen);
+    pthread_mutex_lock(&ctx->ht_lock);
+    fcEntry *e = ctx->buckets[bucket];
+    while (e) {
+        if (e->db_id == db_id && e->klen == klen &&
+            memcmp(e->key, key, klen) == 0) break;
+        e = e->next;
+    }
+    if (!e || !e->value || e->vlen == 0) {
+        pthread_mutex_unlock(&ctx->ht_lock);
+        return STORAGE_NOT_FOUND;
+    }
+    char *copy = storage_malloc(e->vlen);
+    if (!copy) {
+        pthread_mutex_unlock(&ctx->ht_lock);
+        return STORAGE_NOT_FOUND;
+    }
+    memcpy(copy, e->value, e->vlen);
+    *value = copy;
+    *vlen = e->vlen;
+    pthread_mutex_unlock(&ctx->ht_lock);
+    return STORAGE_OK;
+}
+
 static storageType flashcache_type = {
     .name = "flashcache",
     .version = VALKEY_STORAGE_VERSION,
@@ -336,6 +405,10 @@ static storageType flashcache_type = {
     .poll_completions = fc_poll_completions,
     .cron = NULL,
     .get_stats = NULL,
+    .snapshot_hold = fc_snapshot_hold,
+    .snapshot_release = fc_snapshot_release,
+    .gc_pause = fc_gc_pause,
+    .fork_read = fc_fork_read,
 };
 
 storageType *storageGetFlashCacheType(void) { return &flashcache_type; }

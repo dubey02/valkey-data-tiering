@@ -1053,6 +1053,19 @@ flashcacheReturnCode logRead(flashcacheLog *log, uint32_t dbid, char const *key,
 
 // When new cron tasks are added, we need to ensure that 'logShouldRunCronTasksImmediately'
 // function is updated to take into account the urgency of the new cron task.
+/* Snapshot support: when non-zero, logRunCronTasks skips the GC iterator so
+ * on-flash offsets stay stable for a concurrent fork-based snapshot child.
+ * Set/cleared by the embedding application around fork()/child-exit. */
+static int fc_gc_paused = 0;
+
+void logSetGcPaused(int paused) {
+    fc_gc_paused = paused;
+}
+
+int logGetGcPaused(void) {
+    return fc_gc_paused;
+}
+
 flashcacheReturnCode logRunCronTasks(flashcacheLog *log) {
     fioRequest **completed_fio_requests;
     int num_events = fioGetCompletedRequest(log->fio_context, &completed_fio_requests);
@@ -1300,7 +1313,13 @@ finish_processing_request:
     // In logShouldTriggerCronTasks function, we rely on this because if garbage collection is not running we assume
     // that garbage collection for the current window is done. This indicate that there is no pending cron task related
     // to garbage collection.
-    logIteratorCron(log->log_iterator);
+    //
+    // Snapshot support: while a fork-based snapshot child is alive, GC is
+    // paused so that log offsets frozen in the child's CoW index remain
+    // valid on the shared flash file (GC relocates/frees live regions;
+    // appends at the tail are safe). Read/write completions above are NOT
+    // affected -- only the iterator that drives GC is skipped.
+    if (!fc_gc_paused) logIteratorCron(log->log_iterator);
 
     // Update the snapshotting range start offset if tail offset has been moved due to evictions during Threadsave
     // replication. This is required because whenever eviction happens in flash, we move the log tail offset. As tail
@@ -1786,4 +1805,132 @@ void invokeAsioControlMsgCallback() {
     if (asio_control_msg_callback.callback != NULL) {
         asio_control_msg_callback.callback(asio_control_msg_callback.context);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Fork-child synchronous read (snapshot support)
+ *
+ * Reads one item's serialized bytes without touching the async fio path.
+ * Designed to be called from a fork()ed child process (or from the main
+ * thread of the parent while the IO thread is parked):
+ *
+ *  - The index is walked directly (CoW memory in a child; quiesced in the
+ *    parent case). No index mutation of any kind.
+ *  - Staging-buffer entries are served from memory (CoW heap).
+ *  - On-flash entries are read with pread(2) on the inherited fd. pread does
+ *    not share a file offset, and the io_uring/libaio ring is never touched,
+ *    so this is safe alongside the parent's async traffic.
+ *  - Offset validity across the child's lifetime is guaranteed by the GC
+ *    pause (logSetGcPaused): GC is the only writer that relocates or frees
+ *    live regions; normal writes append at the tail.
+ *
+ * Returns FC_OK and a malloc'd (*out_item) holding the full serialized item
+ * (header+key+value) on success; FC_ERR_CATCH_ALL if the key is absent or
+ * fails validation. The caller must free(*out_item).
+ * ---------------------------------------------------------------------------*/
+flashcacheReturnCode logForkChildReadItem(flashcacheLog *log, uint32_t dbid,
+        char const *key, size_t key_len, char **out_item, size_t *out_len) {
+    *out_item = NULL;
+    *out_len = 0;
+    if (dbid >= log->num_databases) return FC_ERR_CATCH_ALL;
+
+    indexEntry *entry = indexGetHeadEntry(log->index_list[dbid], key, key_len);
+    uint64_t want_hash = computeCollisionHash(log->hasher.hash_function, key, key_len);
+
+    while (entry) {
+        if (!entry->item_entry.log_entry.on_flash) {
+            /* Staging buffer: item bytes are in (CoW) memory. */
+            stagingBufferEntry *sbe = entry->item_entry.staging_buffer_entry;
+            if (compareKeyAndDbidInSerializedItem(sbe->item, dbid, key, key_len)) {
+                char *copy = malloc(sbe->item_len);
+                if (copy == NULL) return FC_ERR_CATCH_ALL;
+                memcpy(copy, sbe->item, sbe->item_len);
+                *out_item = copy;
+                *out_len = sbe->item_len;
+                return FC_OK;
+            }
+        } else if (entry->item_entry.log_entry.hash == want_hash) {
+            /* On flash. The 16-bit collision hash can false-positive, so the
+             * key inside the read bytes must be verified; on mismatch we keep
+             * walking the chain. */
+            logEntry *le = &entry->item_entry.log_entry;
+            size_t log_offset = expandTrimmedLogOffset(le->trimmed_log_offset);
+            size_t block_num_pages = (size_t)le->additional_pages + 1;
+            int pages_unknown = 0;
+            if (block_num_pages == (size_t)FC_MAX_ADDITIONAL_PAGES + 1) {
+                /* Very large item: page count saturated; read the header
+                 * first, then the exact remainder. */
+                pages_unknown = 1;
+                block_num_pages = 1;
+                if ((FC_PAGESIZE - (log_offset % FC_PAGESIZE)) < sizeof(itemHeader))
+                    block_num_pages = 2;
+            }
+
+            size_t page_aligned_offset = getFloorPageAlignedOffset(log_offset);
+            size_t item_pos = log_offset - page_aligned_offset;
+            size_t blocksize = FC_PAGESIZE * block_num_pages;
+            char *buf = NULL;
+            if (posix_memalign((void **)&buf, FC_PAGESIZE, blocksize) != 0)
+                return FC_ERR_CATCH_ALL;
+
+            ssize_t n = pread(log->fio_context->fd, buf, blocksize,
+                              (off_t)page_aligned_offset);
+            if (n < 0 || (size_t)n < item_pos + sizeof(itemHeader)) {
+                free(buf);
+                return FC_ERR_CATCH_ALL;
+            }
+
+            char *item = buf + item_pos;
+            if (!validateHeaderInSerializedItem(item, log->crc_function)) {
+                /* Torn/garbage header -- treat as not found rather than
+                 * asserting: the snapshot child must never kill itself on a
+                 * single bad item. */
+                free(buf);
+                entry = entry->next;
+                continue;
+            }
+            size_t total_len = extractTotalLenFromSerializedItem(item);
+
+            if (pages_unknown && item_pos + total_len > (size_t)n) {
+                /* Re-read with the exact size now that the header told us. */
+                size_t full_pages =
+                    (item_pos + total_len + FC_PAGESIZE - 1) / FC_PAGESIZE;
+                char *big = NULL;
+                if (posix_memalign((void **)&big, FC_PAGESIZE,
+                                   full_pages * FC_PAGESIZE) != 0) {
+                    free(buf);
+                    return FC_ERR_CATCH_ALL;
+                }
+                ssize_t n2 = pread(log->fio_context->fd, big,
+                                   full_pages * FC_PAGESIZE,
+                                   (off_t)page_aligned_offset);
+                free(buf);
+                if (n2 < 0 || (size_t)n2 < item_pos + total_len) {
+                    free(big);
+                    return FC_ERR_CATCH_ALL;
+                }
+                buf = big;
+                item = buf + item_pos;
+            } else if (item_pos + total_len > (size_t)n) {
+                free(buf);
+                return FC_ERR_CATCH_ALL;
+            }
+
+            if (compareKeyAndDbidInSerializedItem(item, dbid, key, key_len)) {
+                char *copy = malloc(total_len);
+                if (copy == NULL) {
+                    free(buf);
+                    return FC_ERR_CATCH_ALL;
+                }
+                memcpy(copy, item, total_len);
+                free(buf);
+                *out_item = copy;
+                *out_len = total_len;
+                return FC_OK;
+            }
+            free(buf); /* collision false positive: keep walking */
+        }
+        entry = entry->next;
+    }
+    return FC_ERR_CATCH_ALL;
 }

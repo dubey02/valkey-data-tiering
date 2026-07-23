@@ -24,6 +24,7 @@ int extStorageBridge_submitGet(int db_id, sds key);
 int extStorageBridge_submitDel(int db_id, sds key);
 int extStorageBridge_flushDB(int db_id);
 int extStorageBridge_flushAll(void);
+void extStorageBridge_drainOnly(void);
 
 /* Poll completions (replaces moduleGetCompletedExternalStorageResponses).
  * Returns ValkeyModuleExternalStorageMsg** for compatibility with existing
@@ -31,6 +32,13 @@ int extStorageBridge_flushAll(void);
 int extStorageBridge_pollCompletions(ValkeyModuleExternalStorageMsg **out, int max);
 
 /* Shutdown */
+/* Snapshot support (fork-based RDB save with tiered values) */
+int extStorageBridge_snapshotSupported(void);
+void extStorageBridge_snapshotHold(void);
+void extStorageBridge_snapshotRelease(void);
+void extStorageBridge_gcPause(int paused);
+int extStorageBridge_forkRead(int db_id, sds key, char **payload, size_t *plen);
+
 void extStorageBridge_shutdown(void);
 
 /* Propagate MODIFIABLE FC tuning configs to live backend */

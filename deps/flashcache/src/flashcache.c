@@ -135,6 +135,25 @@ void flashcacheLoadSnapshot(char const *snapshot_filename,
     logLoadSnapshot(flashcache_context.log, snapshot_filename, shared_secret, checksum_comparison_result);
 }
 
+/* Snapshot support: pause/resume GC so a fork-based snapshot child can read
+ * frozen on-flash offsets safely. See logForkChildReadItem. */
+void flashcacheSetGcPaused(int paused) {
+    logSetGcPaused(paused);
+}
+
+int flashcacheGetGcPaused(void) {
+    return logGetGcPaused();
+}
+
+/* Snapshot support: synchronous fork-child-safe read. Returns FC_OK and a
+ * malloc'd serialized item (caller frees) or FC_ERR_CATCH_ALL. */
+flashcacheReturnCode flashcacheForkChildReadItem(uint32_t dbid, char const *key,
+        size_t key_len, char **out_item, size_t *out_len) {
+    flashcacheAssert(flashcache_context.log != NULL);
+    return logForkChildReadItem(flashcache_context.log, dbid, key, key_len,
+                                out_item, out_len);
+}
+
 flashcacheReturnCode flashcacheRunCronTasks() {
     flashcacheAssert(flashcache_context.log != NULL);
 

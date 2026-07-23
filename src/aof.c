@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "ext_storage.h"
 #include "bio.h"
 #include "rio.h"
 #include "functions.h"
@@ -2437,8 +2438,16 @@ int rewriteSlotToAppendOnlyFileRio(rio *aof, int db_num, int hashslot, size_t *k
             }
         }
 
-        // TODO: Handle tiered objects
-        if (objectIsTiered(o)) serverAssert(false);
+        /* Data tiering: only the RDB-preamble rewrite serializes tiered
+         * values (via rdbSaveKeyValuePair materialization). The plain-AOF
+         * rewrite path would need a RESTORE-based emit (planned with slot
+         * migration); until then skip loudly rather than crash or lose
+         * data silently. aof-use-rdb-preamble defaults to yes. */
+        if (objectIsTiered(o)) {
+            serverLog(LL_WARNING, "AOF rewrite (non-preamble): skipping tiered key "
+                                  "(enable aof-use-rdb-preamble for full coverage)");
+            continue;
+        }
         if (rewriteObjectRio(aof, o, db_num) == C_ERR) return C_ERR;
     }
 
@@ -2488,8 +2497,15 @@ int rewriteAppendOnlyFileRio(rio *aof) {
                 }
             }
 
-            // TODO: Handle tiered objects
-            if (objectIsTiered(o)) serverAssert(false);
+            /* Data tiering: slot-migration snapshot serialization of tiered
+             * values (RESTORE-based emit) is the next phase of the
+             * replication design; until it lands, skip loudly rather than
+             * crash. Slot migration is not yet supported with tiering. */
+            if (objectIsTiered(o)) {
+                serverLog(LL_WARNING, "Slot snapshot: skipping tiered key "
+                                      "(tiered slot migration not yet supported)");
+                continue;
+            }
 
             if (rewriteObjectRio(aof, o, j) == C_ERR) goto werr;
         }
@@ -2628,6 +2644,24 @@ int rewriteAppendOnlyFileBackground(void) {
 
     server.stat_aof_rewrites++;
 
+    /* Data tiering: quiesce tiering IO / park the storage IO thread / pause
+     * on-flash GC before fork, exactly as rdbSaveBackground does. The AOF
+     * rewrite child serializes tiered values through the RDB-preamble
+     * materialization path (rdbSaveKeyValuePair) and therefore needs the
+     * same consistent, offset-stable view of flash. */
+    int tiering_snapshot_prepared = 0;
+    if (ext_data_enabled && num_items_on_flash > 0) {
+        if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
+            extStorageSnapshotPrepare() != C_OK) {
+            serverLog(LL_WARNING,
+                "Refusing AOF rewrite: %lld values reside on external storage "
+                "and the active backend cannot snapshot them", num_items_on_flash);
+            server.aof_lastbgrewrite_status = C_ERR;
+            return C_ERR;
+        }
+        tiering_snapshot_prepared = 1;
+    }
+
     if ((childpid = serverFork(CHILD_TYPE_AOF)) == 0) {
         char tmpfile[256];
 
@@ -2649,10 +2683,14 @@ int rewriteAppendOnlyFileBackground(void) {
     } else {
         /* Parent */
         if (childpid == -1) {
+            if (tiering_snapshot_prepared) extStorageSnapshotDone();
             server.aof_lastbgrewrite_status = C_ERR;
             serverLog(LL_WARNING, "Can't rewrite append only file in background: fork: %s", strerror(errno));
             return C_ERR;
         }
+        /* Unpark the storage IO thread; GC stays paused until the rewrite
+         * child is reaped (backgroundRewriteDoneHandler). */
+        if (tiering_snapshot_prepared) extStorageSnapshotResume();
         serverLog(LL_NOTICE, "Background append only file rewriting started by pid %ld", (long)childpid);
         server.aof_rewrite_scheduled = 0;
         server.aof_rewrite_time_start = time(NULL);
@@ -2774,6 +2812,10 @@ int getBaseAndIncrAppendOnlyFilesNum(aofManifest *am) {
 /* A background append only file rewriting (BGREWRITEAOF) terminated its work.
  * Handle this. */
 void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
+    /* Data tiering: the rewrite child is gone -- on-flash GC may resume.
+     * No-op when no snapshot was prepared. */
+    extStorageSnapshotDone();
+
     if (!bysignal && exitcode == 0) {
         char tmpfile[256];
         long long now = ustime();

@@ -21,6 +21,7 @@
  * No pthread mutex on the hot path — matches module's crossbeam performance.
  */
 #include "storage.h"
+#include "serialization.h"
 #include "flashcache.h"
 #include "flashcache_common.h"
 #include <pthread.h>
@@ -71,6 +72,15 @@ typedef struct fcRealCtx {
     pthread_t io_thread;
     _Atomic int shutdown;
     _Atomic int barrier_done;  /* Set by IO thread when BARRIER op is processed */
+
+    /* Snapshot support: snap_hold parks the IO worker at the top of its loop
+     * (outside all FlashCache code, holding nothing); snap_held acks the
+     * park. gc_paused is synced into FlashCache by the worker each loop, so
+     * the GC stays off across the whole snapshot-child lifetime while normal
+     * reads/writes keep flowing. */
+    _Atomic int snap_hold;
+    _Atomic int snap_held;
+    _Atomic int gc_paused;
     int eviction_enabled;      /* 0 = noeviction policy: GC runs but doesn't delete keys from engine */
     storageCompletionFn completion_fn;
     void *completion_privdata;
@@ -152,6 +162,21 @@ static void *fc_io_worker(void *arg) {
     pthread_setname_np(pthread_self(), "fc_io_worker");
 
     while (!atomic_load_explicit(&ctx->shutdown, memory_order_acquire)) {
+        /* Snapshot support: park here (a safe point -- no FC call in
+         * progress, no partial request) while the main thread forks. */
+        if (atomic_load_explicit(&ctx->snap_hold, memory_order_acquire)) {
+            atomic_store_explicit(&ctx->snap_held, 1, memory_order_release);
+            while (atomic_load_explicit(&ctx->snap_hold, memory_order_acquire) &&
+                   !atomic_load_explicit(&ctx->shutdown, memory_order_acquire)) {
+                struct timespec hts = {0, 50000};
+                nanosleep(&hts, NULL);
+            }
+            atomic_store_explicit(&ctx->snap_held, 0, memory_order_release);
+        }
+        /* Sync the GC pause flag into FlashCache (worker owns all FC calls). */
+        int gp = atomic_load_explicit(&ctx->gc_paused, memory_order_acquire);
+        if (gp != flashcacheGetGcPaused()) flashcacheSetGcPaused(gp);
+
         /* Process all pending requests */
         fcRequest req;
         int did_work = 0;
@@ -420,6 +445,60 @@ static int fc_real_cron(void *opaque) {
     return 0; /* cron runs on IO thread, not here */
 }
 
+/* ---------------------------------------------------------------------------
+ * Snapshot support (see storage.h)
+ * ---------------------------------------------------------------------------*/
+static void fc_real_snapshot_hold(void *vctx) {
+    fcRealCtx *ctx = vctx;
+    atomic_store_explicit(&ctx->snap_hold, 1, memory_order_release);
+    while (!atomic_load_explicit(&ctx->snap_held, memory_order_acquire)) {
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+}
+
+static void fc_real_snapshot_release(void *vctx) {
+    fcRealCtx *ctx = vctx;
+    atomic_store_explicit(&ctx->snap_hold, 0, memory_order_release);
+}
+
+static void fc_real_gc_pause(void *vctx, int paused) {
+    fcRealCtx *ctx = vctx;
+    atomic_store_explicit(&ctx->gc_paused, paused, memory_order_release);
+}
+
+/* Synchronous fork-child-safe read. Reads the full serialized item via
+ * FlashCache's pread path (no async ring), then extracts the value bytes.
+ * The returned buffer uses storage_malloc (zmalloc in-tree; safe in the fork
+ * child -- its memory accounting is CoW-private, same as rdbSaveObject). */
+static storageStatus fc_real_fork_read(void *vctx, uint32_t db_id,
+                                       const void *key, size_t klen,
+                                       void **value, size_t *vlen) {
+    (void)vctx;
+    char *item = NULL;
+    size_t item_len = 0;
+    if (flashcacheForkChildReadItem(db_id, (char const *)key, klen,
+                                    &item, &item_len) != FC_OK)
+        return STORAGE_NOT_FOUND;
+    char *val = NULL;
+    size_t val_len = 0;
+    extractValueFromSerializedItem(item, &val, &val_len);
+    if (val == NULL || val_len == 0) {
+        free(item);
+        return STORAGE_NOT_FOUND;
+    }
+    char *copy = storage_malloc(val_len);
+    if (copy == NULL) {
+        free(item); /* from flashcacheForkChildReadItem (plain malloc) */
+        return STORAGE_NOT_FOUND;
+    }
+    memcpy(copy, val, val_len);
+    free(item); /* from flashcacheForkChildReadItem (plain malloc) */
+    *value = copy;
+    *vlen = val_len;
+    return STORAGE_OK;
+}
+
 static storageType flashcache_real_type = {
     .name = "flashcache-real",
     .version = VALKEY_STORAGE_VERSION,
@@ -432,6 +511,10 @@ static storageType flashcache_real_type = {
     .poll_completions = fc_real_poll_completions,
     .cron = fc_real_cron,
     .get_stats = NULL,
+    .snapshot_hold = fc_real_snapshot_hold,
+    .snapshot_release = fc_real_snapshot_release,
+    .gc_pause = fc_real_gc_pause,
+    .fork_read = fc_real_fork_read,
 };
 
 /* Drain all in-flight IO + execute flush on the IO thread.

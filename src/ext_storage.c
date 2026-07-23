@@ -1684,7 +1684,146 @@ sds genExternalStorageInfoString(sds info) {
     }
     sdsfree(module_metrics);
 
+    info = genExternalStorageSnapshotInfoString(info);
     return info;
 }
 
 
+
+/* ---------------------------------------------------------------------------
+ * Snapshot support (fork-based RDB save with tiered values)
+ * Design: .agent/knowledge/replication-design.md, design-docs/data-tiering/replication.md
+ *
+ * Protocol (parent, main thread):
+ *   1. extStorageSnapshotPrepare():
+ *        a. settle loop: drain in-flight IO + apply completions until no key
+ *           is in a COPYING_* state (every value is EITHER in the hashtable
+ *           OR on flash -- the disjointness invariant);
+ *        b. park the backend IO thread at a safe point (so fork() inherits
+ *           no torn backend state and no held locks);
+ *        c. pause backend GC (on-flash offsets stay valid for the child).
+ *   2. fork(). Child inherits: consistent CoW hashtable, consistent CoW
+ *      backend index, stable flash file regions.
+ *   3. Parent: extStorageSnapshotResume() -- unpark the IO thread. Normal
+ *      traffic (spills/fetches/appends) resumes; GC stays paused.
+ *   4. Child exits (or foreground save completes):
+ *      extStorageSnapshotDone() -- unpause GC.
+ *
+ * The child (or the main thread, for foreground SAVE) materializes tiered
+ * values with extStorageMaterializeTiered(): a synchronous pread-based read
+ * that never touches the async IO path.
+ * ---------------------------------------------------------------------------*/
+static int snapshot_active = 0;           /* prepare done, done pending */
+static long long snapshot_saves = 0;      /* snapshots started (INFO) */
+static long long snapshot_tiered_saved = 0;   /* tiered values materialized (INFO, parent-visible only for foreground SAVE) */
+static long long snapshot_tiered_skipped = 0; /* pending-deletion / GC-evicted keys skipped */
+
+int extStorageSnapshotSupported(void) {
+    return ext_data_enabled && extStorageBridge_snapshotSupported();
+}
+
+int extStorageSnapshotActive(void) {
+    return snapshot_active;
+}
+
+int extStorageSnapshotPrepare(void) {
+    if (!ext_data_enabled) return C_OK;
+    if (!extStorageBridge_snapshotSupported()) return C_ERR;
+    serverAssert(!snapshot_active);
+
+    /* Settle: bounded drain until no in-flight IO remains. Completion
+     * processing can re-issue transiently rejected reads, so loop. */
+    for (int i = 0; i < 200; i++) {
+        extStorageBridge_drainOnly();
+        processCompletedStorageRequests();
+        if (total_items_spilling_to_ext_storage == 0 &&
+            total_items_fetching_from_ext_storage == 0) break;
+        usleep(500); /* let the IO worker finish queued work */
+    }
+    if (total_items_spilling_to_ext_storage != 0 ||
+        total_items_fetching_from_ext_storage != 0) {
+        serverLog(LL_WARNING,
+            "Snapshot prepare: in-flight tiering IO did not settle "
+            "(spilling=%lld fetching=%lld) -- refusing snapshot",
+            total_items_spilling_to_ext_storage,
+            total_items_fetching_from_ext_storage);
+        return C_ERR;
+    }
+
+    /* Park the IO thread OUTSIDE any backend call, then freeze GC. Order
+     * matters: the parked worker syncs the GC flag on resume, and while it
+     * is parked no GC can run at all. */
+    extStorageBridge_snapshotHold();
+    extStorageBridge_gcPause(1);
+    snapshot_active = 1;
+    snapshot_saves++;
+    return C_OK;
+}
+
+void extStorageSnapshotResume(void) {
+    if (!snapshot_active) return;
+    extStorageBridge_snapshotRelease();
+}
+
+void extStorageSnapshotDone(void) {
+    if (!snapshot_active) return;
+    extStorageBridge_gcPause(0);
+    extStorageBridge_snapshotRelease(); /* idempotent; covers foreground path */
+    snapshot_active = 0;
+}
+
+/* Materialize a tiered value for RDB serialization.
+ * Returns:  1 -- *payload/(plen) set to the DUMP-format bytes WITHOUT the
+ *                10-byte (version+CRC) footer: [type byte][rdbSaveObject
+ *                bytes], exactly what rdbSaveKeyValuePair needs. Caller
+ *                must zfree().
+ *           0 -- key must be skipped (logically deleted, or evicted from
+ *                flash by GC before the snapshot froze it).
+ * Runs in the fork child, or on the main thread during foreground SAVE
+ * while the IO thread is held. */
+int extStorageMaterializeTiered(int dbid, robj *key, robj *val, char **payload, size_t *plen) {
+    serverAssert(objectIsTiered(val));
+
+    /* PENDING_DELETION: flash copy is (being) deleted for a client DEL --
+     * the key is logically gone. */
+    if (val->tiering_state == TIERING_STATE_PENDING_DELETION) {
+        snapshot_tiered_skipped++;
+        return 0;
+    }
+
+    sds keyname = (sds)objectGetVal(key);
+    char *buf = NULL;
+    size_t len = 0;
+    if (extStorageBridge_forkRead(extStoragePhysicalDbId(dbid), keyname, &buf, &len) != 0) {
+        /* Not on flash: GC evicted it before the freeze. Consistent with the
+         * engine lazily discovering NOT_FOUND and dropping the key. */
+        snapshot_tiered_skipped++;
+        return 0;
+    }
+    /* DUMP payload = [type][object bytes][2B rdbver][8B crc64]. Strip the
+     * footer; sanity-check there is at least a type byte under it. */
+    if (len <= 10) {
+        zfree(buf);
+        snapshot_tiered_skipped++;
+        return 0;
+    }
+    *payload = buf;
+    *plen = len - 10;
+    snapshot_tiered_saved++;
+    return 1;
+}
+
+sds genExternalStorageSnapshotInfoString(sds info) {
+    info = sdscatprintf(info,
+        "snapshot_supported:%d\r\n"
+        "snapshot_active:%d\r\n"
+        "snapshot_saves:%lld\r\n"
+        "snapshot_tiered_values_saved:%lld\r\n"
+        "snapshot_tiered_values_skipped:%lld\r\n",
+        extStorageSnapshotSupported() ? 1 : 0,
+        snapshot_active,
+        snapshot_saves,
+        snapshot_tiered_saved,
+        snapshot_tiered_skipped);
+    return info;
+}

@@ -50,6 +50,20 @@ extern long long num_items_on_flash; /* values currently on external storage */
 void extStorageSyncFetch(serverDb *db, sds key);
 
 int extStorageIsInitialized(void);
+
+/* ---------------------------------------------------------------------------
+ * Snapshot support (fork-based RDB save; see ext_storage.c for the protocol)
+ * ---------------------------------------------------------------------------*/
+int extStorageSnapshotSupported(void);
+int extStorageSnapshotActive(void);
+int extStorageSnapshotPrepare(void);   /* main thread, before fork/save */
+void extStorageSnapshotResume(void);   /* parent, right after fork */
+void extStorageSnapshotDone(void);     /* child reaped / foreground save done */
+/* Fork-child (or held-worker main-thread) materialization of a tiered value.
+ * 1 = *payload/(plen) set ([type][object bytes], zfree() after use);
+ * 0 = skip this key. */
+int extStorageMaterializeTiered(int dbid, robj *key, robj *val, char **payload, size_t *plen);
+sds genExternalStorageSnapshotInfoString(sds info);
 /* SWAPDB db-id indirection (see ext_storage.c). */
 int extStoragePhysicalDbId(int logical_id);
 int extStorageLogicalDbId(int physical_id);

@@ -103,44 +103,29 @@ start_server [list tags {"ext-storage" "ext-storage-blocking"} overrides [list \
     }
 
     # ------------------------------------------------------------------
-    # RDB fail-loudly + DEBUG OBJECT (bugs 5 and 7 from the command audit)
+    # RDB snapshotting with tiered values (full coverage in
+    # ext-storage-snapshot.tcl; these assert the paths formerly gated)
     # ------------------------------------------------------------------
 
-    test {SAVE fails loudly while values are on flash} {
+    test {SAVE succeeds while values are on flash} {
         r set rdbgate "[string repeat q 300]"
         debug_spill_wait rdbgate
         assert {[get_tiering_counter num_items_on_flash] > 0}
-        assert_error "*not supported while values reside on external storage*" {r save}
-        assert_error "*not supported while values reside on external storage*" {r bgsave}
-    }
-
-    test {DEBUG RELOAD fails instead of silently losing flash values} {
-        assert {[get_tiering_counter num_items_on_flash] > 0}
-        catch {r debug reload} err
-        assert_match {*} $err ;# must error, not succeed
-        assert {![string match {OK} $err]}
-        # And critically: the flash-resident key still has its data
+        assert_equal {OK} [r save]
+        assert_match {Background saving started*} [r bgsave]
+        waitForBgsave r
+        # Value untouched, still flash-resident or fetchable
         assert_equal 300 [r strlen rdbgate]
     }
 
-    test {SAVE succeeds again once no values remain on flash} {
-        # Promote everything back to memory by touching all keys
-        foreach k [r keys *] { catch {r type $k}; catch {r getrange $k 0 0} }
-        # Collections need a read too
-        foreach k [r keys *] {
-            switch [r type $k] {
-                list {r lrange $k 0 0}
-                stream {r xlen $k}
-            }
-        }
-        wait_for_counter total_num_items_fetched_from_ext_storage 1 15000
-        if {[get_tiering_counter num_items_on_flash] == 0} {
-            assert_equal {OK} [r save]
-        } else {
-            # Some keys may re-spill under pressure; the invariant tested is
-            # the gate condition itself, exercised in the previous tests.
-            assert_error "*external storage*" {r save}
-        }
+    test {DEBUG RELOAD round-trips flash values} {
+        r set rdbgate2 "[string repeat w 300]"
+        debug_spill_wait rdbgate2
+        assert {[get_tiering_counter num_items_on_flash] > 0}
+        r debug reload
+        # After reload, values that were on flash are back (in memory)
+        assert_equal 300 [r strlen rdbgate]
+        assert_equal 300 [r strlen rdbgate2]
     }
 
     test {SWAPDB works with tiering (db-id indirection)} {

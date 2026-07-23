@@ -54,3 +54,15 @@
 | 1 | **Optimized for** | Read-heavy, skewed (Zipfian) access with a cold tail; values 500 B–5 KB; datasets larger than DRAM; session stores, product catalogs; TTL-heavy workloads | 134K TPS at 82% DRAM hit, ~24% overhead vs non-tiered; TTL workloads fastest (159K TPS) |
 | 2 | **Works, with reduced performance** | Uniform access (no locality); very large values (500 KB+); balanced read/write | Uniform: 86K TPS; 500 KB+: disk-bandwidth-bound (~1.6K TPS) but stable, no cliff |
 | 3 | **Poor fit — not targeted** | Tiny values (~100 B, per-key metadata overhead dominates); always-hot datasets (nothing cold to tier — pure overhead); full-scan and highly-rotating workloads; write-heavy at sustained high rate | 100 B values: lowest TPS of all sizes; scans defeat LRU/LFU locality |
+
+## Acknowledgments
+
+This proposal was shaped by feedback from the Valkey community:
+
+- Barani (Reddit)
+- Xintian Li (Reddit)
+- Vu Pham (Reddit)
+- Skyfire Lee (ByteDance)
+- Harkrishn Patro (Apple)
+- Ping Xie (Oracle)
+- Viktor Söderqvist (Ericsson)

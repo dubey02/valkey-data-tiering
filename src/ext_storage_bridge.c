@@ -287,6 +287,38 @@ int extStorageBridge_pollCompletions(ValkeyModuleExternalStorageMsg **out, int m
     return count;
 }
 
+/* ---------------------------------------------------------------------------
+ * Snapshot support passthrough (native backends only; a module-registered
+ * backend reports unsupported and the engine keeps its fail-loudly gates).
+ * ---------------------------------------------------------------------------*/
+int extStorageBridge_snapshotSupported(void) {
+    return storageSnapshotSupported();
+}
+
+void extStorageBridge_snapshotHold(void) {
+    storageSnapshotHold();
+}
+
+void extStorageBridge_snapshotRelease(void) {
+    storageSnapshotRelease();
+}
+
+void extStorageBridge_gcPause(int paused) {
+    storageGcPause(paused);
+}
+
+/* Fork-child-safe read of a tiered key's serialized DUMP payload.
+ * Returns 0 + malloc'd *payload (caller free()s) on success, -1 if absent. */
+int extStorageBridge_forkRead(int db_id, sds key, char **payload, size_t *plen) {
+    void *val = NULL;
+    size_t vlen = 0;
+    if (storageForkRead((uint32_t)db_id, key, sdslen(key), &val, &vlen) != STORAGE_OK)
+        return -1;
+    *payload = (char *)val;
+    *plen = vlen;
+    return 0;
+}
+
 void extStorageBridge_shutdown(void) {
     storageShutdown();
 
@@ -318,6 +350,17 @@ int extStorageBridge_flushDB(int db_id) {
     storagePollCompletions(64);
     processCompletedStorageRequests();
     return 0;
+}
+
+/* Drain all in-flight backend IO WITHOUT flushing any data (snapshot
+ * prepare). For the real FlashCache backend this is a barrier op on the IO
+ * thread; for async backends without a barrier (mock) it is a no-op -- the
+ * caller's settle loop polls completions until the in-flight counters
+ * reach zero. */
+void extStorageBridge_drainOnly(void) {
+    extern void fc_real_drain(uint32_t db_id);
+    fc_real_drain((uint32_t)-2); /* -2 = drain only, no flush */
+    storagePollCompletions(4096);
 }
 
 int extStorageBridge_flushAll(void) {

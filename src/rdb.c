@@ -1189,26 +1189,43 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid, int rdbver) {
-    /* Skip tiered entries — value is on external storage, not in memory.
-     * The storage module handles its own persistence. On restart, tiered
-     * keys will not be present (cold data is lost unless the module
-     * restores them from its own persistent store). */
-    if (objectIsTiered(val)) return 0;
+    /* Data tiering: the value lives on external storage (robj->ptr is NULL).
+     * Materialize its serialized bytes with a synchronous, fork-child-safe
+     * read. The on-flash format is the DUMP payload ([type byte][rdbSaveObject
+     * bytes][footer]); with the footer stripped it is byte-for-byte what this
+     * function would produce, so the entry below is a 100%% standard RDB
+     * entry -- loadable by any node, tiered or not (on load the value starts
+     * in memory and re-tiers under memory pressure).
+     *
+     * Runs in the BGSAVE fork child, or on the main thread during foreground
+     * SAVE -- both under extStorageSnapshotPrepare()'s guarantees (no
+     * in-flight IO, IO worker parked at fork, GC paused).
+     *
+     * NOTE: the payload was serialized at spill time with this binary's
+     * RDB_VERSION. A future dual-channel replication downgrade (rdbver <
+     * RDB_VERSION) would need a deserialize/reserialize fallback here. */
+    char *tiered_payload = NULL;
+    size_t tiered_plen = 0;
+    if (objectIsTiered(val)) {
+        if (!extStorageMaterializeTiered(dbid, key, val, &tiered_payload, &tiered_plen))
+            return 0; /* logically deleted (pending DEL) or GC-evicted: skip */
+    }
 
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
+#define rdb_kvp_fail() do { if (tiered_payload) zfree(tiered_payload); return -1; } while (0)
     /* Save the expire time */
     if (expiretime != -1) {
-        if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) return -1;
-        if (rdbSaveMillisecondTime(rdb, expiretime) == -1) return -1;
+        if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) rdb_kvp_fail();
+        if (rdbSaveMillisecondTime(rdb, expiretime) == -1) rdb_kvp_fail();
     }
 
     /* Save the LRU info. */
     if (savelru) {
         uint64_t idletime = objectGetLRUIdleSecs(val);
-        if (rdbSaveType(rdb, RDB_OPCODE_IDLE) == -1) return -1;
-        if (rdbSaveLen(rdb, idletime) == -1) return -1;
+        if (rdbSaveType(rdb, RDB_OPCODE_IDLE) == -1) rdb_kvp_fail();
+        if (rdbSaveLen(rdb, idletime) == -1) rdb_kvp_fail();
     }
 
     /* Save the LFU info. */
@@ -1218,11 +1235,21 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
          * bit counter, since the frequency is logarithmic with a 0-255 range.
          * Note that we do not store the halving time because to reset it
          * a single time when loading does not affect the frequency much. */
-        if (rdbSaveType(rdb, RDB_OPCODE_FREQ) == -1) return -1;
-        if (rdbWriteRaw(rdb, &freq, 1) == -1) return -1;
+        if (rdbSaveType(rdb, RDB_OPCODE_FREQ) == -1) rdb_kvp_fail();
+        if (rdbWriteRaw(rdb, &freq, 1) == -1) rdb_kvp_fail();
     }
 
-    /* Save type, key, value */
+    /* Save type, key, value. For a tiered entry the type byte and the object
+     * bytes are spliced from the materialized DUMP payload. */
+    if (tiered_payload) {
+        if (rdbWriteRaw(rdb, tiered_payload, 1) == -1) rdb_kvp_fail();       /* type byte */
+        if (rdbSaveStringObject(rdb, key) == -1) rdb_kvp_fail();
+        if (rdbWriteRaw(rdb, tiered_payload + 1, tiered_plen - 1) == -1) rdb_kvp_fail();
+        zfree(tiered_payload);
+        if (server.rdb_key_save_delay) debugDelay(server.rdb_key_save_delay);
+        return 1;
+    }
+
     int rdbtype = rdbGetObjectType(val, rdbver);
     if (rdbtype == -1) {
         if (server.hide_user_data_from_log) {
@@ -1233,6 +1260,7 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
         }
         return -1;
     }
+#undef rdb_kvp_fail
     if (rdbSaveType(rdb, rdbtype) == -1) return -1;
     if (rdbSaveStringObject(rdb, key) == -1) return -1;
     if (rdbSaveObject(rdb, val, key, dbid, rdbtype) == -1) return -1;
@@ -1639,20 +1667,29 @@ int rdbSaveToFile(const char *filename) {
 
 /* Save the DB on disk. Return C_ERR on error, C_OK on success. */
 int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
-    /* Data tiering: refuse to write a snapshot that silently drops
-     * flash-resident values (covers auto-save, SHUTDOWN save, DEBUG RELOAD;
-     * the command-level gates give clients a descriptive error first).
-     * Rate-limited log: serverCron retries failed saves every cycle. */
-    if (ext_data_enabled && num_items_on_flash > 0) {
-        static mstime_t last_log = 0;
-        if (mstime() - last_log > 60000) {
-            serverLog(LL_WARNING,
-                "Refusing RDB save: %lld values reside on external storage and "
-                "would be silently lost (data tiering limitation)", num_items_on_flash);
-            last_log = mstime();
+    /* Data tiering: flash-resident values are included in the snapshot via
+     * the materialization path in rdbSaveKeyValuePair. A foreground save
+     * (SAVE, DEBUG RELOAD, SHUTDOWN save, serverCron auto-save) must first
+     * quiesce the tiering IO so the main thread can read from flash
+     * directly; a BGSAVE child inherits that quiesced state from the
+     * prepare done in rdbSaveBackground() and must not re-prepare.
+     * Backends without snapshot support (module-registered) still refuse,
+     * loudly, rather than writing a lossy snapshot. */
+    int tiering_snapshot_prepared = 0;
+    if (!server.in_fork_child && ext_data_enabled && num_items_on_flash > 0) {
+        if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
+            extStorageSnapshotPrepare() != C_OK) {
+            static mstime_t last_log = 0;
+            if (mstime() - last_log > 60000) {
+                serverLog(LL_WARNING,
+                    "Refusing RDB save: %lld values reside on external storage and "
+                    "the active backend cannot snapshot them", num_items_on_flash);
+                last_log = mstime();
+            }
+            errno = EPERM;
+            return C_ERR;
         }
-        errno = EPERM;
-        return C_ERR;
+        tiering_snapshot_prepared = 1;
     }
     char tmpfile[256];
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
@@ -1661,6 +1698,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     snprintf(tmpfile, 256, "temp-%d.rdb", (int)getpid());
 
     if (rdbSaveInternal(req, tmpfile, rsi, rdbflags) != C_OK) {
+        if (tiering_snapshot_prepared) extStorageSnapshotDone();
         stopSaving(0);
         return C_ERR;
     }
@@ -1675,11 +1713,13 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
                   "destination %s (in server root dir %s): %s",
                   tmpfile, filename, cwdp ? cwdp : "unknown", str_err);
         unlink(tmpfile);
+        if (tiering_snapshot_prepared) extStorageSnapshotDone();
         stopSaving(0);
         return C_ERR;
     }
     if (fsyncFileDir(filename) != 0) {
         serverLog(LL_WARNING, "Failed to fsync directory while saving DB: %s", strerror(errno));
+        if (tiering_snapshot_prepared) extStorageSnapshotDone();
         stopSaving(0);
         return C_ERR;
     }
@@ -1688,6 +1728,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty = 0;
     server.lastsave = time(NULL);
     server.lastbgsave_status = C_OK;
+    if (tiering_snapshot_prepared) extStorageSnapshotDone();
     stopSaving(1);
     return C_OK;
 }
@@ -1700,6 +1741,24 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
 
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
+
+    /* Data tiering: quiesce tiering IO, park the storage IO thread and pause
+     * on-flash GC BEFORE fork(), so the child inherits a consistent backend
+     * state and stable flash offsets. The parent resumes the IO thread right
+     * after fork; GC stays paused until the child is reaped
+     * (backgroundSaveDoneHandler -> extStorageSnapshotDone). */
+    int tiering_snapshot_prepared = 0;
+    if (ext_data_enabled && num_items_on_flash > 0) {
+        if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
+            extStorageSnapshotPrepare() != C_OK) {
+            serverLog(LL_WARNING,
+                "Refusing background save: %lld values reside on external storage "
+                "and the active backend cannot snapshot them", num_items_on_flash);
+            server.lastbgsave_status = C_ERR;
+            return C_ERR;
+        }
+        tiering_snapshot_prepared = 1;
+    }
 
     if ((childpid = serverFork(CHILD_TYPE_RDB)) == 0) {
         int retval;
@@ -1719,10 +1778,14 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     } else {
         /* Parent */
         if (childpid == -1) {
+            if (tiering_snapshot_prepared) extStorageSnapshotDone();
             server.lastbgsave_status = C_ERR;
             serverLog(LL_WARNING, "Can't save in background: fork: %s", strerror(errno));
             return C_ERR;
         }
+        /* Unpark the storage IO thread: normal tiering traffic resumes while
+         * the child snapshots (GC stays paused for the child's lifetime). */
+        if (tiering_snapshot_prepared) extStorageSnapshotResume();
         serverLog(LL_NOTICE, "Background saving started by pid %ld", (long)childpid);
         server.rdb_save_time_start = time(NULL);
         server.rdb_child_type = RDB_CHILD_TYPE_DISK;
@@ -3739,6 +3802,10 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
 
 /* When a background RDB saving/transfer terminates, call the right handler. */
 void backgroundSaveDoneHandler(int exitcode, int bysignal) {
+    /* Data tiering: the snapshot child is gone (success, error or kill) --
+     * on-flash GC may resume. No-op when no snapshot was prepared. */
+    extStorageSnapshotDone();
+
     int type = server.rdb_child_type;
     time_t save_end = time(NULL);
 
@@ -3958,12 +4025,12 @@ void saveCommand(client *c) {
         return;
     }
 
-    /* Data tiering: RDB does not yet serialize flash-resident values — the
-     * placeholder would be written and the data silently lost on reload.
-     * Fail loudly instead of producing a lossy snapshot. */
-    if (ext_data_enabled && num_items_on_flash > 0) {
+    /* Data tiering: flash-resident values are snapshotted via the
+     * materialization path (see rdbSave). Only refuse when the active
+     * backend cannot support it (module-registered backends). */
+    if (ext_data_enabled && num_items_on_flash > 0 && !extStorageSnapshotSupported()) {
         addReplyError(c, "SAVE is not supported while values reside on external "
-                         "storage (data tiering): the snapshot would silently lose "
+                         "storage: the active storage backend cannot snapshot "
                          "flash-resident values");
         return;
     }
@@ -4009,10 +4076,10 @@ void bgsaveCommand(client *c) {
         }
     }
 
-    /* Data tiering: see saveCommand — refuse to write a lossy snapshot. */
-    if (ext_data_enabled && num_items_on_flash > 0) {
+    /* Data tiering: see saveCommand. */
+    if (ext_data_enabled && num_items_on_flash > 0 && !extStorageSnapshotSupported()) {
         addReplyError(c, "BGSAVE is not supported while values reside on external "
-                         "storage (data tiering): the snapshot would silently lose "
+                         "storage: the active storage backend cannot snapshot "
                          "flash-resident values");
         return;
     }

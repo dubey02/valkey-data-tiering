@@ -79,15 +79,12 @@ start_server [list tags {"ext-storage" "ext-storage-persistence"} overrides [lis
         assert_equal [r dbsize] 6
     }
 
-    test {KNOWN LIMITATION: AOF rewrite loses tiered keys (persistence unsupported)} {
-        # Persistence (RDB/AOF) and replication are NOT supported with data
-        # tiering yet. The AOF rewrite writes an RDB-format base file whose
-        # serializer deliberately skips tiered entries (rdb.c), and the
-        # rewrite absorbs the command history — so flash-resident keys are
-        # LOST across an AOF reload. SAVE/BGSAVE/DEBUG RELOAD fail loudly
-        # (see ext-storage-blocking.tcl); the AOF rewrite path does not yet.
-        # This test documents the current behavior; it should be replaced
-        # when the persistence design (fetch-or-tiered-opcode) lands.
+    test {AOF rewrite (RDB preamble) preserves tiered keys} {
+        # The RDB-preamble base of the AOF rewrite serializes flash-resident
+        # values through the snapshot materialization path (fork-based, see
+        # ext-storage-snapshot.tcl), so tiered keys now SURVIVE an AOF
+        # reload. (The non-preamble rewrite path still skips them with a
+        # warning; aof-use-rdb-preamble defaults to yes.)
         r flushall
         r config set maxmemory 10mb
         r config set appendonly yes
@@ -106,10 +103,10 @@ start_server [list tags {"ext-storage" "ext-storage-persistence"} overrides [lis
 
         r debug loadaof
 
-        # Documented loss: all three keys were flash-resident at rewrite
-        # time, the RDB-preamble base skipped them, and the rewrite
-        # truncated the command tail that would have replayed them.
-        assert_equal [r dbsize] 0
+        assert_equal 3 [r dbsize]
+        assert_equal "important_data_padding_[string repeat X 200]" [r get persist_str]
+        assert_equal "val1" [r hget persist_hash f1]
+        assert_equal {x y z} [r lrange persist_list 0 -1]
         r config set appendonly no
     }
 }

@@ -88,3 +88,32 @@ void storageCron(void) {
         server_storage->cron(server_storage_ctx);
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Snapshot support dispatch
+ * ---------------------------------------------------------------------------*/
+int storageSnapshotSupported(void) {
+    return server_storage && server_storage->fork_read &&
+           server_storage->snapshot_hold && server_storage->snapshot_release;
+}
+
+void storageSnapshotHold(void) {
+    if (server_storage && server_storage->snapshot_hold)
+        server_storage->snapshot_hold(server_storage_ctx);
+}
+
+void storageSnapshotRelease(void) {
+    if (server_storage && server_storage->snapshot_release)
+        server_storage->snapshot_release(server_storage_ctx);
+}
+
+void storageGcPause(int paused) {
+    if (server_storage && server_storage->gc_pause)
+        server_storage->gc_pause(server_storage_ctx, paused);
+}
+
+storageStatus storageForkRead(uint32_t db_id, const void *key, size_t klen,
+                              void **value, size_t *vlen) {
+    if (!server_storage || !server_storage->fork_read) return STORAGE_NOT_FOUND;
+    return server_storage->fork_read(server_storage_ctx, db_id, key, klen, value, vlen);
+}

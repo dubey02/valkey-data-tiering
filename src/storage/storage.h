@@ -117,6 +117,36 @@ typedef struct storageType {
     /* Optional */
     int (*cron)(void *ctx);
     void (*get_stats)(void *ctx, storageStats *out);
+
+    /* -----------------------------------------------------------------------
+     * Snapshot support (fork-based RDB save with tiered values).
+     * All four are optional; a backend that leaves them NULL does not support
+     * snapshotting (the engine keeps its fail-loudly gates).
+     * -----------------------------------------------------------------------*/
+
+    /* Park the backend's IO thread at a safe point (outside any backend
+     * library call, holding no locks) and return once it is parked. Called
+     * by the main thread immediately before fork() so the child inherits a
+     * consistent backend state. */
+    void (*snapshot_hold)(void *ctx);
+
+    /* Release a previously held IO thread. */
+    void (*snapshot_release)(void *ctx);
+
+    /* Pause/resume on-storage garbage collection. While paused, the storage
+     * locations of existing items are stable (new writes may still append).
+     * Pause spans the snapshot child's lifetime. */
+    void (*gc_pause)(void *ctx, int paused);
+
+    /* Synchronous, fork-child-safe read of one item's VALUE bytes (the same
+     * serialized payload that was stored via put). Runs entirely on the
+     * calling thread; never touches the async IO path. Also callable from
+     * the parent main thread while the IO thread is held (foreground SAVE).
+     * Returns STORAGE_OK and a malloc'd *value (caller free()s), or
+     * STORAGE_NOT_FOUND. */
+    storageStatus (*fork_read)(void *ctx, uint32_t db_id,
+                               const void *key, size_t klen,
+                               void **value, size_t *vlen);
 } storageType;
 
 /* ---------------------------------------------------------------------------
@@ -132,6 +162,15 @@ storageStatus storageSubmitGet(uint32_t db_id, const void *key, size_t klen,
 storageStatus storageSubmitDel(uint32_t db_id, const void *key, size_t klen,
                                void *request_ctx);
 int storagePollCompletions(int max);
+
+/* Snapshot support (see storageType). No-ops / STORAGE_NOT_FOUND when the
+ * active backend doesn't implement them. */
+int storageSnapshotSupported(void);
+void storageSnapshotHold(void);
+void storageSnapshotRelease(void);
+void storageGcPause(int paused);
+storageStatus storageForkRead(uint32_t db_id, const void *key, size_t klen,
+                              void **value, size_t *vlen);
 void storageCron(void);
 
 /* Backend getters */
