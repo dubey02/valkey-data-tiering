@@ -780,6 +780,11 @@ long long dbTotalServerKeyCount(void) {
 void signalModifiedKey(client *c, serverDb *db, robj *key) {
     touchWatchedKey(db, key);
     trackingInvalidateKey(c, key, 1);
+    /* Tiering: if this key holds a transiently-installed value (promotion=never /
+     * 2hit-50k first hit), mark it dirty so the beforeSleep revert writes the
+     * modification through to flash instead of discarding it. No-op (single
+     * branch) outside the transient window. */
+    if (ext_data_enabled) extStorageMarkTransientDirty(db, key);
 }
 
 void signalFlushedDb(int dbid, int async) {

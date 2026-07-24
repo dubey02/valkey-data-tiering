@@ -149,6 +149,8 @@ long long flash_admit_skipped_floor = 0; /* skipped: embedded/below spill floor 
 // Promotion policy metrics
 long long total_transient_promotions = 0;       /* fetches served transiently (promotion=never) */
 long long transient_promotion_clients_served = 0; /* total clients served via transient path */
+long long transient_write_throughs = 0;          /* transient entries overwritten by a client and written through to flash */
+long long transient_write_through_retained = 0;  /* write-throughs kept in DRAM (unspillable value; stale flash copy deleted) */
 long long total_permanent_promotions = 0;       /* fetches that promoted to DRAM (promotion=always) */
 
 /* ---------------------------------------------------------------------------
@@ -175,6 +177,9 @@ typedef struct transientValueEntry {
     void *orig_val;     /* saved original placeholder (empty sds) */
     int orig_encoding;
     int orig_type;
+    int dirty;          /* set when a client writes the key during the transient
+                         * window: the entry now holds a client-written value,
+                         * so it must be written through to flash, not reverted */
 } transientValueEntry;
 
 static transientValueEntry transient_values[TRANSIENT_VALUES_MAX];
@@ -1029,6 +1034,7 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                                 tv->orig_val = objectGetVal(entry);
                                 tv->orig_encoding = entry->encoding;
                                 tv->orig_type = entry->type;
+                                tv->dirty = 0;
                             } else {
                                 /* Overflow: free old placeholder (can't revert, fall through to permanent) */
                                 void *placeholder = objectGetVal(entry);
@@ -1119,6 +1125,7 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                                     tv->orig_val = objectGetVal(entry);
                                     tv->orig_encoding = entry->encoding;
                                     tv->orig_type = entry->type;
+                                    tv->dirty = 0;
                                 } else {
                                     void *placeholder = objectGetVal(entry);
                                     if (placeholder != NULL) sdsfree((sds)placeholder);
@@ -1380,7 +1387,10 @@ void extStorageSyncFetch(serverDb *db, sds key) {
         if (state == TIERING_STATE_PENDING_DELETION) goto done_absent; /* logically deleted */
 
         if (state == TIERING_STATE_ONLY_FLASH) {
-            if (extStorageBridge_submitGet(extStoragePhysicalDbId(db->id), key) == 0) {
+            int get_flags = (ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_NEVER ||
+                             ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_2HIT_50K)
+                            ? STORAGE_GET_FLAG_PEEK : STORAGE_GET_FLAG_NONE;
+            if (extStorageBridge_submitGet(extStoragePhysicalDbId(db->id), key, get_flags) == 0) {
                 extStorageSetState(db, key, TIERING_STATE_COPYING_TO_MEMORY,
                                    VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ);
                 total_items_fetching_from_ext_storage++;
@@ -1466,9 +1476,13 @@ static int spillItemAsync(sds key, int db_id) {
      * These keys are in ONLY_MEMORY temporarily — their value will be freed and
      * reverted to a TIERED placeholder in extStorageFreeTransientValues(). Spilling
      * them would cause the WRITE completion to find an unexpected state (ONLY_FLASH)
-     * after the transient revert, triggering the state assertion. */
+     * after the transient revert, triggering the state assertion.
+     * DIRTY transients are exempt: a client wrote them during the window, the
+     * revert is skipped for them, and spilling is exactly how their write is
+     * persisted (write-through). */
     for (int i = 0; i < transient_values_count; i++) {
-        if (transient_values[i].db_id == db_id &&
+        if (!transient_values[i].dirty &&
+            transient_values[i].db_id == db_id &&
             sdscmp(transient_values[i].key, key) == 0) return -1;
     }
 
@@ -1516,6 +1530,10 @@ static int spillItemAsync(sds key, int db_id) {
     /* Transition: ONLY_MEMORY → COPYING_TO_FLASH */
     extStorageSetState(db, key, TIERING_STATE_COPYING_TO_FLASH,
         VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_WRITE);
+    /* Count the in-flight spill HERE so every submit path (eviction loops,
+     * flash admission, transient write-through) is balanced against the
+     * unconditional decrement in the WRITE completion handler. */
+    total_items_spilling_to_ext_storage++;
     consecutive_spill_failures = 0; /* Submission accepted — reset failure counter */
     return 0;
 }
@@ -1736,7 +1754,6 @@ static long long spillFillToProjected(void) {
         if (spillItemAsync(best_key, best_dbid) == -1) break;  /* submit-queue backpressure */
 
         spill_submitted++;
-        total_items_spilling_to_ext_storage++;
         if (spill_submitted >= 64) break;  /* cold-start brake: yield to event loop */
     }
     ext_storage_spill_pool_active = 0;
@@ -1803,7 +1820,6 @@ static long long spillItemCountBeforeSleep(void) {
 
             spill_submitted++;
             num_items_spilling++;
-            total_items_spilling_to_ext_storage++;
         }
         ext_storage_spill_pool_active = 0;
     }
@@ -1827,8 +1843,6 @@ static long long spillItemCountAggressive(void) {
             if (extStorageGetState(server.db[best_dbid], best_key) != TIERING_STATE_ONLY_MEMORY) break;
 
             if (spillItemAsync(best_key, best_dbid) == -1) break;
-
-            total_items_spilling_to_ext_storage++;
         }
         ext_storage_spill_pool_active = 0;
     }
@@ -1882,6 +1896,22 @@ int processCompletedStorageRequestsAndSpillOldItemsAggressive(void) {
  * blockedBeforeSleep → this function). spillItemAsync guards against picking
  * transient keys by checking the transient_values array.
  * ---------------------------------------------------------------------------*/
+void extStorageMarkTransientDirty(serverDb *db, robj *key) {
+    /* Called from signalModifiedKey() on every key modification. Outside the
+     * transient window transient_values_count is 0, so this is a single
+     * predictable branch on the hot write path. Over-marking is safe: a dirty
+     * transient is written through to flash, which is always correct for a
+     * key that was just modified (TTL-only changes included). */
+    if (transient_values_count == 0) return;
+    for (int i = 0; i < transient_values_count; i++) {
+        if (transient_values[i].db_id == db->id &&
+            sdscmp(transient_values[i].key, (sds)objectGetVal(key)) == 0) {
+            transient_values[i].dirty = 1;
+            return;
+        }
+    }
+}
+
 void extStorageFreeTransientValues(void) {
     if (transient_values_count == 0) return;
 
@@ -1891,26 +1921,66 @@ void extStorageFreeTransientValues(void) {
         dbEntry *entry = dbFind(db, tv->key);
 
         if (entry != NULL && !objectIsTiered(entry)) {
-            /* Entry still has the transient value — revert to placeholder.
-             * Free the transient value (the fetched data) and restore the
-             * original placeholder. Multiple clients on the same key were all
-             * served in processUnblockedClients() — free exactly once here. */
-            robj *tmp = createObject(entry->type, objectGetVal(entry));
-            tmp->encoding = entry->encoding;
-            decrRefCount(tmp); /* Frees the transient value data */
+            if (tv->dirty) {
+                /* A client WROTE this key during the transient window: the
+                 * entry no longer holds the fetched copy but a client-written
+                 * value. Reverting would silently discard the write (and free
+                 * a value the transient bookkeeping doesn't own). Instead,
+                 * write it through to flash via the standard spill pipeline:
+                 * the key rides COPYING_TO_FLASH (reads served from RAM,
+                 * writes blocked, value kept alive for IO-thread serialize),
+                 * and the WRITE completion tombstones it back to ONLY_FLASH.
+                 * FC's log index supersedes the old entry on PutItem, so
+                 * subsequent fetches see the new value and the old log entry
+                 * becomes garbage for GC. */
+                sdsfree((sds)tv->orig_val); /* discard the stale placeholder */
+                transient_write_throughs++;
+                if (spillItemAsync(tv->key, tv->db_id) == 0) {
+                    /* WRITE completion will num_items_on_flash++; the flash
+                     * item count is unchanged by a supersede, so balance the
+                     * increment here. */
+                    if (num_items_on_flash > 0) num_items_on_flash--;
+                } else {
+                    /* Not spillable right now (embedded value, refcount>1,
+                     * bridge not ready). Correctness over policy: retain the
+                     * written value in DRAM as ONLY_MEMORY and delete the
+                     * stale flash copy so no future fetch can resurrect the
+                     * old value. */
+                    extStorageBridge_submitDel(tv->db_id, tv->key);
+                    if (num_items_on_flash > 0) num_items_on_flash--;
+                    transient_write_through_retained++;
+                }
+            } else {
+                /* Entry still has the transient value — revert to placeholder.
+                 * Free the transient value (the fetched data) and restore the
+                 * original placeholder. Multiple clients on the same key were all
+                 * served in processUnblockedClients() — free exactly once here. */
+                robj *tmp = createObject(entry->type, objectGetVal(entry));
+                tmp->encoding = entry->encoding;
+                decrRefCount(tmp); /* Frees the transient value data */
 
-            /* Restore TIERED placeholder */
-            entry->encoding = tv->orig_encoding;
-            entry->type = tv->orig_type;
-            objectSetVal(entry, tv->orig_val);
-            /* Transition back to ONLY_FLASH now that clients have been served */
-            extStorageSetState(db, tv->key, TIERING_STATE_ONLY_FLASH, 0);
+                /* Restore TIERED placeholder */
+                entry->encoding = tv->orig_encoding;
+                entry->type = tv->orig_type;
+                objectSetVal(entry, tv->orig_val);
+                /* Transition back to ONLY_FLASH now that clients have been served */
+                extStorageSetState(db, tv->key, TIERING_STATE_ONLY_FLASH, 0);
 
-            transient_promotion_clients_served++; /* approximate: 1 per key */
+                transient_promotion_clients_served++; /* approximate: 1 per key */
+            }
         } else {
             /* Entry was deleted or already reverted (race/DEL during serve).
              * Free the saved placeholder since we won't reinstall it. */
             if (tv->orig_val != NULL) sdsfree((sds)tv->orig_val);
+            if (entry == NULL) {
+                /* Key was DELETED during the transient window (state was
+                 * ONLY_MEMORY, so dbDelete removed it without notifying the
+                 * backend). Delete the flash copy too — otherwise it is
+                 * orphaned in the log forever (space leak) even though reads
+                 * stay correct (not-in-dict is a true miss). */
+                extStorageBridge_submitDel(tv->db_id, tv->key);
+                if (num_items_on_flash > 0) num_items_on_flash--;
+            }
         }
         sdsfree(tv->key);
     }
@@ -2065,6 +2135,8 @@ sds genExternalStorageInfoString(sds info) {
         "flash_admit_skipped_floor:%lld\r\n"
         "total_transient_promotions:%lld\r\n"
         "transient_promotion_clients_served:%lld\r\n"
+        "transient_write_throughs:%lld\r\n"
+        "transient_write_through_retained:%lld\r\n"
         "total_permanent_promotions:%lld\r\n"
         "promotion_filtered_onehit:%lld\r\n"
         "promotion_2hit_admitted:%lld\r\n"
@@ -2073,6 +2145,8 @@ sds genExternalStorageInfoString(sds info) {
         flash_admit_skipped_floor,
         total_transient_promotions,
         transient_promotion_clients_served,
+        transient_write_throughs,
+        transient_write_through_retained,
         total_permanent_promotions,
         promotion_filtered_onehit,
         promotion_2hit_admitted,

@@ -140,6 +140,7 @@ sds genExternalStorageInfoString(sds info);
 
 /* Transient promotion: free values after processUnblockedClients completes */
 void extStorageFreeTransientValues(void);
+void extStorageMarkTransientDirty(serverDb *db, robj *key);
 
 /* State machine API */
 TieringState extStorageGetState(serverDb *db, sds key);

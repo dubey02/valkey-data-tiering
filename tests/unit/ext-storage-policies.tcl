@@ -63,6 +63,7 @@ proc wait_for_flash_admit {expected_min {timeout 5000}} {
 
 start_server [list tags {"ext-storage"} overrides [list \
     ext-storage-enabled yes \
+    ext-storage-backend flashcache-mock \
     maxmemory 8mb \
     maxmemory-policy allkeys-lru \
 ]] {
