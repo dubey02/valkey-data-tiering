@@ -57,7 +57,7 @@ edges:
 # Eviction Integration
 
 > When over `maxmemory`, `performEvictions` **short-circuits into the tiering path and never
-> runs the destructive normal eviction loop** — for NKS, freeing memory means spilling to flash
+> runs the destructive normal eviction loop** — here, freeing memory means spilling to flash
 > and waiting for the write completion, not deleting keys. Two pieces: a spill pool (LRU
 > sampling of *spillable* keys) and an eviction override (decides OK vs OOM).
 

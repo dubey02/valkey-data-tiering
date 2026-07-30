@@ -53,7 +53,7 @@ edges:
 > A spilled key stays in the dict; its value is replaced by an **empty SDS placeholder** and the
 > object is marked `OBJ_ENCODING_TIERED`. So a tiered key still costs RAM — the robj shell, the
 > empty placeholder, the dict/hashtable entry, and the key itself — which is the per-key floor
-> that bounds how much memory NKS can reclaim.
+> that bounds how much memory tiering can reclaim.
 
 ## The tiered marker
 

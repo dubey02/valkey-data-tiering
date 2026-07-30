@@ -1,6 +1,6 @@
 # AGENTS.md — Wiki Maintainer
 
-You are the **maintainer of the NKS Data Tiering wiki** (`.agent/wiki/`). You exist only
+You are the **maintainer of the Data Tiering wiki** (`.agent/wiki/`). You exist only
 to keep this wiki accurate, well-linked, and current. You are **not** the code-development
 agent — building/testing/benchmarking the tiering feature is governed by `../AGENT.md`
 (`.agent/AGENT.md`), which is for a developer agent working in the code.
@@ -19,8 +19,9 @@ first every session and follow its "Start here" loop. If this file and `WIKI.md`
 
 ## What this wiki is
 
-A persistent, compounding architecture reference for Valkey **non-key-spilling (NKS)** data
-tiering. **NKS only** — never document, compare against, or reference key-spilling/DT (see
+A persistent, compounding architecture reference for Valkey **data tiering**. Scope is the
+**v1 design: values spill, keys stay in the dict** — do not document, compare against, or
+reference the key-spilling lineage (see
 `WIKI.md` § Scope). The raw sources (the C engine code + legacy notes) are **immutable**;
 the wiki is the synthesis layer you own.
 

@@ -78,13 +78,13 @@ edges:
 
 # Architecture Decision Records
 
-> Index of the load-bearing NKS tiering design decisions, each distilled from **this repo's
+> Index of the load-bearing data tiering design decisions, each distilled from **this repo's
 > code** and the page that documents it. Legacy `.agent/knowledge` notes are background; where
 > they disagree with the code, the code wins (see [known-limitations](known-limitations.md)).
 
 | ADR | Decision | Code anchor | Page | Status |
 |-----|----------|-------------|------|--------|
-| 001 | **Non-key-spilling**: keys always stay in the dict; only *values* spill to flash | `OBJ_ENCODING_TIERED` `server.h:779`; `objectIsTiered` `server.h:839` | [00-overview](../00-overview.md) | active |
+| 001 | **Values-only spill (v1)**: keys always stay in the dict; only *values* spill to flash | `OBJ_ENCODING_TIERED` `server.h:779`; `objectIsTiered` `server.h:839` | [00-overview](../00-overview.md) | active |
 | 002 | Per-object tiering state lives in a **3-bit `robj` bitfield**, not a side table | `tiering_state:3` `server.h:829` | [state-machine](../components/state-machine.md) | active |
 | 003 | **One `storageType` vtable, two dispatch paths** — async if `put_async!=NULL`, else shared middleware | `storage_dispatch.c:26` | [pluggable-storage-api](../components/pluggable-storage-api.md), [storageType vtable](../interfaces/storagetype-vtable.md) | active |
 | 004 | **robj-at-boundary serialization** — the backend serializes via engine FFI callbacks on its own IO thread | `ext_storage.c:232` | [serialization](../components/serialization.md), [backends](../components/backends.md) | active |
@@ -97,7 +97,7 @@ edges:
 
 ## Notes
 
-- **ADR-001/002 (NKS core).** Because the key never leaves the dict, the engine's state machine —
+- **ADR-001/002 (v1 core).** Because the key never leaves the dict, the engine's state machine —
   not a bloom filter — is the existence oracle; this is why the Rust backends' `key_may_exist` is
   left unregistered ([known-limitations](known-limitations.md) C5).
 - **ADR-003/004 (one vtable, robj boundary).** The vtable serves both sync backends (via the shared

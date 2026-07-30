@@ -32,6 +32,47 @@ python3 .agent/wiki/keg/extract_relations.py        # dry-run; --apply to write 
 Exit 0 = clean (warnings allowed); 1 = errors (broken edge targets, invalid kinds,
 asymmetric `contradicts`). Use `--stats` as a manual gate.
 
+## Two views of the same wiki
+
+| View | Entry point | Good for |
+|---|---|---|
+| **Graph** (node view) | `keg/viewer/index.html` | "what links to what", blast radius, triage |
+| **Book** (reading view) | `docs/index.html` | reading a chapter start-to-finish, sharing a link |
+
+The book view is a documentation-style reading site: a hierarchical top-level table
+of contents, a page per part, a page per wiki page with its own section ToC, and
+Prev / Up / Next navigation (← / → / `u` also work as keys).
+
+**There is no build step and no generated output.** The whole thing is three static
+files — `docs/index.html`, `docs/app.js`, `docs/style.css` — that read the wiki's own
+markdown at request time:
+
+| What | Where it comes from at runtime |
+|---|---|
+| Part → chapter hierarchy, summaries, status | the curated tables in `index.md` |
+| Chapter titles, status, tier | each page's front matter |
+| Section ToCs, anchors, numbering | the H2/H3 headings in each page |
+| Prose | the `.md` itself, rendered with the `marked.js` vendored under `keg/viewer/vendor/` |
+
+So adding a page to an `index.md` table is all it takes for it to appear in the book
+view — nothing to regenerate, and no second copy of the content to drift. The only
+hand-maintained structure is `PARTS` at the top of `app.js`: part titles/blurbs, which
+`index.md` heading feeds each part, and the handful of pages `index.md` does not list
+(`WIKI.md`, `AGENTS.md`, `keg/README.md`, `keg/RETRIEVAL.md`, `log.md`).
+
+Routing is hash-based, because GitHub Pages cannot rewrite paths and one generated
+`.html` per page is not worth committing:
+
+```
+docs/#/                      top-level table of contents
+docs/#/part/components       a part's ToC
+docs/#/state-machine         a chapter
+docs/#/known-limitations/l5-spill-controller-livelocks-on-a-large-instantaneous-memory-overshoot
+```
+
+Both views need to be served over HTTP (see below) rather than opened as `file://`
+paths, since both fetch the markdown.
+
 ## Viewing the graph
 
 ```bash

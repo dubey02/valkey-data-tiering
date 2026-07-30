@@ -69,7 +69,7 @@ edges:
 
 # Integration Tests (Tiering)
 
-> Tcl integration tests under `tests/unit/` that validate NKS tiering: spill/fetch
+> Tcl integration tests under `tests/unit/` that validate data tiering: spill/fetch
 > round-trip integrity for every data type, key lifecycle on tiered keys, and
 > AOF/RDB crash-safety. This page maps each behavior to the test that covers it.
 
@@ -79,7 +79,7 @@ edges:
 |------|--------|------:|-------|
 | ext-storage-data-types.tcl | ext-storage, ext-storage-data-types | 60 | Spill/fetch data validity across all 6 structure types + key lifecycle + Lua/MULTI/EXEC/COPY/APPEND/PERSIST command surface + bash-migration backfill (MSET, RANDOMKEY, DBSIZE, Lua edge cases) |
 | ext-storage-persistence.tcl | ext-storage, ext-storage-persistence | 2 | AOF rewrite crash-safety; AOF-reload persistence (regression marker) |
-| ext-storage.tcl | ext-storage | 12 | NKS dict-invariant suite (loads an external module backend) |
+| ext-storage.tcl | ext-storage | 12 | dict-invariant suite (loads an external module backend) |
 | introspection.tcl | introspection | — | Adds the 4 `ext-storage-*` configs to the immutable skip_configs list |
 
 Line numbers below are positions of the `test {…}` blocks within the named file
@@ -242,9 +242,9 @@ These tests exercise the staged `objectIsTiered` guards in the persistence paths
 > not a currently-passing guarantee. Tracked as L1 in
 > [known-limitations](../decisions/known-limitations.md).
 
-## ext-storage.tcl — NKS dict-invariant suite
+## ext-storage.tcl — dict-invariant suite
 
-`ext-storage.tcl` (12 tests) asserts the core NKS invariant — keys stay in the dict after their
+`ext-storage.tcl` (12 tests) asserts the core v1 invariant — keys stay in the dict after their
 values spill — plus the read/lifecycle surface against a module-backed backend:
 
 | Test (line) | Asserts |

@@ -1,6 +1,6 @@
-// NKS tiering state machine — source: src/ext_storage.h, context/state-machine-design.md
+// Data tiering state machine — source: src/ext_storage.h, context/state-machine-design.md
 // Render: dot -Tpng state-machine.dot -o state-machine.png
-digraph nks_tiering_state {
+digraph data_tiering_state {
     rankdir=LR;
     bgcolor="white";
     node [shape=box, style="rounded,filled", fillcolor="#eef3fb", fontname="Helvetica", fontsize=11];

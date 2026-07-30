@@ -2,7 +2,7 @@
 
 Append-only. One line per ingest/query/lint. Newest at bottom.
 
-## [2026-06-03] scaffold | Created NKS tiering wiki skeleton
+## [2026-06-03] scaffold | Created data tiering wiki skeleton
 - Schema [WIKI](WIKI.md), [index](index.md), this log.
 - 3 seed pages written (draft): [00-overview](00-overview.md), [01-architecture](01-architecture.md), [state-machine](components/state-machine.md).
 - 22 stub pages created across components/, interfaces/, flows/, decisions/.
@@ -211,7 +211,7 @@ Append-only. One line per ingest/query/lint. Newest at bottom.
      referenced in src/ or modules/ — bridge's "rocksdb" arm selects the ASYNC type
      (ext_storage_bridge.c:74). The whole storage_middleware.c sync path is unreachable/dead.
   2. Rust backends implement key_may_exist (rocksdb/backend.rs:218, flashcache/backend.rs:100) but
-     the NKS module leaves it unregistered (lib.rs:533-536: false positives "block clients forever").
+     the value-spill module leaves it unregistered (lib.rs:533-536: false positives "block clients forever").
   + doc-vs-code: README.md uses stale `key-spilling` module name/paths; live crate is `non-key-spilling`.
 - Updated: 01-architecture.md backends-row cell ("rocksdb (sync via middleware)" → async; sync
   variant unwired) to match the bridge (grep-verified). index.md catalog + Remaining work + counts.
@@ -260,7 +260,7 @@ Append-only. One line per ingest/query/lint. Newest at bottom.
 
 ## [2026-06-05] ingest | adr-index + known-limitations (decisions) → active | WIKI COMPLETE
 - New/written: decisions/adr-index.md + decisions/known-limitations.md (stub→active). Final tranche.
-- adr-index: 9 code-grounded ADRs (001 NKS values-only server.h:779/839; 002 robj tiering_state
+- adr-index: 9 code-grounded ADRs (001 values-only server.h:779/839; 002 robj tiering_state
   bitfield server.h:829; 003 one vtable two paths storage_dispatch.c:26; 004 robj-at-boundary
   serialize ext_storage.c:169; 005 module-precedence + mock fallback ext_storage_bridge.c:65-104;
   006 DUMP all-types ext_storage.c:169/749; 007 persistence skips tiered rdb.c:1195; 008 memory-gated
@@ -584,3 +584,36 @@ Append-only. One line per ingest/query/lint. Newest at bottom.
   7-backfill-test confirm). Updated status in the page frontmatter and the index.md registry row.
 - Layer-1 re-verified post-promotion: verify_citations [OK] (0 err/0 warn); keg_lint pages=26
   errors=0 warnings=0 orphans=0.
+
+## [2026-07-30] tooling | reading view under docs/ + legacy moniker dropped
+
+- Added a reading view at `docs/`: hierarchical table of contents over 6 parts / 31
+  chapters / 189 sections, a page per part, and a chapter page with an in-page section
+  ToC, numbered sections with anchor handles, breadcrumbs and Prev/Up/Next (also bound to
+  left/right/u). The KEG viewer keeps the node view; the two cross-link.
+- It is three static files (`docs/index.html`, `docs/app.js`, `docs/style.css`) that
+  assemble the view from this wiki's markdown when the page is opened: hierarchy,
+  summaries and status from the curated tables in `index.md`; titles/status/tier from each
+  page's front matter; section ToCs, numbering and anchors from each page's H2/H3
+  headings; prose via the `marked.js` vendored under `keg/viewer/vendor/`. `index.md` is
+  the manifest -- adding a row to one of its tables is all it takes for a page to appear.
+  The only structure held outside the wiki content is `PARTS` at the top of `app.js`.
+- Routes are hash-based (`docs/#/state-machine`, `docs/#/<page>/<section>`) because GitHub
+  Pages cannot rewrite paths. Cross-page `.md` links and `#fragments` in the rendered
+  prose are rewritten to routes; diagrams and non-page assets resolve to their real paths.
+- Dropped the legacy three-letter moniker from every title, heading, front-matter
+  `title:`, blurb, table summary, diagram comment, tool docstring and both viewers. Scope
+  is now stated as v1 -- values spill, keys stay in the dict, key spilling a possible
+  future config -- in `00-overview.md`, `WIKI.md` § Scope and `AGENTS.md`; ADR-001 is
+  titled "Values-only spill (v1)". Code identifiers are untouched
+  (`modules/non-key-spilling/...` paths, the crate/module name, the `storageType` name,
+  and the verbatim `server.h:779` comment quote) -- rewriting them would falsify the
+  citations.
+- Verified across the corpus: every chapter file present and summarised, 189 ToC sections
+  against 212 rendered H2/H3 headings with 0 unreachable anchors, 0 duplicate route slugs,
+  0 dead `#fragments`, 308/312 intra-wiki `.md` links resolving (the 4 misses are the
+  illustrative `rel.md` placeholders in `WIKI.md`/`AGENTS.md`). Deep-link scrolling
+  confirmed in-browser. `.md` files are served raw as `text/markdown` on Pages thanks to
+  the repo-root `.nojekyll`. `state-machine.dot`'s digraph identifier was renamed and its
+  render confirmed byte-identical, so the committed PNG stays valid. keg_lint: pages=26,
+  0 errors / 0 warnings / 0 orphans.
