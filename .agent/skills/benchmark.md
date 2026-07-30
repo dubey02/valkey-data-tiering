@@ -53,8 +53,8 @@ Located at `benchmark/scenarios/mixed-rw/configs/`:
 | `zipfian-1gb-module.env` | Module backend (currently broken) |
 | `compound-flashcache.env` | All data types (hash, list, set, zset, stream) with FC |
 | `size-sweep-fc.env` | Standard size sweep (512B values) |
-| `size-sweep-fc-100b.env` | Tiny values (100B, metadata overhead dominates) |
-| `size-sweep-fc-500k.env` | Large values (500KB, tests throttle behavior) |
+| `fixed-fc-100b.env` | Tiny values (100B, metadata overhead dominates) |
+| `fixed-fc-500k.env` | Large values (500KB, tests throttle behavior; does not converge) |
 | `size-sweep-fc-large.env` | Extra large values (500KB + 5MB legs) |
 | `balanced-flashcache.env` | 50/50 read/write ratio |
 | `flashcache-local.env` | Local FlashCache (no EC2 needed, uses /tmp) |
