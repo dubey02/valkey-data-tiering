@@ -617,3 +617,157 @@ Append-only. One line per ingest/query/lint. Newest at bottom.
   the repo-root `.nojekyll`. `state-machine.dot`'s digraph identifier was renamed and its
   render confirmed byte-identical, so the committed PNG stays valid. keg_lint: pages=26,
   0 errors / 0 warnings / 0 orphans.
+
+## [2026-07-30] fix | re-grounded citations on the current tree — 42 errors → 0
+
+- `verify_citations` had been red for a while: 42 errors, all in four pages, all one root
+  cause. The pages were grounded on an older layout in which the storage backends were C
+  modules under `modules/storage_example/` and `modules/storage_flashcache_module/`, the
+  Rust module lived at `modules/non-key-spilling/`, and the tcl suite sat directly in
+  `tests/unit/`. None of those paths exist any more. The architecture the pages describe —
+  `storageType` vtable, bridge, middleware, mock and real-flashcache backends — is intact;
+  only the file layout moved.
+- Established mapping (each confirmed by reading the code, not assumed): the Rust module
+  is now `modules/flash-tiering/` with the same internal shape (`src/lib.rs`,
+  `src/dispatcher.rs`, `src/callbacks.rs`, `src/backends/{rocksdb,flashcache}/backend.rs`);
+  the C backends moved into the engine as `src/storage/storage_mock.c` and
+  `src/storage/storage_flashcache_real.c`; the tcl suite is now `tests/unit/data-tiering/`.
+  Every citation was re-pointed **and its line numbers re-read from the current file** —
+  no old range was carried across to a new path.
+- Corrections to claims, not just paths:
+  - `interfaces/storagetype-vtable.md` listed a getter `storageGetRocksDBType` ("RocksDB,
+    sync via middleware") that exists nowhere in the tree. There is no engine-native
+    RocksDB backend at all: `storageGetRocksDBAsyncType` is an **alias returning the same
+    in-memory mock struct** (`src/storage/storage_mock.c:418`), whose own comment says the
+    `"rocksdb"` config value reuses the mock "to avoid duplicating 300 lines of identical
+    hashtable code". Real RocksDB is a module, not an engine backend.
+  - `components/backends.md`: the claimed mock **fallback** does not exist — a failed
+    backend does not silently degrade to the mock.
+  - C5 in `decisions/known-limitations.md` still holds: `key_may_exist` is implemented by
+    both flash-tiering backends but its registration is commented out
+    (`modules/flash-tiering/src/lib.rs:552-559`) with the reason intact in the code —
+    "Registering it causes false positives that block clients forever" — and
+    `src/module.c:945` conservatively returns "may exist" when no callback is registered.
+  - `components/testing.md`: the suite grew from the 3 cited files to **19 files / 225 test
+    blocks**; every per-file count in the coverage table was re-derived from the tcl
+    sources. `ext-storage.tcl` (12 tests) is documented as **never running** in practice
+    because it needs a module path that is absent.
+- **Citation hazard worth knowing:** two headers named `storage.h` exist —
+  `src/storage/storage.h` (the compiled one) and an older, larger, **uncompiled**
+  `src/storage.h` that nothing includes. A bare `storage.h:NN` or `:NN` citation resolves
+  to the wrong file, so this interface must always be cited by full path.
+- Flagged, not fixed: neither Rust module mirrors four of the vtable's fields; and the two
+  `objectIsTiered` skip sites in `src/aof.c` carry each other's log wording.
+- Result: `verify_citations` pages=26 **errors=0**, warnings 121 → 73. keg_lint unchanged
+  at 0 errors / 0 warnings / 0 orphans.
+
+## [2026-07-30] fix | re-grounded the persistence story — it had inverted under us
+
+- The citation pass exposed a worse problem than stale paths: the engine gained fork-based
+  snapshot persistence, and three pages still asserted the opposite. `verify_citations` was
+  **green throughout** — every citation resolved to a real line; the prose simply said the
+  reverse of what those lines do. A clean checker run proves nothing about accuracy.
+- Corrected story, all re-read against the tree: `rdbSaveKeyValuePair` materializes a tiered
+  value via `extStorageMaterializeTiered` and emits a **standard RDB entry** — "loadable by any
+  node, tiered or not" — so RDB files, the AOF-preamble base (default) and disk-target replica
+  full sync all carry tiered data. `return 0` survives only as the skip for a logically-gone
+  key (`PENDING_DELETION` or GC-evicted). The fork-snapshot protocol (settle to no `COPYING_*`
+  key → park the backend IO thread → pause GC → fork → resume → done) is what makes it
+  consistent, and it is wired into foreground SAVE, BGSAVE and background AOF rewrite.
+- `known-limitations` restructured rather than trimmed: **L1** narrowed to what is still true
+  (non-preamble AOF, slot migration, diskless fork, tiering placement), the resolved bulk moved
+  to **R3** with a proof table, former C6 moved to **R4**, and two new entries added — **L8**
+  (with a non-snapshotting backend, tiered data disables persistence *entirely*: the save paths
+  fail closed rather than write a lossy snapshot) and **C8** (see below). Nothing was deleted.
+- **Engine finding, flagged not demonstrated:** `rdbSaveToReplicasSockets` (`rdb.c:3845`) — the
+  **default** replication path, `repl-diskless-sync` defaults to yes — forks and materializes
+  tiered values in the child but is the only fork/save entry point that never calls
+  `extStorageSnapshotPrepare()`, and it carries no fail-closed guard either. So it can fork with
+  keys in `COPYING_*`, the IO thread unparked and GC running: exactly the three conditions the
+  protocol exists to exclude. Likely symptom is silently skipped keys (`forkRead` returns -1 on
+  a miss rather than faulting) rather than a crash — but that is inference. No test covers a
+  replica full sync with tiered values. Needs a maintainer decision on whether it is deliberate.
+- **C8, a real source bug found by reading past the log text:** the two tiered-skip warnings in
+  `src/aof.c` name each other's path. Line 2446 sits in `rewriteSlotToAppendOnlyFileRio` (slot
+  migration) but logs "AOF rewrite (non-preamble)"; line 2504 sits in `rewriteAppendOnlyFileRio`
+  but logs "Slot snapshot". Anything that trusts the message — including an earlier note in this
+  log — attributes both skips to the wrong path. Assign these sites by enclosing function.
+- `index.md`: the persistence registry row and the known-limitations counts (5 contradictions /
+  8 limits / 4 resolved) were corrected. Dated session notes further down are left as record.
+- Result: `verify_citations` pages=26 errors=0, warnings 73 → 67. keg_lint 0/0/0.
+
+## [2026-07-30] tooling+triage | staleness check now uses git dates; the 52 STALE warnings are real
+
+- `verify_citations` computed staleness from filesystem **mtime**, which in a fresh clone or
+  after a branch checkout is the checkout time for every file — so the reported dates were
+  meaningless (everything read "mtime 2026-07-30"). It now asks git for each cited file's last
+  commit date (`source_change_date()`, falling back to mtime for untracked files or when git is
+  unavailable).
+- Worth recording honestly: I expected this to eliminate most of the 52 STALE warnings as clone
+  artifacts. **It did not.** The identical 52 warnings fire, now with true dates — the cited
+  sources really did change (2026-07-01, 07-22, 07-23) after these pages were last verified
+  (2026-06-03 … 06-10). The fix corrected the *dates*, not the count; its value is accuracy plus
+  removing a latent false-positive source.
+- What the 52 actually point at: three feature commits landed on this branch after the pages were
+  verified, and only one has been reconciled.
+  - `bb442bcff` fork-based RDB snapshotting (07-23) — **reconciled** today, see the persistence
+    entry above.
+  - `6976634d2` module correctness / DEL semantics / mid-execution key access (07-22) — **not
+    reconciled**.
+  - `b36f2d1a1` SWAPDB support, pending-DEL guard, runtime policy guard (07-23) — **not
+    reconciled**.
+- Three concrete defects already confirmed from the unreconciled pair, each traced to code:
+  1. `components/state-machine.md` says "each key is in one of **5** states" and documents five.
+     The enum has **six**: `TIERING_STATE_PENDING_DELETION = 5` (`src/ext_storage.h`) is absent
+     from the page's state table, transition table and blocking matrix.
+  2. The SWAPDB physical-db-id indirection (`extStoragePhysicalDbId`, used in `src/db.c`,
+     `src/expire.c`) appears in **no** component page — only as a test name in `testing.md`.
+  3. Mid-execution synchronous fetch (`extStorageSyncFetch`, `src/db.c`) is likewise
+     undocumented outside a test name.
+- The remaining 15 warnings are the softer "symbol not in cited sources" class, and most are
+  benign: command names used as prose (`DBSIZE`, `EXISTS`, `EXPIRE`), module/file basenames
+  (`ext_storage_bridge`, `ext_storage_throttle`), and engine symbols a page mentions without
+  citing (`processCommand`, `blockedBeforeSleep`, `storageConfig`, `req_ctx`, `capacity_bytes`).
+  Padding `sources:` to silence them would game the check; they should be fixed only where the
+  page genuinely relies on the symbol.
+- Deliberately **not** done: bumping any page's `updated:` date. That would silence a real
+  freshness signal while verifying nothing.
+
+## [2026-07-30] ingest | reconciled the two outstanding feature commits (7 pages)
+
+- Reconciled `6976634d2` (module correctness / DEL semantics / mid-execution key access, 07-22)
+  and `b36f2d1a1` (SWAPDB, pending-DEL guard, runtime policy guard, 07-23) across
+  state-machine, delete, fetch, engine-integration, ext-storage-api, eviction-integration and
+  config-and-module-args. Warnings 67 → 49; errors stay 0; graph edges 203 → 215 from the new
+  cross-references.
+- **Sixth state documented.** `TIERING_STATE_PENDING_DELETION = 5` was missing from the state
+  table, transitions and blocking matrix; the page claimed "one of 5 states". PENDING_DELETION
+  is now distinguished from PENDING_EVICT (4) explicitly: the flash copy is *already* deleted
+  for a client `DEL`/`UNLINK`, and the TIERED placeholder is deliberately retained so the
+  re-executed command performs the keyspace removal with full command-layer side effects.
+- **SWAPDB logical/physical db-id indirection** documented for the first time. The backend is
+  keyed by a physical id that `SWAPDB` remaps (`extStorageSwapDbIds`, `ext_storage.c:352-360`,
+  from `db.c:1931`), so after a swap logical db N is *not* backend namespace N. Getting the
+  direction wrong does not fault — it silently reads or writes another database's keyspace.
+  Both helpers are identity while the maps are unallocated (`ext_storage.c:343`, `:348`), so
+  calls are safe pre-init. The complete translating-site inventory is on the page, and it
+  includes the one deliberate **non**-translating call: the `READ_RETRY` resubmit at
+  `ext_storage.c:934` passes `msg->db_id` straight through because inside
+  `processOneCompletion` it is already physical — translating there would be the bug. Verified
+  independently against every `extStorageBridge_submit*` / `forkRead` / `flushDB` call site.
+- **Mid-execution synchronous fetch** (`extStorageSyncFetch`, `ext_storage.c:1078`, called from
+  `db.c:95`) documented as a second fetch mode alongside block-and-retry, with its drain
+  ordering rule (sync-fetch-deferred completions run first, `ext_storage.c:1040`) and its stall
+  warning (`:1143`). Motivating cases: SORT BY/GET patterns and Lua undeclared keys.
+- **Runtime `maxmemory-policy` guard** documented: `updateMaxmemoryPolicy`
+  (`config.c:2620-2635`) restricts the policy to `allkeys-lru`, `allkeys-lfu` or `noeviction`
+  while tiering is active, closing a runtime `CONFIG SET` path that the comment says
+  "previously bypassed the check silently"; the same rule at init disables tiering instead.
+- **Two stale source comments flagged, not fixed** (the wiki does not edit `src/`):
+  `ext_storage.h:21-22` still says "one of 5 states" and still refers to the
+  `keys_tiering_state` hashtable, which was removed in favour of the `robj->tiering_state`
+  bitfield (`server.h:913`, `server.c:2942` both say so).
+- Remaining 49 warnings: 13 of the soft "symbol not in cited sources" class, and 36 STALE on
+  pages this pass did not touch — most concentrated in `adr-index` (9), `memory-accounting` (4)
+  and `01-architecture` (4). No page's `updated:` was bumped except where an agent personally
+  re-verified the content.

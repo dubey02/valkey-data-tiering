@@ -8,7 +8,7 @@ Mechanical (not semantic) verification. For every wiki page that has a
   1. CITATIONS  - every `file:line` / `file:start-end` reference (in `sources:`
                   and inline `` `path:line` ``) resolves to a real file and the
                   line range is in-bounds.  Out-of-range or missing => ERROR.
-  2. STALENESS  - WARN if a cited source file's mtime is newer than the page's
+  2. STALENESS  - WARN if a cited source file's last git commit date is newer than the page's
                   `updated:` date (code may have moved past the page).
   3. SYMBOLS    - every distinctive identifier / snake_case / CamelCase /
                   hyphenated-directive written in inline-code on the page must
@@ -29,6 +29,7 @@ Usage:
 """
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -127,6 +128,39 @@ def line_count(fp):
     return _linecount_cache[fp]
 
 
+_changedate_cache = {}
+
+
+def source_change_date(fp):
+    """Date a cited source last actually changed.
+
+    Filesystem mtime is useless here: a fresh clone or a branch checkout stamps
+    every file with the checkout time, which made every page look stale at once.
+    Ask git for the file's last commit date instead, and fall back to mtime only
+    for files git does not track (or when git is unavailable).
+    """
+    if fp in _changedate_cache:
+        return _changedate_cache[fp]
+    result = None
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "log", "-1", "--format=%cI", "--", str(fp)],
+            capture_output=True, text=True, timeout=15,
+        )
+        stamp = out.stdout.strip()
+        if out.returncode == 0 and stamp:
+            result = datetime.fromisoformat(stamp).date()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        result = None
+    if result is None:
+        try:
+            result = datetime.fromtimestamp(fp.stat().st_mtime).date()
+        except OSError:
+            result = None
+    _changedate_cache[fp] = result
+    return result
+
+
 def is_checkable(tok):
     """Is this token distinctive enough to demand grounding (low false-positive)?"""
     if len(tok) < 5:
@@ -189,12 +223,11 @@ def check_page(page, repo_corpus):
             if not fp or fp in seen:
                 continue
             seen.add(fp)
-            try:
-                mdate = datetime.fromtimestamp(fp.stat().st_mtime).date()
-            except OSError:
+            mdate = source_change_date(fp)
+            if mdate is None:
                 continue
             if mdate > updated:
-                warns.append(f"STALE? {fp.relative_to(REPO_ROOT)} mtime {mdate} "
+                warns.append(f"STALE? {fp.relative_to(REPO_ROOT)} changed {mdate} "
                              f"> page updated {updated} (re-verify citations)")
 
     # ---- 3. symbol grounding ----
