@@ -38,6 +38,7 @@ PALETTE = ["#0ea5e9", "#f97316", "#8b5cf6", "#10b981", "#ef4444", "#eab308",
            "#c084fc", "#34d399", "#fca5a5", "#fcd34d", "#22d3ee"]
 
 METRICS = [
+    'db0_keys',
     'used_memory', 'used_memory_rss', 'maxmemory', 'keyspace_hits', 'keyspace_misses',
     'ops_per_sec', 'total_commands_delta',
     'total_num_items_spilled_to_ext_storage', 'total_num_items_fetched_from_ext_storage',
@@ -55,6 +56,7 @@ METRICS = [
 ]
 
 GROUPS = {
+    'Dataset': ['db0_keys'],
     'Throughput': ['ops_per_sec', 'total_commands_delta', 'keyspace_hits', 'keyspace_misses'],
     'Memory': ['used_memory', 'used_memory_rss', 'maxmemory', 'mem_frag_ratio'],
     'Tiering': ['total_num_items_spilled_to_ext_storage', 'total_num_items_fetched_from_ext_storage',
@@ -73,7 +75,7 @@ GROUPS = {
     'Latency (server)': ['_server_latency'],
 }
 
-DEFAULT_VISIBLE = ['ops_per_sec', 'used_memory', 'disk_util_pct',
+DEFAULT_VISIBLE = ['db0_keys', 'ops_per_sec', 'used_memory', 'disk_util_pct',
                    'total_num_items_spilled_to_ext_storage',
                    'total_num_items_fetched_from_ext_storage',
                    'blocked_clients', 'valkey_cpu_total',
@@ -612,7 +614,7 @@ DATA.scenarios.forEach(scen => {
   // Chart cards
   DATA.metrics.forEach(m => {
     const card = document.createElement('div');
-    card.className = 'chart-card' + (m === 'ops_per_sec' ? ' wide' : '') + (st.visible.has(m) ? ' visible' : '');
+    card.className = 'chart-card' + ((m === 'ops_per_sec' || m === 'db0_keys') ? ' wide' : '') + (st.visible.has(m) ? ' visible' : '');
     card.dataset.metric = m;
     card.innerHTML = `<h3>${m.replace(/_/g, ' ')}</h3><canvas></canvas>`;
     st.grid.appendChild(card);

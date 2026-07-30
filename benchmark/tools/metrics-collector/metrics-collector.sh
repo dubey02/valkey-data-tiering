@@ -8,7 +8,7 @@ OUTFILE="${2:?Usage: $0 PORT OUTFILE [INTERVAL]}"
 INTERVAL="${3:-1}"
 CLI="${VALKEY_CLI:-valkey-cli}"
 
-HEADER="timestamp,used_memory,used_memory_rss,maxmemory,keyspace_hits,keyspace_misses,ops_per_sec,total_commands_delta,total_num_items_spilled_to_ext_storage,total_num_items_fetched_from_ext_storage,completion_read_ok,dram_value_hits,kbc_fetching_block,num_items_spilling_to_ext_storage,blocked_clients,cpu_user,cpu_sys,valkey_cpu_user,valkey_cpu_sys,valkey_cpu_total,asio_cpu_pct,disk_hit_pct,mem_hit_pct,mem_frag_ratio,disk_read_iops,disk_write_iops,disk_read_mb,disk_write_mb,disk_read_merges_ps,disk_write_merges_ps,disk_r_await_ms,disk_w_await_ms,disk_aqu_sz,disk_util_pct,disk_in_flight,disk_req_sz_kb,throttle_total_throttled,throttle_queued_clients,throttle_current_rate,throttle_allowed_tps,spill_submitted_count,spill_serialized_count,mean_spill_ram,inflight_spill_ram_bytes"
+HEADER="timestamp,db0_keys,used_memory,used_memory_rss,maxmemory,keyspace_hits,keyspace_misses,ops_per_sec,total_commands_delta,total_num_items_spilled_to_ext_storage,total_num_items_fetched_from_ext_storage,completion_read_ok,dram_value_hits,kbc_fetching_block,num_items_spilling_to_ext_storage,blocked_clients,cpu_user,cpu_sys,valkey_cpu_user,valkey_cpu_sys,valkey_cpu_total,asio_cpu_pct,disk_hit_pct,mem_hit_pct,mem_frag_ratio,disk_read_iops,disk_write_iops,disk_read_mb,disk_write_mb,disk_read_merges_ps,disk_write_merges_ps,disk_r_await_ms,disk_w_await_ms,disk_aqu_sz,disk_util_pct,disk_in_flight,disk_req_sz_kb,throttle_total_throttled,throttle_queued_clients,throttle_current_rate,throttle_allowed_tps,spill_submitted_count,spill_serialized_count,mean_spill_ram,inflight_spill_ram_bytes"
 echo "$HEADER" > "$OUTFILE"
 
 # Full raw INFO ALL snapshot per tick, appended to a sibling log so we can mine
@@ -18,6 +18,10 @@ INFO_DUMP="$(dirname "$OUTFILE")/info-full.log"
 : > "$INFO_DUMP"
 
 get_info_field() { echo "$INFO" | grep -m1 "^${1}:" | cut -d: -f2 | tr -d '\r'; }
+
+# Resident key count. INFO reports it as "db0:keys=N,expires=..." rather than a plain
+# field, so it needs its own extractor. Empty db0 line (no keys yet) reports 0.
+get_db0_keys() { echo "$INFO" | grep -m1 '^db0:' | grep -oP 'keys=\K[0-9]+' || echo 0; }
 
 prev_cpu_user=0; prev_cpu_sys=0; prev_cpu_idle=0; prev_cpu_total=1
 prev_valkey_cpu_user=0; prev_valkey_cpu_sys=0
@@ -126,6 +130,7 @@ while true; do
     used_memory=$(get_info_field used_memory)
     used_memory_rss=$(get_info_field used_memory_rss)
     maxmemory=$(get_info_field maxmemory)
+    db0_keys=$(get_db0_keys)
     keyspace_hits=$(get_info_field keyspace_hits)
     keyspace_misses=$(get_info_field keyspace_misses)
     ops_per_sec=$(get_info_field instantaneous_ops_per_sec); ops_per_sec=${ops_per_sec:-0}
@@ -164,7 +169,7 @@ while true; do
         mem_hit_pct="0.0"
     fi
     mem_frag_ratio=$(get_info_field mem_fragmentation_ratio); mem_frag_ratio=${mem_frag_ratio:-0}
-    echo "${ts},${used_memory},${used_memory_rss},${maxmemory},${keyspace_hits},${keyspace_misses},${ops_per_sec},${total_commands_delta},${total_num_items_spilled_to_ext_storage},${total_num_items_fetched_from_ext_storage},${completion_read_ok},${dram_value_hits},${kbc_fetching_block},${num_items_spilling_to_ext_storage},${blocked_clients},${cpu_user},${cpu_sys},${valkey_cpu_user},${valkey_cpu_sys},${valkey_cpu_total},${asio_cpu_pct},${disk_hit_pct},${mem_hit_pct},${mem_frag_ratio},${disk_read_iops},${disk_write_iops},${disk_read_mb},${disk_write_mb},${disk_read_merges_ps},${disk_write_merges_ps},${disk_r_await_ms},${disk_w_await_ms},${disk_aqu_sz},${disk_util_pct},${disk_in_flight},${disk_req_sz_kb},${throttle_total_throttled},${throttle_queued_clients},${throttle_current_rate},${throttle_allowed_tps},${spill_submitted_count},${spill_serialized_count},${mean_spill_ram},${inflight_spill_ram_bytes}" >> "$OUTFILE"
+    echo "${ts},${db0_keys},${used_memory},${used_memory_rss},${maxmemory},${keyspace_hits},${keyspace_misses},${ops_per_sec},${total_commands_delta},${total_num_items_spilled_to_ext_storage},${total_num_items_fetched_from_ext_storage},${completion_read_ok},${dram_value_hits},${kbc_fetching_block},${num_items_spilling_to_ext_storage},${blocked_clients},${cpu_user},${cpu_sys},${valkey_cpu_user},${valkey_cpu_sys},${valkey_cpu_total},${asio_cpu_pct},${disk_hit_pct},${mem_hit_pct},${mem_frag_ratio},${disk_read_iops},${disk_write_iops},${disk_read_mb},${disk_write_mb},${disk_read_merges_ps},${disk_write_merges_ps},${disk_r_await_ms},${disk_w_await_ms},${disk_aqu_sz},${disk_util_pct},${disk_in_flight},${disk_req_sz_kb},${throttle_total_throttled},${throttle_queued_clients},${throttle_current_rate},${throttle_allowed_tps},${spill_submitted_count},${spill_serialized_count},${mean_spill_ram},${inflight_spill_ram_bytes}" >> "$OUTFILE"
     # Append the full raw INFO ALL snapshot for this tick (timestamp-delimited).
     printf '===== INFO ALL @ %s =====\n%s\n\n' "$ts" "$INFO" >> "$INFO_DUMP"
     sleep "$INTERVAL"
