@@ -69,7 +69,7 @@ GROUPS = {
                  'throttle_allowed_tps', 'blocked_clients'],
     'Spill Pipeline': ['spill_submitted_count', 'spill_serialized_count', 'mean_spill_ram',
                        'inflight_spill_ram_bytes'],
-    'Latency (client)': ['_client_get_latency', '_client_set_latency'],
+    'Latency (client)': ['_trace_latency', '_client_get_latency', '_client_set_latency'],
     'Latency (server)': ['_server_latency'],
 }
 
@@ -77,7 +77,8 @@ DEFAULT_VISIBLE = ['ops_per_sec', 'used_memory', 'disk_util_pct',
                    'total_num_items_spilled_to_ext_storage',
                    'total_num_items_fetched_from_ext_storage',
                    'blocked_clients', 'valkey_cpu_total',
-                   '_client_get_latency', '_client_set_latency', '_server_latency']
+                   '_trace_latency', '_client_get_latency', '_client_set_latency',
+                   '_server_latency']
 
 
 def git(repo, *args):
@@ -118,6 +119,35 @@ def parse_bench_csv(path):
         return None
     rows = list(csv.DictReader(path.open()))
     return rows[0] if rows else None
+
+
+def parse_trace_latency(output_txt):
+    """Pull client-side latency out of trace-replay's summary block.
+
+    tiering-latency drives load with trace-replay, not valkey-benchmark, so there is no
+    --csv file to read. Client latency -- the whole point of that scenario -- only appears
+    in output.txt as:
+
+        Latency:    p50=1.21ms  p99=1.25ms  p99.9=1.25ms  p100=1.25ms
+    """
+    if not output_txt.exists():
+        return None
+    txt = output_txt.read_text(errors="replace")
+    m = re.search(r'Latency:\s+(p50=.*)', txt)
+    if not m:
+        return None
+    row = {}
+    for k, v in re.findall(r'(p[\d.]+)=([\d.]+)ms', m.group(1)):
+        row[f"{k}_ms"] = float(v)
+    if not row:
+        return None
+    for field, pat in (("throughput_ops", r'Throughput:\s+([\d.]+) ops/s'),
+                       ("hit_ratio_pct", r'Hit ratio:\s+([\d.]+)%'),
+                       ("ops", r'Ops:\s+(\d+)')):
+        mm = re.search(pat, txt)
+        if mm:
+            row[field] = float(mm.group(1))
+    return row
 
 
 def parse_server_latency(final_info):
@@ -197,6 +227,13 @@ def main():
             srv = parse_server_latency(run / "final-info.txt")
             if srv:
                 (out_dir / f"{slug}-server-latency.txt").write_text(srv + "\n")
+
+            trace = parse_trace_latency(run / "output.txt")
+            if trace:
+                with (out_dir / f"{slug}-trace-latency.csv").open("w", newline="") as fh:
+                    w = csv.DictWriter(fh, fieldnames=list(trace.keys()))
+                    w.writeheader()
+                    w.writerow(trace)
 
             # Sample count is not run length: the collector's poll loop (INFO ALL + system
             # stats) takes ~1.15s per tick, so record wall seconds from the timestamps too.
@@ -408,7 +445,7 @@ DATA.scenarios.forEach(scen => {
     notice: wrap.querySelector('.notice'),
     kpiRow: wrap.querySelector('.kpi-row'),
     grid: wrap.querySelector('.chart-grid'),
-    loaded: {}, latency: {get:{},set:{},server:{}}, charts: {},
+    loaded: {}, latency: {get:{},set:{},server:{},trace:{}}, charts: {},
     active: new Set(), visible: new Set(DATA.defaultVisible),
     sidebarCBs: {}, built: false,
   };
@@ -460,7 +497,8 @@ DATA.scenarios.forEach(scen => {
   const btnRow = document.createElement('div');
   btnRow.className = 'btn-row';
   const mk = (text, fn) => { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; return b; };
-  const allMetrics = () => [...DATA.metrics, '_client_get_latency', '_client_set_latency', '_server_latency'];
+  const allMetrics = () => [...DATA.metrics, '_trace_latency', '_client_get_latency',
+                            '_client_set_latency', '_server_latency'];
   btnRow.append(
     mk('All',     () => { st.visible = new Set(allMetrics()); syncSidebar(st); updateVisibility(st); }),
     mk('None',    () => { st.visible.clear(); syncSidebar(st); updateVisibility(st); }),
@@ -498,7 +536,8 @@ DATA.scenarios.forEach(scen => {
     st.charts[m] = new Chart(card.querySelector('canvas'),
       { type:'line', data:{labels:[],datasets:[]}, options:chartOpts });
   });
-  [['_client_get_latency','Client GET Latency (ms)'],
+  [['_trace_latency','Client Latency (ms, trace-replay) — primary metric for tiering-latency'],
+   ['_client_get_latency','Client GET Latency (ms)'],
    ['_client_set_latency','Client SET Latency (ms)'],
    ['_server_latency','Server-side Latency (µs)']].forEach(([m,title]) => {
     const card = document.createElement('div');
@@ -545,6 +584,11 @@ async function loadScenario(st) {
 
   await Promise.all(withData.map(async s => {
     st.loaded[s.file] = await fetchCsv(base(s.file));
+  }));
+  // trace-replay scenarios (tiering-latency) report client latency here, not via --csv files.
+  await Promise.all(withData.map(async s => {
+    const t = await fetchCsv(base(`${s.file.replace('.csv','')}-trace-latency.csv`));
+    if (t[0]) st.latency.trace[s.file] = t[0];
   }));
   await Promise.all(withData.map(async s => {
     const stem = s.file.replace('.csv', '');
@@ -598,11 +642,25 @@ function render(st) {
     chart.update();
   });
 
+  traceBar(st, sel);
   latBar(st, '_client_get_latency', st.latency.get, sel);
   latBar(st, '_client_set_latency', st.latency.set, sel);
   srvBar(st, sel);
   kpis(st, sel);
   updateVisibility(st);
+}
+
+// trace-replay reports p50/p99/p99.9/p100 -- a different percentile set to
+// valkey-benchmark's avg/p50/p95/p99/max, so it gets its own chart rather than being
+// forced into the GET/SET bars.
+const TRACE_FIELDS = ['p50_ms','p99_ms','p99.9_ms','p100_ms'];
+function traceBar(st, sel) {
+  const chart = st.charts['_trace_latency'];
+  chart.data.labels = TRACE_FIELDS.map(f => f.replace('_ms',''));
+  chart.data.datasets = sel.filter(s => st.latency.trace[s.file]).map(s => ({
+    label:s.label, data:TRACE_FIELDS.map(f => parseFloat(st.latency.trace[s.file][f]) || 0),
+    backgroundColor:s.color+'cc', borderColor:s.color, borderWidth:1 }));
+  chart.update();
 }
 
 function latBar(st, key, data, sel) {
