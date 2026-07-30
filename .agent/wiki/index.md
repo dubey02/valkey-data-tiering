@@ -1,21 +1,27 @@
 ---
-title: NKS Data Tiering — Index
+title: Data Tiering — Index
 status: active
 updated: 2026-06-08
 ---
 
-# NKS Data Tiering Wiki — Index
+# Data Tiering Wiki — Index
 
-LLM-maintained wiki for Valkey **non-key-spilling (NKS) data tiering**. Keys always
-stay in the dict; only values spill to flash. Scope and conventions: [WIKI](WIKI.md).
+LLM-maintained wiki for Valkey **data tiering**. In v1, keys always stay in the dict
+and only values spill to flash; key spilling may be enabled by config later. Scope and conventions: [WIKI](WIKI.md).
 Start at [00-overview](00-overview.md) → [01-architecture](01-architecture.md), then drill into components/interfaces/flows.
+
+> **Reading view:** this index is the source of truth in both senses — for humans, and
+> as the manifest the book view parses at runtime. For start-to-finish reading open
+> [`docs/index.html`](docs/index.html): a hierarchical ToC, a page per
+> chapter, per-page section ToC, Prev/Up/Next. Nothing to regenerate — adding a row to a
+> table below is enough for a page to appear there.
 
 > Status legend: `stub` = placeholder · `draft` = written, unverified · `active` = verified vs code.
 
 ## Top level
 | Page | Summary | Status |
 |------|---------|--------|
-| [00-overview](00-overview.md) | What NKS tiering is, key semantics, when it helps | active |
+| [00-overview](00-overview.md) | What data tiering is, key semantics, when it helps | active |
 | [01-architecture](01-architecture.md) | System context, threading, event-loop integration | active |
 
 ## Components (L2)
@@ -55,7 +61,7 @@ Start at [00-overview](00-overview.md) → [01-architecture](01-architecture.md)
 ## Decisions (L4)
 | Page | Summary | Status |
 |------|---------|--------|
-| [adr-index](decisions/adr-index.md) | 9 code-grounded NKS design decisions (ADR-001…009) | active |
+| [adr-index](decisions/adr-index.md) | 9 code-grounded design decisions (ADR-001…009) | active |
 | [known-limitations](decisions/known-limitations.md) | 6 code-vs-comment contradictions + functional limits, all cited | active |
 
 ## Diagrams
@@ -89,7 +95,7 @@ The wiki is a typed-edge graph (KiRoom Entity Graph). Schema + edge kinds: [WIKI
 | `python3 .agent/wiki/keg/query.py related <page> --max-hops 2` | graph-aware retrieval |
 | `python3 .agent/wiki/keg/query.py hubs --by inbound` | most-referenced pages |
 | `python3 .agent/wiki/keg/extract_relations.py` | validation cross-check (edge proposals) |
-| `python3 -m http.server 8000 --bind 127.0.0.1 -d .agent/wiki` | interactive graph |
+| `python3 -m http.server 8000 --bind 127.0.0.1 -d .agent/wiki` | serve both views: `/keg/viewer/index.html` (graph) and `/docs/` (book) |
 
 ## Remaining work (handoff)
 
@@ -184,9 +190,9 @@ Current state (2026-06-10): **25 active · 0 draft · 0 stub · 0 stale** — La
   1. ~~`storageGetRocksDBType()` sync backend~~ — **RESOLVED** (Jul 2026): file deleted,
      `ext-storage-backend=rocksdb` routes to the same in-memory mock as `flashcache-mock`
      via `storage_mock.c`. The shared middleware path remains available for future sync backends.
-  2. Rust backends implement `key_may_exist` but the NKS module **deliberately leaves it
+  2. Rust backends implement `key_may_exist` but the value-spill module **deliberately leaves it
      unregistered** (`non-key-spilling/src/lib.rs:533-536`: false positives "block clients
-     forever") — the dict, not a bloom filter, is the existence oracle in NKS.
+     forever") — the dict, not a bloom filter, is the existence oracle while keys stay in memory.
   Also fixed `01-architecture.md` backends-row cell ("rocksdb (sync via middleware)" → async; sync
   variant unwired) to match the bridge.
 - **Verified → active 2026-06-05:** [serialization](components/serialization.md),

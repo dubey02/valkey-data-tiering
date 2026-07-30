@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-verify_citations.py - Layer-1 citation + symbol-grounding check for the NKS wiki.
+verify_citations.py - Layer-1 citation + symbol-grounding check for the data tiering wiki.
 
 Mechanical (not semantic) verification. For every wiki page that has a
 `sources:` frontmatter block it checks:

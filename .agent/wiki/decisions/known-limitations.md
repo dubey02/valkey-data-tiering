@@ -82,7 +82,7 @@ edges:
 
 # Known Limitations
 
-> Code-grounded contradictions and functional constraints in the NKS tiering POC.
+> Code-grounded contradictions and functional constraints in the data tiering POC.
 > Every entry cites `file:line` in **this** repo; where a comment or legacy doc disagrees
 > with the code, the **code is authoritative**.
 
@@ -93,7 +93,7 @@ edges:
 | C1 | tiered `val_ptr` | **empty-SDS placeholder** (freed via `sdsfree`, sized via `sdsAllocSize`) | `val_ptr is NULL` | `server.h:838` vs `object.c:632-634`, `object.c:1208-1211` |
 | C3 | metadata on a tiered key | gate is **value-agnostic** → any named-key cmd blocks+fetches | EXISTS/TYPE/TTL answered from RAM, no fetch | `server.c:4718` + `ext_storage.c:359-434` vs `DATA-TIERING.md` |
 | C4 | sync `rocksdb` backend | **RESOLVED** (Jul 2026) — file deleted. `ext-storage-backend=rocksdb` routes to mock via `storage_mock.c` | N/A | `storage_mock.c` (see [backends](../components/backends.md)) |
-| C5 | `key_may_exist` | implemented in both Rust backends but **left unregistered** in NKS | (bloom probe available) | `non-key-spilling/src/lib.rs:533-536` (see [backends](../components/backends.md)) |
+| C5 | `key_may_exist` | implemented in both Rust backends but **left unregistered** | (bloom probe available) | `non-key-spilling/src/lib.rs:533-536` (see [backends](../components/backends.md)) |
 | C6 | plain-AOF rewrite of tiered keys | **no skip** — emits the empty placeholder value | (RDB/preamble path skips cleanly) | `aof.c:2356-2409` (see [persistence-replication](../components/persistence-replication.md)) |
 | C7 | `items_spillover_batch_size` config | **dead** — the cap-less spill controller never reads it | config directive still settable (1–100) | `ext_storage.c:95`, `config.c:3426` (see [eviction-integration](../components/eviction-integration.md)) |
 
@@ -153,13 +153,13 @@ bounded by the largest in-flight fetch, not by NVMe random-read latency. See
 [backends](../components/backends.md), [bridge-layer](../components/bridge-layer.md).
 
 ### L4 — Small/embedded values are un-spillable; memory-gated throttle then collapses throughput
-Two NKS constraints compound on key-heavy / tiny-value workloads:
+Two constraints compound on key-heavy / tiny-value workloads:
 
 1. **Embedded values never spill.** `isEmbeddedObject` (`ext_storage.c:341`) treats
    `OBJ_ENCODING_EMBSTR` (string ≤44B) and `OBJ_ENCODING_INT` as embedded, and `spillItemAsync`
    rejects them (`ext_storage.c:814`, `return -1`). The value lives in the object header itself,
    so there is nothing to move to flash. Combined with the per-key metadata floor (keys never
-   leave RAM in NKS — see L2), a workload of many small values pins `used_memory` **above
+   leave RAM — see L2), a workload of many small values pins `used_memory` **above
    `maxmemory`** no matter how well the spill controller runs. The spill loop still *attempts*
    every LRU victim, but only the RAW-encoded (>44B) minority can submit.
 
@@ -197,7 +197,7 @@ So when `used_memory` starts far above `maxmemory` (overshoot ≫ ring × mean_v
 bound, draining the entire resident `ONLY_MEMORY` set into the in-flight queue, and then:
 - if the IO thread keeps the ring drained, candidates exhaust and `findBestEvictionCandidate`
   (`evict.c:378`) — whose `while (bestkey == NULL)` loop (`evict.c:386`) exits only via
-  `if (!total_keys) break` (`evict.c:418`), never true in NKS — **spins at 100% CPU on the main
+  `if (!total_keys) break` (`evict.c:418`), never true here — **spins at 100% CPU on the main
   thread** inside `evictionPoolPopulate` (`evict.c:409`): the event loop never runs, completions
   never drain, RAM never frees — a hard livelock (server stops answering PING/INFO);
 - if the IO thread can't keep up, the ring fills and `spillItemAsync` returns −1 → `break`

@@ -157,7 +157,7 @@ must serialize them. This happens **on the backend's IO thread, not the main thr
   `<flash_file_path> <size_bytes>` args (`storage_flashcache_module.c:172-181`), runs
   `flashcacheInit` (`storage_flashcache_module.c:197`), registers the backend
   (`storage_flashcache_module.c:210`).
-- **`non-key-spilling`** (Rust) — the primary NKS module. Compile-time backend selection via
+- **`non-key-spilling`** (Rust) — the primary value-spill module. Compile-time backend selection via
   Cargo features `backend-rocksdb` (default) / `backend-flashcache` (`dispatcher.rs:11-19`),
   runtime selection via the `backend=…` load arg (`create_dispatcher`,
   `modules/non-key-spilling/src/lib.rs:378`). It exposes a single C `storageType` named
@@ -189,7 +189,7 @@ must serialize them. This happens **on the backend's IO thread, not the main thr
 > `modules/non-key-spilling/src/backends/flashcache/backend.rs:100`) — a sync bloom/occupancy
 > probe — but the `non-key-spilling` module **deliberately does not register it**
 > (`modules/non-key-spilling/src/lib.rs:533-536`, commented out): *"Registering it causes false
-> positives that block clients forever."* This is the NKS invariant in action — the key is
+> positives that block clients forever."* This is the v1 invariant in action — the key is
 > always in the dict, so the engine's state machine, not a bloom filter, tracks existence. The
 > README's *"No bloom filter is needed"* (`README.md`) matches the code; the RocksDB backend
 > still builds an SST bloom filter internally, but it is not consulted on the existence-check path.
@@ -198,7 +198,7 @@ must serialize them. This happens **on the backend's IO thread, not the main thr
 > predecessor "key-spilling" module name, modules/key-spilling/ paths, and a
 > lib​key_spilling_module.so artifact. The live crate is **`non-key-spilling`** (`MODULE_NAME`,
 > `modules/non-key-spilling/src/lib.rs:39`, and `valkey_module! { name: "non-key-spilling" }` at
-> `modules/non-key-spilling/src/lib.rs:564`). Treat the README's NKS-relevant *behaviour* as
+> `modules/non-key-spilling/src/lib.rs:564`). Treat the README's in-scope *behaviour* as
 > source; ignore the stale key-spilling paths/artifact names.
 
 ## See also
