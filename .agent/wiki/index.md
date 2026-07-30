@@ -35,7 +35,7 @@ Start at [00-overview](00-overview.md) → [01-architecture](01-architecture.md)
 | [eviction-integration](components/eviction-integration.md) | `extStoragePerformEvictions`, spill-pool LRU | active |
 | [serialization](components/serialization.md) | Key/value ser/deser, DUMP payload, encodings | active |
 | [backends](components/backends.md) | flashcache (mock/real), rocksdb (sync/async), example + Rust modules; registration & selection | active |
-| [persistence-replication](components/persistence-replication.md) | RDB/AOF/defrag skip tiered via `objectIsTiered`; full-sync omits tiered; per-node backend | active |
+| [persistence-replication](components/persistence-replication.md) | Tiered values materialized into standard RDB entries under the fork-snapshot protocol; RDB/AOF-preamble/disk-target full sync covered; non-preamble AOF, slot migration and diskless fork are the gaps | active |
 | [memory-accounting](components/memory-accounting.md) | `OBJ_ENCODING_TIERED`, objectComputeSize, overshoot | active |
 | [testing](components/testing.md) | Tiering integration tests: data-type spill/fetch validity, lifecycle, Lua/MULTI-EXEC/COPY-APPEND-PERSIST command surface, AOF/RDB crash-safety | active |
 
@@ -62,7 +62,7 @@ Start at [00-overview](00-overview.md) → [01-architecture](01-architecture.md)
 | Page | Summary | Status |
 |------|---------|--------|
 | [adr-index](decisions/adr-index.md) | 9 code-grounded design decisions (ADR-001…009) | active |
-| [known-limitations](decisions/known-limitations.md) | 6 code-vs-comment contradictions + functional limits, all cited | active |
+| [known-limitations](decisions/known-limitations.md) | 6 code-vs-comment contradictions + 8 functional limits + 4 resolved, all cited | active |
 
 ## Diagrams
 Sources + `Makefile` in `diagrams/`. Regenerate: `cd .agent/wiki/diagrams && make seq-image && make` (mermaid renders via a container — see [render.Dockerfile](diagrams/render.Dockerfile)).

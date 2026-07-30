@@ -11,6 +11,7 @@ digraph data_tiering_state {
     OF   [label="ONLY_FLASH (2)\nvalue on disk\nencoding=TIERED", fillcolor="#fdeede"];
     CTM  [label="COPYING_TO_MEMORY (3)\nfetch/delete in-flight"];
     PE   [label="PENDING_EVICT (4)\nevict requested\nduring in-flight op", fillcolor="#f7dede"];
+    PD   [label="PENDING_DELETION (5)\nflash copy deleted;\nentry kept for the\nre-executed DEL", fillcolor="#f7e6de"];
     DEL  [label="key deleted", shape=ellipse, fillcolor="#eeeeee"];
 
     OM  -> CTF [label="spillItemAsync()"];
@@ -19,7 +20,10 @@ digraph data_tiering_state {
     CTF -> PE  [label="eviction during spill"];
     OF  -> CTM [label="GET/SET fetch\nDEL/evict async delete"];
     CTM -> OM  [label="fetch OK\n(restore, unblock)"];
-    CTM -> DEL [label="delete OK"];
+    CTM -> PD  [label="delete OK,\nclient-initiated DEL"];
+    CTM -> DEL [label="delete OK,\nGC/evict-initiated"];
     CTM -> PE  [label="eviction during fetch"];
     PE  -> DEL [label="op completes\n(discard value)"];
+    PD  -> DEL [label="blocked DEL re-executes\n(dbDelete, full side effects)"];
+    PD  -> DEL [label="orphan: next toucher\nfinishes the delete inline"];
 }
