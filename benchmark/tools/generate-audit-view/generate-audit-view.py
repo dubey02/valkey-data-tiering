@@ -267,6 +267,16 @@ def main():
             slug = str(rel).replace("/", "__")
             label = cfg if not leg else f"{cfg} · {pretty_leg(leg)}"
 
+            # A sweep's verdict is per-config, but individual legs can abort while siblings
+            # succeed. Read each leg's own output.txt so a failed leg is not charted and a
+            # healthy sibling is not tarred with the config-level verdict.
+            out_txt = run / "output.txt"
+            aborted = ""
+            if out_txt.exists():
+                am = re.search(r'POPULATE_ABORTED:.*', out_txt.read_text(errors="replace"))
+                if am:
+                    aborted = am.group(0).strip()
+
             header, wrows, dropped = workload_rows(mcsv, run)
             (out_dir / f"{slug}.csv").write_text("\n".join([header, *wrows]) + "\n")
 
@@ -305,7 +315,8 @@ def main():
                     wall = 0
 
             series.append({
-                "file": f"{slug}.csv",
+                "file": None if aborted else f"{slug}.csv",
+                "aborted": aborted,
                 "label": label,
                 "config": cfg,
                 "leg": leg,
@@ -531,10 +542,11 @@ DATA.scenarios.forEach(scen => {
     };
     lbl.appendChild(cb);
     lbl.append(s.label);
-    if (s.verdict && s.verdict !== 'PASS') {
+    const badge = s.aborted ? 'ABORTED' : (s.verdict && s.verdict !== 'PASS' ? s.verdict : '');
+    if (badge) {
       const b = document.createElement('span');
-      b.className = 'vb ' + s.verdict;
-      b.textContent = s.verdict;
+      b.className = 'vb ' + (badge === 'ABORTED' ? 'FAIL' : badge);
+      b.textContent = badge;
       lbl.appendChild(b);
     }
     if (s.file && s.samples < 10) {
@@ -548,7 +560,9 @@ DATA.scenarios.forEach(scen => {
         + `(${s.populateSamples} populate samples dropped) `
         + `(the collector polls INFO ALL, so a tick is ~1.15s, not 1s). Populate is not `
         + `duration-bounded, so legs with a larger derived KEYSPACE run longer.`
-      : `${s.config} — ${s.verdict}: ${DATA.meta.details[scen.id + '/' + s.config] || 'no data produced'}`;
+      : (s.aborted
+          ? `${s.label} — populate aborted, not charted: ${s.aborted}`
+          : `${s.config} — ${s.verdict}: ${DATA.meta.details[scen.id + '/' + s.config] || 'no data produced'}`);
     st.topBar.appendChild(lbl);
   });
 
@@ -611,6 +625,7 @@ DATA.scenarios.forEach(scen => {
   const bad = scen.series.filter(s => s.verdict && s.verdict !== 'PASS');
   const thin = scen.series.filter(s => s.file && s.samples < 10);
   const notRun = scen.notRun || [];
+  const aborted = scen.series.filter(s => s.aborted);
   st.notice.innerHTML =
     `Run <b>${DATA.meta.tag}</b> at commit <b>${DATA.meta.commit}</b>, generated ${DATA.meta.generated}. `
     + `Charts cover the measured workload only — populate-phase samples are dropped, so memory
@@ -622,6 +637,8 @@ DATA.scenarios.forEach(scen => {
     + (bad.length ? `<b>${bad.length}</b> config(s) did not pass and carry no series: `
         + bad.map(s => `${s.config} (${s.verdict})`).join(', ') + '. ' : '')
     + (notRun.length ? `Not included in this run: <b>${notRun.join(', ')}</b>. ` : '')
+    + (aborted.length ? `<b>${aborted.length}</b> leg(s) aborted during populate and are not
+        charted: ` + aborted.map(s => s.label).join(', ') + '. ' : '')
     + (thin.length && !DATA.meta.capped
         ? `<b>${thin.length}</b> series still have under 10 points — metrics are sampled once per
            second and those configs set a small OPS/RPS of their own, so the workload simply
