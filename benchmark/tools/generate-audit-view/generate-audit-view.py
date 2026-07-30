@@ -111,6 +111,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results_dir")
     ap.add_argument("--audit-csv", default=None)
+    ap.add_argument("--capped", action="store_true",
+                    help="Run came from audit-configs.sh without --full, i.e. OPS/DURATION were "
+                         "capped. Changes how the view explains short series.")
     args = ap.parse_args()
 
     rdir = pathlib.Path(args.results_dir).resolve()
@@ -194,8 +197,17 @@ def main():
         for i, s in enumerate(series):
             s["color"] = PALETTE[i % len(PALETTE)]
 
+        # Configs that exist on disk but were not part of this run at all (deliberately
+        # excluded, e.g. known-broken legs). Recorded so the view can say so rather than
+        # just appearing to have fewer configs than the suite has.
+        cfg_dir = bench / "scenarios" / scen_id / "configs"
+        on_disk = {p.stem for p in cfg_dir.glob("*.env")} if cfg_dir.is_dir() else set()
+        in_run = {s["config"] for s in series}
+        not_run = sorted(on_disk - in_run)
+
         if series:
-            scenarios.append({"id": scen_id, "label": scen_label, "series": series})
+            scenarios.append({"id": scen_id, "label": scen_label, "series": series,
+                              "notRun": not_run})
 
     if not scenarios:
         sys.exit(f"no scenario data found under {rdir}")
@@ -206,6 +218,7 @@ def main():
         "branch": branch,
         "commit": git(repo, "rev-parse", "--short", "HEAD"),
         "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "capped": bool(args.capped),
         "verdictCounts": {},
         "details": {f"{k[0]}/{k[1]}": v for k, v in details.items() if v},
     }
@@ -367,8 +380,12 @@ DATA.scenarios.forEach(scen => {
   };
   scenarioState[scen.id] = st;
 
-  // Default: select the runnable series, capped so the first paint stays readable.
-  scen.series.filter(s => s.file && s.samples > 1).slice(0, 6).forEach(s => st.active.add(s.file));
+  // Default selection: the six longest series, so the first paint shows real curves rather
+  // than whichever configs happen to sort first (often the shortest ones). Falls back to
+  // whatever exists when no series is long enough (e.g. mixed-size has a single short run).
+  const ranked = scen.series.filter(s => s.file).slice().sort((a, b) => b.samples - a.samples);
+  (ranked.filter(s => s.samples > 1).length ? ranked.filter(s => s.samples > 1) : ranked)
+    .slice(0, 6).forEach(s => st.active.add(s.file));
 
   // Series checkboxes
   scen.series.forEach(s => {
@@ -459,13 +476,21 @@ DATA.scenarios.forEach(scen => {
 
   const bad = scen.series.filter(s => s.verdict && s.verdict !== 'PASS');
   const thin = scen.series.filter(s => s.file && s.samples < 10);
+  const notRun = scen.notRun || [];
   st.notice.innerHTML =
     `Run <b>${DATA.meta.tag}</b> at commit <b>${DATA.meta.commit}</b>, generated ${DATA.meta.generated}. `
+    + (DATA.meta.capped
+        ? `Workload lengths were <b>capped</b> (config audit), so series are short by construction —
+           treat these as "it ran", not as performance data. `
+        : `Configs ran at their own full <b>OPS</b>/<b>DURATION</b>. `)
     + (bad.length ? `<b>${bad.length}</b> config(s) did not pass and carry no series: `
         + bad.map(s => `${s.config} (${s.verdict})`).join(', ') + '. ' : '')
-    + (thin.length ? `<b>${thin.length}</b> series have fewer than 10 samples — this run was produced by
-        the config audit, which caps OPS/DURATION to bound runtime, so short workloads yield very few
-        metric ticks. Treat those lines as "it ran", not as performance data.` : '');
+    + (notRun.length ? `Not included in this run: <b>${notRun.join(', ')}</b>. ` : '')
+    + (thin.length && !DATA.meta.capped
+        ? `<b>${thin.length}</b> series still have under 10 points — metrics are sampled once per
+           second and those configs set a small OPS/RPS of their own, so the workload simply
+           finishes in a few seconds. Raising their OPS is a config change, not a harness one.`
+        : '');
 });
 
 function syncSidebar(st) {

@@ -12,11 +12,13 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 REMOTE_DIR=/tmp/valkey-bench
 PER_CONFIG_TIMEOUT=600
 TAG="audit-$(date +%Y%m%d-%H%M%S)"
+FULL=false
 
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --timeout) PER_CONFIG_TIMEOUT="$2"; shift 2 ;;
         --tag) TAG="$2"; shift 2 ;;
+        --full) FULL=true; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -71,12 +73,18 @@ for CFG_PATH in "${CONFIGS[@]}"; do
     CFG="$(basename "$CFG_PATH" .env)"
     LOCAL_CFG="$DIR/$CFG_PATH"
 
-    # Apply cost caps to a scratch copy, then deploy that.
+    # Apply cost caps to a scratch copy, then deploy that. --full deploys the config
+    # unmodified, which is what you want for graphable time series: the capped runs are
+    # too short to produce enough metric ticks to read.
     TMP_CFG="$(mktemp)"
-    sed -E -e "s/^OPS=.*/OPS=$CAP_OPS/" \
-           -e "s/^DURATION=.*/DURATION=$CAP_DURATION/" \
-           -e "s/^KEY_COUNT=[0-9]{5,}.*/KEY_COUNT=$CAP_KEY_COUNT/" \
-           "$LOCAL_CFG" > "$TMP_CFG"
+    if [ "$FULL" = true ]; then
+        cp "$LOCAL_CFG" "$TMP_CFG"
+    else
+        sed -E -e "s/^OPS=.*/OPS=$CAP_OPS/" \
+               -e "s/^DURATION=.*/DURATION=$CAP_DURATION/" \
+               -e "s/^KEY_COUNT=[0-9]{5,}.*/KEY_COUNT=$CAP_KEY_COUNT/" \
+               "$LOCAL_CFG" > "$TMP_CFG"
+    fi
     $SCP "$TMP_CFG" "$EC2_USER@$EC2_HOST:$REMOTE_DIR/scenarios/$SCEN/configs/$CFG.env"
     rm -f "$TMP_CFG"
 
