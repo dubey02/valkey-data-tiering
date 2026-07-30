@@ -88,6 +88,30 @@ def git(repo, *args):
         return ""
 
 
+def pretty_leg(leg):
+    """Render a sweep leg directory name as a self-describing label.
+
+    benchmark.sh names sweep subdirectories '<var>-<value>' (lowercased var). A bare value is
+    ambiguous -- 'size-sweep · 500' reads as though 500 were a rate -- so ITEM_SIZE legs get a
+    byte suffix and anything unrecognised keeps 'var=value'.
+    """
+    var, _, value = leg.rpartition("-")
+    if var == "item_size" and value.isdigit():
+        n = int(value)
+        for div, unit in ((1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")):
+            if n >= div and n % div == 0:
+                return f"{n // div}{unit}"
+        # Values like 500000 are decimal-round, not binary-round; show them as-is in KB/MB
+        # only when exact, otherwise fall back to a plain byte count.
+        for div, unit in ((1_000_000, "MB"), (1_000, "KB")):
+            if n >= div and n % div == 0:
+                return f"{n // div}{unit}"
+        return f"{n}B"
+    if var == "datatype":
+        return value
+    return f"{var}={value}" if var else value
+
+
 def parse_bench_csv(path):
     """valkey-benchmark --csv writes a header row plus one row per command."""
     if not path.exists():
@@ -154,7 +178,7 @@ def main():
             cfg = rel.parts[0]
             leg = "/".join(rel.parts[1:])
             slug = str(rel).replace("/", "__")
-            label = cfg if not leg else f"{cfg} · {leg.split('-')[-1]}"
+            label = cfg if not leg else f"{cfg} · {pretty_leg(leg)}"
 
             shutil.copyfile(mcsv, out_dir / f"{slug}.csv")
 
@@ -174,8 +198,17 @@ def main():
             if srv:
                 (out_dir / f"{slug}-server-latency.txt").write_text(srv + "\n")
 
+            # Sample count is not run length: the collector's poll loop (INFO ALL + system
+            # stats) takes ~1.15s per tick, so record wall seconds from the timestamps too.
             with mcsv.open() as fh:
-                samples = max(0, sum(1 for _ in fh) - 1)
+                rows = fh.read().splitlines()
+            samples = max(0, len(rows) - 1)
+            wall = 0
+            if samples >= 2:
+                try:
+                    wall = int(rows[-1].split(",")[0]) - int(rows[1].split(",")[0])
+                except (ValueError, IndexError):
+                    wall = 0
 
             series.append({
                 "file": f"{slug}.csv",
@@ -183,6 +216,7 @@ def main():
                 "config": cfg,
                 "leg": leg,
                 "samples": samples,
+                "wall": wall,
                 "verdict": verdicts.get((scen_id, cfg), ""),
             })
 
@@ -415,7 +449,9 @@ DATA.scenarios.forEach(scen => {
       lbl.appendChild(t);
     }
     lbl.title = s.file
-      ? `${s.config}${s.leg ? ' / ' + s.leg : ''} — ${s.samples} samples`
+      ? `${s.config}${s.leg ? ' / ' + s.leg : ''} — ${s.samples} samples over ${s.wall}s wall `
+        + `(the collector polls INFO ALL, so a tick is ~1.15s, not 1s). Populate is not `
+        + `duration-bounded, so legs with a larger derived KEYSPACE run longer.`
       : `${s.config} — ${s.verdict}: ${DATA.meta.details[scen.id + '/' + s.config] || 'no data produced'}`;
     st.topBar.appendChild(lbl);
   });
@@ -604,7 +640,7 @@ function kpis(st, sel) {
     const kpi = document.createElement('div');
     kpi.className = 'kpi';
     kpi.innerHTML = `<div class="value" style="color:${s.color}">${(avg/1000).toFixed(1)}K</div>`
-                  + `<div class="label">${s.label} ops/s</div>`;
+                  + `<div class="label">ops/s &middot; ${s.label}</div>`;
     st.kpiRow.appendChild(kpi);
   });
 }
