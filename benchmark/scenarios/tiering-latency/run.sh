@@ -31,6 +31,9 @@ else
         -synth-type "${SYNTH_TYPE:-string}" -synth-items "${SYNTH_ITEMS:-1}" -spill
 fi
 
+# Populate (+ spill) is done; metrics before this point are not the measured read phase.
+echo "POPULATE_END=$(date +%s)" > "$RESULTS_DIR/phase-markers.env"
+
 # Phase 4: paced reads (client-side latency)
 "$TRACE_REPLAY" -host "$VALKEY_HOST" -port "$PORT" \
     -synth-keys "$KEY_COUNT" -synth-keysize "$KEY_SIZE" -synth-read \

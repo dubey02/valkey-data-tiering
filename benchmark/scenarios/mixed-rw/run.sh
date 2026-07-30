@@ -137,6 +137,9 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 if [ "$DATATYPE" = "string" ]; then
     echo "[mixed-rw] Populating $KEYSPACE keys (sequential, OOM-resilient)..."
+    POP_OK=false
+    PREV_DBSIZE=-1
+    STALLED=0
     for attempt in $(seq 1 100); do
         "$BENCH" -h "$VALKEY_HOST" -p "$VALKEY_PORT" \
             $SET_CMD -n "$KEYSPACE" -r "$KEYSPACE" $SET_CMD_ARGS $KS_FLAG \
@@ -145,10 +148,38 @@ if [ "$DATATYPE" = "string" ]; then
         DBSIZE=$(cli DBSIZE | grep -oP '[0-9]+')
         if [ "$DBSIZE" -ge "$KEYSPACE" ]; then
             echo "[mixed-rw] Populate complete: DBSIZE=$DBSIZE (attempt $attempt)"
+            POP_OK=true
             break
         fi
+        # A frozen DBSIZE means the write path is rejecting, not merely slow. Bail out early
+        # rather than spending 100 attempts to reach the same conclusion.
+        if [ "$DBSIZE" -le "$PREV_DBSIZE" ]; then
+            STALLED=$((STALLED + 1))
+        else
+            STALLED=0
+        fi
+        PREV_DBSIZE=$DBSIZE
         echo "[mixed-rw] Populate attempt $attempt: DBSIZE=$DBSIZE/$KEYSPACE — retrying..."
+        if [ "$STALLED" -ge 5 ]; then
+            echo "[mixed-rw] Populate stalled: DBSIZE=$DBSIZE unchanged over $STALLED attempts."
+            break
+        fi
     done
+
+    # Running the workload against a partly-populated keyspace produces throughput numbers
+    # that look valid but measure the wrong dataset. Abort instead, matching the compound branch.
+    if [ "$POP_OK" != true ]; then
+        OOM_REJECTS=$(cli INFO everything 2>/dev/null | grep -oP 'oom_reject_write_count:\K[0-9]+' || echo 0)
+        echo "[mixed-rw] POPULATE ABORTED — skipping workload."
+        echo "POPULATE_ABORTED: datatype=string keys=$DBSIZE/$KEYSPACE item_size=$ITEM_SIZE oom_rejects=${OOM_REJECTS:-0}" \
+            > "$RESULTS/output.txt"
+        cat "$RESULTS/output.txt"
+        exit 0
+    fi
+
+    # Marker for the reporting layer: metrics collected before this point cover populate, not
+    # the measured workload, and mixing the two distorts every chart.
+    echo "POPULATE_END=$(date +%s)" > "$RESULTS/phase-markers.env"
 
     # ── Workload: parallel GET + SET ──
     echo "[mixed-rw] Running workload: GET + SET ($ACCESS_PATTERN, $CLIENTS clients)..."
@@ -260,6 +291,7 @@ else
         exit 0
     fi
     echo "[mixed-rw] Population complete. DBSIZE=$DBSIZE"
+    echo "POPULATE_END=$(date +%s)" > "$RESULTS/phase-markers.env"
 
     # ── Workload ──
     echo "[mixed-rw] Running workload..."

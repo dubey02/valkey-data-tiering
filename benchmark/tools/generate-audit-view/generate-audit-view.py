@@ -121,6 +121,63 @@ def parse_bench_csv(path):
     return rows[0] if rows else None
 
 
+def workload_rows(mcsv, run):
+    """Return (header, workload_rows, dropped) with the populate phase removed.
+
+    Charts that include populate are misleading: memory ramps from zero, ops/s reflects a
+    SET-only sequential load, and for some configs populate is most of the wall time
+    (fixed-fc-100b spends ~84% of its run populating 10.7M keys).
+
+    Authoritative source is POPULATE_END in phase-markers.env, written by run.sh. Older runs
+    have no marker, so fall back to the first sample where keyspace_hits increases -- populate
+    issues only SETs, so hits stay flat until the measured workload starts.
+    """
+    with mcsv.open() as fh:
+        lines = fh.read().splitlines()
+    if len(lines) < 2:
+        return (lines[0] if lines else ""), [], 0
+    header, rows = lines[0], lines[1:]
+    cols = header.split(",")
+
+    populate_end = None
+    marker = run / "phase-markers.env"
+    if marker.exists():
+        m = re.search(r'POPULATE_END=(\d+)', marker.read_text(errors="replace"))
+        if m:
+            populate_end = int(m.group(1))
+
+    start = 0
+    if populate_end is not None:
+        for i, r in enumerate(rows):
+            try:
+                if int(r.split(",")[0]) >= populate_end:
+                    start = i
+                    break
+            except (ValueError, IndexError):
+                continue
+    elif "keyspace_hits" in cols:
+        k = cols.index("keyspace_hits")
+        prev = None
+        for i, r in enumerate(rows):
+            f = r.split(",")
+            if len(f) <= k:
+                continue
+            try:
+                v = float(f[k] or 0)
+            except ValueError:
+                continue
+            if prev is not None and v > prev:
+                start = i
+                break
+            prev = v
+
+    # Never trim everything away: a run with no detectable workload keeps its rows so the
+    # series is still visible rather than silently empty.
+    if start >= len(rows):
+        start = 0
+    return header, rows[start:], start
+
+
 def parse_trace_latency(output_txt):
     """Pull client-side latency out of trace-replay's summary block.
 
@@ -210,7 +267,8 @@ def main():
             slug = str(rel).replace("/", "__")
             label = cfg if not leg else f"{cfg} · {pretty_leg(leg)}"
 
-            shutil.copyfile(mcsv, out_dir / f"{slug}.csv")
+            header, wrows, dropped = workload_rows(mcsv, run)
+            (out_dir / f"{slug}.csv").write_text("\n".join([header, *wrows]) + "\n")
 
             for src, kind in (("get_output.txt", "get"), ("set_output.txt", "set")):
                 row = parse_bench_csv(run / src)
@@ -237,13 +295,12 @@ def main():
 
             # Sample count is not run length: the collector's poll loop (INFO ALL + system
             # stats) takes ~1.15s per tick, so record wall seconds from the timestamps too.
-            with mcsv.open() as fh:
-                rows = fh.read().splitlines()
-            samples = max(0, len(rows) - 1)
+            # Both describe the measured workload only -- populate rows are dropped above.
+            samples = len(wrows)
             wall = 0
             if samples >= 2:
                 try:
-                    wall = int(rows[-1].split(",")[0]) - int(rows[1].split(",")[0])
+                    wall = int(wrows[-1].split(",")[0]) - int(wrows[0].split(",")[0])
                 except (ValueError, IndexError):
                     wall = 0
 
@@ -254,6 +311,7 @@ def main():
                 "leg": leg,
                 "samples": samples,
                 "wall": wall,
+                "populateSamples": dropped,
                 "verdict": verdicts.get((scen_id, cfg), ""),
             })
 
@@ -486,7 +544,8 @@ DATA.scenarios.forEach(scen => {
       lbl.appendChild(t);
     }
     lbl.title = s.file
-      ? `${s.config}${s.leg ? ' / ' + s.leg : ''} — ${s.samples} samples over ${s.wall}s wall `
+      ? `${s.config}${s.leg ? ' / ' + s.leg : ''} — ${s.samples} workload samples over ${s.wall}s wall `
+        + `(${s.populateSamples} populate samples dropped) `
         + `(the collector polls INFO ALL, so a tick is ~1.15s, not 1s). Populate is not `
         + `duration-bounded, so legs with a larger derived KEYSPACE run longer.`
       : `${s.config} — ${s.verdict}: ${DATA.meta.details[scen.id + '/' + s.config] || 'no data produced'}`;
@@ -554,6 +613,8 @@ DATA.scenarios.forEach(scen => {
   const notRun = scen.notRun || [];
   st.notice.innerHTML =
     `Run <b>${DATA.meta.tag}</b> at commit <b>${DATA.meta.commit}</b>, generated ${DATA.meta.generated}. `
+    + `Charts cover the measured workload only — populate-phase samples are dropped, so memory
+       does not ramp from zero and ops/s is not diluted by the SET-only load phase. `
     + (DATA.meta.capped
         ? `Workload lengths were <b>capped</b> (config audit), so series are short by construction —
            treat these as "it ran", not as performance data. `
