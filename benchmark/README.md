@@ -192,7 +192,7 @@ benchmark/
 | FlashCache, 400–512B values | `uniform-flashcache`, `zipfian-flashcache`, `balanced-flashcache`, `zipfian-1gb`, `zipfian-1gb-ttl`, `compound-flashcache` | The main tiering set. `balanced-flashcache` is 50/50 read/write; `zipfian-1gb-ttl` adds `TTL=120` to every SET. |
 | FlashCache, value-size sweeps | `size-sweep-fc`, `size-sweep-fc-large`, `size-sweep-fc-100b`, `size-sweep-fc-500k` | Derive `KEYSPACE` from `MAXMEMORY_MB`/`DATASET_BYTES` + `HOT_PCT` so the hot set is a fixed fraction of DRAM. |
 | No-tiering size sweep | `size-sweep` | Same derivation as above but `MAXMEMORY_OVERRIDE=0` to run uncapped. |
-| Local dev | `flashcache-local` | `--ext-storage-path /tmp/flashcache.db` instead of `/mnt/nvme`. |
+| Local dev | `flashcache-local` | Zipfian twin of `zipfian-flashcache` backed by `/tmp/flashcache.db` instead of `/mnt/nvme`, with 10x fewer ops. Costs 2 GB of `/tmp` (the backing file is pre-allocated). |
 | Module backend | `zipfian-1gb-module` | Loads `libflash_tiering_module.so` from `modules/flash-tiering` instead of the built-in backend. Neither `benchmark.sh` nor `--remote` builds or ships that .so, so the server aborts on a missing module unless you build it (`cargo build --release` in `modules/flash-tiering`) and place it at `$EC2_REMOTE_DIR` yourself. |
 
 ### Sizing constraint: maxmemory must cover the DRAM key floor
@@ -213,9 +213,9 @@ without progressing. Symptom in the log is a run of identical lines:
 [mixed-rw] Populate attempt 13: DBSIZE=226083/500000 — retrying...
 ```
 
-`flashcache-local` currently violates this — `KEYSPACE=500000`, `KEYSIZE=100`,
-`MAXMEMORY=32mb` needs a 78 MB key floor — so it stalls at ~226K keys. Either raise
-`MAXMEMORY` above the floor or lower `KEYSPACE`.
+`flashcache-local` used to violate this — `KEYSPACE=500000`, `KEYSIZE=100`, `MAXMEMORY=32mb`
+needs a 78 MB key floor — and stalled at ~226K keys. Either raise `MAXMEMORY` above the
+floor or lower `KEYSPACE`.
 
 The `size-sweep*` configs avoid the problem by deriving `KEYSPACE` from `MAXMEMORY_MB` /
 `DATASET_BYTES` plus `HOT_PCT` rather than hardcoding both sides.
