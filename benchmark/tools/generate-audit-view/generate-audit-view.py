@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Turn a config-audit run into a self-contained dashboard view.
+"""Turn a config-audit run into this branch's dashboard view.
 
 Reads an audit results directory (audit.csv + per-config .log files, as produced by
-benchmark/audit-configs.sh) plus the scenario configs themselves, and emits a single
-HTML file with one tab per scenario and one expandable card per config.
+benchmark/audit-configs.sh) plus the scenario configs themselves, and emits
+benchmark_dashboard/view.html with one tab per scenario and one expandable card per config.
 
-The output inlines all of its data. benchmark_dashboard/index.html renders views via
-iframe srcdoc, which breaks relative fetches, so a self-contained file is the only
-shape that works there without hardcoding raw.githubusercontent URLs.
+benchmark_dashboard/index.html on the GitHub Pages branch is a shell: given ?branch=NAME it
+fetches benchmark_dashboard/view.html from that branch and renders it. So a branch publishes
+its results simply by carrying its own view.html -- no change to the shell, and the shell needs
+no knowledge of the branch. This overwrites view.html on purpose: on this branch, the thing
+worth showing is the config audit.
+
+The output inlines all of its data. The shell renders views via iframe srcdoc, which breaks
+relative fetches, so a view must either use absolute raw.githubusercontent URLs (what the
+perf view does for its CSVs) or carry its data inline (what this one does).
 
 Usage:
-  generate-audit-view.py <results/TAG> [-o benchmark_dashboard/config-audit.html]
+  generate-audit-view.py <results/TAG> [-o benchmark_dashboard/view.html]
 """
 import argparse
 import csv
@@ -83,7 +89,7 @@ def main():
 
     bench = pathlib.Path(__file__).resolve().parents[2]     # benchmark/
     repo = bench.parent                                      # repo root
-    out = pathlib.Path(args.out) if args.out else repo / "benchmark_dashboard" / "config-audit.html"
+    out = pathlib.Path(args.out) if args.out else repo / "benchmark_dashboard" / "view.html"
 
     # Prefer the reclassified CSV when present; it is derived from the same logs but
     # with the corrected verdict rules.
@@ -283,6 +289,17 @@ SCENARIOS.forEach(s => {
 });
 
 render(SCENARIOS.find(s => DATA.configs.some(c => c.scenario === s)));
+
+// The dashboard shell (benchmark_dashboard/index.html) shows whatever the embedded view
+// reports here in its status area.
+function setStatus(text, cls) {
+  try { parent.postMessage({ type: 'view-status', text, cls }, '*'); } catch (e) {}
+}
+const bad = DATA.configs.filter(c => c.verdict !== 'PASS').length;
+setStatus(
+  `${m.branch} · config audit · ${DATA.configs.length} configs, ${bad} failing`,
+  bad ? 'error' : 'ok'
+);
 </script>
 </body>
 </html>

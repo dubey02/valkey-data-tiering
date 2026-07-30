@@ -249,28 +249,31 @@ anything, which is how you fix a classifier bug after a long run.
 
 ### Dashboard view
 
-`tools/generate-audit-view/generate-audit-view.py` turns an audit run into a single
-self-contained HTML page — one tab per scenario, one expandable card per config showing its
-verdict, throughput, `.env` source and full run output:
+`tools/generate-audit-view/generate-audit-view.py` renders an audit run as this branch's
+dashboard view — one tab per scenario, one expandable card per config showing its verdict,
+throughput, `.env` source and full run output:
 
 ```bash
 python3 tools/generate-audit-view/generate-audit-view.py results/<tag>
-# -> benchmark_dashboard/config-audit.html
+# -> benchmark_dashboard/view.html
 ```
 
-Pick **View: Config audit** in `benchmark_dashboard/index.html`. That shell fetches the view
-from `raw.githubusercontent.com` for whichever branch is selected, so it only sees branches that
-have been pushed — and GitHub Pages serves the shell itself from `unstable`, so a view on an
-unmerged branch is reachable either by `?branch=<name>` against the deployed shell or by serving
-the repo locally:
+`benchmark_dashboard/index.html` is a shell: given `?branch=NAME` it fetches
+`benchmark_dashboard/view.html` from that branch and renders it. A branch publishes its results
+just by carrying its own `view.html`, so this works against the deployed dashboard immediately —
+no merge required, and the Pages branch needs no knowledge of the branch being viewed:
 
-```bash
-python3 -m http.server 8137 --bind 127.0.0.1
-# http://127.0.0.1:8137/benchmark_dashboard/index.html?view=config-audit.html
+```
+https://dubey02.github.io/valkey-data-tiering/benchmark_dashboard/index.html?branch=<branch>
 ```
 
-The page inlines all of its data because the shell renders views via iframe `srcdoc`, which
-breaks relative fetches.
+Note this **overwrites** `view.html`, which on `unstable` is the performance dashboard. That is
+the intended pattern: each branch's `view.html` shows whatever that branch is about.
+
+A view must either fetch its data over absolute `raw.githubusercontent.com` URLs (what the
+performance view does for its CSVs) or carry it inline (what this one does) — the shell renders
+views via iframe `srcdoc`, which breaks relative fetches. Views report load status to the shell
+by posting `{type:'view-status', text, cls}` to `parent`.
 
 ## Report Generation
 
