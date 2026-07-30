@@ -249,31 +249,47 @@ anything, which is how you fix a classifier bug after a long run.
 
 ### Dashboard view
 
-`tools/generate-audit-view/generate-audit-view.py` renders an audit run as this branch's
-dashboard view — one tab per scenario, one expandable card per config showing its verdict,
-throughput, `.env` source and full run output:
+`tools/generate-audit-view/generate-audit-view.py` publishes a run as this branch's dashboard
+view, in the same shape as the view on `unstable` / `policies`:
+
+```
+scenario tabs -> colour-coded per-config checkboxes -> metric sidebar -> KPI cards + charts
+```
 
 ```bash
 python3 tools/generate-audit-view/generate-audit-view.py results/<tag>
-# -> benchmark_dashboard/view.html
+# -> benchmark_dashboard/view.html  +  benchmark_dashboard/data/<scenario>/
 ```
+
+Tabs are the scenarios (`mixed-rw`, `mixed-size`, `tiering-latency`). Each config is a checkbox
+that graphs as a line series; sweep legs are separate series. The sidebar toggles which metric
+charts show, grouped Throughput / Memory / Tiering / CPU / Disk / Throttle / Spill Pipeline /
+Latency. Time series come from each run's `metrics.csv`, client latency from the
+`valkey-benchmark --csv` output, server latency from `INFO latencystats`.
 
 `benchmark_dashboard/index.html` is a shell: given `?branch=NAME` it fetches
 `benchmark_dashboard/view.html` from that branch and renders it. A branch publishes its results
-just by carrying its own `view.html`, so this works against the deployed dashboard immediately —
-no merge required, and the Pages branch needs no knowledge of the branch being viewed:
+just by carrying its own `view.html` plus `data/`, so this works against the deployed dashboard
+immediately — no merge required, and the Pages branch needs no knowledge of the branch:
 
 ```
 https://dubey02.github.io/valkey-data-tiering/benchmark_dashboard/index.html?branch=<branch>
 ```
 
-Note this **overwrites** `view.html`, which on `unstable` is the performance dashboard. That is
-the intended pattern: each branch's `view.html` shows whatever that branch is about.
+Two constraints worth knowing before writing a view:
 
-A view must either fetch its data over absolute `raw.githubusercontent.com` URLs (what the
-performance view does for its CSVs) or carry it inline (what this one does) — the shell renders
-views via iframe `srcdoc`, which breaks relative fetches. Views report load status to the shell
-by posting `{type:'view-status', text, cls}` to `parent`.
+- The shell renders views via iframe `srcdoc`, so **relative fetches do not work**. Data must be
+  fetched over absolute `raw.githubusercontent.com` URLs; the generator stamps `currentBranch`
+  so a view reads its own branch's data. This also means the view only works once pushed.
+- Views report load status to the shell by posting `{type:'view-status', text, cls}` to `parent`.
+
+Generating a view **overwrites** `view.html`, which on `unstable` is the performance dashboard.
+That is the intended pattern: each branch's `view.html` shows whatever that branch is about.
+
+Configs that produced no `metrics.csv` still appear in the picker, disabled and badged with
+their verdict, so a failing config stays visible instead of silently vanishing. An audit run
+caps `OPS`/`DURATION`, so its series are short — the view marks any series with under 10 samples
+and says so. For graphs worth reading, generate from a full-length run instead.
 
 ## Report Generation
 
