@@ -30,6 +30,11 @@
       <option value="unstable">unstable</option>
       <option value="policies">policies</option>
     </select>
+    <label style="font-size:.75rem;color:#a0a0b0">View:</label>
+    <select id="view-select">
+      <option value="benchmark_dashboard/view.html">Benchmarks</option>
+      <option value="benchmark_dashboard/config-audit.html">Config audit</option>
+    </select>
     <span class="status" id="status"></span>
   </nav>
 
@@ -38,23 +43,26 @@
 <script>
 const OWNER = 'dubey02';
 const REPO = 'valkey-data-tiering';
-const VIEW_PATH = 'benchmark_dashboard/view.html';
 
-function rawUrl(branch) {
-  return `https://raw.githubusercontent.com/${OWNER}/${REPO}/${branch}/${VIEW_PATH}`;
+function rawUrl(branch, viewPath) {
+  return `https://raw.githubusercontent.com/${OWNER}/${REPO}/${branch}/${viewPath}`;
 }
 
 const branchSelect = document.getElementById('branch-select');
+const viewSelect = document.getElementById('view-select');
 const frame = document.getElementById('view-frame');
 const status = document.getElementById('status');
 
-async function loadBranch(branch) {
+async function load() {
+  const branch = branchSelect.value;
+  const viewPath = viewSelect.value;
+  const viewName = viewPath.split('/').pop();
   status.textContent = 'Loading...';
   status.className = 'status loading';
 
   try {
-    const resp = await fetch(rawUrl(branch));
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} — branch may not have view.html yet`);
+    const resp = await fetch(rawUrl(branch, viewPath));
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} — branch may not have ${viewName} yet`);
     const html = await resp.text();
     frame.srcdoc = html;
     status.textContent = branch;
@@ -67,10 +75,12 @@ async function loadBranch(branch) {
   // Update URL without reload
   const url = new URL(window.location);
   url.searchParams.set('branch', branch);
+  url.searchParams.set('view', viewName);
   history.replaceState(null, '', url);
 }
 
-branchSelect.onchange = () => loadBranch(branchSelect.value);
+branchSelect.onchange = load;
+viewSelect.onchange = load;
 
 // Receive data-loading status from the embedded view
 window.addEventListener('message', e => {
@@ -80,14 +90,21 @@ window.addEventListener('message', e => {
   }
 });
 
-// Init from URL param or default to unstable
+// Init from URL params or default to unstable + the benchmarks view
 const params = new URLSearchParams(window.location.search);
 const initBranch = params.get('branch') || 'unstable';
 if (![...branchSelect.options].some(o => o.value === initBranch)) {
   branchSelect.add(new Option(initBranch, initBranch));
 }
 branchSelect.value = initBranch;
-loadBranch(branchSelect.value);
+
+const initView = params.get('view');
+if (initView) {
+  const match = [...viewSelect.options].find(o => o.value.endsWith('/' + initView));
+  if (match) viewSelect.value = match.value;
+}
+
+load();
 </script>
 </body>
 </html>

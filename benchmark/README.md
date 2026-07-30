@@ -221,6 +221,57 @@ floor or lower `KEYSPACE`.
 The `size-sweep*` configs avoid the problem by deriving `KEYSPACE` from `MAXMEMORY_MB` /
 `DATASET_BYTES` plus `HOT_PCT` rather than hardcoding both sides.
 
+## Config Audit
+
+`audit-configs.sh` runs **every** config in `scenarios/*/configs/` against a remote host and
+classifies each one, so a config that has silently rotted gets caught:
+
+```bash
+./audit-configs.sh                          # all configs
+./audit-configs.sh --timeout 600 --tag mytag
+./audit-configs.sh scenarios/mixed-rw/configs/zipfian.env   # just these
+```
+
+It is not a performance measurement. `OPS` is capped at 200k, `DURATION` at 10s and `KEY_COUNT`
+at 100k on a deployed copy of each config, so each one is exercised end-to-end (parse -> server
+start -> populate -> workload -> report) in bounded time. Verdicts:
+
+| Verdict | Meaning |
+|---------|---------|
+| `PASS` | Ran and reported throughput. |
+| `FAIL` | Config parse error, server failed to start, or no throughput produced. |
+| `GRIND` | Populate never converged — ≥5 retries without reaching `KEYSPACE`. |
+| `TIMEOUT` | Exceeded `--timeout`. |
+
+Results land in `results/<tag>/`: an `audit.csv` plus one `<scenario>--<config>.log` per config.
+`reclassify.sh results/<tag>` re-derives verdicts from those saved logs without re-running
+anything, which is how you fix a classifier bug after a long run.
+
+### Dashboard view
+
+`tools/generate-audit-view/generate-audit-view.py` turns an audit run into a single
+self-contained HTML page — one tab per scenario, one expandable card per config showing its
+verdict, throughput, `.env` source and full run output:
+
+```bash
+python3 tools/generate-audit-view/generate-audit-view.py results/<tag>
+# -> benchmark_dashboard/config-audit.html
+```
+
+Pick **View: Config audit** in `benchmark_dashboard/index.html`. That shell fetches the view
+from `raw.githubusercontent.com` for whichever branch is selected, so it only sees branches that
+have been pushed — and GitHub Pages serves the shell itself from `unstable`, so a view on an
+unmerged branch is reachable either by `?branch=<name>` against the deployed shell or by serving
+the repo locally:
+
+```bash
+python3 -m http.server 8137 --bind 127.0.0.1
+# http://127.0.0.1:8137/benchmark_dashboard/index.html?view=config-audit.html
+```
+
+The page inlines all of its data because the shell renders views via iframe `srcdoc`, which
+breaks relative fetches.
+
 ## Report Generation
 
 Reports are auto-generated at the end of each run. They include:
