@@ -114,6 +114,7 @@ aws s3 cp s3://ezbench-833348497722/reports/<hostname>/report.html /tmp/
 | ID | Name | Tools | What it measures | Requires Tiering |
 |----|------|-------|-----------------|:---:|
 | mixed-rw | Mixed R/W | valkey-benchmark | Throughput under configurable GET/SET ratio, access pattern, and data type. Full sequential populate so GETs always hit. | No |
+| mixed-size | Mixed value sizes | valkey-benchmark | Throughput and latency when several value-size classes share one keyspace (`MIX_CLASSES="type:value_size:keysize:weight ..."`). Each class is populated under its own key prefix and driven by a parallel read/write pair. | No |
 | tiering-latency | Tiering storage latency | trace-replay | Storage-layer read latency (client + server p50/p99/p99.9/p100) | Yes* |
 
 \* `tiering-latency` has both tiering and no-tiering control configs (`SPILL=no`) for isolating the fetch-path cost from load-induced effects.
@@ -173,14 +174,51 @@ benchmark/
 ├── scenarios/                # Scenario configs + docs
 │   ├── README.md             # Scenario architecture details
 │   ├── lib.sh               # Shared helpers
-│   ├── mixed-rw/             (run.sh + configs: uniform, zipfian, uniform-flashcache, zipfian-flashcache, compound, compound-flashcache)
-│   └── tiering-latency/      (run.sh + configs: idle, slam, idle-hash, *-notier)
+│   ├── mixed-rw/             # run.sh + configs (see below)
+│   ├── mixed-size/           # run.sh + configs: default
+│   └── tiering-latency/      # run.sh + configs: idle, idle-hash, slam, *-notier
 ├── tools/
 │   ├── trace-replay/         # Go binary: synthetic workload generation
 │   ├── metrics-collector/    # Bash: polls INFO + system stats → CSV
 │   └── generate-report/      # Python: results → HTML + Markdown
 └── results/                  # Output (gitignored)
 ```
+
+`mixed-rw` configs, grouped by what they are for:
+
+| Group | Configs | Notes |
+|-------|---------|-------|
+| No-tiering baselines | `uniform`, `zipfian`, `zipfian-1gb-baseline`, `compound` | `MAXMEMORY=0`, `noeviction`. `compound` sweeps `DATATYPE` over hash/list/set/zset/stream. |
+| FlashCache, 400–512B values | `uniform-flashcache`, `zipfian-flashcache`, `balanced-flashcache`, `zipfian-1gb`, `zipfian-1gb-ttl`, `compound-flashcache` | The main tiering set. `balanced-flashcache` is 50/50 read/write; `zipfian-1gb-ttl` adds `TTL=120` to every SET. |
+| FlashCache, value-size sweeps | `size-sweep-fc`, `size-sweep-fc-large`, `size-sweep-fc-100b`, `size-sweep-fc-500k` | Derive `KEYSPACE` from `MAXMEMORY_MB`/`DATASET_BYTES` + `HOT_PCT` so the hot set is a fixed fraction of DRAM. |
+| No-tiering size sweep | `size-sweep` | Same derivation as above but `MAXMEMORY_OVERRIDE=0` to run uncapped. |
+| Local dev | `flashcache-local` | `--ext-storage-path /tmp/flashcache.db` instead of `/mnt/nvme`. |
+| Module backend | `zipfian-1gb-module` | Loads `libflash_tiering_module.so` from `modules/flash-tiering` instead of the built-in backend. Neither `benchmark.sh` nor `--remote` builds or ships that .so, so the server aborts on a missing module unless you build it (`cargo build --release` in `modules/flash-tiering`) and place it at `$EC2_REMOTE_DIR` yourself. |
+
+### Sizing constraint: maxmemory must cover the DRAM key floor
+
+Keys stay in DRAM, so `maxmemory` has to hold the whole key set before any value can be
+cached. `mixed-rw/run.sh` budgets `KEYSIZE + 64` bytes per key, so:
+
+```
+KEYSPACE * (KEYSIZE + 64)  <  MAXMEMORY
+```
+
+If that does not hold, populate can never reach `KEYSPACE`: DBSIZE climbs to whatever the
+cap allows and then stops, and the OOM-resilient populate loop retries up to 100 times
+without progressing. Symptom in the log is a run of identical lines:
+
+```
+[mixed-rw] Populate attempt 12: DBSIZE=226083/500000 — retrying...
+[mixed-rw] Populate attempt 13: DBSIZE=226083/500000 — retrying...
+```
+
+`flashcache-local` currently violates this — `KEYSPACE=500000`, `KEYSIZE=100`,
+`MAXMEMORY=32mb` needs a 78 MB key floor — so it stalls at ~226K keys. Either raise
+`MAXMEMORY` above the floor or lower `KEYSPACE`.
+
+The `size-sweep*` configs avoid the problem by deriving `KEYSPACE` from `MAXMEMORY_MB` /
+`DATASET_BYTES` plus `HOT_PCT` rather than hardcoding both sides.
 
 ## Report Generation
 
