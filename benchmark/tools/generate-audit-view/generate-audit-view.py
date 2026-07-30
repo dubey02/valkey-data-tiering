@@ -486,6 +486,16 @@ function fetchText(path) {
 }
 
 const LAT_FIELDS = ['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms'];
+
+// Per-series status. A config-level verdict must NOT be applied to a series that ran fine:
+// a sweep fails as a whole if any leg aborts, but its healthy legs are still valid data.
+// So only report a failure for a series that actually has none: it aborted, or it produced
+// no metrics at all.
+function seriesStatus(s) {
+  if (s.aborted) return 'ABORTED';
+  if (s.file) return '';                                  // has workload data -> it ran
+  return s.verdict && s.verdict !== 'PASS' ? s.verdict : '';
+}
 const viewsEl = document.getElementById('views');
 const tabBar = document.getElementById('tab-bar');
 const scenarioState = {};
@@ -542,7 +552,7 @@ DATA.scenarios.forEach(scen => {
     };
     lbl.appendChild(cb);
     lbl.append(s.label);
-    const badge = s.aborted ? 'ABORTED' : (s.verdict && s.verdict !== 'PASS' ? s.verdict : '');
+    const badge = seriesStatus(s);
     if (badge) {
       const b = document.createElement('span');
       b.className = 'vb ' + (badge === 'ABORTED' ? 'FAIL' : badge);
@@ -622,7 +632,7 @@ DATA.scenarios.forEach(scen => {
       { type:'bar', data:{labels:[],datasets:[]}, options:chartOpts });
   });
 
-  const bad = scen.series.filter(s => s.verdict && s.verdict !== 'PASS');
+  const bad = scen.series.filter(s => seriesStatus(s) && !s.aborted);
   const thin = scen.series.filter(s => s.file && s.samples < 10);
   const notRun = scen.notRun || [];
   const aborted = scen.series.filter(s => s.aborted);
@@ -784,7 +794,7 @@ function kpis(st, sel) {
 // ─── Tabs ───
 let currentScenario = DATA.scenarios[0].id;
 DATA.scenarios.forEach(scen => {
-  const bad = scen.series.filter(s => s.verdict && s.verdict !== 'PASS').length;
+  const bad = scen.series.filter(s => seriesStatus(s)).length;
   const btn = document.createElement('button');
   btn.dataset.scenario = scen.id;
   btn.innerHTML = scen.label + (bad ? ` <span class="bad">${bad} failing</span>` : '');
