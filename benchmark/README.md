@@ -190,8 +190,9 @@ benchmark/
 |-------|---------|-------|
 | No-tiering baselines | `uniform`, `zipfian`, `zipfian-1gb-baseline`, `compound` | `MAXMEMORY=0`, `noeviction`. `compound` sweeps `DATATYPE` over hash/list/set/zset/stream. |
 | FlashCache, 400–512B values | `uniform-flashcache`, `zipfian-flashcache`, `balanced-flashcache`, `zipfian-1gb`, `zipfian-1gb-ttl`, `compound-flashcache` | The main tiering set. `balanced-flashcache` is 50/50 read/write; `zipfian-1gb-ttl` adds `TTL=120` to every SET. |
-| FlashCache, value-size sweeps | `size-sweep-fc`, `size-sweep-fc-large`, `size-sweep-fc-100b`, `size-sweep-fc-500k` | Derive `KEYSPACE` from `MAXMEMORY_MB`/`DATASET_BYTES` + `HOT_PCT` so the hot set is a fixed fraction of DRAM. |
-| No-tiering size sweep | `size-sweep` | Same derivation as above but `MAXMEMORY_OVERRIDE=0` to run uncapped. |
+| FlashCache, value-size sweeps | `size-sweep-fc`, `size-sweep-fc-large` | Sweep `ITEM_SIZE` (500B–5MB, and 500KB–5MB respectively) via `SWEEP_ITEM_SIZE`. `KEYSPACE` is re-derived per sweep point from `MAXMEMORY_MB` + `HOT_PCT`, so the hot set stays a fixed fraction of DRAM as the value size changes. |
+| FlashCache, fixed value size | `size-sweep-fc-100b` (100 B), `size-sweep-fc-500k` (500 KB) | Single value size, no sweep — the two ends of the range isolated for detailed study. Despite the `size-sweep-` prefix neither declares `SWEEP_ITEM_SIZE`. `-100b` derives `KEYSPACE` from `DATASET_BYTES` (1 GiB of values); `-500k` derives it from `MAXMEMORY_MB`. |
+| No-tiering size sweep | `size-sweep` | Same `SWEEP_ITEM_SIZE` and derivation as `size-sweep-fc`, but `MAXMEMORY_OVERRIDE=0` runs it uncapped as a baseline. |
 | Local dev | `flashcache-local` | Zipfian twin of `zipfian-flashcache` backed by `/tmp/flashcache.db` instead of `/mnt/nvme`, with 10x fewer ops. Costs 2 GB of `/tmp` (the backing file is pre-allocated). |
 | Module backend | `zipfian-1gb-module` | Loads `libflash_tiering_module.so` from `modules/flash-tiering` instead of the built-in backend. Neither `benchmark.sh` nor `--remote` builds or ships that .so, so the server aborts on a missing module unless you build it (`cargo build --release` in `modules/flash-tiering`) and place it at `$EC2_REMOTE_DIR` yourself. |
 
