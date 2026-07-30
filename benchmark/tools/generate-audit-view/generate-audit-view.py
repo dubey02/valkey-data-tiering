@@ -1,35 +1,83 @@
 #!/usr/bin/env python3
-"""Turn a config-audit run into this branch's dashboard view.
-
-Reads an audit results directory (audit.csv + per-config .log files, as produced by
-benchmark/audit-configs.sh) plus the scenario configs themselves, and emits
-benchmark_dashboard/view.html with one tab per scenario and one expandable card per config.
+"""Publish a benchmark run as this branch's dashboard view.
 
 benchmark_dashboard/index.html on the GitHub Pages branch is a shell: given ?branch=NAME it
-fetches benchmark_dashboard/view.html from that branch and renders it. So a branch publishes
-its results simply by carrying its own view.html -- no change to the shell, and the shell needs
-no knowledge of the branch. This overwrites view.html on purpose: on this branch, the thing
-worth showing is the config audit.
+fetches benchmark_dashboard/view.html from that branch and renders it. A branch publishes its
+results purely by carrying its own view.html plus data/ -- the shell is never modified.
 
-The output inlines all of its data. The shell renders views via iframe srcdoc, which breaks
-relative fetches, so a view must either use absolute raw.githubusercontent URLs (what the
-perf view does for its CSVs) or carry its data inline (what this one does).
+This follows the same shape as the view on unstable/policies:
+  scenario tabs -> per-config checkboxes (colour-coded) -> metric sidebar -> KPI cards + charts
+Time series come from each run's metrics.csv (written by tools/metrics-collector), client
+latency from valkey-benchmark --csv output, server latency from INFO latencystats.
+
+Sweep legs (e.g. size-sweep-fc/item_size-500000) become separate selectable series.
 
 Usage:
-  generate-audit-view.py <results/TAG> [-o benchmark_dashboard/view.html]
+  generate-audit-view.py <results/TAG> [--audit-csv results/TAG/audit-reclassified.csv]
+Writes benchmark_dashboard/view.html and benchmark_dashboard/data/<scenario>/*.
 """
 import argparse
 import csv
 import datetime
-import html
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
-SCENARIOS = ["mixed-rw", "mixed-size", "tiering-latency"]
-VERDICT_ORDER = {"FAIL": 0, "GRIND": 1, "TIMEOUT": 2, "PASS": 3}
+SCENARIO_LABELS = [
+    ("mixed-rw", "Mixed R/W"),
+    ("mixed-size", "Mixed Size"),
+    ("tiering-latency", "Tiering Latency"),
+]
+
+# Distinct hues; cycled per scenario.
+PALETTE = ["#0ea5e9", "#f97316", "#8b5cf6", "#10b981", "#ef4444", "#eab308",
+           "#ec4899", "#14b8a6", "#a3e635", "#f472b6", "#60a5fa", "#fb923c",
+           "#c084fc", "#34d399", "#fca5a5", "#fcd34d", "#22d3ee"]
+
+METRICS = [
+    'used_memory', 'used_memory_rss', 'maxmemory', 'keyspace_hits', 'keyspace_misses',
+    'ops_per_sec', 'total_commands_delta',
+    'total_num_items_spilled_to_ext_storage', 'total_num_items_fetched_from_ext_storage',
+    'completion_read_ok', 'dram_value_hits', 'kbc_fetching_block',
+    'num_items_spilling_to_ext_storage', 'blocked_clients',
+    'cpu_user', 'cpu_sys', 'valkey_cpu_user', 'valkey_cpu_sys', 'valkey_cpu_total', 'asio_cpu_pct',
+    'disk_hit_pct', 'mem_hit_pct', 'mem_frag_ratio',
+    'disk_read_iops', 'disk_write_iops', 'disk_read_mb', 'disk_write_mb',
+    'disk_read_merges_ps', 'disk_write_merges_ps', 'disk_r_await_ms', 'disk_w_await_ms',
+    'disk_aqu_sz', 'disk_util_pct', 'disk_in_flight', 'disk_req_sz_kb',
+    'throttle_total_throttled', 'throttle_queued_clients', 'throttle_current_rate',
+    'throttle_allowed_tps',
+    'spill_submitted_count', 'spill_serialized_count', 'mean_spill_ram',
+    'inflight_spill_ram_bytes',
+]
+
+GROUPS = {
+    'Throughput': ['ops_per_sec', 'total_commands_delta', 'keyspace_hits', 'keyspace_misses'],
+    'Memory': ['used_memory', 'used_memory_rss', 'maxmemory', 'mem_frag_ratio'],
+    'Tiering': ['total_num_items_spilled_to_ext_storage', 'total_num_items_fetched_from_ext_storage',
+                'num_items_spilling_to_ext_storage', 'completion_read_ok', 'dram_value_hits',
+                'kbc_fetching_block', 'disk_hit_pct', 'mem_hit_pct'],
+    'CPU': ['cpu_user', 'cpu_sys', 'valkey_cpu_user', 'valkey_cpu_sys', 'valkey_cpu_total',
+            'asio_cpu_pct'],
+    'Disk': ['disk_read_iops', 'disk_write_iops', 'disk_read_mb', 'disk_write_mb',
+             'disk_read_merges_ps', 'disk_write_merges_ps', 'disk_r_await_ms', 'disk_w_await_ms',
+             'disk_aqu_sz', 'disk_util_pct', 'disk_in_flight', 'disk_req_sz_kb'],
+    'Throttle': ['throttle_total_throttled', 'throttle_queued_clients', 'throttle_current_rate',
+                 'throttle_allowed_tps', 'blocked_clients'],
+    'Spill Pipeline': ['spill_submitted_count', 'spill_serialized_count', 'mean_spill_ram',
+                       'inflight_spill_ram_bytes'],
+    'Latency (client)': ['_client_get_latency', '_client_set_latency'],
+    'Latency (server)': ['_server_latency'],
+}
+
+DEFAULT_VISIBLE = ['ops_per_sec', 'used_memory', 'disk_util_pct',
+                   'total_num_items_spilled_to_ext_storage',
+                   'total_num_items_fetched_from_ext_storage',
+                   'blocked_clients', 'valkey_cpu_total',
+                   '_client_get_latency', '_client_set_latency', '_server_latency']
 
 
 def git(repo, *args):
@@ -40,266 +88,527 @@ def git(repo, *args):
         return ""
 
 
-def throughput(log_text):
-    """Pull throughput figures out of a run log.
-
-    Three output shapes exist: mixed-rw string configs use valkey-benchmark --csv
-    ("GET","134228.19"), mixed-rw compound configs print "N requests per second",
-    mixed-size prints "N rps", and tiering-latency prints "Throughput: N ops/s".
-    """
-    out = []
-    for m in re.finditer(r'^"([A-Z][^"]*)","([0-9.]+)"', log_text, re.M):
-        out.append((m.group(1).split()[0], float(m.group(2))))
-    for m in re.finditer(r'^(\S+).*?: ([0-9.]+) requests per second', log_text, re.M):
-        out.append((m.group(1).split()[0], float(m.group(2))))
-    for m in re.finditer(r'^(\S+) \([^)]*\): ([0-9.]+) rps', log_text, re.M):
-        out.append((m.group(1), float(m.group(2))))
-    for m in re.finditer(r'Throughput: +([0-9]+) ops/s', log_text):
-        out.append(("ops/s", float(m.group(1))))
-    # De-duplicate while preserving order; sweeps repeat the same command name per leg.
-    seen, uniq = set(), []
-    for name, val in out:
-        if (name, val) in seen:
-            continue
-        seen.add((name, val))
-        uniq.append({"name": name, "rps": val})
-    return uniq
+def parse_bench_csv(path):
+    """valkey-benchmark --csv writes a header row plus one row per command."""
+    if not path.exists():
+        return None
+    rows = list(csv.DictReader(path.open()))
+    return rows[0] if rows else None
 
 
-def failure_detail(log_text, verdict, csv_detail):
-    if verdict == "PASS":
+def parse_server_latency(final_info):
+    """Pull latency_percentiles_usec_* lines out of INFO ALL."""
+    if not final_info.exists():
         return ""
-    if csv_detail:
-        return csv_detail
-    m = re.search(r'.*command not found.*', log_text)
-    if m:
-        return m.group(0).strip()
-    return ""
+    out = []
+    for line in final_info.read_text(errors="replace").splitlines():
+        if line.startswith("latency_percentiles_usec_"):
+            out.append(line.strip())
+    return "\n".join(out)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results_dir")
-    ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("--audit-csv", default=None)
     args = ap.parse_args()
 
     rdir = pathlib.Path(args.results_dir).resolve()
     if not rdir.is_dir():
         sys.exit(f"not a directory: {rdir}")
 
-    bench = pathlib.Path(__file__).resolve().parents[2]     # benchmark/
-    repo = bench.parent                                      # repo root
-    out = pathlib.Path(args.out) if args.out else repo / "benchmark_dashboard" / "view.html"
+    bench = pathlib.Path(__file__).resolve().parents[2]
+    repo = bench.parent
+    dash = repo / "benchmark_dashboard"
+    data_root = dash / "data"
 
-    # Prefer the reclassified CSV when present; it is derived from the same logs but
-    # with the corrected verdict rules.
-    csv_path = rdir / "audit-reclassified.csv"
-    if not csv_path.exists():
-        csv_path = rdir / "audit.csv"
-    if not csv_path.exists():
-        sys.exit(f"no audit.csv or audit-reclassified.csv in {rdir}")
+    # Verdicts, if an audit CSV is available: shown on each series so a config that failed
+    # is still visible in the picker rather than silently absent.
+    verdicts, details = {}, {}
+    acsv = pathlib.Path(args.audit_csv) if args.audit_csv else None
+    for cand in [acsv, rdir / "audit-reclassified.csv", rdir / "audit.csv"]:
+        if cand and cand.exists():
+            for row in csv.DictReader(cand.open()):
+                verdicts[(row["scenario"], row["config"])] = row["verdict"]
+                details[(row["scenario"], row["config"])] = row.get("detail", "")
+            break
 
-    rows = []
-    with csv_path.open() as fh:
-        for row in csv.DictReader(fh):
-            rows.append(row)
+    scenarios = []
+    for scen_id, scen_label in SCENARIO_LABELS:
+        sdir = rdir / scen_id
+        if not sdir.is_dir():
+            continue
+        out_dir = data_root / scen_id
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    configs = []
-    for row in rows:
-        scen, cfg, verdict = row["scenario"], row["config"], row["verdict"]
-        log_file = rdir / f"{scen}--{cfg}.log"
-        log_text = log_file.read_text(errors="replace") if log_file.exists() else "(log missing)"
-        env_file = bench / "scenarios" / scen / "configs" / f"{cfg}.env"
-        env_text = env_file.read_text() if env_file.exists() else "(config file not found)"
-        configs.append({
-            "scenario": scen,
-            "config": cfg,
-            "verdict": verdict,
-            "seconds": row.get("seconds", ""),
-            "detail": row.get("detail", ""),
-            "failure": failure_detail(log_text, verdict, row.get("detail", "")),
-            "throughput": throughput(log_text),
-            "env": env_text,
-            "log": log_text,
-            "tiered": "ext-storage-enabled" in env_text,
-        })
+        series = []
+        # A run directory is any directory containing metrics.csv; sweeps nest one level.
+        for mcsv in sorted(sdir.rglob("metrics.csv")):
+            run = mcsv.parent
+            rel = run.relative_to(sdir)
+            cfg = rel.parts[0]
+            leg = "/".join(rel.parts[1:])
+            slug = str(rel).replace("/", "__")
+            label = cfg if not leg else f"{cfg} · {leg.split('-')[-1]}"
 
-    configs.sort(key=lambda c: (VERDICT_ORDER.get(c["verdict"], 9), c["config"]))
+            shutil.copyfile(mcsv, out_dir / f"{slug}.csv")
 
+            for src, kind in (("get_output.txt", "get"), ("set_output.txt", "set")):
+                row = parse_bench_csv(run / src)
+                if row:
+                    with (out_dir / f"{slug}-{kind}-latency.csv").open("w", newline="") as fh:
+                        w = csv.DictWriter(fh, fieldnames=list(row.keys()))
+                        w.writeheader()
+                        w.writerow(row)
+            # Compound configs write a combined client-latency.csv instead.
+            clat = run / "client-latency.csv"
+            if clat.exists():
+                shutil.copyfile(clat, out_dir / f"{slug}-client-latency.csv")
+
+            srv = parse_server_latency(run / "final-info.txt")
+            if srv:
+                (out_dir / f"{slug}-server-latency.txt").write_text(srv + "\n")
+
+            with mcsv.open() as fh:
+                samples = max(0, sum(1 for _ in fh) - 1)
+
+            series.append({
+                "file": f"{slug}.csv",
+                "label": label,
+                "config": cfg,
+                "leg": leg,
+                "samples": samples,
+                "verdict": verdicts.get((scen_id, cfg), ""),
+            })
+
+        # Configs that produced no metrics.csv at all (e.g. server never started) still need
+        # to appear, otherwise the view silently hides a failure.
+        seen = {s["config"] for s in series}
+        for (vscen, vcfg), verdict in sorted(verdicts.items()):
+            if vscen == scen_id and vcfg not in seen:
+                series.append({"file": None, "label": vcfg, "config": vcfg, "leg": "",
+                               "samples": 0, "verdict": verdict})
+
+        for i, s in enumerate(series):
+            s["color"] = PALETTE[i % len(PALETTE)]
+
+        if series:
+            scenarios.append({"id": scen_id, "label": scen_label, "series": series})
+
+    if not scenarios:
+        sys.exit(f"no scenario data found under {rdir}")
+
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD") or "unstable"
     meta = {
         "tag": rdir.name,
+        "branch": branch,
         "commit": git(repo, "rev-parse", "--short", "HEAD"),
-        "branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
-        "subject": git(repo, "log", "-1", "--format=%s"),
         "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "counts": {},
+        "verdictCounts": {},
+        "details": {f"{k[0]}/{k[1]}": v for k, v in details.items() if v},
     }
-    for c in configs:
-        meta["counts"][c["verdict"]] = meta["counts"].get(c["verdict"], 0) + 1
+    for v in verdicts.values():
+        meta["verdictCounts"][v] = meta["verdictCounts"].get(v, 0) + 1
 
-    payload = json.dumps({"meta": meta, "configs": configs})
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(TEMPLATE.replace("__PAYLOAD__", payload))
-    print(f"wrote {out}  ({len(configs)} configs, {out.stat().st_size // 1024} KB)")
-    for v, n in sorted(meta["counts"].items()):
-        print(f"  {v:<8} {n}")
+    payload = json.dumps({
+        "meta": meta, "scenarios": scenarios,
+        "metrics": METRICS, "groups": GROUPS, "defaultVisible": DEFAULT_VISIBLE,
+    })
+
+    (dash / "view.html").write_text(TEMPLATE.replace("__PAYLOAD__", payload))
+
+    n_series = sum(len(s["series"]) for s in scenarios)
+    print(f"wrote {dash/'view.html'}")
+    print(f"  branch={branch} tag={meta['tag']}")
+    print(f"  {len(scenarios)} scenarios, {n_series} series")
+    for s in scenarios:
+        thin = [x['label'] for x in s['series'] if x['samples'] < 10]
+        print(f"    {s['id']:<16} {len(s['series'])} series"
+              + (f"  ({len(thin)} with <10 samples)" if thin else ""))
+    print(f"  data -> {data_root}")
 
 
 TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Valkey Data Tiering — Benchmark Config Audit</title>
-<style>
-  :root { --bg:#1a1a2e;--surface:#16213e;--border:#0f3460;--text:#e4e4e4;--muted:#a0a0b0;--accent:#0ea5e9;
-          --pass:#10b981;--fail:#ef4444;--warn:#f97316; }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;min-height:100vh}
-  header{padding:1rem 1.5rem .75rem;background:var(--surface);border-bottom:1px solid var(--border)}
-  header h1{font-size:1rem;font-weight:600}
-  header h1 span{color:var(--accent)}
-  .meta{font-size:.72rem;color:var(--muted);margin-top:.35rem;display:flex;gap:1.2rem;flex-wrap:wrap}
-  .meta code{color:var(--text);background:#0d1117;padding:.05rem .3rem;border-radius:3px}
-  .pills{display:flex;gap:.5rem;margin-top:.6rem;flex-wrap:wrap}
-  .pill{font-size:.7rem;padding:.2rem .6rem;border-radius:999px;border:1px solid var(--border);background:#0d1117}
-  .pill b{font-weight:700}
-  .pill.PASS b{color:var(--pass)} .pill.FAIL b{color:var(--fail)}
-  .pill.GRIND b,.pill.TIMEOUT b{color:var(--warn)}
-  .banner{margin:.75rem 1.5rem 0;padding:.6rem .8rem;border-left:3px solid var(--warn);background:#0d1117;font-size:.75rem;color:var(--muted);line-height:1.5}
-  .banner b{color:var(--text)}
-  .tab-bar{display:flex;gap:0;border-bottom:2px solid var(--border);background:var(--surface);margin-top:.75rem;overflow-x:auto}
-  .tab-bar button{padding:.7rem 1.5rem;background:none;border:none;color:var(--muted);font-size:.85rem;cursor:pointer;
-                  border-bottom:2px solid transparent;margin-bottom:-2px;white-space:nowrap}
-  .tab-bar button:hover{color:var(--text)}
-  .tab-bar button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
-  .tab-bar button .n{font-size:.7rem;color:var(--muted);margin-left:.4rem}
-  main{padding:1rem 1.5rem 3rem;flex:1}
-  .card{border:1px solid var(--border);border-radius:6px;margin-bottom:.6rem;background:var(--surface);overflow:hidden}
-  .card>summary{padding:.6rem .9rem;cursor:pointer;display:flex;align-items:center;gap:.75rem;font-size:.82rem;list-style:none}
-  .card>summary::-webkit-details-marker{display:none}
-  .card>summary:hover{background:#1b2a4e}
-  .card>summary .chev{color:var(--muted);font-size:.7rem;width:.7rem;flex-shrink:0}
-  .card[open]>summary .chev{transform:rotate(90deg)}
-  .name{font-family:ui-monospace,monospace;font-weight:600}
-  .badge{font-size:.65rem;font-weight:700;padding:.15rem .5rem;border-radius:3px;letter-spacing:.03em;flex-shrink:0}
-  .badge.PASS{background:rgba(16,185,129,.15);color:var(--pass)}
-  .badge.FAIL{background:rgba(239,68,68,.15);color:var(--fail)}
-  .badge.GRIND,.badge.TIMEOUT{background:rgba(249,115,22,.15);color:var(--warn)}
-  .tierpill{font-size:.62rem;color:var(--muted);border:1px solid var(--border);padding:.1rem .35rem;border-radius:3px;flex-shrink:0}
-  .thru{margin-left:auto;font-family:ui-monospace,monospace;font-size:.72rem;color:var(--muted);text-align:right}
-  .thru b{color:var(--text);font-weight:600}
-  .why{padding:.55rem .9rem;background:rgba(239,68,68,.07);border-top:1px solid var(--border);
-       font-family:ui-monospace,monospace;font-size:.72rem;color:#fca5a5;white-space:pre-wrap;word-break:break-word}
-  .why.warn{background:rgba(249,115,22,.07);color:#fdba74}
-  .panes{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:1px;background:var(--border);border-top:1px solid var(--border)}
-  @media (max-width:900px){.panes{grid-template-columns:minmax(0,1fr)}}
-  .pane{background:#0d1117;display:flex;flex-direction:column;min-width:0}
-  .pane h4{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
-           padding:.45rem .7rem;border-bottom:1px solid var(--border);background:var(--surface)}
-  .pane pre{padding:.7rem;overflow:auto;max-height:26rem;font-family:ui-monospace,monospace;font-size:.7rem;line-height:1.5;white-space:pre}
-  .empty{color:var(--muted);font-size:.8rem;padding:2rem;text-align:center}
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Valkey Data Tiering — Benchmarks</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5"></script>
+  <style>
+    :root { --bg:#1a1a2e;--surface:#16213e;--border:#0f3460;--text:#e4e4e4;--muted:#a0a0b0;--accent:#0ea5e9; }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column;height:100vh}
+    /* Scenario tab bar */
+    .tab-bar{display:flex;gap:0;border-bottom:2px solid var(--border);flex-shrink:0;background:var(--surface)}
+    .tab-bar button{padding:.7rem 1.5rem;background:none;border:none;color:var(--muted);font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
+    .tab-bar button:hover{color:var(--text)}
+    .tab-bar button.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+    .tab-bar button .bad{color:#ef4444;font-size:.7rem;margin-left:.4rem}
+    /* Dataset selector bar */
+    .top-bar{padding:.5rem 1.5rem;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;flex-shrink:0}
+    .top-bar label{display:flex;align-items:center;gap:.3rem;background:var(--surface);border:1px solid var(--border);padding:.25rem .6rem;border-radius:4px;font-size:.75rem;cursor:pointer}
+    .top-bar label:hover{border-color:var(--accent)}
+    .top-bar label.dead{opacity:.55}
+    .top-bar input[type="checkbox"]{accent-color:var(--accent)}
+    .top-bar .vb{font-size:.6rem;font-weight:700;padding:.05rem .3rem;border-radius:2px}
+    .top-bar .vb.FAIL{background:rgba(239,68,68,.2);color:#fca5a5}
+    .top-bar .vb.GRIND,.top-bar .vb.TIMEOUT{background:rgba(249,115,22,.2);color:#fdba74}
+    .top-bar .thin{font-size:.6rem;color:var(--muted)}
+    .layout{display:flex;flex:1;overflow:hidden}
+    /* Sidebar */
+    .sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;padding:.5rem}
+    .sidebar h3{font-size:.75rem;color:var(--muted);padding:.4rem .3rem;text-transform:uppercase;letter-spacing:.05em}
+    .sidebar label{display:flex;align-items:center;gap:.3rem;padding:.2rem .3rem;font-size:.72rem;cursor:pointer;border-radius:3px}
+    .sidebar label:hover{background:var(--border)}
+    .sidebar input[type="checkbox"]{accent-color:var(--accent);width:13px;height:13px}
+    .sidebar .group{margin-bottom:.8rem}
+    .sidebar .btn-row{display:flex;gap:.3rem;padding:.3rem;margin-bottom:.5rem}
+    .sidebar button{font-size:.68rem;padding:.2rem .5rem;background:var(--bg);border:1px solid var(--border);color:var(--muted);border-radius:3px;cursor:pointer}
+    .sidebar button:hover{color:var(--text);border-color:var(--accent)}
+    /* Main content */
+    .main{flex:1;overflow-y:auto;padding:1.5rem}
+    .notice{background:var(--surface);border-left:3px solid #f97316;padding:.55rem .8rem;margin-bottom:1rem;font-size:.72rem;color:var(--muted);line-height:1.5}
+    .notice b{color:var(--text)}
+    .kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.8rem;margin-bottom:1.2rem}
+    .kpi{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.6rem;text-align:center}
+    .kpi .value{font-size:1.2rem;font-weight:700;color:var(--accent)}
+    .kpi .label{font-size:.68rem;color:var(--muted);margin-top:.15rem}
+    .chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}
+    .chart-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem;display:none}
+    .chart-card.visible{display:block}
+    .chart-card.wide{grid-column:1/-1}
+    .chart-card h3{font-size:.78rem;color:var(--muted);margin-bottom:.4rem}
+    canvas{width:100%!important;max-height:240px}
+    .scenario-view{display:none;flex-direction:column;flex:1;overflow:hidden}
+    .scenario-view.active{display:flex}
+    .no-data{display:flex;align-items:center;justify-content:center;flex:1;color:var(--muted);font-size:.9rem;font-style:italic}
+    @media(max-width:1000px){.chart-grid{grid-template-columns:1fr}.sidebar{width:180px}}
+  </style>
 </head>
 <body>
 
-<header>
-  <h1><span>Valkey</span> Data Tiering — Benchmark Config Audit</h1>
-  <div class="meta" id="meta"></div>
-  <div class="pills" id="pills"></div>
-</header>
-
-<div class="banner">
-  Every config in <code>benchmark/scenarios/*/configs/</code> was run end-to-end against this commit on a
-  single aarch64 host with NVMe at <code>/mnt/nvme</code>. <b>Throughput here is not performance data</b> —
-  the audit caps <code>OPS</code> at 200k, <code>DURATION</code> at 10s and <code>KEY_COUNT</code> at 100k so
-  each config is exercised (parse &rarr; server start &rarr; populate &rarr; workload &rarr; report) in bounded
-  time. A verdict of PASS means the config runs and reports throughput, not that it is fast.
-</div>
-
-<div class="tab-bar" id="tabs"></div>
-<main id="body"></main>
+  <div class="tab-bar" id="tab-bar"></div>
+  <div id="views"></div>
 
 <script>
 const DATA = __PAYLOAD__;
-const SCENARIOS = ['mixed-rw','mixed-size','tiering-latency'];
 
-const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const GITHUB_OWNER = 'dubey02';
+const GITHUB_REPO = 'valkey-data-tiering';
+const DATA_PATH = 'benchmark_dashboard/data';
+const currentBranch = DATA.meta.branch;
 
-const m = DATA.meta;
-document.getElementById('meta').innerHTML = [
-  `branch <code>${esc(m.branch)}</code>`,
-  `commit <code>${esc(m.commit)}</code>`,
-  `run tag <code>${esc(m.tag)}</code>`,
-  `generated ${esc(m.generated)}`
-].join('');
-
-document.getElementById('pills').innerHTML =
-  Object.entries(m.counts).sort().map(([v,n]) =>
-    `<span class="pill ${v}"><b>${n}</b> ${v}</span>`).join('') +
-  `<span class="pill"><b>${DATA.configs.length}</b> total</span>`;
-
-function card(c) {
-  const thru = c.throughput.length
-    ? c.throughput.slice(0,4).map(t => `${t.name} <b>${Math.round(t.rps).toLocaleString()}</b>`).join(' · ')
-    : '<i>no throughput reported</i>';
-  const why = c.failure
-    ? `<div class="why ${c.verdict === 'PASS' ? '' : (c.verdict === 'FAIL' ? '' : 'warn')}">${esc(c.failure)}</div>`
-    : '';
-  return `
-  <details class="card">
-    <summary>
-      <span class="chev">&#9654;</span>
-      <span class="badge ${c.verdict}">${c.verdict}</span>
-      <span class="name">${esc(c.config)}</span>
-      <span class="tierpill">${c.tiered ? 'tiering' : 'no tiering'}</span>
-      ${c.seconds ? `<span class="tierpill">${esc(c.seconds)}s</span>` : ''}
-      <span class="thru">${thru}</span>
-    </summary>
-    ${why}
-    <div class="panes">
-      <div class="pane"><h4>${esc(c.config)}.env</h4><pre>${esc(c.env)}</pre></div>
-      <div class="pane"><h4>run output</h4><pre>${esc(c.log)}</pre></div>
-    </div>
-  </details>`;
+function rawUrl(branch, path) {
+  return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${branch}/${path}`;
 }
 
-const tabs = document.getElementById('tabs');
-const body = document.getElementById('body');
-let current = null;
-
-function render(scen) {
-  current = scen;
-  [...tabs.children].forEach(b => b.classList.toggle('active', b.dataset.s === scen));
-  const list = DATA.configs.filter(c => c.scenario === scen);
-  body.innerHTML = list.length
-    ? list.map(card).join('')
-    : '<div class="empty">No configs recorded for this scenario.</div>';
-}
-
-SCENARIOS.forEach(s => {
-  const list = DATA.configs.filter(c => c.scenario === s);
-  if (!list.length) return;
-  const bad = list.filter(c => c.verdict !== 'PASS').length;
-  const b = document.createElement('button');
-  b.dataset.s = s;
-  b.innerHTML = `${s}<span class="n">${list.length}${bad ? ` · ${bad} failing` : ''}</span>`;
-  b.onclick = () => render(s);
-  tabs.appendChild(b);
-});
-
-render(SCENARIOS.find(s => DATA.configs.some(c => c.scenario === s)));
-
-// The dashboard shell (benchmark_dashboard/index.html) shows whatever the embedded view
-// reports here in its status area.
 function setStatus(text, cls) {
   try { parent.postMessage({ type: 'view-status', text, cls }, '*'); } catch (e) {}
 }
-const bad = DATA.configs.filter(c => c.verdict !== 'PASS').length;
-setStatus(
-  `${m.branch} · config audit · ${DATA.configs.length} configs, ${bad} failing`,
-  bad ? 'error' : 'ok'
-);
+
+const chartOpts = {
+  responsive:true, animation:false, interaction:{intersect:false,mode:'index'},
+  plugins:{legend:{labels:{color:'#a0a0b0',boxWidth:10,font:{size:10}}}},
+  scales:{
+    x:{ticks:{color:'#a0a0b0',maxTicksLimit:15},grid:{color:'#0f3460'}},
+    y:{ticks:{color:'#a0a0b0'},grid:{color:'#0f3460'}},
+  }
+};
+
+function fetchCsv(path) {
+  return new Promise(resolve => {
+    Papa.parse(rawUrl(currentBranch, path), {
+      download:true, header:true, dynamicTyping:true,
+      complete: r => resolve(r.data.filter(row => Object.values(row).some(v => v !== null))),
+      error: () => resolve([])
+    });
+  });
+}
+function fetchText(path) {
+  return fetch(rawUrl(currentBranch, path)).then(r => r.ok ? r.text() : '').catch(() => '');
+}
+
+const LAT_FIELDS = ['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_latency_ms','max_latency_ms'];
+const viewsEl = document.getElementById('views');
+const tabBar = document.getElementById('tab-bar');
+const scenarioState = {};
+
+// ─── Build one scenario view ───
+DATA.scenarios.forEach(scen => {
+  const wrap = document.createElement('div');
+  wrap.className = 'scenario-view';
+  wrap.id = 'scenario-' + scen.id;
+  wrap.innerHTML = `
+    <div class="top-bar"></div>
+    <div class="layout">
+      <aside class="sidebar"></aside>
+      <main class="main">
+        <div class="notice"></div>
+        <div class="kpi-row"></div>
+        <div class="chart-grid"></div>
+      </main>
+    </div>`;
+  viewsEl.appendChild(wrap);
+
+  const st = {
+    scen,
+    topBar: wrap.querySelector('.top-bar'),
+    sidebar: wrap.querySelector('.sidebar'),
+    notice: wrap.querySelector('.notice'),
+    kpiRow: wrap.querySelector('.kpi-row'),
+    grid: wrap.querySelector('.chart-grid'),
+    loaded: {}, latency: {get:{},set:{},server:{}}, charts: {},
+    active: new Set(), visible: new Set(DATA.defaultVisible),
+    sidebarCBs: {}, built: false,
+  };
+  scenarioState[scen.id] = st;
+
+  // Default: select the runnable series, capped so the first paint stays readable.
+  scen.series.filter(s => s.file && s.samples > 1).slice(0, 6).forEach(s => st.active.add(s.file));
+
+  // Series checkboxes
+  scen.series.forEach(s => {
+    const lbl = document.createElement('label');
+    lbl.style.borderLeft = `3px solid ${s.color}`;
+    if (!s.file) lbl.classList.add('dead');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = st.active.has(s.file);
+    cb.disabled = !s.file;
+    cb.onchange = () => {
+      if (cb.checked) st.active.add(s.file); else st.active.delete(s.file);
+      render(st);
+    };
+    lbl.appendChild(cb);
+    lbl.append(s.label);
+    if (s.verdict && s.verdict !== 'PASS') {
+      const b = document.createElement('span');
+      b.className = 'vb ' + s.verdict;
+      b.textContent = s.verdict;
+      lbl.appendChild(b);
+    }
+    if (s.file && s.samples < 10) {
+      const t = document.createElement('span');
+      t.className = 'thin';
+      t.textContent = `${s.samples}pt`;
+      lbl.appendChild(t);
+    }
+    lbl.title = s.file
+      ? `${s.config}${s.leg ? ' / ' + s.leg : ''} — ${s.samples} samples`
+      : `${s.config} — ${s.verdict}: ${DATA.meta.details[scen.id + '/' + s.config] || 'no data produced'}`;
+    st.topBar.appendChild(lbl);
+  });
+
+  // Metric sidebar
+  const btnRow = document.createElement('div');
+  btnRow.className = 'btn-row';
+  const mk = (text, fn) => { const b = document.createElement('button'); b.textContent = text; b.onclick = fn; return b; };
+  const allMetrics = () => [...DATA.metrics, '_client_get_latency', '_client_set_latency', '_server_latency'];
+  btnRow.append(
+    mk('All',     () => { st.visible = new Set(allMetrics()); syncSidebar(st); updateVisibility(st); }),
+    mk('None',    () => { st.visible.clear(); syncSidebar(st); updateVisibility(st); }),
+    mk('Default', () => { st.visible = new Set(DATA.defaultVisible); syncSidebar(st); updateVisibility(st); }),
+  );
+  st.sidebar.appendChild(btnRow);
+
+  Object.entries(DATA.groups).forEach(([group, fields]) => {
+    const div = document.createElement('div');
+    div.className = 'group';
+    const h = document.createElement('h3');
+    h.textContent = group;
+    div.appendChild(h);
+    fields.forEach(f => {
+      const lbl = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = st.visible.has(f);
+      cb.onchange = () => { if (cb.checked) st.visible.add(f); else st.visible.delete(f); updateVisibility(st); };
+      st.sidebarCBs[f] = cb;
+      lbl.appendChild(cb);
+      lbl.append(f.replace(/^_/, '').replace(/_/g, ' '));
+      div.appendChild(lbl);
+    });
+    st.sidebar.appendChild(div);
+  });
+
+  // Chart cards
+  DATA.metrics.forEach(m => {
+    const card = document.createElement('div');
+    card.className = 'chart-card' + (m === 'ops_per_sec' ? ' wide' : '') + (st.visible.has(m) ? ' visible' : '');
+    card.dataset.metric = m;
+    card.innerHTML = `<h3>${m.replace(/_/g, ' ')}</h3><canvas></canvas>`;
+    st.grid.appendChild(card);
+    st.charts[m] = new Chart(card.querySelector('canvas'),
+      { type:'line', data:{labels:[],datasets:[]}, options:chartOpts });
+  });
+  [['_client_get_latency','Client GET Latency (ms)'],
+   ['_client_set_latency','Client SET Latency (ms)'],
+   ['_server_latency','Server-side Latency (µs)']].forEach(([m,title]) => {
+    const card = document.createElement('div');
+    card.className = 'chart-card wide' + (st.visible.has(m) ? ' visible' : '');
+    card.dataset.metric = m;
+    card.innerHTML = `<h3>${title}</h3><canvas></canvas>`;
+    st.grid.appendChild(card);
+    st.charts[m] = new Chart(card.querySelector('canvas'),
+      { type:'bar', data:{labels:[],datasets:[]}, options:chartOpts });
+  });
+
+  const bad = scen.series.filter(s => s.verdict && s.verdict !== 'PASS');
+  const thin = scen.series.filter(s => s.file && s.samples < 10);
+  st.notice.innerHTML =
+    `Run <b>${DATA.meta.tag}</b> at commit <b>${DATA.meta.commit}</b>, generated ${DATA.meta.generated}. `
+    + (bad.length ? `<b>${bad.length}</b> config(s) did not pass and carry no series: `
+        + bad.map(s => `${s.config} (${s.verdict})`).join(', ') + '. ' : '')
+    + (thin.length ? `<b>${thin.length}</b> series have fewer than 10 samples — this run was produced by
+        the config audit, which caps OPS/DURATION to bound runtime, so short workloads yield very few
+        metric ticks. Treat those lines as "it ran", not as performance data.` : '');
+});
+
+function syncSidebar(st) {
+  Object.entries(st.sidebarCBs).forEach(([f, cb]) => cb.checked = st.visible.has(f));
+}
+function updateVisibility(st) {
+  st.grid.querySelectorAll('.chart-card').forEach(el =>
+    el.classList.toggle('visible', st.visible.has(el.dataset.metric)));
+}
+
+async function loadScenario(st) {
+  if (st.built) return;
+  st.built = true;
+  const withData = st.scen.series.filter(s => s.file);
+  const base = f => `${DATA_PATH}/${st.scen.id}/${f}`;
+
+  await Promise.all(withData.map(async s => {
+    st.loaded[s.file] = await fetchCsv(base(s.file));
+  }));
+  await Promise.all(withData.map(async s => {
+    const stem = s.file.replace('.csv', '');
+    const [g, sx] = await Promise.all([
+      fetchCsv(base(`${stem}-get-latency.csv`)),
+      fetchCsv(base(`${stem}-set-latency.csv`)),
+    ]);
+    if (g[0]) st.latency.get[s.file] = g[0];
+    if (sx[0]) st.latency.set[s.file] = sx[0];
+    // Compound configs emit a single combined file instead of get/set pairs.
+    if (!g[0] && !sx[0]) {
+      const c = await fetchCsv(base(`${stem}-client-latency.csv`));
+      if (c[0]) st.latency.get[s.file] = { p50_latency_ms:c[0].p50_ms, p95_latency_ms:c[0].p95_ms,
+                                           p99_latency_ms:c[0].p99_ms, max_latency_ms:c[0].p100_ms };
+      if (c[1]) st.latency.set[s.file] = { p50_latency_ms:c[1].p50_ms, p95_latency_ms:c[1].p95_ms,
+                                           p99_latency_ms:c[1].p99_ms, max_latency_ms:c[1].p100_ms };
+    }
+  }));
+  await Promise.all(withData.map(async s => {
+    const txt = await fetchText(base(`${s.file.replace('.csv','')}-server-latency.txt`));
+    if (!txt) return;
+    const parsed = {};
+    txt.trim().split('\n').forEach(line => {
+      const m = line.match(/^latency_percentiles_usec_(\w+):(.+)/);
+      if (!m) return;
+      const vals = {};
+      m[2].split(',').forEach(p => { const [k,v] = p.split('='); vals[k] = parseFloat(v); });
+      parsed[m[1]] = vals;
+    });
+    st.latency.server[s.file] = parsed;
+  }));
+  render(st);
+}
+
+function render(st) {
+  const sel = st.scen.series.filter(s => s.file && st.active.has(s.file));
+
+  DATA.metrics.forEach(m => {
+    const chart = st.charts[m];
+    const datasets = [];
+    let maxLen = 0;
+    sel.forEach(s => {
+      const rows = st.loaded[s.file];
+      if (!rows || !rows.length) return;
+      maxLen = Math.max(maxLen, rows.length);
+      datasets.push({ label:s.label, data:rows.map(r => r[m] ?? 0), borderColor:s.color,
+                      tension:.2, pointRadius:0, borderWidth:1.5 });
+    });
+    chart.data.labels = Array.from({length:maxLen}, (_,i) => i+1);
+    chart.data.datasets = datasets;
+    chart.update();
+  });
+
+  latBar(st, '_client_get_latency', st.latency.get, sel);
+  latBar(st, '_client_set_latency', st.latency.set, sel);
+  srvBar(st, sel);
+  kpis(st, sel);
+  updateVisibility(st);
+}
+
+function latBar(st, key, data, sel) {
+  const chart = st.charts[key];
+  chart.data.labels = LAT_FIELDS.map(f => f.replace('_latency_ms','').replace('_',' '));
+  chart.data.datasets = sel.filter(s => data[s.file]).map(s => ({
+    label:s.label, data:LAT_FIELDS.map(f => parseFloat(data[s.file][f]) || 0),
+    backgroundColor:s.color+'cc', borderColor:s.color, borderWidth:1 }));
+  chart.update();
+}
+
+function srvBar(st, sel) {
+  const chart = st.charts['_server_latency'];
+  const pct = ['p50','p99','p99.9','p100'], cmds = ['get','set'];
+  const labels = [];
+  cmds.forEach(c => pct.forEach(p => labels.push(`${c} ${p}`)));
+  chart.data.labels = labels;
+  chart.data.datasets = sel.filter(s => st.latency.server[s.file]).map(s => {
+    const srv = st.latency.server[s.file];
+    const data = [];
+    cmds.forEach(c => pct.forEach(p => data.push(srv[c]?.[p] ?? 0)));
+    return { label:s.label, data, backgroundColor:s.color+'cc', borderColor:s.color, borderWidth:1 };
+  });
+  chart.update();
+}
+
+function kpis(st, sel) {
+  st.kpiRow.innerHTML = '';
+  sel.forEach(s => {
+    const rows = st.loaded[s.file];
+    if (!rows || !rows.length) return;
+    // Skip the ramp when there is enough of a series to have a steady state.
+    const steady = rows.length > 12 ? rows.slice(10) : rows;
+    const avg = steady.reduce((a,r) => a + (r.ops_per_sec || 0), 0) / (steady.length || 1);
+    const kpi = document.createElement('div');
+    kpi.className = 'kpi';
+    kpi.innerHTML = `<div class="value" style="color:${s.color}">${(avg/1000).toFixed(1)}K</div>`
+                  + `<div class="label">${s.label} ops/s</div>`;
+    st.kpiRow.appendChild(kpi);
+  });
+}
+
+// ─── Tabs ───
+let currentScenario = DATA.scenarios[0].id;
+DATA.scenarios.forEach(scen => {
+  const bad = scen.series.filter(s => s.verdict && s.verdict !== 'PASS').length;
+  const btn = document.createElement('button');
+  btn.dataset.scenario = scen.id;
+  btn.innerHTML = scen.label + (bad ? ` <span class="bad">${bad} failing</span>` : '');
+  btn.onclick = () => activate(scen.id);
+  tabBar.appendChild(btn);
+});
+
+function activate(id) {
+  currentScenario = id;
+  document.querySelectorAll('.scenario-view').forEach(v => v.classList.remove('active'));
+  document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
+  document.getElementById('scenario-' + id).classList.add('active');
+  tabBar.querySelector(`[data-scenario="${id}"]`).classList.add('active');
+  loadScenario(scenarioState[id]);
+}
+
+const totalBad = Object.entries(DATA.meta.verdictCounts)
+  .filter(([v]) => v !== 'PASS').reduce((a,[,n]) => a+n, 0);
+setStatus(`${DATA.meta.branch} · ${DATA.meta.tag}` + (totalBad ? ` · ${totalBad} failing` : ''),
+          totalBad ? 'error' : 'ok');
+activate(currentScenario);
 </script>
 </body>
 </html>
