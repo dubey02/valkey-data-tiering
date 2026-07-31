@@ -1,0 +1,4 @@
+latency_percentiles_usec_info:p50=125.439,p90=125.439,p99=125.439,p99.9=125.439,p100=125.439
+latency_percentiles_usec_ping:p50=0.001,p90=3.007,p99=3.007,p99.9=3.007,p100=3.007
+latency_percentiles_usec_config|get:p50=1.003,p90=7.007,p99=7.007,p99.9=7.007,p100=7.007
+latency_percentiles_usec_config|set:p50=3.007,p90=4.015,p99=4.015,p99.9=4.015,p100=4.015

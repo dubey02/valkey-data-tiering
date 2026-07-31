@@ -1,0 +1,8 @@
+latency_percentiles_usec_echo:p50=1.003,p90=2.007,p99=2.007,p99.9=2.007,p100=2.007
+latency_percentiles_usec_dbsize:p50=2.007,p90=2.007,p99=2.007,p99.9=2.007,p100=2.007
+latency_percentiles_usec_info:p50=177.151,p90=14942.207,p99=22282.239,p99.9=23461.887,p100=23461.887
+latency_percentiles_usec_smembers:p50=2.007,p90=2.007,p99=3.007,p99.9=10.047,p100=40.191
+latency_percentiles_usec_sadd:p50=0.001,p90=1.003,p99=2.007,p99.9=10.047,p100=24248.319
+latency_percentiles_usec_config|get:p50=2.007,p90=6.015,p99=7.007,p99.9=7.007,p100=7.007
+latency_percentiles_usec_config|set:p50=3.007,p90=5.023,p99=5.023,p99.9=5.023,p100=5.023
+latency_percentiles_usec_ping:p50=0.001,p90=3.007,p99=3.007,p99.9=3.007,p100=3.007

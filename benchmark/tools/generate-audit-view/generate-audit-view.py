@@ -94,18 +94,25 @@ def git(repo, *args):
 def pretty_leg(leg):
     """Render a sweep leg directory name as a self-describing label.
 
-    benchmark.sh names sweep subdirectories '<var>-<value>' (lowercased var). A bare value is
-    ambiguous -- 'size-sweep · 500' reads as though 500 were a rate -- so ITEM_SIZE legs get a
-    byte suffix and anything unrecognised keeps 'var=value'.
+    benchmark.sh names sweep subdirectories '<var>-<value>' (lowercased var), and a
+    multi-variable sweep nests one directory per variable, e.g.
+    'datatype-hash/value_bytes-500000'. Format each level and join, so the label reads
+    'hash · 500KB' rather than the raw path.
+
+    A bare value is ambiguous -- 'size-sweep · 500' reads as though 500 were a rate -- so
+    VALUE_BYTES/ITEM_SIZE levels get a byte suffix and anything unrecognised keeps 'var=value'.
     """
-    var, _, value = leg.rpartition("-")
-    if var == "item_size" and value.isdigit():
+    return " · ".join(_pretty_level(p) for p in leg.split("/") if p)
+
+
+def _pretty_level(level):
+    var, _, value = level.rpartition("-")
+    if var in ("item_size", "value_bytes") and value.isdigit():
         n = int(value)
         for div, unit in ((1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")):
             if n >= div and n % div == 0:
                 return f"{n // div}{unit}"
-        # Values like 500000 are decimal-round, not binary-round; show them as-is in KB/MB
-        # only when exact, otherwise fall back to a plain byte count.
+        # Values like 500000 are decimal-round, not binary-round.
         for div, unit in ((1_000_000, "MB"), (1_000, "KB")):
             if n >= div and n % div == 0:
                 return f"{n // div}{unit}"
@@ -294,12 +301,20 @@ def main():
             slug = str(rel).replace("/", "__")
             label = cfg if not leg else f"{cfg} · {pretty_leg(leg)}"
 
-            # A sweep's verdict is per-config, but individual legs can abort while siblings
+            # A sweep's verdict is per-config, but individual legs can fail while siblings
             # succeed. Read each leg's own output.txt so a failed leg is not charted and a
             # healthy sibling is not tarred with the config-level verdict.
+            #
+            # Two distinct per-leg failures:
+            #   ABORTED  - populate ran but never reached KEYSPACE (output.txt says so)
+            #   NO OUTPUT - run.sh died before writing output.txt at all. metrics.csv still
+            #               exists because benchmark.sh starts the collector first, so the leg
+            #               looks real until you notice the DB is empty.
             out_txt = run / "output.txt"
             aborted = ""
-            if out_txt.exists():
+            if not out_txt.exists():
+                aborted = "NO OUTPUT: scenario produced no output.txt (harness died before the workload)"
+            else:
                 am = re.search(r'POPULATE_ABORTED:.*', out_txt.read_text(errors="replace"))
                 if am:
                     aborted = am.group(0).strip()
@@ -519,7 +534,7 @@ const LAT_FIELDS = ['avg_latency_ms','p50_latency_ms','p95_latency_ms','p99_late
 // So only report a failure for a series that actually has none: it aborted, or it produced
 // no metrics at all.
 function seriesStatus(s) {
-  if (s.aborted) return 'ABORTED';
+  if (s.aborted) return s.aborted.startsWith('NO OUTPUT') ? 'NO DATA' : 'ABORTED';
   if (s.file) return '';                                  // has workload data -> it ran
   return s.verdict && s.verdict !== 'PASS' ? s.verdict : '';
 }
@@ -582,7 +597,7 @@ DATA.scenarios.forEach(scen => {
     const badge = seriesStatus(s);
     if (badge) {
       const b = document.createElement('span');
-      b.className = 'vb ' + (badge === 'ABORTED' ? 'FAIL' : badge);
+      b.className = 'vb ' + (badge === 'ABORTED' || badge === 'NO DATA' ? 'FAIL' : badge);
       b.textContent = badge;
       lbl.appendChild(b);
     }
@@ -674,8 +689,16 @@ DATA.scenarios.forEach(scen => {
     + (bad.length ? `<b>${bad.length}</b> config(s) did not pass and carry no series: `
         + bad.map(s => `${s.config} (${s.verdict})`).join(', ') + '. ' : '')
     + (notRun.length ? `Not included in this run: <b>${notRun.join(', ')}</b>. ` : '')
-    + (aborted.length ? `<b>${aborted.length}</b> leg(s) aborted during populate and are not
-        charted: ` + aborted.map(s => s.label).join(', ') + '. ' : '')
+    + (aborted.filter(s => !s.aborted.startsWith('NO OUTPUT')).length
+        ? `<b>${aborted.filter(s => !s.aborted.startsWith('NO OUTPUT')).length}</b> leg(s) aborted
+           during populate (engine could not absorb the writes) and are not charted: `
+          + aborted.filter(s => !s.aborted.startsWith('NO OUTPUT')).map(s => s.label).join(', ')
+          + '. ' : '')
+    + (aborted.filter(s => s.aborted.startsWith('NO OUTPUT')).length
+        ? `<b>${aborted.filter(s => s.aborted.startsWith('NO OUTPUT')).length}</b> leg(s) produced no
+           output at all — a harness fault, not an engine result — and are not charted: `
+          + aborted.filter(s => s.aborted.startsWith('NO OUTPUT')).map(s => s.label).join(', ')
+          + '. ' : '')
     + (thin.length && !DATA.meta.capped
         ? `<b>${thin.length}</b> series still have under 10 points — metrics are sampled once per
            second and those configs set a small OPS/RPS of their own, so the workload simply
