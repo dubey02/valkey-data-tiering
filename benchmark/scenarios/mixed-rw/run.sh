@@ -24,16 +24,24 @@ source "$CONFIG"
 
 # VALUE_BYTES: total value bytes per key. ITEM_SIZE is per element for compound types, so
 # sweeping it directly makes a size axis incomparable -- ITEM_SIZE=5000000 is a 5MB string but
-# a 50MB hash. VALUE_BYTES fixes the per-key total instead and derives ITEM_SIZE from it, so
-# "5MB" means the same amount of value data whichever data type is under test.
+# a 50MB hash. VALUE_BYTES fixes the per-key total instead, so "5MB" means the same amount of
+# value data whichever data type is under test.
+#
+# Strings take it as the value size. Compound types hold the element size fixed at
+# COMPOUND_ITEM_SIZE and scale ITEMS_PER_KEY, so a 500B set is 10 x 50B and a 5MB set is
+# 100k x 50B. Scaling the element instead would push each element past
+# PROTO_INLINE_MAX_SIZE (64KB) -- the populate path pipes inline commands, and an
+# over-limit inline command is dropped with no error, giving a silently empty keyspace.
+: "${COMPOUND_ITEM_SIZE:=50}"
 if [ -n "${VALUE_BYTES:-}" ] && [ "$VALUE_BYTES" -gt 0 ] 2>/dev/null; then
     if [ "$DATATYPE" = "string" ]; then
         ITEM_SIZE=$VALUE_BYTES
     else
-        ITEM_SIZE=$(( VALUE_BYTES / ITEMS_PER_KEY ))
-        (( ITEM_SIZE < 1 )) && ITEM_SIZE=1
+        ITEM_SIZE=$COMPOUND_ITEM_SIZE
+        ITEMS_PER_KEY=$(( VALUE_BYTES / ITEM_SIZE ))
+        (( ITEMS_PER_KEY < 1 )) && ITEMS_PER_KEY=1
     fi
-    echo "[mixed-rw] VALUE_BYTES=$VALUE_BYTES type=$DATATYPE items_per_key=$ITEMS_PER_KEY -> ITEM_SIZE=$ITEM_SIZE"
+    echo "[mixed-rw] VALUE_BYTES=$VALUE_BYTES type=$DATATYPE -> item_size=$ITEM_SIZE items_per_key=$ITEMS_PER_KEY"
 fi
 : "${OPS:=1000000}"
 : "${DURATION:=}"  # If set, use --duration instead of -n (time-based workload)

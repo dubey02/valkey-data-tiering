@@ -197,7 +197,7 @@ the cost of tiering.
 
 Shared across all four: `VALUE_BYTES` ∈ {500, 5000, 500000, 5000000} x `DATATYPE` ∈
 {string, zset, set, hash, list, stream}, `KEYSIZE=100`, `HOT_PCT=10`, `MAXMEMORY_MB=512`,
-`READ_PCT=80`, `CLIENTS=200`, `DURATION=60`, `ITEMS_PER_KEY=10`.
+`READ_PCT=80`, `CLIENTS=200`, `DURATION=60`, `COMPOUND_ITEM_SIZE=50`.
 
 Both halves use the same constant-maxmemory keyspace derivation, so a baseline leg and its
 tiered twin hold the same number of keys. The baselines then add `MAXMEMORY_OVERRIDE=0` to run
@@ -205,9 +205,35 @@ uncapped with the whole dataset DRAM-resident; the tiered halves keep the 512 MB
 
 **`VALUE_BYTES` is per key, not per element.** `ITEM_SIZE` is per element for compound types, so
 sweeping it directly would make the size axis meaningless -- `ITEM_SIZE=5000000` is a 5 MB string
-but a 50 MB hash. `VALUE_BYTES` fixes the per-key total and `run.sh` derives `ITEM_SIZE` from it
-(`VALUE_BYTES / ITEMS_PER_KEY` for compound types), so "5 KB" is 5 KB of value data whichever
-type is under test.
+but a 50 MB hash. `VALUE_BYTES` fixes the per-key total instead:
+
+- **string** -- the value is `VALUE_BYTES` long.
+- **compound** -- the element size is fixed at `COMPOUND_ITEM_SIZE` (50 B) and the *item count*
+  scales: `ITEMS_PER_KEY = VALUE_BYTES / 50`. So a 500 B set is 10 x 50 B and a 5 MB set is
+  100,000 x 50 B.
+
+Scaling the element instead of the count is not an option here: at 5 MB it would put each element
+at 500 KB, over `PROTO_INLINE_MAX_SIZE` (64 KB, `src/server.h`). The compound populate path pipes
+**inline** commands, and an over-limit inline command is dropped with no error at all -- `--pipe`
+prints nothing, so the leg reports zero keys and zero errors and looks like an engine failure
+rather than a harness one.
+
+`VALUE_BYTES` is *logical payload* bytes, not resident bytes. Compound types carry per-element
+overhead, and the encoding changes as the item count grows, so a compound key costs more than its
+string twin at the same `VALUE_BYTES`. Measured with 50 B elements:
+
+| `VALUE_BYTES` | items | type | resident | vs `VALUE_BYTES` | encoding |
+|---|---|---|---|---|---|
+| 500 | 10 | hash | 664 B | 1.33x | listpack |
+| 5,000 | 100 | hash | 6.2 KB | 1.23x | listpack |
+| 500,000 | 10,000 | hash | 787 KB | 1.57x | hashtable |
+| 5,000,000 | 100,000 | hash | 7.7 MB | 1.55x | hashtable |
+| 5,000,000 | 100,000 | zset | 11.3 MB | 2.25x | skiplist |
+
+The keyspace derivation budgets `ITEMS_PER_KEY * ITEM_SIZE`, i.e. the logical total, so a compound
+leg's resident dataset runs 1.2-2.3x larger than the string leg it pairs with. That is inherent to
+compound encoding rather than an artefact to cancel out -- and it is part of what tiering has to
+cope with -- but it means "same `VALUE_BYTES`" is a statement about payload, not about DRAM.
 
 Two configs sit outside the matrix because they test something it does not cover:
 
