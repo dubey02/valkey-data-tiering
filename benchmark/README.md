@@ -184,18 +184,18 @@ benchmark/
 └── results/                  # Output (gitignored)
 ```
 
-`mixed-rw` configs. The four matrix configs are the suite: each sweeps 5 value sizes x 6 data
-types (30 legs), and each baseline pairs 1:1 with a tiered twin so a leg-for-leg diff isolates
+`mixed-rw` configs. The four matrix configs are the suite: each sweeps 4 value sizes x 6 data
+types (24 legs), and each baseline pairs 1:1 with a tiered twin so a leg-for-leg diff isolates
 the cost of tiering.
 
 | Config | Access | Tiering | Legs |
 |--------|--------|:---:|---|
-| `zipfian` | zipfian (α=1.0) | no | 30 |
-| `zipfian-flashcache` | zipfian (α=1.0) | yes | 30 |
-| `uniform` | uniform | no | 30 |
-| `uniform-flashcache` | uniform | yes | 30 |
+| `zipfian` | zipfian (α=1.0) | no | 24 |
+| `zipfian-flashcache` | zipfian (α=1.0) | yes | 24 |
+| `uniform` | uniform | no | 24 |
+| `uniform-flashcache` | uniform | yes | 24 |
 
-Shared across all four: `VALUE_BYTES` ∈ {100, 500, 5000, 500000, 5000000} x `DATATYPE` ∈
+Shared across all four: `VALUE_BYTES` ∈ {500, 5000, 500000, 5000000} x `DATATYPE` ∈
 {string, zset, set, hash, list, stream}, `KEYSIZE=100`, `HOT_PCT=10`, `MAXMEMORY_MB=512`,
 `READ_PCT=80`, `CLIENTS=200`, `DURATION=60`, `ITEMS_PER_KEY=10`.
 
@@ -218,18 +218,23 @@ Two configs sit outside the matrix because they test something it does not cover
 
 Derived dataset per size, at `MAXMEMORY_MB=512` / `HOT_PCT=10` (identical for every data type):
 
-| `VALUE_BYTES` | keyspace | dataset | vs DRAM |
-|---|---|---|---|
-| 100 | 2,964,939 | 283 MB | 0.6x |
-| 500 | 2,410,744 | 1.1 GB | 2.2x |
-| 5,000 | 776,956 | 3.6 GB | 7.2x |
-| 500,000 | 10,284 | 4.8 GB | 9.6x |
-| 5,000,000 | 1,031 | 4.8 GB | 9.6x |
+| `VALUE_BYTES` | keyspace | keys in DRAM | dataset | vs DRAM |
+|---|---|---|---|---|
+| 500 | 2,410,744 | 377 MB (77%) | 1.1 GB | 2.3x |
+| 5,000 | 776,956 | 122 MB (25%) | 3.6 GB | 7.5x |
+| 500,000 | 10,284 | 2 MB (0%) | 4.8 GB | 10.0x |
+| 5,000,000 | 1,031 | 0 MB (0%) | 4.8 GB | 10.0x |
 
-Note the 100-byte leg fits inside DRAM (0.6x), so its tiered half has nothing to spill and
-should match its baseline. That is expected rather than a fault: with a 100-byte key and a
-100-byte value the key overhead dominates, and tiering only pays off once values are comfortably
-larger than keys.
+`HOT_PCT` sets the overspill ceiling: `ratio(V) = 100V / (100·per_key + HOT_PCT·V)`, which tends
+to `100/HOT_PCT` = 10x as the value grows. Small values fall short of that ceiling because keys
+stay DRAM-resident and `per_key` (`KEYSIZE + 64` = 164 B) eats the budget — at 500 B, keys are
+still 77% of DRAM.
+
+A 100-byte leg was dropped for that reason. It derived 2.96M keys whose keys alone filled 94% of
+DRAM, leaving a 283 MB dataset at **0.6x** — entirely resident, so its tiered half had nothing to
+spill. That is not fixable by tuning: a 10x dataset at 100 B values needs ~49M keys, or 7.9 GB of
+DRAM just for keys against a 492 MB budget. It restates the design rule that values must be
+comfortably larger than keys before tiering can pay for itself.
 
 ### Sizing constraint: maxmemory must cover the DRAM key floor
 
