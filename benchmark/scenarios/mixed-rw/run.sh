@@ -236,8 +236,16 @@ if [ "$DATATYPE" = "string" ]; then
 else
     echo "[mixed-rw] Compound: items_per_key=$ITEMS_PER_KEY item_size=$ITEM_SIZE"
 
-    # Generate a fixed payload of ITEM_SIZE bytes (no newlines)
-    PAYLOAD=$(head -c "$ITEM_SIZE" /dev/urandom | base64 -w0 | tr -d '\n' | head -c "$ITEM_SIZE")
+    # Fixed payload of ITEM_SIZE bytes (no newlines). Truncate with parameter expansion, not a
+    # trailing `head -c`: head closing the pipe early sends SIGPIPE upstream, which under
+    # `set -o pipefail` kills the whole scenario. That silently produced zero-key legs at
+    # ITEM_SIZE >= ~500000 (exit 141) with no output.txt and no error.
+    PAYLOAD=$(head -c $(( ITEM_SIZE * 3 / 4 + 16 )) /dev/urandom | base64 -w0 | tr -d '\n')
+    PAYLOAD=${PAYLOAD:0:ITEM_SIZE}
+    if [ "${#PAYLOAD}" -ne "$ITEM_SIZE" ]; then
+        echo "[mixed-rw] ERROR: payload is ${#PAYLOAD}B, expected ${ITEM_SIZE}B" >&2
+        exit 1
+    fi
 
     # ── Populate via --pipe ──
     echo "[mixed-rw] Populating $KEYSPACE keys x $ITEMS_PER_KEY items ($DATATYPE)..."
