@@ -184,17 +184,52 @@ benchmark/
 └── results/                  # Output (gitignored)
 ```
 
-`mixed-rw` configs, grouped by what they are for:
+`mixed-rw` configs. The four matrix configs are the suite: each sweeps 5 value sizes x 6 data
+types (30 legs), and each baseline pairs 1:1 with a tiered twin so a leg-for-leg diff isolates
+the cost of tiering.
 
-| Group | Configs | Notes |
-|-------|---------|-------|
-| No-tiering baselines | `uniform`, `zipfian`, `zipfian-1gb-baseline`, `compound` | `MAXMEMORY=0`, `noeviction`. `compound` sweeps `DATATYPE` over hash/list/set/zset/stream. |
-| FlashCache, 400–512B values | `uniform-flashcache`, `zipfian-flashcache`, `balanced-flashcache`, `zipfian-1gb`, `zipfian-1gb-ttl`, `compound-flashcache` | The main tiering set. `balanced-flashcache` is 50/50 read/write; `zipfian-1gb-ttl` adds `TTL=120` to every SET. |
-| FlashCache, value-size sweeps | `size-sweep-fc`, `size-sweep-fc-large` | Sweep `ITEM_SIZE` (500B–5MB, and 500KB–5MB respectively) via `SWEEP_ITEM_SIZE`. `KEYSPACE` is re-derived per sweep point from `MAXMEMORY_MB` + `HOT_PCT`, so the hot set stays a fixed fraction of DRAM as the value size changes. |
-| FlashCache, fixed value size | `fixed-fc-100b` (100 B), `fixed-fc-500k` (500 KB) | Single value size, no sweep — the two ends of the range isolated for detailed study. `-100b` derives `KEYSPACE` from `DATASET_BYTES` (1 GiB of values); `-500k` derives it from `MAXMEMORY_MB`. `-500k` does not currently converge; see the note in the file. |
-| No-tiering size sweep | `size-sweep` | Same `SWEEP_ITEM_SIZE` and derivation as `size-sweep-fc`, but `MAXMEMORY_OVERRIDE=0` runs it uncapped as a baseline. |
-| Local dev | `flashcache-local` | Zipfian twin of `zipfian-flashcache` backed by `/tmp/flashcache.db` instead of `/mnt/nvme`, with 10x fewer ops. Costs 2 GB of `/tmp` (the backing file is pre-allocated). |
-| Module backend | `zipfian-1gb-module` | Loads `libflash_tiering_module.so` from `modules/flash-tiering` instead of the built-in backend. Neither `benchmark.sh` nor `--remote` builds or ships that .so, so the server aborts on a missing module unless you build it (`cargo build --release` in `modules/flash-tiering`) and place it at `$EC2_REMOTE_DIR` yourself. |
+| Config | Access | Tiering | Legs |
+|--------|--------|:---:|---|
+| `zipfian` | zipfian (α=1.0) | no | 30 |
+| `zipfian-flashcache` | zipfian (α=1.0) | yes | 30 |
+| `uniform` | uniform | no | 30 |
+| `uniform-flashcache` | uniform | yes | 30 |
+
+Shared across all four: `VALUE_BYTES` ∈ {100, 500, 5000, 500000, 5000000} x `DATATYPE` ∈
+{string, zset, set, hash, list, stream}, `KEYSIZE=100`, `HOT_PCT=10`, `MAXMEMORY_MB=512`,
+`READ_PCT=80`, `CLIENTS=200`, `DURATION=60`, `ITEMS_PER_KEY=10`.
+
+Both halves use the same constant-maxmemory keyspace derivation, so a baseline leg and its
+tiered twin hold the same number of keys. The baselines then add `MAXMEMORY_OVERRIDE=0` to run
+uncapped with the whole dataset DRAM-resident; the tiered halves keep the 512 MB cap and spill.
+
+**`VALUE_BYTES` is per key, not per element.** `ITEM_SIZE` is per element for compound types, so
+sweeping it directly would make the size axis meaningless -- `ITEM_SIZE=5000000` is a 5 MB string
+but a 50 MB hash. `VALUE_BYTES` fixes the per-key total and `run.sh` derives `ITEM_SIZE` from it
+(`VALUE_BYTES / ITEMS_PER_KEY` for compound types), so "5 KB" is 5 KB of value data whichever
+type is under test.
+
+Two configs sit outside the matrix because they test something it does not cover:
+
+| Config | Why it is separate |
+|--------|--------------------|
+| `flashcache-local` | Backing file in `/tmp` instead of `/mnt/nvme`, for a dev box with no NVMe. |
+| `zipfian-1gb-module` | Loads `libflash_tiering_module.so` instead of the built-in backend. Needs the .so built and deployed by hand -- see below. |
+
+Derived dataset per size, at `MAXMEMORY_MB=512` / `HOT_PCT=10` (identical for every data type):
+
+| `VALUE_BYTES` | keyspace | dataset | vs DRAM |
+|---|---|---|---|
+| 100 | 2,964,939 | 283 MB | 0.6x |
+| 500 | 2,410,744 | 1.1 GB | 2.2x |
+| 5,000 | 776,956 | 3.6 GB | 7.2x |
+| 500,000 | 10,284 | 4.8 GB | 9.6x |
+| 5,000,000 | 1,031 | 4.8 GB | 9.6x |
+
+Note the 100-byte leg fits inside DRAM (0.6x), so its tiered half has nothing to spill and
+should match its baseline. That is expected rather than a fault: with a 100-byte key and a
+100-byte value the key overhead dominates, and tiering only pays off once values are comfortably
+larger than keys.
 
 ### Sizing constraint: maxmemory must cover the DRAM key floor
 

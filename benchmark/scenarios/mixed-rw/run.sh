@@ -21,6 +21,20 @@ source "$CONFIG"
 # Value-size: ITEM_SIZE is canonical; fall back to DATASIZE for back-compat with old string configs
 : "${ITEM_SIZE:=${DATASIZE:-400}}"
 : "${ITEMS_PER_KEY:=10}"
+
+# VALUE_BYTES: total value bytes per key. ITEM_SIZE is per element for compound types, so
+# sweeping it directly makes a size axis incomparable -- ITEM_SIZE=5000000 is a 5MB string but
+# a 50MB hash. VALUE_BYTES fixes the per-key total instead and derives ITEM_SIZE from it, so
+# "5MB" means the same amount of value data whichever data type is under test.
+if [ -n "${VALUE_BYTES:-}" ] && [ "$VALUE_BYTES" -gt 0 ] 2>/dev/null; then
+    if [ "$DATATYPE" = "string" ]; then
+        ITEM_SIZE=$VALUE_BYTES
+    else
+        ITEM_SIZE=$(( VALUE_BYTES / ITEMS_PER_KEY ))
+        (( ITEM_SIZE < 1 )) && ITEM_SIZE=1
+    fi
+    echo "[mixed-rw] VALUE_BYTES=$VALUE_BYTES type=$DATATYPE items_per_key=$ITEMS_PER_KEY -> ITEM_SIZE=$ITEM_SIZE"
+fi
 : "${OPS:=1000000}"
 : "${DURATION:=}"  # If set, use --duration instead of -n (time-based workload)
 : "${CLIENTS:=200}"
