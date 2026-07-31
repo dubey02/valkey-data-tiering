@@ -222,13 +222,38 @@ def parse_server_latency(final_info):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("results_dir")
+    ap.add_argument("results_dir", nargs="?",
+                    help="Audit/benchmark results directory. Omit only with --empty.")
     ap.add_argument("--audit-csv", default=None)
+    ap.add_argument("--empty", action="store_true",
+                    help="Write a placeholder view carrying no data, for a branch that has not "
+                         "produced a run yet. Keeps the view from referencing data/ files that "
+                         "are not there.")
     ap.add_argument("--capped", action="store_true",
                     help="Run came from audit-configs.sh without --full, i.e. OPS/DURATION were "
                          "capped. Changes how the view explains short series.")
     args = ap.parse_args()
 
+    bench_root = pathlib.Path(__file__).resolve().parents[2]
+    if args.empty:
+        dash = bench_root.parent / "benchmark_dashboard"
+        branch = git(bench_root.parent, "rev-parse", "--abbrev-ref", "HEAD") or "unstable"
+        payload = json.dumps({
+            "meta": {"tag": "", "branch": branch,
+                     "commit": git(bench_root.parent, "rev-parse", "--short", "HEAD"),
+                     "generated": datetime.datetime.now(datetime.timezone.utc)
+                                  .strftime("%Y-%m-%d %H:%M UTC"),
+                     "capped": False, "verdictCounts": {}, "details": {}},
+            "scenarios": [], "metrics": METRICS, "groups": GROUPS,
+            "defaultVisible": DEFAULT_VISIBLE,
+        })
+        dash.mkdir(parents=True, exist_ok=True)
+        (dash / "view.html").write_text(TEMPLATE.replace("__PAYLOAD__", payload))
+        print(f"wrote {dash/'view.html'} (empty: no data referenced, branch={branch})")
+        return
+
+    if not args.results_dir:
+        sys.exit("results_dir is required unless --empty is given")
     rdir = pathlib.Path(args.results_dir).resolve()
     if not rdir.is_dir():
         sys.exit(f"not a directory: {rdir}")
@@ -791,6 +816,28 @@ function kpis(st, sel) {
                   + `<div class="label">ops/s &middot; ${s.label}</div>`;
     st.kpiRow.appendChild(kpi);
   });
+}
+
+// ─── Empty state ───
+// A branch can carry the view without having produced a run yet. Say so plainly rather
+// than rendering empty tabs or pointing at data/ files that are not there.
+if (!DATA.scenarios.length) {
+  document.body.innerHTML =
+    `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                 height:100vh;gap:.6rem;color:#a0a0b0;font-family:system-ui,sans-serif;
+                 text-align:center;padding:2rem">
+       <div style="font-size:1rem;color:#e4e4e4">No benchmark data on this branch yet</div>
+       <div style="font-size:.8rem">Branch <code style="color:#0ea5e9">${DATA.meta.branch}</code>
+         carries the harness but no results.</div>
+       <div style="font-size:.75rem;max-width:34rem;line-height:1.6">
+         Produce a run, then publish it:<br>
+         <code style="color:#e4e4e4">./benchmark.sh --remote --tag &lt;tag&gt; &lt;scenario&gt;</code><br>
+         <code style="color:#e4e4e4">python3 benchmark/tools/generate-audit-view/generate-audit-view.py
+           benchmark/results/&lt;tag&gt;</code>
+       </div>
+     </div>`;
+  setStatus(`${DATA.meta.branch} · no data`, '');
+  throw new Error('no data');   // stop before the chart wiring runs
 }
 
 // ─── Tabs ───

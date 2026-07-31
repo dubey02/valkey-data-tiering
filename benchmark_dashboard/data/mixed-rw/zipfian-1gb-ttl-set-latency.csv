@@ -1,2 +1,0 @@
-test,rps,avg_latency_ms,min_latency_ms,p50_latency_ms,p95_latency_ms,p99_latency_ms,max_latency_ms
-SET __rand_int__ __data__ EX 120,37397.86,1.048,0.264,0.911,1.647,2.055,65.663

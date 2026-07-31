@@ -1,9 +1,0 @@
-latency_percentiles_usec_info:p50=158.719,p99=184.319,p99.9=184.319,p100=184.319
-latency_percentiles_usec_config|resetstat:p50=62.207,p99=62.207,p99.9=62.207,p100=62.207
-latency_percentiles_usec_client|setinfo:p50=0.001,p99=1.003,p99.9=1.003,p100=1.003
-latency_percentiles_usec_hello:p50=5.023,p99=6.015,p99.9=6.015,p100=6.015
-latency_percentiles_usec_cluster|shards:p50=1.003,p99=1.003,p99.9=1.003,p100=1.003
-latency_percentiles_usec_hset:p50=565.247,p99=655.359,p99.9=655.359,p100=655.359
-latency_percentiles_usec_ping:p50=1.003,p99=2.007,p99.9=2.007,p100=2.007
-latency_percentiles_usec_debug:p50=1.003,p99=8.031,p99.9=8.031,p100=8.031
-latency_percentiles_usec_hgetall:p50=257.023,p99=272.383,p99.9=272.383,p100=272.383
