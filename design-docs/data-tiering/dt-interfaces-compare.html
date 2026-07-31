@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Valkey Data Tiering - Storage Interfaces & Call Stack</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --card:#1d2740; --border:#2a3550; --text:#dce3f2;
+          --muted:#8593ad; --accent:#4da3ff; --ok:#3ecf8e; --warn:#f5b950; --purple:#c586f0; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif; padding:24px; }
+  h1 { font-size:20px; margin-bottom:2px; }
+  .sub { color:var(--muted); margin-bottom:16px; font-size:13px; max-width:900px; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; }
+  .controls button { background:var(--panel); color:var(--text); border:1px solid var(--border);
+    padding:7px 16px; border-radius:8px; cursor:pointer; font-size:13.5px; }
+  .controls button:hover { border-color:var(--accent); }
+  .controls button.active { background:var(--accent); color:#08101f; border-color:var(--accent); font-weight:600; }
+
+  .layout { display:grid; grid-template-columns:minmax(560px,1fr) 360px; gap:18px; align-items:start; max-width:1280px; }
+  @media (max-width:1080px){ .layout{ grid-template-columns:1fr; } }
+
+  /* ---------- diagram ---------- */
+  .diagram { display:flex; flex-direction:column; align-items:center; }
+  .card { background:var(--card); border:1.5px solid var(--border); border-radius:14px;
+          padding:14px 18px; width:100%; transition:all .3s; position:relative; }
+  .card .title { font-weight:700; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .card .file { color:var(--muted); font-size:11.5px; font-family:ui-monospace,Menlo,monospace; margin-top:1px; }
+  .tag { font-size:9.5px; letter-spacing:1.4px; color:var(--muted); font-weight:700;
+         background:var(--panel); border:1px solid var(--border); border-radius:5px; padding:1px 7px; }
+  .apis { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; align-items:center; }
+  .apis .grp { font-size:10px; color:var(--muted); letter-spacing:.8px; font-weight:700; margin-right:2px; }
+  .pill { font:11.5px ui-monospace,Menlo,monospace; background:#0c1220; border:1px solid var(--border);
+          border-radius:14px; padding:2.5px 11px; color:#c9d6ee; white-space:nowrap; }
+  .pill.hi { border-color:var(--warn); color:var(--warn); }
+  .pill.hi-b { border-color:var(--accent); color:var(--accent); }
+  .pill.hi-p { border-color:var(--purple); color:var(--purple); }
+  .note-badge { margin-top:10px; font-size:11.5px; color:var(--warn); background:#221c10;
+                border:1px solid #4a3d1e; border-radius:8px; padding:5px 10px; display:inline-block; }
+
+  .card.engine { border-color:var(--accent); }
+  .card.contract { border-color:var(--warn); background:#1c2536; }
+  .card.native.on { border-color:var(--ok); }
+  .card.modapi { border-color:var(--purple); background:#221b30; }
+  .card.module.on { border-color:var(--purple); }
+  .dimmed { opacity:.25; }
+
+  /* ---------- connectors ---------- */
+  .conn { display:flex; flex-direction:column; align-items:center; padding:2px 0; transition:opacity .3s; }
+  .conn .line { width:0; border-left:3px solid var(--accent); height:34px; }
+  .conn .line.dashed { border-left-style:dashed; }
+  .conn .line.g { border-left-color:var(--ok); }
+  .conn .line.p { border-left-color:var(--purple); }
+  .conn .head { width:0; height:0; border-left:7px solid transparent; border-right:7px solid transparent;
+                border-top:9px solid var(--accent); }
+  .conn .head.g { border-top-color:var(--ok); }
+  .conn .head.p { border-top-color:var(--purple); }
+  .conn .head.up { border-top:none; border-bottom:9px solid var(--purple); order:-1; }
+  .conn .clabel { font:11px ui-monospace,Menlo,monospace; color:var(--accent); background:var(--panel);
+                  border:1px solid var(--border); border-radius:6px; padding:2px 10px; margin:4px 0; }
+  .conn .clabel.g { color:var(--ok); } .conn .clabel.p { color:var(--purple); }
+
+  .split { display:grid; grid-template-columns:1fr 1fr; gap:22px; width:100%; }
+  .col { display:flex; flex-direction:column; align-items:center; }
+  .col .card { flex:1; }
+
+  /* ---------- side panel ---------- */
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px; }
+  .panel h3 { font-size:12.5px; color:var(--accent); text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; }
+  #explain { font-size:13.5px; }
+  #explain code { background:#0c1220; padding:1px 5px; border-radius:4px; font-size:12px; color:var(--warn); }
+  #explain b.n { color:var(--ok); } #explain b.m { color:var(--purple); } #explain b.y { color:var(--warn); }
+  #explain p + p { margin-top:9px; }
+  .legend { margin-top:14px; padding-top:10px; border-top:1px solid var(--border); font-size:12px;
+            color:var(--muted); display:flex; flex-direction:column; gap:5px; }
+  .lg { display:inline-block; width:30px; border-top:3px solid; margin-right:8px; vertical-align:middle; }
+
+  /* ---------- click-to-open code modal ---------- */
+  .card { cursor:pointer; }
+  .card:hover { filter:brightness(1.15); }
+  .card::after { content:'view source'; position:absolute; top:10px; right:12px; font-size:9.5px;
+                 color:var(--muted); letter-spacing:.8px; opacity:0; transition:opacity .2s; }
+  .card:hover::after { opacity:.9; }
+  .card .tag { margin-right:52px; }
+  #overlay { position:fixed; inset:0; background:rgba(5,8,16,.75); display:none;
+             align-items:center; justify-content:center; z-index:50; padding:24px; }
+  #overlay.open { display:flex; }
+  #modal { background:var(--panel); border:1px solid var(--accent); border-radius:14px;
+           width:min(860px, 94vw); max-height:88vh; display:flex; flex-direction:column;
+           box-shadow:0 18px 60px rgba(0,0,0,.6); }
+  #modal header { display:flex; align-items:center; gap:12px; padding:14px 18px;
+                  border-bottom:1px solid var(--border); }
+  #modal header .mt { font-weight:700; font-size:15px; }
+  #modal header .mf { font:11.5px ui-monospace,Menlo,monospace; color:var(--muted); flex:1; }
+  #modal header button { background:none; border:1px solid var(--border); color:var(--text);
+                         border-radius:7px; padding:3px 11px; cursor:pointer; font-size:13px; }
+  #modal header button:hover { border-color:var(--accent); }
+  #mcode { overflow:auto; padding:16px 18px; font:12.5px/1.6 ui-monospace,Menlo,monospace;
+           color:#c9d6ee; white-space:pre; }
+  #mcode .cm { color:#6a9955; } #mcode .kw { color:#c586c0; } #mcode .ty { color:#4ec9b0; }
+  #mcode .fn { color:#dcdcaa; } #mcode .hl { color:var(--warn); }
+</style>
+</head>
+<body>
+
+<h1>Valkey Data Tiering &mdash; Storage Interfaces & Call Stack</h1>
+<div class="sub">How the engine's tiering logic reaches the storage backend, layer by layer. Click any component to view its exact source code.</div>
+
+<div class="controls">
+  <button id="b-both" class="active" onclick="setView('both')">Both paths</button>
+  <button id="b-native" onclick="setView('native')">Native path</button>
+  <button id="b-module" onclick="setView('module')">Module path</button>
+</div>
+
+<div class="layout">
+<div class="diagram">
+
+  <!-- LAYER 1: TIERING LOGIC -->
+  <div class="card engine" id="c-engine">
+    <div class="title">Tiering logic <span class="tag">LAYER 1 &middot; CORE</span></div>
+    <div class="file">src/ext_storage.c &nbsp;&mdash;&nbsp; KBC, state machine, spill controller, eviction hook</div>
+    <div class="apis">
+      <span class="grp">CALLS</span>
+      <span class="pill hi-b">extStorageBridge_submitPut(dbId, key_robj, value_robj, ttl)</span>
+      <span class="pill hi-b">extStorageBridge_submitGet(dbId, key)</span>
+    </div>
+    <div class="apis">
+      <span class="grp">DRAINS</span>
+      <span class="pill hi-b">extStorageBridge_pollCompletions(batch, max)</span>
+      <span class="pill">in beforeSleep(), once per event-loop iteration</span>
+    </div>
+  </div>
+
+  <div class="conn" id="k-call">
+    <div class="line"></div>
+    <div class="clabel">extStorageBridge_submitPut(...) &nbsp;&mdash;&nbsp; robj* pointers cross, nothing serialized yet</div>
+    <div class="line" style="height:12px"></div>
+    <div class="head"></div>
+  </div>
+
+  <!-- LAYER 2: BRIDGE -->
+  <div class="card engine" id="c-bridge">
+    <div class="title">Bridge <span class="tag">LAYER 2 &middot; CORE</span></div>
+    <div class="file">src/ext_storage_bridge.c &nbsp;&mdash;&nbsp; backend selection at startup + completion buffering</div>
+    <div class="apis">
+      <span class="grp">FORWARDS</span>
+      <span class="pill">submitPut() &rarr; storageSubmitPut(db, key, 0, value, 0, ttl, ctx)</span>
+    </div>
+    <div class="apis">
+      <span class="grp">OWNS</span>
+      <span class="pill">bridge_on_completion() &rarr; comp_ring &nbsp;(lock-free, IO thread writes / main thread reads)</span>
+    </div>
+  </div>
+
+  <div class="conn" id="k-call2">
+    <div class="line"></div>
+    <div class="clabel">storageSubmitPut(db_id, key, 0, value, 0, expire_ms, request_ctx)</div>
+    <div class="line" style="height:12px"></div>
+    <div class="head"></div>
+  </div>
+
+  <!-- LAYER 3: DISPATCH -->
+  <div class="card engine" id="c-dispatch">
+    <div class="title">Dispatch <span class="tag">LAYER 3 &middot; CORE</span></div>
+    <div class="file">src/storage/storage_dispatch.c &nbsp;&mdash;&nbsp; the hybrid router</div>
+    <div class="apis">
+      <span class="grp">ROUTES</span>
+      <span class="pill">if (server_storage-&gt;put_async) &rarr; call it directly</span>
+      <span class="pill">else &rarr; storage_middleware.c wraps sync put() on its own IO thread</span>
+    </div>
+  </div>
+
+  <div class="conn" id="k-call3">
+    <div class="line"></div>
+    <div class="clabel">server_storage-&gt;put_async(ctx, db, key, klen, value, vlen, ttl, req_ctx)</div>
+    <div class="line" style="height:12px"></div>
+    <div class="head"></div>
+  </div>
+
+  <!-- LAYER 4: CONTRACT -->
+  <div class="card contract" id="c-contract">
+    <div class="title">struct storageType <span class="tag">THE CONTRACT &middot; storage/storage.h &middot; v1</span></div>
+    <div class="apis"><span class="grp">LIFECYCLE</span>
+      <span class="pill">open(cfg)</span><span class="pill">close()</span>
+    </div>
+    <div class="apis"><span class="grp">ASYNC IO</span>
+      <span class="pill hi">put_async</span><span class="pill hi">get_async</span>
+      <span class="pill hi">del_async</span><span class="pill hi">poll_completions</span>
+    </div>
+    <div class="apis"><span class="grp">OPTIONAL</span>
+      <span class="pill">put / get / del &nbsp;(sync &rarr; middleware wraps)</span>
+      <span class="pill">cron</span><span class="pill">get_stats</span>
+    </div>
+  </div>
+
+  <!-- split connectors -->
+  <div class="split">
+    <div class="col">
+      <div class="conn" id="k-native">
+        <div class="line g dashed"></div>
+        <div class="clabel g">fills the struct at compile time,<br>selected by config</div>
+        <div class="line g dashed" style="height:12px"></div>
+        <div class="head g"></div>
+      </div>
+      <!-- NATIVE -->
+      <div class="card native on" id="c-native">
+        <div class="title">Native provider <span class="tag">COMPILED IN</span></div>
+        <div class="file">storage/storage_flashcache_real.c &nbsp;(links libflashcache.a)</div>
+        <div class="apis"><span class="grp">FILLS</span>
+          <span class="pill">.put_async = fc_put</span>
+          <span class="pill">.get_async = fc_get</span>
+          <span class="pill">.poll_completions = fc_poll</span>
+        </div>
+        <div class="apis"><span class="grp">SELECT</span>
+          <span class="pill">ext-storage-backend flashcache</span>
+        </div>
+        <div class="note-badge">serde: calls engine callbacks directly on its IO thread</div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="conn" id="k-reg">
+        <div class="head up"></div>
+        <div class="line p dashed" style="height:12px"></div>
+        <div class="clabel p">registers the SAME struct,<br>once, at MODULE LOADEX</div>
+        <div class="line p dashed"></div>
+      </div>
+      <!-- MODULE API -->
+      <div class="card modapi" id="c-modapi">
+        <div class="title">Module API <span class="tag">LOAD TIME ONLY</span></div>
+        <div class="file">valkeymodule.h &nbsp;/&nbsp; module.c</div>
+        <div class="apis"><span class="grp">UP</span>
+          <span class="pill hi-p">RegisterStorageBackend(ctx, &amp;struct)</span>
+        </div>
+        <div class="apis"><span class="grp">DOWN</span>
+          <span class="pill hi-p">GetExternalStorageSerializationCallbacks(...)</span>
+        </div>
+      </div>
+      <div class="conn" id="k-mod">
+        <div class="head up"></div>
+        <div class="line p dashed" style="height:20px"></div>
+      </div>
+      <!-- MODULE -->
+      <div class="card module on" id="c-module">
+        <div class="title">Module provider <span class="tag">LOADABLE .so</span></div>
+        <div class="file">modules/flash-tiering &nbsp;(Rust, #[repr(C)])</div>
+        <div class="apis"><span class="grp">FILLS</span>
+          <span class="pill">.put_async = nks_put_async</span>
+          <span class="pill">.get_async = nks_get_async</span>
+          <span class="pill">.poll_completions = nks_poll</span>
+        </div>
+        <div class="note-badge">serde: fetches engine callbacks once, runs them on its IO worker</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SIDE PANEL -->
+<div>
+  <div class="panel">
+    <h3 id="v-title">Both paths</h3>
+    <div id="explain"></div>
+    <div class="legend">
+      <div><span class="lg" style="border-color:var(--accent)"></span>runtime call path (every operation)</div>
+      <div><span class="lg" style="border-color:var(--ok);border-top-style:dashed"></span>native: compile-time + config</div>
+      <div><span class="lg" style="border-color:var(--purple);border-top-style:dashed"></span>module: one-time registration</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<div id="overlay" onclick="if(event.target===this)closeModal()">
+  <div id="modal">
+    <header><span class="mt" id="m-title"></span><span class="mf" id="m-file"></span><button onclick="closeModal()">Close &nbsp;Esc</button></header>
+    <div id="mcode"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const PARTS = ['c-engine','c-bridge','c-dispatch','c-contract','c-native','c-modapi','c-module','k-call','k-call2','k-call3','k-native','k-reg','k-mod'];
+
+/* ---------- real source for each card (verified against unstable) ---------- */
+const CODE = {
+'c-engine': { t:'Tiering logic — where the calls originate', f:'src/ext_storage.c (spill :1205, fetch :625, drain :1053)', c:
+`<span class="cm">/* ---- SPILL call site (ext_storage.c:1195) ---- */</span>
+<span class="cm">/* Borrowed value robj — points to original value, no copy */</span>
+<span class="ty">void</span> *raw_value = <span class="fn">objectGetVal</span>(item);
+robj *value_ref = <span class="fn">zmalloc</span>(<span class="kw">sizeof</span>(robj));
+<span class="fn">objectSetVal</span>(value_ref, raw_value);  <span class="cm">/* points to ORIGINAL value! */</span>
+
+<span class="ty">int</span> rc = <span class="hl">extStorageBridge_submitPut</span>(<span class="fn">extStoragePhysicalDbId</span>(db_id),
+                                     key_ref, value_ref, expireMs);
+
+<span class="cm">/* ---- FETCH call site (ext_storage.c:625, inside preCommandExec) ---- */</span>
+<span class="ty">int</span> rc = <span class="hl">extStorageBridge_submitGet</span>(<span class="fn">extStoragePhysicalDbId</span>(current_db-&gt;id),
+                                     key_str);
+...
+<span class="fn">blockClientInUseOnKeys</span>(c, num_keys_to_block, blocking_keys);  <span class="cm">/* :641 */</span>
+
+<span class="cm">/* ---- DRAIN call site (ext_storage.c:1053, from beforeSleep) ---- */</span>
+<span class="kw">while</span> ((n = <span class="hl">extStorageBridge_pollCompletions</span>(
+            completed_storage_requests, BATCH_SIZE)) &gt; 0)
+    <span class="kw">for</span> (<span class="ty">int</span> j = 0; j &lt; n; j++)
+        <span class="fn">processOneCompletion</span>(completed_storage_requests[j]);`},
+
+'c-bridge': { t:'Bridge — forwards down, buffers completions back', f:'src/ext_storage_bridge.c (:138, :56)', c:
+`<span class="cm">/* ---- the forward: bridge API -&gt; dispatch API (:138) ---- */</span>
+<span class="ty">int</span> <span class="fn">extStorageBridge_submitPut</span>(<span class="ty">int</span> db_id, robj *key, robj *value,
+                               <span class="ty">int64_t</span> expire_ms) {
+    ...
+    <span class="ty">storageStatus</span> s = <span class="hl">storageSubmitPut</span>(db_id, (<span class="ty">void</span>*)key, 0,
+                                       (<span class="ty">void</span>*)value, 0, expire_ms, ctx);
+    <span class="cm">/* klen/vlen are 0: these are robj* pointers, not byte buffers */</span>
+}
+
+<span class="cm">/* ---- the way back: completion callback -&gt; ring buffer (:56) ---- */</span>
+<span class="cm">/* Called from the backend's IO thread */</span>
+<span class="kw">static void</span> <span class="fn">bridge_on_completion</span>(storageCompletion *c, <span class="ty">void</span> *privdata) {
+    <span class="ty">int</span> next = (comp_ring.head + 1) % BRIDGE_COMP_RING;
+    <span class="kw">if</span> (next != comp_ring.tail) {
+        comp_ring.ring[comp_ring.head] = *c;   <span class="cm">/* single producer, no mutex */</span>
+        comp_ring.head = next;
+    }
+}
+
+<span class="cm">/* ---- and the drain the main thread calls ---- */</span>
+<span class="ty">int</span> <span class="fn">extStorageBridge_pollCompletions</span>(ValkeyModuleExternalStorageMsg **out,
+                                      <span class="ty">int</span> max) {
+    <span class="fn">storagePollCompletions</span>(max);   <span class="cm">/* backend pushes into the ring... */</span>
+    <span class="cm">/* ...then the ring is read out into msgs for ext_storage.c */</span>
+}`},
+
+'c-dispatch': { t:'Dispatch — the hybrid router', f:'src/storage/storage_dispatch.c (:53, :63, :80)', c:
+`<span class="cm">/* ---- storageSubmitPut: async direct, or middleware-wrapped ---- */</span>
+<span class="ty">storageStatus</span> <span class="fn">storageSubmitPut</span>(<span class="ty">uint32_t</span> db_id,
+        <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+        <span class="kw">const void</span> *value, <span class="ty">size_t</span> vlen,
+        <span class="ty">int64_t</span> expire_ms, <span class="ty">void</span> *request_ctx) {
+    <span class="kw">if</span> (server_storage-&gt;<span class="hl">put_async</span>) {
+        <span class="kw">return</span> server_storage-&gt;<span class="hl">put_async</span>(server_storage_ctx, db_id,
+                                          key, klen, value, vlen,
+                                          expire_ms, request_ctx);
+    }
+    <span class="cm">/* else: sync backend — middleware queues the op and calls</span>
+<span class="cm">       type-&gt;put() from its own IO thread (storage_middleware.c) */</span>
+}
+
+<span class="ty">storageStatus</span> <span class="fn">storageSubmitGet</span>(...) {
+    <span class="kw">if</span> (server_storage-&gt;<span class="hl">get_async</span>)
+        <span class="kw">return</span> server_storage-&gt;<span class="hl">get_async</span>(server_storage_ctx, db_id,
+                                          key, klen, request_ctx);
+    ...
+}
+
+<span class="ty">int</span> <span class="fn">storagePollCompletions</span>(<span class="ty">int</span> max) {
+    <span class="kw">if</span> (server_storage-&gt;<span class="hl">poll_completions</span>)
+        <span class="kw">return</span> server_storage-&gt;<span class="hl">poll_completions</span>(server_storage_ctx, max);
+    ...
+}
+
+<span class="cm">/* server_storage / server_storage_ctx: set once by storageInit()</span>
+<span class="cm">   at startup — this is THE pointer both native and module fill */</span>`},
+
+'c-contract': { t:'struct storageType — the full contract', f:'src/storage/storage.h (VALKEY_STORAGE_VERSION 1)', c:
+`<span class="kw">typedef struct</span> <span class="ty">storageType</span> {
+    <span class="kw">const char</span> *name;
+    <span class="ty">int</span> version;
+
+    <span class="cm">/* Lifecycle */</span>
+    <span class="ty">void</span> *(*<span class="fn">open</span>)(storageConfig *cfg);
+    <span class="ty">void</span> (*<span class="fn">close</span>)(<span class="ty">void</span> *ctx);
+
+    <span class="cm">/* Sync KV ops (called from middleware IO thread). NULL if async-only. */</span>
+    <span class="ty">storageStatus</span> (*<span class="fn">put</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                         <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                         <span class="kw">const void</span> *value, <span class="ty">size_t</span> vlen, <span class="ty">int64_t</span> expire_ms);
+    <span class="ty">storageStatus</span> (*<span class="fn">get</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                         <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                         <span class="ty">void</span> **value, <span class="ty">size_t</span> *vlen, <span class="ty">int64_t</span> *expire_ms);
+    <span class="ty">storageStatus</span> (*<span class="fn">del</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                         <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen);
+
+    <span class="cm">/* Async KV ops (backend owns IO). NULL = use middleware with sync ops. */</span>
+    <span class="ty">storageStatus</span> (*<span class="hl">put_async</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="kw">const void</span> *value, <span class="ty">size_t</span> vlen,
+                               <span class="ty">int64_t</span> expire_ms, <span class="ty">void</span> *request_ctx);
+    <span class="ty">storageStatus</span> (*<span class="hl">get_async</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="ty">void</span> *request_ctx);
+    <span class="ty">storageStatus</span> (*<span class="hl">del_async</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="ty">void</span> *request_ctx);
+    <span class="ty">int</span> (*<span class="hl">poll_completions</span>)(<span class="ty">void</span> *ctx, <span class="ty">int</span> max);
+
+    <span class="cm">/* Optional */</span>
+    <span class="ty">int</span> (*<span class="fn">cron</span>)(<span class="ty">void</span> *ctx);
+    <span class="ty">void</span> (*<span class="fn">get_stats</span>)(<span class="ty">void</span> *ctx, storageStats *out);
+
+    <span class="cm">/* Snapshot support (all optional; NULL = snapshotting unsupported) */</span>
+    <span class="ty">void</span> (*<span class="fn">snapshot_hold</span>)(<span class="ty">void</span> *ctx);
+    <span class="ty">void</span> (*<span class="fn">snapshot_release</span>)(<span class="ty">void</span> *ctx);
+    <span class="ty">void</span> (*<span class="fn">gc_pause</span>)(<span class="ty">void</span> *ctx, <span class="ty">int</span> paused);
+    <span class="ty">storageStatus</span> (*<span class="fn">fork_read</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="ty">void</span> **value, <span class="ty">size_t</span> *vlen);
+} <span class="ty">storageType</span>;
+
+<span class="cm">/* Status codes */</span>
+STORAGE_OK = 0        <span class="cm">/* done */</span>
+STORAGE_NOT_FOUND = 1 <span class="cm">/* GET miss */</span>
+STORAGE_WOULDBLOCK = 2 <span class="cm">/* async op accepted */</span>
+STORAGE_ERR_IO = -1,  STORAGE_ERR_FULL = -2
+STORAGE_ERR_REJECTED = -3 <span class="cm">/* backpressure — caller retries */</span>`},
+
+'c-native': { t:'Native provider — how the struct is filled', f:'src/storage/storage_flashcache_real.c:502', c:
+`<span class="cm">/* storage_flashcache_real.c:502 — verbatim */</span>
+<span class="kw">static</span> <span class="ty">storageType</span> flashcache_real_type = {
+    .name = <span class="hl">"flashcache-real"</span>,
+    .version = VALKEY_STORAGE_VERSION,
+    .open = <span class="fn">fc_real_open</span>,
+    .close = <span class="fn">fc_real_close</span>,
+    .put = NULL, .get = NULL, .del = NULL,   <span class="cm">/* async-only */</span>
+    .put_async = <span class="fn">fc_real_put_async</span>,
+    .get_async = <span class="fn">fc_real_get_async</span>,
+    .del_async = <span class="fn">fc_real_del_async</span>,
+    .poll_completions = <span class="fn">fc_real_poll_completions</span>,
+    .cron = <span class="fn">fc_real_cron</span>,
+    .get_stats = NULL,
+    .snapshot_hold = <span class="fn">fc_real_snapshot_hold</span>,
+    .snapshot_release = <span class="fn">fc_real_snapshot_release</span>,
+    .gc_pause = <span class="fn">fc_real_gc_pause</span>,
+    .fork_read = <span class="fn">fc_real_fork_read</span>,
+};
+
+<span class="cm">/* :544 — the getter the bridge calls */</span>
+<span class="ty">storageType</span> *<span class="fn">storageGetFlashCacheRealType</span>(<span class="ty">void</span>) { <span class="kw">return</span> &flashcache_real_type; }
+
+<span class="cm">/* ============ selection at startup (ext_storage_bridge.c) ============ */</span>
+<span class="kw">if</span> (<span class="fn">moduleHasRegisteredStorageBackend</span>())
+    type = <span class="fn">moduleGetRegisteredStorageBackend</span>();   <span class="cm">/* module wins */</span>
+<span class="kw">else if</span> (strcmp(backend_name, <span class="hl">"flashcache"</span>) == 0)
+    type = <span class="fn">storageGetFlashCacheRealType</span>();
+<span class="kw">else if</span> (strcmp(backend_name, <span class="hl">"flashcache-mock"</span>) == 0)
+    type = <span class="fn">storageGetFlashCacheType</span>();  <span class="cm">/* in-memory mock — testing */</span>
+<span class="kw">else if</span> (strcmp(backend_name, <span class="hl">"rocksdb"</span>) == 0)
+    type = <span class="fn">storageGetRocksDBAsyncType</span>();`},
+
+'c-modapi': { t:'Module API — the load-time conduit', f:'src/valkeymodule.h · src/module.c:820', c:
+`<span class="cm">/* ============ src/valkeymodule.h ============ */</span>
+<span class="cm">/* New pluggable storage API — module registers a storageType struct.
+ * After registration, the engine calls the struct's function pointers
+ * directly (zero per-call overhead, same as native backends). */</span>
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="hl">ValkeyModule_RegisterStorageBackend</span>)(
+        ValkeyModuleCtx *ctx, <span class="ty">void</span> *storage_type);
+
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="hl">ValkeyModule_GetExternalStorageSerializationCallbacks</span>)(
+        ValkeyModuleCtx *ctx,
+        ValkeyModuleSerializeKeyCallback      *serialize_key,
+        ValkeyModuleSerializeValueCallback    *serialize_value,
+        ValkeyModuleDeserializeKeyCallback    *deserialize_key,
+        ValkeyModuleDeserializeValueCallback  *deserialize_value,
+        ValkeyModuleFreeSerializedKeyCallback *free_serialized_key,
+        ValkeyModuleFreeSerializedValueCallback *free_serialized_value);
+
+<span class="cm">/* ============ src/module.c:820 — the implementation ============ */</span>
+<span class="ty">int</span> <span class="fn">VM_RegisterStorageBackend</span>(ValkeyModuleCtx *ctx, <span class="ty">void</span> *storage_type);
+<span class="ty">int</span> <span class="fn">moduleHasRegisteredStorageBackend</span>(<span class="ty">void</span>);      <span class="cm">/* :834 */</span>
+<span class="ty">void</span> *<span class="fn">moduleGetRegisteredStorageBackend</span>(<span class="ty">void</span>);    <span class="cm">/* :839 */</span>
+
+<span class="cm">/* ============ legacy mechanism (also present) ============ */</span>
+<span class="cm">/* Request/response callbacks — predates RegisterStorageBackend.
+ * Engine pushes READ/DELETE/FLUSH_DB/FLUSH_ALL/FSYNC/START_SAVE/
+ * LOAD_SNAP/SHUTDOWN/EVICT; polls responses via res_callback. */</span>
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="fn">ValkeyModule_SubscribeToExternalStorage</span>)(
+        ValkeyModuleCtx *ctx, req_callback, res_callback);
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="fn">ValkeyModule_SubscribeToExternalStorageWithCallbacks</span>)(
+        ctx, req_callback, res_callback, <span class="cm">/* + 6 serde callbacks */</span>);
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="fn">ValkeyModule_UnsubscribeFromExternalStorage</span>)(ctx);`},
+
+'c-module': { t:'Module provider — same struct, in Rust', f:'modules/flash-tiering/src/storage_type_bridge.rs', c:
+`<span class="cm">// C-layout struct, must match src/storage/storage.h</span>
+#[<span class="fn">repr</span>(C)]
+<span class="kw">pub struct</span> <span class="ty">StorageType</span> {
+    <span class="kw">pub</span> name: *<span class="kw">const</span> c_char,
+    <span class="kw">pub</span> version: c_int,
+    <span class="kw">pub</span> open:  Option&lt;<span class="kw">unsafe extern</span> <span class="hl">"C"</span> <span class="kw">fn</span>(*<span class="kw">mut</span> StorageConfig) -&gt; *<span class="kw">mut</span> c_void&gt;,
+    <span class="kw">pub</span> close: Option&lt;...&gt;,
+    <span class="kw">pub</span> put/get/del: Option&lt;...&gt;,            <span class="cm">// sync — set to None</span>
+    <span class="kw">pub</span> put_async / get_async / del_async / poll_completions: Option&lt;...&gt;,
+    <span class="kw">pub</span> cron / get_stats: Option&lt;...&gt;,
+}
+
+<span class="cm">// The static instance handed to the engine:</span>
+<span class="kw">static mut</span> NKS_STORAGE_TYPE: StorageType = StorageType {
+    name: b<span class="hl">"flash-tiering-rust\\0"</span>.as_ptr() <span class="kw">as</span> *<span class="kw">const</span> c_char,
+    version: 1,
+    open:  Some(<span class="fn">nks_open</span>),     <span class="cm">// captures engine's completion_fn</span>
+    close: Some(<span class="fn">nks_close</span>),
+    put: None, get: None, del: None,       <span class="cm">// async-only</span>
+    put_async: Some(<span class="fn">nks_put_async</span>),
+    get_async: Some(<span class="fn">nks_get_async</span>),
+    del_async: Some(<span class="fn">nks_del_async</span>),
+    poll_completions: Some(<span class="fn">nks_poll_completions</span>),
+    cron: None, get_stats: None,
+};
+
+<span class="cm">// Example: what a filled pointer does</span>
+<span class="kw">unsafe extern</span> <span class="hl">"C"</span> <span class="kw">fn</span> <span class="fn">nks_put_async</span>(_ctx, db_id, key, _klen,
+                                    value, _vlen, _ttl, request_ctx) -&gt; c_int {
+    <span class="kw">let</span> req = StorageRequest::WriteValue {
+        db_id, key_robj: key, value_robj: value,
+        request_context: request_ctx <span class="kw">as</span> u64 };
+    <span class="kw">match</span> state.dispatcher.<span class="fn">submit_request</span>(req) {
+        SubmitResult::Ok        =&gt; STORAGE_WOULDBLOCK,   <span class="cm">// accepted</span>
+        SubmitResult::Throttled =&gt; STORAGE_ERR_REJECTED, <span class="cm">// backpressure</span>
+    }
+}
+
+<span class="cm">// Registration at MODULE LOADEX (lib.rs):</span>
+<span class="kw">let</span> ptr = storage_type_bridge::<span class="fn">get_storage_type_ptr</span>();
+<span class="fn">register</span>(ctx, ptr);   <span class="cm">// ValkeyModule_RegisterStorageBackend</span>`},
+};
+
+function openModal(id) {
+  const c = CODE[id]; if (!c) return;
+  $('m-title').textContent = c.t;
+  $('m-file').textContent = c.f;
+  $('mcode').innerHTML = c.c;
+  $('overlay').classList.add('open');
+}
+function closeModal() { $('overlay').classList.remove('open'); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+['c-engine','c-bridge','c-dispatch','c-contract','c-native','c-modapi','c-module'].forEach(id =>
+  $(id).addEventListener('click', () => openModal(id)));
+</script>
+<script>
+
+const VIEWS = {
+both: { dim: [], title: 'Both paths', ex: `
+  <p>Follow one write down the stack: <b>tiering logic</b> calls <code>extStorageBridge_submitPut(key_robj, value_robj)</code> &rarr; the <b>bridge</b> forwards to <code>storageSubmitPut()</code> &rarr; <b>dispatch</b> resolves <code>server_storage-&gt;put_async(...)</code> &rarr; lands in whichever provider filled the <b class="y">storageType</b> struct.</p>
+  <p><b class="n">Native</b>: the struct is defined statically in the backend file, compiled in, chosen by <code>ext-storage-backend</code>.</p>
+  <p><b class="m">Module</b>: the identical struct layout, handed over once at load time. A registered module backend takes priority over the config.</p>
+  <p><i>Click any box to see its exact source.</i></p>` },
+
+native: { dim: ['c-modapi','c-module','k-reg','k-mod'], title: 'Native path', ex: `
+  <p>The backend defines <code>static storageType fc_type = { .put_async = fc_put, ... }</code>. At startup the bridge matches the config name and stores the pointer.</p>
+  <p>From then on: <code>storageSubmitPut()</code> &rarr; <code>type-&gt;put_async(...)</code> &mdash; a plain function-pointer call into compiled-in code.</p>
+  <p>Serialization needs no handoff: same address space, the IO thread calls the engine's callbacks directly.</p>` },
+
+module: { dim: ['c-native','k-native'], title: 'Module path', ex: `
+  <p>The module API has exactly <b class="m">two jobs, both at load time</b>:</p>
+  <p><b class="m">UP</b> &mdash; <code>RegisterStorageBackend(ctx, &amp;struct)</code>: carries the module's struct to the engine. It lands in the same slot a native struct would occupy.</p>
+  <p><b class="m">DOWN</b> &mdash; <code>GetExternalStorageSerializationCallbacks(...)</code>: hands the engine's robj*&harr;bytes functions to the module, so serialization still runs on the module's IO worker, never the main thread.</p>
+  <p>After these two calls, the module API's work is done.</p>` },
+
+runtime: { dim: ['c-modapi','k-reg','k-mod','k-native'], title: 'Call time &mdash; the punchline', ex: `
+  <p>At runtime, <b class="m">the module API is not on the path at all</b> (dimmed). Both providers are reached identically:</p>
+  <p><code>storageSubmitPut()</code> &rarr; <code>type-&gt;put_async(...)</code> &rarr; <code>fc_put</code> <i>or</i> <code>nks_put_async</code>.</p>
+  <p><b>Zero per-call overhead difference.</b> No message queue, no translation layer &mdash; the registration API moved a pointer once; it never moves data.</p>
+  <p>This is why a module-provided backend benchmarks the same as a native one, and why the registration API could stay tiny.</p>` },
+};
+
+function setView(v) {
+  document.querySelectorAll('.controls button').forEach(b => b.classList.remove('active'));
+  $('b-' + v).classList.add('active');
+  PARTS.forEach(id => $(id).classList.toggle('dimmed', VIEWS[v].dim.includes(id)));
+  $('v-title').innerHTML = VIEWS[v].title;
+  $('explain').innerHTML = VIEWS[v].ex;
+}
+setView('both');
+</script>
+</body>
+</html>
