@@ -1,0 +1,1790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Valkey Data Tiering - How It Works</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --card:#1d2740; --border:#2a3550; --text:#dce3f2;
+          --muted:#8593ad; --accent:#4da3ff; --ok:#3ecf8e; --warn:#f5b950; --hot:#ff6b6b; --purple:#c586f0; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif; padding:22px; }
+  h1 { font-size:20px; margin-bottom:2px; }
+  .sub { color:var(--muted); margin-bottom:14px; font-size:13px; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; align-items:center; }
+  button { background:var(--panel); color:var(--text); border:1px solid var(--border); padding:7px 15px;
+           border-radius:8px; cursor:pointer; font-size:13.5px; }
+  button:hover { border-color:var(--accent); }
+  button.active { background:var(--accent); color:#08101f; border-color:var(--accent); font-weight:600; }
+  .stepctl { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  .stepctl .count { color:var(--muted); font-size:12.5px; min-width:58px; text-align:center; }
+  .layout { display:grid; grid-template-columns:minmax(500px,1fr) 440px; align-items:start; gap:16px; align-items:start; max-width:1280px; }
+  @media (max-width:1080px){ .layout{ grid-template-columns:1fr; } }
+  svg { width:100%; background:var(--panel); border:1px solid var(--border); border-radius:12px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px; }
+  .panel h3 { font-size:12.5px; color:var(--accent); text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; }
+  #detail { font-size:13.5px; }
+  #detail code { background:#0c1220; padding:1px 5px; border-radius:4px; font-size:12px; color:var(--warn); }
+  #detail p + p, #detail table { margin-top:9px; }
+  #detail table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  #detail td, #detail th { border:1px solid var(--border); padding:4px 8px; text-align:left; }
+  #detail th { color:var(--muted); font-weight:600; }
+  #detail .ok { color:var(--ok); } #detail .hot { color:var(--hot); } #detail .wa { color:var(--warn); }
+  .hint { margin-top:12px; padding-top:10px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); }
+  /* SVG shared */
+  .node { rx:11; cursor:pointer; transition:all .25s; }
+  .node:hover { stroke:var(--accent); }
+  .node.sel { stroke:var(--accent); stroke-width:3.5; fill:#22324f; }
+  .node.lit { stroke:var(--warn); stroke-width:3.5; fill:#2a2a1f; }
+  .node.ok-lit { stroke:var(--ok); stroke-width:3.5; fill:#1c3a30; }
+  .nlabel { fill:var(--text); font-size:12.5px; font-weight:700; pointer-events:none; }
+  .nsub { fill:var(--muted); font-size:10px; pointer-events:none; }
+  .edge { stroke:var(--border); stroke-width:2; fill:none; marker-end:url(#arr); transition:all .25s; }
+  .edge.hi { stroke:var(--accent); stroke-width:3; marker-end:url(#arrB); }
+  .edge.hi-in { stroke:var(--ok); stroke-width:3; marker-end:url(#arrG); }
+  .elabel { fill:var(--muted); font-size:10.5px; font-family:ui-monospace,Menlo,monospace; transition:all .25s; }
+  .elabel.hi { fill:var(--accent); font-weight:700; }
+  .elabel.hi-in { fill:var(--ok); font-weight:700; }
+  .dim { opacity:.22; }
+  .stage { fill:#1d2740; stroke:var(--border); stroke-width:1.6; rx:10; transition:all .3s; }
+  .stage.lit { stroke:var(--accent); stroke-width:3; fill:#22324f; }
+  .stage.io { }
+  .stage.io.lit { stroke:var(--hot); fill:#3a2230; }
+  .slabel { fill:var(--text); font-size:12px; font-weight:700; }
+  .ssub { fill:var(--muted); font-size:10px; }
+  .chip { fill:#0c1220; stroke:var(--warn); stroke-width:1.5; rx:12; }
+  .chiptext { fill:var(--warn); font-size:12px; font-weight:700; font-family:ui-monospace,Menlo,monospace; }
+  .zone { transition:all .3s; }
+  .marker { transition:all .5s; }
+
+  /* ---------- HTML card pipeline (write/read paths) ---------- */
+  .pipeline { display:flex; flex-direction:column; align-items:center; width:100%;
+              padding:12px 0; }
+  .pipe-card { width:100%; background:var(--card); border:2px solid var(--accent); border-radius:14px;
+               padding:14px 18px; position:relative; cursor:pointer; transition:all .2s;
+               box-shadow:0 3px 12px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.03); }
+  .pipe-card:hover { box-shadow:0 6px 24px rgba(77,163,255,.3); transform:translateY(-1px); }
+  .pipe-card.io { border-color:var(--hot); }
+  .pipe-card.io:hover { box-shadow:0 6px 24px rgba(255,107,107,.25); }
+  .pipe-card.active { background:#1c2e4f; box-shadow:0 6px 24px rgba(77,163,255,.4); transform:translateY(-1px); }
+  .pipe-card.io.active { background:#2e1a2a; box-shadow:0 6px 24px rgba(255,107,107,.35); }
+  .pipe-card .pc-title { font-weight:700; font-size:14.5px; display:flex; align-items:center; gap:10px; }
+  .pipe-card .pc-title .tag { font-size:9.5px; letter-spacing:1.2px; font-weight:700;
+                               background:#0c1220; border:1px solid var(--border); border-radius:5px;
+                               padding:2px 8px; color:var(--accent); }
+  .pipe-card.io .pc-title .tag { color:var(--hot); border-color:#4a2030; }
+  .pipe-card .pc-sub { color:var(--muted); font-size:12.5px; margin-top:4px; }
+  .pipe-card .pc-file { font:11px ui-monospace,Menlo,monospace; color:#5a7090; margin-top:6px; }
+  .pipe-card .pc-pills { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .pipe-card .pill { font:11.5px ui-monospace,Menlo,monospace; background:#0c1220; border:1px solid #3a4a6a;
+                     border-radius:14px; padding:3px 11px; color:#c9d6ee; white-space:nowrap; }
+  .pipe-card .pill.hi { border-color:var(--warn); color:var(--warn); }
+  .pipe-card .pill.ret { border-color:var(--ok); color:var(--ok); }
+  .pipe-card::after { content:'view source'; position:absolute; top:12px; right:14px; font-size:9.5px;
+                      color:var(--muted); letter-spacing:.8px; opacity:.6; }
+  .pipe-conn { display:flex; flex-direction:column; align-items:center; padding:4px 0; }
+  .pipe-conn .conn-line { width:3px; height:22px; background:var(--accent); border-radius:2px; opacity:.8; }
+  .pipe-conn .conn-arrow { width:0; height:0; border-left:9px solid transparent; border-right:9px solid transparent;
+                            border-top:11px solid var(--accent); opacity:.8; }
+  .pipe-card.io ~ .pipe-conn .conn-line, .pipe-card.io ~ .pipe-conn .conn-arrow { background:var(--hot); border-top-color:var(--hot); }
+  .pipe-conn .conn-label { font-size:10.5px; color:var(--accent); font-family:ui-monospace,Menlo,monospace;
+                            background:#111827; border:1px solid #3a4a6a; border-radius:10px;
+                            padding:2px 12px; margin:3px 0; white-space:nowrap; box-shadow:0 1px 4px rgba(0,0,0,.3); }
+  .pipe-state { display:inline-flex; align-items:center; gap:6px; font:12px ui-monospace,Menlo,monospace;
+                background:#0c1220; border:1px solid var(--warn); border-radius:16px; padding:3px 12px;
+                color:var(--warn); margin:6px 0; }
+
+  /* ---------- Code syntax highlighting (modals + inline) ---------- */
+  #mcode .cm, .panel .cm { color:#6a9955; }
+  #mcode .kw, .panel .kw { color:#c586c0; }
+  #mcode .fn, .panel .fn { color:#dcdcaa; }
+  #mcode .ty, .panel .ty { color:#4ec9b0; }
+  #mcode .hl, .panel .hl { color:#f5b950; font-weight:700; }
+
+  .pipe-state.changed { animation: stateFlash 0.6s ease; }
+  @keyframes stateFlash {
+    0% { transform:scale(1); box-shadow:none; }
+    50% { transform:scale(1.15); box-shadow:0 0 16px rgba(245,185,80,.5); }
+    100% { transform:scale(1); box-shadow:none; }
+  }
+
+  /* ---------- FlashCache block diagram ---------- */
+  .fc-arch { margin-bottom:18px; padding:16px; background:var(--panel); border:1px solid var(--border); border-radius:14px; }
+  .fc-arch-title { font-size:11px; color:var(--muted); font-weight:700; letter-spacing:1.5px; margin-bottom:12px; }
+  .fc-block { display:flex; flex-direction:column; gap:0; }
+  .fc-layer { border:2px solid var(--border); border-radius:10px; padding:12px 16px; position:relative; }
+  .fc-layer + .fc-layer { margin-top:10px; }
+  .fc-layer.engine-l { border-color:var(--accent); }
+  .fc-layer.dram-l { border-color:var(--ok); }
+  .fc-layer.nvme-l { border-color:var(--hot); }
+  .fc-layer-tag { position:absolute; top:-9px; left:16px; background:var(--panel); padding:0 8px;
+                  font-size:9.5px; font-weight:700; letter-spacing:1.2px; color:var(--muted); }
+  .fc-layer.engine-l .fc-layer-tag { color:var(--accent); }
+  .fc-layer.dram-l .fc-layer-tag { color:var(--ok); }
+  .fc-layer.nvme-l .fc-layer-tag { color:var(--hot); }
+  .fc-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .fc-comp { background:var(--card); border:1.5px solid var(--border); border-radius:8px;
+             padding:6px 12px; font-size:12.5px; font-weight:600; white-space:nowrap; }
+  .fc-comp small { display:block; font-weight:400; font-size:10.5px; color:var(--muted); }
+  .fc-arrow { display:flex; flex-direction:column; align-items:center; padding:4px 0; }
+  .fc-arrow .fa-line { width:3px; height:14px; background:var(--accent); border-radius:2px; opacity:.7; }
+  .fc-arrow .fa-head { width:0; height:0; border-left:7px solid transparent; border-right:7px solid transparent;
+                        border-top:8px solid var(--accent); opacity:.7; }
+  .fc-arrow.up .fa-head { border-top:none; border-bottom:8px solid var(--ok); }
+  .fc-arrow.up .fa-line { background:var(--ok); }
+  .fc-flow-label { font-size:10px; color:var(--accent); font-family:ui-monospace,Menlo,monospace;
+                   text-align:center; padding:2px 0; }
+
+  /* ---------- Sub-tabs (within FlashCache) ---------- */
+  .subtabs { display:flex; gap:6px; margin:14px 0 10px; }
+  .subtabs button { background:var(--card); color:var(--muted); border:1.5px solid var(--border);
+                    padding:5px 14px; border-radius:8px; font-size:12.5px; cursor:pointer; }
+  .subtabs button:hover { border-color:var(--accent); color:var(--text); }
+  .subtabs button.active { background:var(--accent); color:#08101f; border-color:var(--accent); font-weight:600; }
+
+
+  /* ---------- Overview spatial diagram ---------- */
+  .ov-diagram { padding:16px; display:grid; grid-template-columns:1fr; gap:12px; }
+  .ov-box { border:2.5px solid var(--border); border-radius:14px; padding:16px; position:relative; background:rgba(23,30,46,.5); }
+  .ov-box-tag { position:absolute; top:-10px; left:14px; background:var(--bg); padding:0 8px;
+                font-size:10px; font-weight:700; letter-spacing:1.3px; }
+  .ov-box.client { border-color:#8593ad; min-width:100px; max-width:130px; align-self:center; }
+  .ov-box.client .ov-box-tag { color:#8593ad; }
+  .ov-box.main { border-color:var(--accent); flex:1; min-width:240px; max-width:300px; }
+  .ov-box.main .ov-box-tag { color:var(--accent); }
+  .ov-box.iot { border-color:var(--hot); flex:1; min-width:200px; max-width:260px; }
+  .ov-box.iot .ov-box-tag { color:var(--hot); }
+  .ov-box.disk { border-color:var(--warn); min-width:100px; max-width:130px; align-self:center; }
+  .ov-box.disk .ov-box-tag { color:var(--warn); }
+  .ov-inner { background:var(--card); border:1.5px solid var(--border); border-radius:8px;
+              padding:8px 12px; margin:6px 0; font-size:12.5px; font-weight:600; }
+  .ov-inner small { display:block; font-weight:400; font-size:11px; color:var(--muted); margin-top:2px; }
+  .ov-inner.hi { border-color:var(--accent); }
+  .ov-inner.hi-r { border-color:var(--hot); }
+  .ov-inner.hi-g { border-color:var(--ok); }
+  .ov-conn { display:flex; flex-direction:column; align-items:center; justify-content:center; align-self:center; min-width:44px; flex-shrink:0; }
+  .ov-conn .ov-c-line { width:40px; height:3px; background:var(--accent); border-radius:2px; opacity:.7; }
+  .ov-conn .ov-c-head { width:0; height:0; border-top:6px solid transparent; border-bottom:6px solid transparent;
+                         border-left:8px solid var(--accent); opacity:.7; }
+  .ov-conn .ov-c-lbl { font-size:9.5px; color:var(--accent); font-family:ui-monospace,Menlo,monospace;
+                        text-align:center; max-width:80px; margin-top:4px; }
+  .ov-conn.red .ov-c-line { background:var(--hot); }
+  .ov-conn.red .ov-c-head { border-left-color:var(--hot); }
+  .ov-conn.red .ov-c-lbl { color:var(--hot); }
+  .ov-conn.gold .ov-c-line { background:var(--warn); }
+  .ov-conn.gold .ov-c-head { border-left-color:var(--warn); }
+  .ov-conn.gold .ov-c-lbl { color:var(--warn); }
+
+  .ov-boxes-row { display:grid; grid-template-columns: 110px 44px 1fr 90px 1fr 44px 110px; gap:0; align-items:center; }
+  .layout.full-width { grid-template-columns:1fr !important; }
+
+  .ov-queue { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; min-width:80px; }
+  .ov-q-box { background:#0c1220; border:1.5px solid var(--border); border-radius:6px; padding:4px 8px;
+              font-size:10px; font-family:ui-monospace,Menlo,monospace; text-align:center; white-space:nowrap; }
+  .ov-q-box.down { border-color:var(--hot); color:var(--hot); }
+  .ov-q-box.up { border-color:var(--ok); color:var(--ok); }
+  .ov-q-arrow { font-size:14px; line-height:1; }
+  .ov-q-arrow.down { color:var(--hot); }
+  .ov-q-arrow.up { color:var(--ok); }
+  .ov-q-label { font-size:9px; color:var(--muted); text-align:center; }
+
+  
+</style>
+<style>
+/* ===== Storage Interfaces tab (ported from dt-interfaces-compare.html) ===== */
+#ifc-root { --purple:#c586f0; max-width:1280px; }
+#ifc-root .controls { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; }
+#ifc-root .controls button { background:var(--panel); color:var(--text); border:1px solid var(--border);
+    padding:7px 16px; border-radius:8px; cursor:pointer; font-size:13.5px; }
+#ifc-root .controls button:hover { border-color:var(--accent); }
+#ifc-root .controls button.active { background:var(--accent); color:#08101f; border-color:var(--accent); font-weight:600; }
+#ifc-root .layout { display:grid; grid-template-columns:minmax(560px,1fr) 360px; gap:18px; align-items:start; max-width:1280px; }
+#ifc-root /* ---------- diagram ---------- */
+  .diagram { display:flex; flex-direction:column; align-items:center; }
+#ifc-root .card { background:var(--card); border:1.5px solid var(--border); border-radius:14px;
+          padding:14px 18px; width:100%; transition:all .3s; position:relative; }
+#ifc-root .card .title { font-weight:700; font-size:15px; display:flex; align-items:center; gap:8px; }
+#ifc-root .card .file { color:var(--muted); font-size:11.5px; font-family:ui-monospace,Menlo,monospace; margin-top:1px; }
+#ifc-root .tag { font-size:9.5px; letter-spacing:1.4px; color:var(--muted); font-weight:700;
+         background:var(--panel); border:1px solid var(--border); border-radius:5px; padding:1px 7px; }
+#ifc-root .apis { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; align-items:center; }
+#ifc-root .apis .grp { font-size:10px; color:var(--muted); letter-spacing:.8px; font-weight:700; margin-right:2px; }
+#ifc-root .pill { font:11.5px ui-monospace,Menlo,monospace; background:#0c1220; border:1px solid var(--border);
+          border-radius:14px; padding:2.5px 11px; color:#c9d6ee; white-space:nowrap; }
+#ifc-root .pill.hi { border-color:var(--warn); color:var(--warn); }
+#ifc-root .pill.hi-b { border-color:var(--accent); color:var(--accent); }
+#ifc-root .pill.hi-p { border-color:var(--purple); color:var(--purple); }
+#ifc-root .note-badge { margin-top:10px; font-size:11.5px; color:var(--warn); background:#221c10;
+                border:1px solid #4a3d1e; border-radius:8px; padding:5px 10px; display:inline-block; }
+#ifc-root .card.engine { border-color:var(--accent); }
+#ifc-root .card.contract { border-color:var(--warn); background:#1c2536; }
+#ifc-root .card.native.on { border-color:var(--ok); }
+#ifc-root .card.modapi { border-color:var(--purple); background:#221b30; }
+#ifc-root .card.module.on { border-color:var(--purple); }
+#ifc-root .dimmed { opacity:.25; }
+#ifc-root /* ---------- connectors ---------- */
+  .conn { display:flex; flex-direction:column; align-items:center; padding:2px 0; transition:opacity .3s; }
+#ifc-root .conn .line { width:0; border-left:3px solid var(--accent); height:34px; }
+#ifc-root .conn .line.dashed { border-left-style:dashed; }
+#ifc-root .conn .line.g { border-left-color:var(--ok); }
+#ifc-root .conn .line.p { border-left-color:var(--purple); }
+#ifc-root .conn .head { width:0; height:0; border-left:7px solid transparent; border-right:7px solid transparent;
+                border-top:9px solid var(--accent); }
+#ifc-root .conn .head.g { border-top-color:var(--ok); }
+#ifc-root .conn .head.p { border-top-color:var(--purple); }
+#ifc-root .conn .head.up { border-top:none; border-bottom:9px solid var(--purple); order:-1; }
+#ifc-root .conn .clabel { font:11px ui-monospace,Menlo,monospace; color:var(--accent); background:var(--panel);
+                  border:1px solid var(--border); border-radius:6px; padding:2px 10px; margin:4px 0; }
+#ifc-root .conn .clabel.g { color:var(--ok); }
+#ifc-root .conn .clabel.p { color:var(--purple); }
+#ifc-root .split { display:grid; grid-template-columns:1fr 1fr; gap:22px; width:100%; }
+#ifc-root .col { display:flex; flex-direction:column; align-items:center; }
+#ifc-root .col .card { flex:1; }
+#ifc-root /* ---------- side panel ---------- */
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px; }
+#ifc-root .panel h3 { font-size:12.5px; color:var(--accent); text-transform:uppercase; letter-spacing:1px; margin-bottom:10px; }
+#ifc-root #explain { font-size:13.5px; }
+#ifc-root #explain code { background:#0c1220; padding:1px 5px; border-radius:4px; font-size:12px; color:var(--warn); }
+#ifc-root #explain b.n { color:var(--ok); }
+#ifc-root #explain b.m { color:var(--purple); }
+#ifc-root #explain b.y { color:var(--warn); }
+#ifc-root #explain p + p { margin-top:9px; }
+#ifc-root .legend { margin-top:14px; padding-top:10px; border-top:1px solid var(--border); font-size:12px;
+            color:var(--muted); display:flex; flex-direction:column; gap:5px; }
+#ifc-root .lg { display:inline-block; width:30px; border-top:3px solid; margin-right:8px; vertical-align:middle; }
+#ifc-root /* ---------- click-to-open code modal ---------- */
+  .card { cursor:pointer; }
+#ifc-root .card:hover { filter:brightness(1.15); }
+#ifc-root .card::after { content:'view source'; position:absolute; top:10px; right:12px; font-size:9.5px;
+                 color:var(--muted); letter-spacing:.8px; opacity:0; transition:opacity .2s; }
+#ifc-root .card:hover::after { opacity:.9; }
+#ifc-root .card .tag { margin-right:52px; }
+@media (max-width:1080px){ #ifc-root .layout{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<h1>Valkey Data Tiering &mdash; How It Works</h1>
+<div class="sub">Interactive guide to Valkey Data Tiering internals. Explore the architecture, key state machine, read/write flows, storage engine, and pressure handling. Click components for source code.</div>
+
+<div class="controls">
+  <button id="b-overview" class="active" onclick="setView('overview')">Overview</button>
+  <button id="b-states" onclick="setView('states')">Key state machine</button>
+  <button id="b-spill" onclick="setView('spill')">Write path</button>
+  <button id="b-fetch" onclick="setView('fetch')">Read path</button>
+  <button id="b-fc" onclick="setView('fc')">FlashCache internals</button>
+  <button id="b-ifaces" onclick="setView('ifaces')">Storage Interfaces</button>
+  <button id="b-pressure" onclick="setView('pressure')">Under pressure</button>
+  <div class="stepctl" id="stepctl" style="display:none">
+    <button onclick="step(-1)">&larr;</button><span class="count" id="count"></span><button onclick="step(1)">&rarr;</button>
+    <button onclick="play()" id="b-play">&#9654;</button>
+  </div>
+</div>
+
+<div class="layout">
+  <svg id="stage" viewBox="0 0 880 580">
+    <defs>
+      <marker id="arr"  markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0,9 3.5,0 7" fill="#2a3550"/></marker>
+      <marker id="arrB" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0,9 3.5,0 7" fill="#4da3ff"/></marker>
+      <marker id="arrG" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><polygon points="0 0,9 3.5,0 7" fill="#3ecf8e"/></marker>
+    </defs>
+    <g id="scene"></g>
+  </svg>
+  <div class="panel">
+    <h3 id="p-title">Key state machine</h3>
+    <div id="detail"></div>
+    <div class="hint" id="hint"></div>
+  </div>
+</div>
+
+<template id="ifc-template">
+<div style="color:var(--muted);font-size:13px;margin-bottom:12px;max-width:900px">How the engine's tiering logic reaches the storage backend, layer by layer. Click any component to view its exact source code.</div>
+<div class="controls">
+  <button id="b-both" class="active" onclick="ifcSetView('both')">Both paths</button>
+  <button id="b-native" onclick="ifcSetView('native')">Native path</button>
+  <button id="b-module" onclick="ifcSetView('module')">Module path</button>
+  
+</div>
+
+<div class="layout">
+<div class="diagram">
+
+  <!-- LAYER 1: TIERING LOGIC -->
+  <div class="card engine" id="c-engine">
+    <div class="title">Tiering logic <span class="tag">LAYER 1 &middot; CORE</span></div>
+    <div class="file">src/ext_storage.c &nbsp;&mdash;&nbsp; KBC, state machine, spill controller, eviction hook</div>
+    <div class="apis">
+      <span class="grp">CALLS</span>
+      <span class="pill hi-b">extStorageBridge_submitPut(dbId, key_robj, value_robj, ttl)</span>
+      <span class="pill hi-b">extStorageBridge_submitGet(dbId, key)</span>
+    </div>
+    <div class="apis">
+      <span class="grp">DRAINS</span>
+      <span class="pill hi-b">extStorageBridge_pollCompletions(batch, max)</span>
+      <span class="pill">in beforeSleep(), once per event-loop iteration</span>
+    </div>
+  </div>
+
+  <div class="conn" id="k-call">
+    <div class="line"></div>
+    <div class="clabel">extStorageBridge_submitPut(...) &nbsp;&mdash;&nbsp; robj* pointers cross, nothing serialized yet</div>
+    <div class="line" style="height:12px"></div>
+    <div class="head"></div>
+  </div>
+
+  <!-- LAYER 2: BRIDGE -->
+  <div class="card engine" id="c-bridge">
+    <div class="title">Bridge <span class="tag">LAYER 2 &middot; CORE</span></div>
+    <div class="file">src/ext_storage_bridge.c &nbsp;&mdash;&nbsp; backend selection at startup + completion buffering</div>
+    <div class="apis">
+      <span class="grp">FORWARDS</span>
+      <span class="pill">submitPut() &rarr; storageSubmitPut(db, key, 0, value, 0, ttl, ctx)</span>
+    </div>
+    <div class="apis">
+      <span class="grp">OWNS</span>
+      <span class="pill">bridge_on_completion() &rarr; comp_ring &nbsp;(lock-free, IO thread writes / main thread reads)</span>
+    </div>
+  </div>
+
+  <div class="conn" id="k-call2">
+    <div class="line"></div>
+    <div class="clabel">storageSubmitPut(db_id, key, 0, value, 0, expire_ms, request_ctx)</div>
+    <div class="line" style="height:12px"></div>
+    <div class="head"></div>
+  </div>
+
+  <!-- LAYER 3: DISPATCH -->
+  <div class="card engine" id="c-dispatch">
+    <div class="title">Dispatch <span class="tag">LAYER 3 &middot; CORE</span></div>
+    <div class="file">src/storage/storage_dispatch.c &nbsp;&mdash;&nbsp; the hybrid router</div>
+    <div class="apis">
+      <span class="grp">ROUTES</span>
+      <span class="pill">if (server_storage-&gt;put_async) &rarr; call it directly</span>
+      <span class="pill">else &rarr; storage_middleware.c wraps sync put() on its own IO thread</span>
+    </div>
+  </div>
+
+  <div class="conn" id="k-call3">
+    <div class="line"></div>
+    <div class="clabel">server_storage-&gt;put_async(ctx, db, key, klen, value, vlen, ttl, req_ctx)</div>
+    <div class="line" style="height:12px"></div>
+    <div class="head"></div>
+  </div>
+
+  <!-- LAYER 4: CONTRACT -->
+  <div class="card contract" id="c-contract">
+    <div class="title">struct storageType <span class="tag">THE CONTRACT &middot; storage/storage.h &middot; v1</span></div>
+    <div class="apis"><span class="grp">LIFECYCLE</span>
+      <span class="pill">open(cfg)</span><span class="pill">close()</span>
+    </div>
+    <div class="apis"><span class="grp">ASYNC IO</span>
+      <span class="pill hi">put_async</span><span class="pill hi">get_async</span>
+      <span class="pill hi">del_async</span><span class="pill hi">poll_completions</span>
+    </div>
+    <div class="apis"><span class="grp">OPTIONAL</span>
+      <span class="pill">put / get / del &nbsp;(sync &rarr; middleware wraps)</span>
+      <span class="pill">cron</span><span class="pill">get_stats</span>
+    </div>
+  </div>
+
+  <!-- split connectors -->
+  <div class="split">
+    <div class="col">
+      <div class="conn" id="k-native">
+        <div class="line g dashed"></div>
+        <div class="clabel g">fills the struct at compile time,<br>selected by config</div>
+        <div class="line g dashed" style="height:12px"></div>
+        <div class="head g"></div>
+      </div>
+      <!-- NATIVE -->
+      <div class="card native on" id="c-native">
+        <div class="title">Native provider <span class="tag">COMPILED IN</span></div>
+        <div class="file">storage/storage_flashcache_real.c &nbsp;(links libflashcache.a)</div>
+        <div class="apis"><span class="grp">FILLS</span>
+          <span class="pill">.put_async = fc_put</span>
+          <span class="pill">.get_async = fc_get</span>
+          <span class="pill">.poll_completions = fc_poll</span>
+        </div>
+        <div class="apis"><span class="grp">SELECT</span>
+          <span class="pill">ext-storage-backend flashcache</span>
+        </div>
+        <div class="note-badge">serde: calls engine callbacks directly on its IO thread</div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="conn" id="k-reg">
+        <div class="head up"></div>
+        <div class="line p dashed" style="height:12px"></div>
+        <div class="clabel p">registers the SAME struct,<br>once, at MODULE LOADEX</div>
+        <div class="line p dashed"></div>
+      </div>
+      <!-- MODULE API -->
+      <div class="card modapi" id="c-modapi">
+        <div class="title">Module API <span class="tag">LOAD TIME ONLY</span></div>
+        <div class="file">valkeymodule.h &nbsp;/&nbsp; module.c</div>
+        <div class="apis"><span class="grp">UP</span>
+          <span class="pill hi-p">RegisterStorageBackend(ctx, &amp;struct)</span>
+        </div>
+        <div class="apis"><span class="grp">DOWN</span>
+          <span class="pill hi-p">GetExternalStorageSerializationCallbacks(...)</span>
+        </div>
+      </div>
+      <div class="conn" id="k-mod">
+        <div class="head up"></div>
+        <div class="line p dashed" style="height:20px"></div>
+      </div>
+      <!-- MODULE -->
+      <div class="card module on" id="c-module">
+        <div class="title">Module provider <span class="tag">LOADABLE .so</span></div>
+        <div class="file">modules/flash-tiering &nbsp;(Rust, #[repr(C)])</div>
+        <div class="apis"><span class="grp">FILLS</span>
+          <span class="pill">.put_async = nks_put_async</span>
+          <span class="pill">.get_async = nks_get_async</span>
+          <span class="pill">.poll_completions = nks_poll</span>
+        </div>
+        <div class="note-badge">serde: fetches engine callbacks once, runs them on its IO worker</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SIDE PANEL -->
+<div>
+  <div class="panel">
+    <h3 id="v-title">Both paths</h3>
+    <div id="explain"></div>
+    <div class="legend">
+      <div><span class="lg" style="border-color:var(--accent)"></span>runtime call path (every operation)</div>
+      <div><span class="lg" style="border-color:var(--ok);border-top-style:dashed"></span>native: compile-time + config</div>
+      <div><span class="lg" style="border-color:var(--purple);border-top-style:dashed"></span>module: one-time registration</div>
+    </div>
+  </div>
+</div>
+</div>
+</template>
+<script>
+const $ = id => document.getElementById(id);
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs, parent, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  parent.appendChild(e); return e;
+}
+
+
+/* =========================================================================
+   VIEW 1: STATE MACHINE (clickable, color-coded, edge labels in panel)
+   Layout: two-row; Colors: green=resident, blue=on-disk, yellow=transient, red=edge-case
+   ========================================================================= */
+const STATES = {
+  mem:   { x:440, y:60,  w:195, label:'ONLY_MEMORY', sub:'(0) value in RAM', color:'#0d4a2a', stroke:'#3ecf8e' },
+  ctf:   { x:190, y:230, w:210, label:'COPYING_TO_FLASH', sub:'(1) spill in-flight', color:'#3a3510', stroke:'#f5b950' },
+  ctm:   { x:690, y:230, w:225, label:'COPYING_TO_MEMORY', sub:'(3) fetch in-flight', color:'#3a3510', stroke:'#f5b950' },
+  flash: { x:440, y:400, w:195, label:'ONLY_FLASH', sub:'(2) value on disk', color:'#122850', stroke:'#4da3ff' },
+  pev:   { x:690, y:490, w:195, label:'PENDING_EVICT', sub:'(4) GC evicted from disk', color:'#3d1525', stroke:'#ff6b6b' },
+  pdel:  { x:190, y:490, w:210, label:'PENDING_DELETION', sub:'(5) DEL mid-flight', color:'#3d1525', stroke:'#ff6b6b' },
+};
+const EDGES = [
+  { from:'mem',   to:'ctf',   label:'spill selected (cold, LRU/LFU sampling)', short:'spill', bend:-30, lx:-60, ly:-4 },
+  { from:'ctf',   to:'flash', label:'write completion OK: release RAM value, encoding=TIERED', short:'write OK', bend:-30 },
+  { from:'ctf',   to:'mem',   label:'write failed/rejected: value stays in RAM, retry later', short:'write fail', bend:50 },
+  { from:'flash', to:'ctm',   label:'command touches key: async fetch submitted', short:'fetch', bend:-30 },
+  { from:'ctm',   to:'mem',   label:'read completion OK: value re-attached to entry', short:'read OK', bend:-30 },
+  { from:'ctm',   to:'pev',   label:'FlashCache GC evicts item from disk while fetch is in-flight', short:'GC evict', bend:0 },
+  { from:'pev',   to:'flash', label:'IO done: GC already reclaimed the flash copy; entry removed from keyspace', short:'entry removed', bend:-25 },
+  { from:'flash', to:'pdel',  label:'client DEL: delete flash copy first', short:'DEL', bend:-25 },
+  { from:'pdel',  to:'mem',   label:'delete OK: entry retained, DEL re-executes with full semantics', short:'del OK', bend:-120 },
+];
+const STATE_DETAIL = {
+  mem: {
+    t: 'ONLY_MEMORY (0)',
+    summary: 'The default state. Value lives in RAM. Keys in this state are <b>not tracked</b> in any tiering structure -- the state is implicit (0 in the 3-bit field). This is why memory-resident keys pay only a header-bits check: if the bits are 0, the command proceeds with zero additional cost.',
+    commands: '<tr><th>GET</th><td class="ok">normal execution</td></tr><tr><th>SET</th><td class="ok">normal execution</td></tr><tr><th>DEL</th><td class="ok">normal execution</td></tr>',
+    code: `<span class="cm">// ext_storage.h</span>
+<span class="kw">typedef enum</span> {
+    TIERING_STATE_ONLY_MEMORY = <span class="hl">0</span>,  <span class="cm">/* not in HT */</span>
+    ...
+} <span class="ty">TieringState</span>;
+
+<span class="cm">// State 0 = not in the tiering hashtable.</span>
+<span class="cm">// Never reached in the KBC switch -- the</span>
+<span class="cm">// key simply isn't found in the state HT.</span>`
+  },
+  ctf: {
+    t: 'COPYING_TO_FLASH (1)',
+    summary: 'An async write (spill) to storage is in-flight. The value is <b>still in RAM</b> -- nothing is lost if the write fails. Reads can proceed normally since the value is still accessible in memory. Writes must block because mutating a value while it is being serialized on the IO thread would corrupt the serialized output.',
+    commands: '<tr><th>GET</th><td class="ok">served from RAM (value still there)</td></tr><tr><th>SET</th><td class="hot">BLOCK until spill completes</td></tr><tr><th>DEL</th><td class="hot">BLOCK until spill completes</td></tr>',
+    code: `<span class="cm">// ext_storage.c:466</span>
+<span class="kw">case</span> TIERING_STATE_COPYING_TO_FLASH:
+    <span class="kw">if</span> (is_write_cmd) {
+        kbc_spilling_block_count++;
+        <span class="kw">return</span> 1;  <span class="cm">/* BLOCK */</span>
+    }
+    <span class="cm">/* GET: value still in RAM */</span>
+    dram_value_hits++;
+    <span class="kw">return</span> 0;  <span class="cm">/* allow */</span>`
+  },
+  flash: {
+    t: 'ONLY_FLASH (2)',
+    summary: 'The value lives on storage. In RAM: key, expiry, and a stub object with <code>encoding=TIERED</code>. This is the state that saves memory. Any command that needs the value triggers an async fetch; DEL triggers an async delete-on-flash. TTL expiry still works: expired flash keys are caught by lazy expiry (on access) and active expiry (periodic sampling).',
+    commands: '<tr><th>GET</th><td class="wa">triggers async fetch + blocks client</td></tr><tr><th>SET</th><td class="wa">triggers async fetch + blocks client</td></tr><tr><th>DEL</th><td class="wa">triggers async delete-on-flash</td></tr>',
+    code: `<span class="cm">// ext_storage.c:508</span>
+<span class="kw">case</span> TIERING_STATE_ONLY_FLASH:
+    <span class="kw">if</span> (is_delete_cmd) {
+        extStorageBridge_submitDel(db_id, key);
+        extStorageSetState(db, key,
+            <span class="hl">TIERING_STATE_PENDING_DELETION</span>, 1);
+    } <span class="kw">else</span> {
+        extStorageBridge_submitGet(db_id, key);
+        extStorageSetState(db, key,
+            <span class="hl">TIERING_STATE_COPYING_TO_MEMORY</span>, 1);
+    }
+    <span class="kw">return</span> 1;  <span class="cm">/* BLOCK client */</span>`
+  },
+  ctm: {
+    t: 'COPYING_TO_MEMORY (3)',
+    summary: 'An async read from flash is in-flight. The client that triggered the fetch is blocked; the event loop keeps serving everyone else. Additional commands on the same key join the waiters. A transient backend rejection (read queue full) returns <code>READ_RETRY</code> -- the fetch is re-issued, NOT treated as a miss.',
+    commands: '<tr><th>GET</th><td class="hot">BLOCK (join waiters on this key)</td></tr><tr><th>SET</th><td class="hot">BLOCK</td></tr><tr><th>DEL</th><td class="hot">BLOCK</td></tr>',
+    code: `<span class="cm">// ext_storage.c:487</span>
+<span class="kw">case</span> TIERING_STATE_COPYING_TO_MEMORY:
+    kbc_fetching_block_count++;
+    <span class="kw">return</span> 1;
+
+<span class="cm">// on READ_RETRY completion:</span>
+<span class="kw">if</span> (status == <span class="hl">READ_RETRY</span>) {
+    extStorageBridge_submitGet(db_id, key);
+    <span class="cm">/* re-issue, don't treat as miss */</span>
+}`
+  },
+  pev: {
+    t: 'PENDING_EVICT (4)',
+    summary: 'A client touched a flash-resident key, triggering a fetch (COPYING_TO_MEMORY). While that fetch is in-flight, FlashCache\'s GC autonomously evicts the same item from disk to reclaim NVMe space. The engine can\'t act on the GC notification yet (IO thread holds references), so it marks the key PENDING_EVICT. When the fetch completes, the completion handler sees PENDING_EVICT and removes the entry from the keyspace -- the flash copy is already gone. <b>This is NOT memory eviction by the engine. This is the engine reconciling after the storage backend\'s GC reclaimed the item from disk.</b>',
+    commands: '<tr><th>GET</th><td class="hot">BLOCK (wait for fetch to finish)</td></tr><tr><th>SET</th><td class="hot">BLOCK</td></tr><tr><th>DEL</th><td class="hot">BLOCK</td></tr>',
+    code: `<span class="cm">// ext_storage.c:1256 -- GC DELETE arrives</span>
+<span class="cm">// while a fetch is in-flight:</span>
+<span class="kw">case</span> TIERING_STATE_COPYING_TO_MEMORY:
+    <span class="cm">/* Fetch in-flight, GC wants the item.</span>
+<span class="cm">       Mark for cleanup on completion. */</span>
+    extStorageSetState(db, key,
+        <span class="hl">TIERING_STATE_PENDING_EVICT</span>, 0);
+
+<span class="cm">// ext_storage.c:1006 -- fetch completes:</span>
+<span class="cm">/* GC already reclaimed it. No client is</span>
+<span class="cm">   waiting for a reply -- remove entry. */</span>
+<span class="fn">dbDelete</span>(db, &keyobj);
+
+<span class="cm">// KBC (ext_storage.c:494)</span>
+<span class="kw">case</span> TIERING_STATE_PENDING_EVICT:
+    <span class="kw">return</span> 1;  <span class="cm">/* BLOCK all */</span>`
+  },
+  pdel: {
+    t: 'PENDING_DELETION (5)',
+    summary: 'A client ran DEL on a flash-resident key. The flash copy is deleted via async IO. When the delete completes, the engine does NOT remove the entry from the hashtable. Instead it marks it PENDING_DELETION and unblocks the client. The client\'s DEL command <b>re-executes through the normal path</b> and finds the entry, so it fires all command-layer side effects (WATCH invalidation, keyspace notification, replication propagation, dirty++). The entry has no real value (both DRAM and flash copies are gone) -- PENDING_DELETION exists solely to keep the metadata alive long enough for the DEL to run with full semantics.',
+    commands: '<tr><th>DEL</th><td class="ok">allowed through (the re-execute)</td></tr><tr><th>GET</th><td class="hot">BLOCK (wait for DEL to drain)</td></tr><tr><th>SET</th><td class="hot">BLOCK</td></tr>',
+    code: `<span class="cm">// ext_storage.c:999 -- delete completion</span>
+<span class="cm">/* Do NOT remove entry. Client's DEL must</span>
+<span class="cm">   find it for full side effects. */</span>
+extStorageSetState(db, key_name,
+    <span class="hl">TIERING_STATE_PENDING_DELETION</span>, 0);
+
+<span class="cm">// KBC (ext_storage.c:506)</span>
+<span class="kw">if</span> (is_delete_cmd) <span class="kw">return</span> 0; <span class="cm">/* allow */</span>
+<span class="cm">/* everything else blocks */</span>
+
+<span class="cm">// Client's DEL re-runs normally:</span>
+<span class="cm">// dbDelete() -> signalModifiedKey()</span>
+<span class="cm">//   + notifyKeyspaceEvent("del")</span>
+<span class="cm">//   + server.dirty++</span>`
+  },
+};
+
+function borderPoint(s, toward) {
+  const dx = toward.x - s.x, dy = toward.y - s.y;
+  const hw = s.w/2 + 6, hh = 26 + 6;
+  const sx = dx !== 0 ? hw / Math.abs(dx) : Infinity;
+  const sy = dy !== 0 ? hh / Math.abs(dy) : Infinity;
+  const t = Math.min(sx, sy);
+  return { x: s.x + dx*t, y: s.y + dy*t };
+}
+function drawStates() {
+  const g = $('scene'); g.innerHTML = '';
+  EDGES.forEach((e, i) => {
+    const A = STATES[e.from], B = STATES[e.to];
+    const mid = { x:(A.x+B.x)/2, y:(A.y+B.y)/2 };
+    const dx = B.x-A.x, dy = B.y-A.y, len = Math.hypot(dx,dy) || 1;
+    const cp = { x: mid.x + (-dy/len)*e.bend, y: mid.y + (dx/len)*e.bend };
+    const p1 = borderPoint(A, cp), p2 = borderPoint(B, cp);
+    e._el = el('path', { d:`M ${p1.x} ${p1.y} Q ${cp.x} ${cp.y} ${p2.x} ${p2.y}`, class:'edge', id:'e'+i }, g);
+    const pt = e._el.getPointAtLength(e._el.getTotalLength() * 0.5);
+    e._lb = el('text', { x:pt.x+(e.lx||6), y:pt.y+(e.ly||-8), class:'elabel' }, g, e.short);
+  });
+  Object.entries(STATES).forEach(([id, s]) => {
+    s._el = el('rect', { x:s.x-s.w/2, y:s.y-26, width:s.w, height:52, class:'node', id:'n-'+id, fill:s.color, stroke:s.stroke, 'stroke-width':'2.5' }, g);
+    el('text', { x:s.x, y:s.y-3, 'text-anchor':'middle', class:'nlabel' }, g, s.label);
+    el('text', { x:s.x, y:s.y+14, 'text-anchor':'middle', class:'nsub' }, g, s.sub);
+    s._el.addEventListener('click', () => selectState(id));
+  });
+}
+function selectState(id) {
+  Object.entries(STATES).forEach(([k, s]) => { s._el.classList.toggle('sel', k === id); });
+  EDGES.forEach(e => {
+    const out = e.from === id, inn = e.to === id;
+    e._el.classList.toggle('hi', out); e._el.classList.toggle('hi-in', inn);
+    e._el.classList.toggle('dim', !out && !inn);
+    if (e._lb) {
+      e._lb.classList.toggle('hi', out); e._lb.classList.toggle('hi-in', inn);
+      e._lb.classList.toggle('dim', !out && !inn);
+    }
+  });
+  const d = STATE_DETAIL[id];
+  const transitions = EDGES.filter(e => e.from === id || e.to === id)
+    .map(e => `<li><span style="color:${e.from===id?'var(--accent)':'var(--ok)'}">${e.from===id?'OUT':'IN'}</span> ${e.label}</li>`).join('');
+  $('p-title').textContent = d.t;
+  $('detail').innerHTML =
+      `<p style="font-weight:700;font-size:11.5px;color:var(--muted);margin-bottom:4px">SUMMARY</p>`
+    + `<p>${d.summary}</p>`
+    + `<p style="font-weight:700;font-size:11.5px;color:var(--muted);margin-top:12px;margin-bottom:4px">COMMAND BEHAVIOR</p>`
+    + `<table style="width:100%;border-collapse:collapse;font-size:12.5px"><tbody>${d.commands}</tbody></table>`
+    + `<p style="font-weight:700;font-size:11.5px;color:var(--muted);margin-top:12px;margin-bottom:4px">TRANSITIONS</p>`
+    + `<ul style="font-size:12.5px;margin:4px 0 0 16px;color:var(--muted)">${transitions}</ul>`
+    + `<p style="font-weight:700;font-size:11.5px;color:var(--muted);margin-top:12px;margin-bottom:4px">CODE</p>`
+    + `<div style="background:#0c1220;border:1px solid var(--border);border-radius:8px;padding:10px;font:12px/1.55 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#c9d6ee;overflow-x:auto">${d.code}</div>`;
+  $('hint').textContent = 'Click another state, or switch to a flow view above.';
+}
+
+
+/* =========================================================================
+   VIEWS 2-4: STEP-THROUGH FLOWS (pipeline stages + state chip / gauge)
+   ========================================================================= */
+function drawPipeline(stages, chipText) {
+  const g = $('scene'); g.innerHTML = '';
+  const W = 300, X = 260;
+  const gap = Math.min(88, Math.floor(500 / stages.length));
+  const H = Math.min(64, gap - 14);
+  stages.forEach((s, i) => {
+    const y = 26 + i*gap;
+    if (i > 0) el('path', { d:`M ${X+W/2} ${y-gap+H} L ${X+W/2} ${y}`, class:'edge' }, g);
+    s._el = el('rect', { x:X, y, width:W, height:H, class:'stage'+(s.io?' io':''), rx:10, style:'cursor:pointer' }, g);
+    if (s.code) { const _s = s; s._el.addEventListener('click', () => openModal(_s.name, _s.code, _s.file || '')); }
+    el('text', { x:X+W/2, y:y+H/2-4, 'text-anchor':'middle', class:'slabel' }, g, s.name);
+    el('text', { x:X+W/2, y:y+H/2+13, 'text-anchor':'middle', class:'ssub' }, g, s.sub);
+  });
+  el('rect', { x:600, y:26, width:266, height:44, class:'chip', id:'chip' }, g);
+  el('text', { x:733, y:53, 'text-anchor':'middle', class:'chiptext', id:'chiptext' }, g, chipText);
+  el('text', { x:733, y:16, 'text-anchor':'middle', class:'nsub' }, g, 'KEY STATE');
+}
+/* FlashCache internals scene */
+const FC = {};
+function drawFC() {
+  const g = $('scene'); g.innerHTML = '';
+  Object.keys(FC).forEach(k => delete FC[k]);
+  function box(id, x, y, w, h, name, sub, io) {
+    FC[id] = el('rect', { x, y, width:w, height:h, class:'stage'+(io?' io':''), rx:10 }, g);
+    el('text', { x:x+w/2, y:y+24, 'text-anchor':'middle', class:'slabel' }, g, name);
+    el('text', { x:x+w/2, y:y+42, 'text-anchor':'middle', class:'ssub' }, g, sub);
+  }
+  el('text', { x:20, y:30, class:'nsub' }, g, 'ENGINE SIDE');
+  box('iot', 40, 44, 240, 60, 'Backend IO thread', 'serialized items in / bytes out', true);
+  el('text', { x:20, y:150, class:'nsub' }, g, 'FLASHCACHE (DRAM)');
+  box('idx', 40, 164, 240, 60, 'Hash index', 'key -> staging slot OR log offset');
+  box('stage', 340, 164, 260, 60, 'Staging buffer', 'recent writes; flush at threshold');
+  el('text', { x:20, y:300, class:'nsub' }, g, 'FLASHCACHE (NVMe)');
+  box('log', 40, 314, 560, 84, 'Append-only log (segments)', 'large sequential writes; one IO per read miss');
+  box('gc', 660, 314, 190, 84, 'Garbage collector', 'relocate live, reclaim dead; rate-bounded');
+  /* wires */
+  el('path', { d:'M 160 104 L 160 164', class:'edge' }, g);
+  el('path', { d:'M 280 74 C 400 74, 460 110, 470 164', class:'edge' }, g);
+  el('path', { d:'M 470 224 L 470 314', class:'edge' }, g);
+  el('text', { x:480, y:280, class:'ssub' }, g, 'flush (sequential)');
+  el('path', { d:'M 660 356 L 600 356', class:'edge' }, g);
+  el('path', { d:'M 250 224 C 280 260, 300 280, 320 314', class:'edge' }, g);
+  el('text', { x:180 , y:270, class:'ssub' }, g, 'read: offset lookup');
+  el('text', { x:900, y:0 }, g, '');
+}
+function fcLight(ids) {
+  Object.entries(FC).forEach(([k, e]) => e.classList.toggle('lit', ids.includes(k)));
+}
+function drawGauge() {
+  const g = $('scene'); g.innerHTML = '';
+  const X = 340, W = 180, TOP = 40, BOT = 520;
+  const zones = [
+    { from:0.0, to:0.50, color:'#0f3d28', label:'normal', sub:'no tiering activity needed', border:'#3ecf8e' },
+    { from:0.50, to:0.72, color:'#162e4a', label:'spill zone', sub:'cold values move to flash', border:'#4da3ff' },
+    { from:0.72, to:0.88, color:'#3d3010', label:'throttle band', sub:'client writes rate-limited', border:'#f5b950' },
+    { from:0.88, to:1.0, color:'#3d1220', label:'OOM reject', sub:'writes rejected (-OOM to client)', border:'#ff6b6b' },
+  ];
+  zones.forEach(z => {
+    const y1 = BOT - (BOT-TOP)*z.to, h = (BOT-TOP)*(z.to-z.from);
+    el('rect', { x:X, y:y1, width:W, height:h, fill:z.color, stroke:z.border||'#2a3550', 'stroke-width':2.5, rx:6, class:'zone' }, g);
+    el('text', { x:X+W+14, y:y1+h/2, class:'slabel', fill:z.border||'var(--text)' }, g, z.label);
+    el('text', { x:X+W+14, y:y1+h/2+16, class:'ssub' }, g, z.sub);
+  });
+  el('text', { x:X-12, y:BOT-(BOT-TOP)*0.72+4, 'text-anchor':'end', class:'ssub' }, g, 'maxmemory');
+  el('text', { x:X-12, y:BOT-(BOT-TOP)*0.88+4, 'text-anchor':'end', class:'ssub' }, g, 'band end');
+  el('polygon', { points:'0,0 16,8 0,16', fill:'#f5b950', id:'gmark', class:'marker', transform:`translate(${X-26},${BOT-40})` }, g);
+  el('text', { x:120, y:60, class:'slabel' }, g, 'used_memory');
+  el('text', { x:120, y:78, class:'ssub' }, g, '(marker moves as pressure grows)');
+}
+function gaugeMark(frac) {
+  const TOP = 40, BOT = 520;
+  $('gmark').setAttribute('transform', `translate(314,${BOT-(BOT-TOP)*frac-8})`);
+}
+
+const FLOWS = {
+spill: {
+  title: 'Write path: client SET -> DRAM -> spill to flash', chip: 'ONLY_MEMORY',
+  stages: [
+    { name:'Client sends SET', file:'src/t_string.c (setCommand) + src/db.c (dbAdd)', sub:'normal DRAM write -- the fast path, no storage involved', pills:[{t:'setCommand()'},{t:'dbAdd()'}],
+      code:`<span class="cm">/* ============================================================
+ * The write path for a normal SET command.
+ * NO tiering code runs here. The value goes straight to DRAM.
+ * Tiering acts LATER, asynchronously, under memory pressure.
+ *
+ * This is important: writes NEVER wait for storage.
+ * The client gets an immediate +OK reply.
+ * ============================================================ */</span>
+
+<span class="cm">// src/t_string.c</span>
+<span class="kw">void</span> <span class="fn">setCommand</span>(client *c) {
+    ...
+    <span class="fn">setGenericCommand</span>(c, flags, c->argv[1],
+                      c->argv[2], expire, ...);
+}
+
+<span class="cm">// src/t_string.c</span>
+<span class="kw">void</span> <span class="fn">setGenericCommand</span>(...) {
+    ...
+    <span class="fn">setKey</span>(c, c->db, key, val, flags);
+    <span class="cm">/* Value is now in the database hashtable (DRAM).
+     * Nothing else happens until memory pressure
+     * triggers the spill controller. */</span>
+    <span class="fn">addReply</span>(c, ok_reply);  <span class="cm">/* +OK to client */</span>
+}` },
+    { name:'Spill controller (beforeSleep)', file:'src/server.c:1912 + src/ext_storage.c:1355-1540', sub:'memory over threshold; cold candidates via LRU/LFU sampling', connLabel:'memory > threshold', pills:[{t:'processCompletedStorageRequestsAndSpillOldItems()',hi:true}],
+      code:`<span class="cm">/* ============================================================
+ * Called once per event-loop iteration from beforeSleep().
+ * Two jobs: (1) drain completed IO, (2) spill cold items.
+ *
+ * The spill decision uses a Smith-predictor controller:
+ * it projects memory INCLUDING in-flight spill bytes, and
+ * spills until projected_memory <= maxmemory.
+ * ============================================================ */</span>
+
+<span class="cm">// src/server.c:1912 (beforeSleep)</span>
+<span class="kw">if</span> (ext_data_enabled) {
+    <span class="fn">processCompletedStorageRequestsAndSpillOldItems</span>();
+}
+
+<span class="cm">// src/ext_storage.c:1515 -- the spill decision</span>
+<span class="kw">static int</span> <span class="fn">spillFillToProjected</span>(<span class="ty">void</span>) {
+    <span class="ty">size_t</span> projected = <span class="fn">extStorageProjectedMemory</span>();
+    <span class="kw">if</span> (projected <= server.maxmemory)
+        <span class="kw">return</span> 0;  <span class="cm">/* no spill needed */</span>
+
+    <span class="cm">/* Select cold candidates using the SAME LRU/LFU
+     * sampling that eviction uses. No new policy. */</span>
+    <span class="kw">while</span> (projected > server.maxmemory) {
+        dbEntry *item = <span class="fn">evictionPoolPopBestKey</span>(...);
+        <span class="kw">if</span> (!item) <span class="kw">break</span>;
+        <span class="fn">spillItemAsync</span>(db_id, item);
+        projected = <span class="fn">extStorageProjectedMemory</span>();
+    }
+}` },
+    { name:'Submit: robj* handoff', file:'src/ext_storage.c:1190-1220', sub:'extStorageBridge_submitPut -> storageSubmitPut -> backend queue', connLabel:'robj* key + robj* value', pills:[{t:'submitPut(robj*)',hi:true},{t:'no copy',ret:true}],
+      code:`<span class="cm">/* ============================================================
+ * The core of the zero-copy handoff: we create a BORROWED robj
+ * that points to the ORIGINAL value -- no memcpy, no serialization.
+ * The IO thread will serialize later on its own time.
+ *
+ * Ownership transfers to the IO thread on success.
+ * On failure, we free the wrapper (not the value it points to).
+ * ============================================================ */</span>
+
+<span class="cm">// src/ext_storage.c:1195</span>
+robj *key_ref = <span class="fn">createStringObject</span>(key, sdslen(key));
+<span class="ty">long long</span> expireMs = <span class="fn">objectGetExpire</span>(item);
+
+<span class="cm">/* Borrowed value robj -- points to original value, no copy */</span>
+<span class="ty">void</span> *raw_value = <span class="fn">objectGetVal</span>(item);
+robj *value_ref = <span class="fn">zmalloc</span>(<span class="kw">sizeof</span>(robj));
+<span class="fn">memset</span>(value_ref, 0, <span class="kw">sizeof</span>(robj));
+value_ref->type = item->type;
+value_ref->encoding = item->encoding;
+value_ref->refcount = 1;
+<span class="fn">objectSetVal</span>(value_ref, raw_value);
+<span class="cm">/* Points to ORIGINAL value -- no copy! */</span>
+
+<span class="ty">int</span> rc = <span class="hl">extStorageBridge_submitPut</span>(
+    <span class="fn">extStoragePhysicalDbId</span>(db_id),
+    key_ref, value_ref, expireMs);
+
+<span class="kw">if</span> (rc != 0) {
+    <span class="fn">decrRefCount</span>(key_ref);
+    <span class="fn">zfree</span>(value_ref);  <span class="cm">/* don't free the sds */</span>
+    consecutive_spill_failures++;
+    <span class="kw">return</span> -1;
+}
+<span class="cm">/* DO NOT free key_ref/value_ref here --
+ * ownership transferred to IO thread */</span>` },
+    { name:'Request queue (lock-free MPSC)', file:'src/ext_storage_bridge.c:138 + src/storage/storage_dispatch.c:50-60', sub:'main thread enqueues; never waits', connLabel:'storageSubmitPut() <span style="color:#f5b950;font-weight:700">\u2192 state = COPYING_TO_FLASH</span>', pills:[{t:'WOULDBLOCK',ret:true},{t:'REJECTED = retry'}],
+      code:`<span class="cm">/* ============================================================
+ * The bridge forwards the robj* pointers to the dispatch layer.
+ * klen/vlen are 0 because these are robj*, not byte buffers.
+ * The dispatch layer calls the backend's put_async directly --
+ * a function pointer, zero indirection beyond that one deref.
+ *
+ * Returns immediately: WOULDBLOCK = queued, REJECTED = retry.
+ * The main thread NEVER waits here.
+ * ============================================================ */</span>
+
+<span class="cm">// src/ext_storage_bridge.c:138</span>
+<span class="ty">int</span> <span class="fn">extStorageBridge_submitPut</span>(...) {
+    ...
+    storageStatus s = <span class="hl">storageSubmitPut</span>(
+        db_id, (<span class="ty">void</span>*)key, <span class="hl">0</span>,
+        (<span class="ty">void</span>*)value, <span class="hl">0</span>, expire_ms, ctx);
+    <span class="cm">/* klen=0, vlen=0: these are robj*, not bytes */</span>
+    <span class="kw">if</span> (s == STORAGE_WOULDBLOCK || s == STORAGE_OK)
+        <span class="kw">return</span> 0;
+    <span class="kw">return</span> -1;  <span class="cm">/* REJECTED */</span>
+}
+
+<span class="cm">// src/storage/storage_dispatch.c:53</span>
+storageStatus <span class="fn">storageSubmitPut</span>(...) {
+    <span class="kw">if</span> (server_storage-><span class="hl">put_async</span>) {
+        <span class="cm">/* Direct function pointer into the backend.
+         * Native: fc_real_put_async
+         * Module: nks_put_async (Rust) */</span>
+        <span class="kw">return</span> server_storage-><span class="fn">put_async</span>(
+            server_storage_ctx, db_id,
+            key, klen, value, vlen,
+            expire_ms, request_ctx);
+    }
+    <span class="cm">/* Else: middleware wraps sync put() */</span>
+    <span class="kw">return</span> <span class="fn">storageMiddlewareSubmit</span>(...);
+}` },
+    { name:'Backend IO thread', file:'IO worker (module: storage_type_bridge.rs / native: storage_flashcache_real.c)', sub:'dequeue -> serialize (engine callbacks) -> hand to FlashCache', io:true, connLabel:'dequeue from MPSC', pills:[{t:'serializeValue(robj*)',hi:true},{t:'ram_bytes'}],
+      code:`<span class="cm">/* ============================================================
+ * This runs entirely on the backend's IO worker thread.
+ * The main thread is NOT involved -- it's already serving
+ * other clients.
+ *
+ * The IO thread:
+ * 1. Dequeues the request
+ * 2. Serializes the robj* to bytes using engine callbacks
+ * 3. Measures the RAM footprint for memory projection
+ * 4. Hands the bytes to FlashCache for writing
+ * ============================================================ */</span>
+
+<span class="cm">// Engine-provided serialization callback (called on IO thread)</span>
+<span class="ty">int</span> <span class="fn">extStorageSerializeValue</span>(
+    <span class="ty">void</span> *value,      <span class="cm">/* the robj* */</span>
+    <span class="kw">char</span> **out);      <span class="cm">/* -> RDB DUMP bytes */</span>
+<span class="cm">/* Uses rdbSaveObject internally -- same format as
+ * RDB persistence. Runs on the IO thread, never main. */</span>
+
+<span class="cm">// RAM footprint accounting</span>
+<span class="ty">size_t</span> ram_bytes = <span class="fn">zmalloc_size</span>(value_ptr);
+<span class="fn">atomic_fetch_add</span>(&inflight_spill_ram_bytes, ram_bytes);
+<span class="cm">/* The spill controller reads this to project memory
+ * accurately even while spills are in flight */</span>
+
+<span class="cm">// Module side (storage_type_bridge.rs):</span>
+<span class="kw">unsafe extern</span> <span class="hl">"C"</span> <span class="kw">fn</span> <span class="fn">nks_put_async</span>(...) {
+    <span class="kw">let</span> req = StorageRequest::WriteValue {
+        db_id, key_robj, value_robj, ... };
+    dispatcher.<span class="fn">submit_request</span>(req)
+    <span class="cm">// -> crossbeam channel -> IO worker picks up</span>
+}` },
+    { name:'FlashCache write', file:'FlashCache internal (log-structured cache engine)', sub:'append to staging buffer; flush to NVMe log at threshold', io:true, connLabel:'serialized bytes', pills:[{t:'staging append'},{t:'sequential flush',hi:true}],
+      code:`<span class="cm">/* ============================================================
+ * FlashCache is a log-structured cache engine optimized for
+ * NVMe. It NEVER does random writes -- only large sequential
+ * appends. This is what NVMe hardware is best at.
+ *
+ * Write path:
+ * 1. Append item to in-memory staging buffer
+ * 2. Update the DRAM hash index (key -> staging slot)
+ * 3. When buffer hits flush threshold -> one big write
+ *
+ * No per-item disk IO on write. Amortized over the batch.
+ * ============================================================ */</span>
+
+<span class="cm">// Step 1: staging buffer append (DRAM, fast)</span>
+staging_buffer[write_pos] = { header, key_bytes, value_bytes };
+write_pos += item_size;
+
+<span class="cm">// Step 2: index update (DRAM hash table)</span>
+index[key_hash] = { .location = STAGING, .offset = write_pos };
+
+<span class="cm">// Step 3: flush (when buffer full)</span>
+<span class="kw">if</span> (write_pos >= <span class="hl">flush_threshold</span>) {
+    <span class="cm">/* One large sequential write to NVMe log.
+     * Typically 1-4MB at a time.
+     * Config: ext-storage-buffered-write-flush-threshold */</span>
+    pwrite(fd, staging_buffer, write_pos, log_tail);
+    log_tail += write_pos;
+    <span class="cm">/* Update index: staging -> log offset */</span>
+}
+
+<span class="cm">// Metrics: fc_num_disk_writes, fc_total_disk_bytes</span>` },
+    { name:'Completion ring -> apply', file:'src/ext_storage_bridge.c:56 + src/ext_storage.c:763-810', sub:'next beforeSleep: release RAM value; encoding=TIERED', connLabel:'completion_fn -> ring', pills:[{t:'objectSetVal(NULL)',hi:true},{t:'ONLY_FLASH',ret:true}],
+      code:`<span class="cm">/* ============================================================
+ * The completion travels back from the IO thread to main:
+ *
+ * IO thread: calls bridge_on_completion() -> ring buffer
+ * Main thread (next beforeSleep): drains ring, applies result
+ *
+ * On write success:
+ * - Release the in-flight RAM credit
+ * - Free the original DRAM value
+ * - Set encoding = TIERED (stub remains for key lookup)
+ * - State -> ONLY_FLASH
+ * ============================================================ */</span>
+
+<span class="cm">// src/ext_storage_bridge.c:56 (IO thread)</span>
+<span class="kw">static void</span> <span class="fn">bridge_on_completion</span>(
+    storageCompletion *c, <span class="ty">void</span> *privdata) {
+    comp_ring.ring[head] = *c;  <span class="cm">/* lock-free */</span>
+    comp_ring.head = next;
+}
+
+<span class="cm">// src/ext_storage.c:763 (main thread, next beforeSleep)</span>
+<span class="kw">case</span> VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_WRITE: {
+    <span class="cm">/* Release in-flight RAM credit */</span>
+    <span class="fn">atomic_fetch_sub</span>(&inflight_spill_ram_bytes,
+                      msg->ram_bytes);
+
+    <span class="kw">if</span> (msg->status == VALKEYMODULE_OK) {
+        <span class="cm">/* Spill OK -- free RAM value */</span>
+        dbEntry *entry = <span class="fn">dbFind</span>(db, key_name);
+        robj *old = <span class="fn">createObject</span>(entry->type,
+                                  <span class="fn">objectGetVal</span>(entry));
+        <span class="hl">objectSetVal(entry, NULL);</span>  <span class="cm">/* detach */</span>
+        <span class="hl">decrRefCount(old);</span>         <span class="cm">/* free value */</span>
+
+        <span class="cm">/* Tombstone: placeholder sds + TIERED flag */</span>
+        <span class="fn">objectSetVal</span>(entry, sdsnewlen(NULL, 0));
+        <span class="fn">objectSetTiered</span>(entry);
+
+        <span class="cm">/* State -> ONLY_FLASH. DRAM freed. */</span>
+        <span class="fn">extStorageSetState</span>(db, key,
+            <span class="hl">TIERING_STATE_ONLY_FLASH</span>, 0);
+    } <span class="kw">else</span> {
+        <span class="cm">/* Spill FAILED -- keep in RAM, retry later */</span>
+        <span class="fn">extStorageRemoveState</span>(db, key_name);
+    }
+}` },
+  ],
+  steps: [
+    { lit:[0], chip:'ONLY_MEMORY', cap:`<p><b>Writes never wait for storage.</b> A client SET is a normal DRAM write and replies immediately -- tiering is not a write-through cache. Values move to flash later, asynchronously, only when memory pressure calls for it.</p>` },
+    { lit:[1], chip:'ONLY_MEMORY', cap:`<p>Once per event-loop iteration, if memory is over the spill threshold, the controller picks cold candidates using the SAME LRU/LFU sampling eviction uses. Batch size comes from a predictive model of projected memory (in-flight spill RAM is accounted).</p>` },
+    { lit:[2], chip:'COPYING_TO_FLASH', cap:`<p>Object references cross down: <code>extStorageBridge_submitPut(dbId, key_robj, value_robj, ttl)</code> -> <code>storageSubmitPut</code> -> the backend's <code>put_async</code>. No copy, no serialization on the main thread. State -> <code>COPYING_TO_FLASH</code>: reads still serve from RAM, writes to this key wait.</p>` },
+    { lit:[3], chip:'COPYING_TO_FLASH', cap:`<p>The request lands in a lock-free queue between the main thread and the IO worker. If the queue is saturated the submit returns <code>REJECTED</code> -- the spill retries later; the value was never at risk (still in RAM). The main thread moves on immediately either way.</p>` },
+    { lit:[4], chip:'COPYING_TO_FLASH', cap:`<p>The IO thread dequeues, calls the engine-provided serialization callback to turn the <code>robj*</code> into bytes (RDB DUMP format), measures the value's RAM footprint for memory projection, and hands the bytes to FlashCache. All serialization CPU is off the main thread.</p>` },
+    { lit:[5], chip:'COPYING_TO_FLASH', cap:`<p>FlashCache appends the item to its in-memory staging buffer and updates its DRAM index. When the buffer hits the flush threshold (<code>ext-storage-buffered-write-flush-threshold</code>), it is written to the NVMe append-only log in one large sequential IO. See the <b>FlashCache internals</b> view for the full mechanism.</p>` },
+    { lit:[6], chip:'ONLY_FLASH', cap:`<p>The write completion travels back through the ring buffer; on the next event-loop iteration the DRAM value is released and the stub keeps <code>encoding=TIERED</code>. Memory reclaimed; key, expiry, and metadata stay in RAM.</p>` },
+  ],
+},
+fetch: {
+  title: 'Read path: client GET -> intercept -> flash -> re-execute', chip: 'ONLY_FLASH',
+  stages: [
+    { name:'Client sends GET', sub:'command parsed off the socket; not yet executed',
+      file:'src/networking.c + src/server.c (processCommand)',
+      pills:[{t:'processCommand()'},{t:'not yet call()'}],
+      code:'<span class="cm">/* A client sends GET mykey. Parsed and queued.\n * Before call() runs, preCommandExec intercepts.\n * If the value is in DRAM, tiering cost = 0. */</span>\n\n<span class="cm">// src/server.c</span>\n<span class="ty">int</span> <span class="fn">processCommand</span>(client *c) {\n    ...\n    <span class="kw">if</span> (<span class="hl">preCommandExec</span>(c) == CMD_FILTER_REJECT)\n        <span class="kw">return</span>;  <span class="cm">/* client blocked */</span>\n    <span class="fn">call</span>(c, ...);  <span class="cm">/* normal execution */</span>\n}' },
+    { name:'Intercept: preCommandExec', sub:'getKeysFromCommand extracts keys; residency check = header bits',
+      file:'src/ext_storage.c:580-650',
+      pills:[{t:'preCommandExec()',hi:true},{t:'3-bit check'},{t:'getKeysFromCommand()'}],
+      connLabel:'command + client',
+      code:'<span class="cm">/* preCommandExec: extracts keys, checks 3-bit state.\n * Memory-resident keys: THIS IS THE ENTIRE TIERING COST.\n * Flash-resident: issues fetch + blocks client. */</span>\n\n<span class="cm">// src/ext_storage.c:580</span>\n<span class="ty">int</span> <span class="fn">preCommandExec</span>(client *c) {\n    keyReference *keys = <span class="fn">getKeysFromCommand</span>(...);\n    <span class="kw">for</span> (i = 0; i < numkeys; i++) {\n        <span class="kw">if</span> (<span class="hl">keyBlocksClient</span>(db, key, ...))\n            blocking_keys[n++] = ...;\n    }\n    <span class="kw">if</span> (n > 0) {\n        <span class="fn">blockClientInUseOnKeys</span>(c, ...);\n        <span class="kw">return</span> CMD_FILTER_REJECT;\n    }\n    <span class="kw">return</span> CMD_FILTER_ACCEPT;\n}' },
+    { name:'Block client + submit fetch', sub:'blockClientInUseOnKeys; async GET queued; event loop continues',
+      file:'src/ext_storage.c:625 + :641',
+      pills:[{t:'blockClientInUseOnKeys()',hi:true},{t:'submitGet()'},{t:'event loop free'}],
+      connLabel:'key is <span style="color:#f5b950;font-weight:700">ONLY_FLASH</span>',
+      code:'<span class="cm">/* Key is ONLY_FLASH. Two things happen:\n * 1. Async GET submitted to backend\n * 2. ONLY this client blocks (everyone else fine) */</span>\n\n<span class="cm">// src/ext_storage.c:625</span>\n<span class="kw">case</span> TIERING_STATE_ONLY_FLASH:\n    <span class="ty">int</span> rc = <span class="hl">extStorageBridge_submitGet</span>(\n        <span class="fn">extStoragePhysicalDbId</span>(db->id), key);\n    <span class="fn">extStorageSetState</span>(db, key,\n        <span class="hl">TIERING_STATE_COPYING_TO_MEMORY</span>, 1);\n    <span class="kw">return</span> 1;  <span class="cm">/* BLOCK */</span>\n\n<span class="cm">// src/ext_storage.c:641</span>\n<span class="fn">blockClientInUseOnKeys</span>(c, num_keys, keys);\n<span class="cm">/* Event loop NOT blocked. Only this client. */</span>' },
+    { name:'Backend IO thread', sub:'dequeue -> FlashCache read -> deserialize to robj*', io:true,
+      file:'IO worker (module: dispatcher.rs / native: fc_real)',
+      pills:[{t:'get_async()',hi:true},{t:'deserializeValue()'}],
+      connLabel:'<span style="color:#f5b950;font-weight:700">state = COPYING_TO_MEMORY</span>',
+      code:'<span class="cm">/* Runs on IO worker. Main thread is free.\n * 1. Dequeue request\n * 2. FlashCache reads bytes from index/disk\n * 3. Deserialize bytes -> robj* (engine callback)\n * 4. Package into completion */</span>\n\nserver_storage-><span class="hl">get_async</span>(\n    ctx, db_id, key, klen, request_ctx);\n\n<span class="cm">// Deserialization (engine callback, on IO thread):</span>\n<span class="ty">void</span> *value = <span class="fn">extStorageDeserializeValue</span>(\n    bytes, length);\n<span class="cm">/* wraps rdbLoadObject -- rebuilds robj* */</span>\n\n<span class="cm">// Transient rejection:</span>\n<span class="kw">if</span> (rejected) status = <span class="hl">READ_RETRY</span>;\n<span class="cm">/* Engine re-issues, NOT a miss */</span>' },
+    { name:'FlashCache read', sub:'index lookup -> staging-buffer hit or NVMe read + CRC check', io:true,
+      file:'FlashCache internal',
+      pills:[{t:'index lookup'},{t:'staging hit = 0 IO',ret:true},{t:'NVMe read',hi:true}],
+      connLabel:'key hash -> location',
+      code:'<span class="cm">/* Two cases:\n * Case 1: STAGING HIT -- item still in memory buffer.\n *   No disk IO. Free!\n * Case 2: LOG READ -- one NVMe read at the offset.\n *   Capped by ext-storage-max-in-flight-reads. */</span>\n\nIndexEntry *ie = index[hash(key)];\n\n<span class="kw">if</span> (ie->location == STAGING) {\n    <span class="cm">/* No disk IO! */</span>\n    memcpy(out, staging + ie->offset, ie->size);\n    <span class="kw">return</span> STORAGE_OK;\n}\n\n<span class="cm">// On-disk: one read</span>\npread(fd, buf, ie->size, ie->log_offset);\n<span class="kw">if</span> (<span class="fn">crc32</span>(buf) != ie->checksum)\n    <span class="kw">return</span> STORAGE_NOT_FOUND; <span class="cm">/* corrupt */</span>\n<span class="kw">return</span> STORAGE_OK;' },
+    { name:'Completion ring -> apply', sub:'value re-attached; clients on this key unblocked',
+      file:'src/ext_storage_bridge.c:56 + src/ext_storage.c:880',
+      pills:[{t:'completion_fn -> ring'},{t:'value re-attached',ret:true},{t:'unblockClients',hi:true}],
+      connLabel:'completion (robj* value)',
+      code:'<span class="cm">/* Value rides back through the ring buffer.\n * Main thread applies:\n * 1. Re-attach value to the hashtable entry\n * 2. Clear TIERED encoding\n * 3. Unblock all waiting clients */</span>\n\n<span class="cm">// src/ext_storage.c:880</span>\n<span class="kw">case</span> MSG_TYPE_READ: {\n    dbEntry *entry = <span class="fn">dbFind</span>(db, key);\n    <span class="cm">/* Re-attach the real value */</span>\n    <span class="hl">objectSetVal(entry, objectGetVal(new_value));</span>\n    entry->encoding = new_value->encoding;\n\n    <span class="cm">/* State -> ONLY_MEMORY */</span>\n    <span class="fn">extStorageSetState</span>(db, key,\n        <span class="hl">TIERING_STATE_ONLY_MEMORY</span>, 0);\n\n    <span class="cm">/* Unblock ALL clients waiting */</span>\n    <span class="hl">unblockClientsInUseOnKey</span>(key);\n}' },
+    { name:'Command RE-EXECUTES', sub:'normal path: notifications, propagation, reply to client',
+      file:'src/server.c (processCommand -> call)',
+      pills:[{t:'call(c, cmd)',hi:true},{t:'notifications'},{t:'replication'},{t:'reply',ret:true}],
+      connLabel:'<span style="color:#f5b950;font-weight:700">state = ONLY_MEMORY</span> (unblocked)',
+      code:'<span class="cm">/* Client wakes. Command RE-EXECUTES from start.\n * This time preCommandExec sees ONLY_MEMORY -> ACCEPT.\n * call() runs the real getCommand().\n *\n * WHY this is correct: it is the REAL command running\n * through the REAL path. All side effects fire\n * naturally -- not a shortcut, not a replay. */</span>\n\n<span class="fn">processCommand</span>(c);\n    <span class="cm">/* preCommandExec: state=0 -> ACCEPT */</span>\n    <span class="fn">call</span>(c, CMD_CALL_FULL);\n        <span class="fn">getCommand</span>(c);\n            <span class="fn">addReplyBulk</span>(c, value);\n\n<span class="cm">/* Side effects (all automatic):\n *   keyspace notification\n *   replication propagation\n *   server.dirty++\n *   WATCH invalidation */</span>' },
+  ],
+  steps: [
+    { lit:[0], chip:'ONLY_FLASH', cap:`<p>The client's GET arrives and is parsed. Before <code>call()</code> runs, every command passes through <code>preCommandExec</code> -- the interception point.</p>` },
+    { lit:[1], chip:'ONLY_FLASH', cap:`<p><code>getKeysFromCommand</code> extracts the command's keys; each key's 3-bit residency state is read from the object header. For memory-resident keys this is the ENTIRE tiering cost -- a bits check, no function call, and the command proceeds normally. This one's value is on flash.</p>` },
+    { lit:[2], chip:'COPYING_TO_MEMORY', cap:`<p>An async GET is queued to the backend and ONLY this client blocks (<code>blockClientInUseOnKeys</code> -- the same machinery BLPOP uses). The event loop keeps serving every other connection. Multi-key commands block once for ALL missing keys. Zero partial execution: nothing ran yet.</p>` },
+    { lit:[3], chip:'COPYING_TO_MEMORY', cap:`<p>The IO thread dequeues the read request and asks FlashCache for the key's bytes.</p>` },
+    { lit:[4], chip:'COPYING_TO_MEMORY', cap:`<p>FlashCache looks up its DRAM index for the item's location. If the item is still in the staging buffer (recently written, not yet flushed) it is served from memory; otherwise an async NVMe read fetches it (concurrency capped by <code>ext-storage-max-in-flight-reads</code>) and the item's checksum is validated. A transient rejection (read queue full) returns <code>READ_RETRY</code> -- the engine re-issues rather than misreporting a miss.</p>` },
+    { lit:[5], chip:'COPYING_TO_MEMORY', cap:`<p>The IO thread deserializes bytes back into a <code>robj*</code> (engine callback wrapping <code>rdbLoadObject</code>) and the completion -- carrying the reconstructed value -- rides the ring buffer back. Next <code>beforeSleep</code>: value re-attached to the entry.</p>` },
+    { lit:[6], chip:'ONLY_MEMORY', cap:`<p>The blocked client wakes and its command <b>re-executes through the normal path</b> -- keyspace notifications, replication propagation, dirty counting all fire exactly once, because it is the real command running, not a replay. The reply goes out to the client.</p>` },
+    { lit:[1,6], chip:'ONLY_MEMORY', cap:`<p><b>The one exception:</b> Lua scripts and MULTI cannot block mid-execution and have no rollback, so a tiered key hit inside them triggers a synchronous single-key fetch -- a bounded single-IO stall. Correctness over a bounded stall; the large-object guardrail caps the worst case.</p>` },
+  ],
+},
+fc: {
+  title: 'FlashCache internals', chip: 'FLASHCACHE',
+  subflows: {
+    'fc-overview': {
+      label: 'Overview',
+      stages: [],
+      steps: [],
+    },
+    'fc-write': {
+      label: 'Write Flow',
+      stages: [
+        { name:'API: put(key, value, ttl)', sub:'serialized bytes arrive from engine IO thread', io:true,
+          file:'FlashCache API layer',
+          pills:[{t:'put()',hi:true},{t:'async',ret:true}],
+          code:'<span class="cm">/* Write entry point. Called from the engine\'s\n * IO thread with serialized key+value bytes.\n * Returns immediately -- no disk IO here. */</span>\n\n<span class="fn">fc_put</span>(ctx, db_id, key, klen, value, vlen, ttl) {\n    <span class="cm">/* 1. Compute key hash for index */</span>\n    hash = <span class="fn">fc_hash</span>(key, klen);\n\n    <span class="cm">/* 2. Append to staging buffer */</span>\n    slot = <span class="fn">staging_append</span>(key, value, ttl);\n\n    <span class="cm">/* 3. Update index -> STAGING */</span>\n    index[hash] = {STAGING, slot, size, crc};\n\n    <span class="cm">/* 4. Acknowledge (no disk IO!) */</span>\n    <span class="kw">return</span> STORAGE_OK;\n}' },
+        { name:'Index: update entry -> STAGING', sub:'hash index now points to the staging buffer slot', io:true,
+          file:'FlashCache index layer',
+          pills:[{t:'index[hash] = STAGING'},{t:'O(1)'}],
+          connLabel:'key_hash + slot offset',
+          code:'<span class="cm">/* Index update is pure DRAM operation.\n * The entry records:\n *   location = STAGING\n *   offset = position in staging buffer\n *   size = serialized item size\n *   crc = checksum for validation */</span>\n\nindex_entry->location = <span class="hl">STAGING</span>;\nindex_entry->offset = staging_write_pos;\nindex_entry->size = item_size;\nindex_entry->crc = <span class="fn">crc32</span>(item_bytes);' },
+        { name:'Staging: append item to buffer', sub:'in-memory buffer; no disk IO per item', io:true,
+          file:'FlashCache staging layer',
+          pills:[{t:'memcpy to buffer'},{t:'zero disk IO',ret:true}],
+          connLabel:'item bytes',
+          code:'<span class="cm">/* Items are appended to a contiguous memory buffer.\n * No per-item disk write -- this is what makes writes\n * fast. The buffer acts as a write-combining layer.\n *\n * Config: ext-storage-max-buffered-write-size */</span>\n\nmemcpy(staging_buffer + write_pos,\n       item_bytes, item_size);\nwrite_pos += item_size;' },
+        { name:'Flush: buffer -> one sequential NVMe write', sub:'triggered when buffer hits threshold; large batch IO', io:true,
+          file:'FlashCache flush path -> File IO layer',
+          pills:[{t:'flush_threshold hit',hi:true},{t:'pwrite() 1-4MB'},{t:'sequential only'}],
+          connLabel:'buffer full -> <span style="color:#f5b950;font-weight:700">FLUSH</span>',
+          code:'<span class="cm">/* FLUSH: the only time disk is touched for writes.\n * One large sequential write -- NVMe\'s sweet spot.\n * After flush: index entries update STAGING -> LOG.\n *\n * Config: ext-storage-buffered-write-flush-threshold */</span>\n\n<span class="kw">if</span> (write_pos >= <span class="hl">flush_threshold</span>) {\n    <span class="cm">/* One large sequential write */</span>\n    pwrite(log_fd, staging_buffer,\n           write_pos, log_tail);\n    log_tail += write_pos;\n\n    <span class="cm">/* Update index: STAGING -> LOG */</span>\n    <span class="kw">for</span> (item in batch)\n        index[item].location = <span class="hl">LOG</span>;\n\n    write_pos = 0;  <span class="cm">/* recycle */</span>\n}' },
+      ],
+      steps: [
+        { lit:[0], chip:'PUT', cap:'<p>Serialized bytes arrive. Index updated, item appended to staging buffer. <b>No disk IO.</b></p>' },
+        { lit:[1], chip:'INDEX', cap:'<p>Hash index entry created pointing at the staging buffer slot. Pure DRAM operation.</p>' },
+        { lit:[2], chip:'STAGING', cap:'<p>Item bytes appended to the in-memory buffer. Write acknowledged to the engine.</p>' },
+        { lit:[3], chip:'FLUSH', cap:'<p>When buffer is full: one large sequential pwrite to the NVMe log. Index entries switch from STAGING to LOG offsets.</p>' },
+      ],
+    },
+    'fc-read': {
+      label: 'Read Flow',
+      stages: [
+        { name:'API: get(key)', sub:'read request arrives from engine IO thread', io:true,
+          file:'FlashCache API layer',
+          pills:[{t:'get()',hi:true},{t:'async'}],
+          code:'<span class="cm">/* Read entry point. Looks up the index to find\n * where the item lives, then serves it. */</span>\n\n<span class="fn">fc_get</span>(ctx, db_id, key, klen) {\n    hash = <span class="fn">fc_hash</span>(key, klen);\n    entry = index[hash];\n\n    <span class="kw">if</span> (!entry)\n        <span class="kw">return</span> STORAGE_NOT_FOUND;\n\n    <span class="kw">if</span> (entry->location == STAGING)\n        <span class="kw">return</span> <span class="fn">read_from_staging</span>(...);\n    <span class="kw">else</span>\n        <span class="kw">return</span> <span class="fn">read_from_log</span>(...);\n}' },
+        { name:'Index: lookup location', sub:'O(1) hash lookup resolves STAGING or LOG', io:true,
+          file:'FlashCache index layer',
+          pills:[{t:'index[hash]'},{t:'STAGING?',ret:true},{t:'LOG?',hi:true}],
+          connLabel:'key_hash',
+          code:'<span class="cm">/* Index tells us exactly where the item is:\n *   STAGING = still in memory buffer (free read!)\n *   LOG = on disk at a specific offset (one IO) */</span>\n\nIndexEntry *ie = &index[hash(key)];\n<span class="kw">if</span> (ie->location == <span class="hl">STAGING</span>) {\n    <span class="cm">/* Fast path: no disk IO */</span>\n} <span class="kw">else</span> {\n    <span class="cm">/* Disk path: one read */</span>\n}' },
+        { name:'Case 1: staging hit (DRAM)', sub:'item still in buffer; served from memory -- zero IO', io:true,
+          file:'FlashCache staging layer',
+          pills:[{t:'memcpy from buffer'},{t:'0 disk IO',ret:true}],
+          connLabel:'location = STAGING',
+          code:'<span class="cm">/* FAST PATH: item not yet flushed to disk.\n * Serve directly from the staging buffer.\n * Zero disk IO -- recently written items are free! */</span>\n\nmemcpy(out_buf,\n       staging_buffer + ie->offset,\n       ie->size);\n<span class="kw">return</span> STORAGE_OK;\n\n<span class="cm">/* This is why recently-spilled keys are cheap\n * to fetch back -- they haven\'t hit disk yet. */</span>' },
+        { name:'Case 2: log read (NVMe)', sub:'one async pread at the exact offset; CRC validated', io:true,
+          file:'FlashCache File IO layer',
+          pills:[{t:'pread(fd, offset)',hi:true},{t:'CRC check'},{t:'max-in-flight-reads'}],
+          connLabel:'location = LOG, offset',
+          code:'<span class="cm">/* DISK PATH: exactly one NVMe read.\n * No scanning, no multi-level lookup, no LSM merge.\n * The index gave us the exact byte offset.\n *\n * Concurrency capped: ext-storage-max-in-flight-reads */</span>\n\npread(log_fd, read_buf, ie->size, ie->offset);\n\n<span class="cm">/* Validate integrity */</span>\n<span class="kw">if</span> (<span class="fn">crc32</span>(read_buf) != ie->crc) {\n    <span class="kw">return</span> STORAGE_NOT_FOUND;\n    <span class="cm">/* Engine treats as miss, cleans up */</span>\n}\n<span class="kw">return</span> STORAGE_OK;' },
+      ],
+      steps: [
+        { lit:[0], chip:'GET', cap:'<p>Read request arrives. Index is consulted.</p>' },
+        { lit:[1], chip:'INDEX', cap:'<p>O(1) hash lookup resolves location: STAGING (in memory) or LOG (on disk).</p>' },
+        { lit:[2], chip:'STAGING HIT', cap:'<p>Item still in buffer -- served from DRAM. Zero disk IO. Recently spilled keys are free to read back.</p>' },
+        { lit:[3], chip:'LOG READ', cap:'<p>One async NVMe read at the exact offset. CRC validated. Capped by max-in-flight-reads.</p>' },
+      ],
+    },
+    'fc-gc': {
+      label: 'GC & Eviction',
+      stages: [
+        { name:'GC trigger: space pressure', sub:'allocation exceeds max-allocated-percent (default 90%)', io:true,
+          file:'FlashCache GC',
+          pills:[{t:'max-allocated-percent',hi:true},{t:'background task'}],
+          code:'<span class="cm">/* GC activates when disk usage hits the threshold.\n * Runs as a background task, rate-bounded so it\n * never starves foreground IO.\n *\n * Config: ext-storage-max-allocated-percent (90%) */</span>\n\n<span class="kw">if</span> (allocated_bytes / capacity > <span class="hl">max_allocated_pct</span>) {\n    <span class="fn">gc_activate</span>();\n}' },
+        { name:'Walk old segments', sub:'identify dead items (overwritten or deleted)', io:true,
+          file:'FlashCache GC',
+          pills:[{t:'segment scan'},{t:'live vs dead'}],
+          connLabel:'oldest segment first',
+          code:'<span class="cm">/* GC walks log segments from oldest to newest.\n * For each item: is it still live?\n * (index points to this offset = live,\n *  index points elsewhere = dead/overwritten) */</span>\n\n<span class="kw">for</span> (item in oldest_segment) {\n    <span class="kw">if</span> (index[item.key].offset == item.offset)\n        live_items.<span class="fn">push</span>(item);  <span class="cm">/* still referenced */</span>\n    <span class="cm">/* else: dead, skip */</span>\n}' },
+        { name:'Relocate live items', sub:'copy live items to the log tail; update index', io:true,
+          file:'FlashCache GC + Log layer',
+          pills:[{t:'append to tail'},{t:'index update',hi:true}],
+          connLabel:'live items only',
+          code:'<span class="cm">/* Live items are appended to the log tail\n * (same sequential write pattern as flush).\n * Index entries updated to new offsets.\n * Dead space in the old segment is now reclaimable. */</span>\n\n<span class="kw">for</span> (item in live_items) {\n    new_offset = <span class="fn">appendToLogTail</span>(item);\n    index[item.key].offset = <span class="hl">new_offset</span>;\n}' },
+        { name:'Reclaim segment', sub:'old segment freed; space available for new writes', io:true,
+          file:'FlashCache GC',
+          pills:[{t:'free segment'},{t:'capacity restored',ret:true}],
+          connLabel:'segment fully dead now',
+          code:'<span class="cm">/* The old segment has no live references.\n * Mark it as free for reuse.\n *\n * Rate control: between ext-storage-min-gc-rate\n * and ext-storage-max-gc-rate bytes/sec.\n * GC never starves foreground IO. */</span>\n\n<span class="fn">freeSegment</span>(old_segment);\nallocated_bytes -= segment_size;' },
+        { name:'Autonomous eviction (if needed)', sub:'cannot reclaim enough -> evict cold items from disk', io:true,
+          file:'FlashCache GC -> Engine notification',
+          pills:[{t:'evict cold items'},{t:'DELETE to engine',hi:true},{t:'fc_num_items_evicted'}],
+          connLabel:'space still insufficient',
+          code:'<span class="cm">/* If GC cannot free enough space (all items live),\n * FlashCache evicts cold items autonomously.\n *\n * Sends a DELETE completion to the engine.\n * Engine discovers on next fetch (NOT_FOUND)\n * and drops stale metadata.\n * This is the PENDING_EVICT path. */</span>\n\n<span class="kw">if</span> (!enough_space_after_gc) {\n    <span class="fn">evictColdest</span>(needed_bytes);\n    <span class="cm">/* -> completion_fn(DELETE) to engine */</span>\n}\n\n<span class="cm">/* Metric: fc_num_items_evicted */</span>' },
+      ],
+      steps: [
+        { lit:[0], chip:'TRIGGER', cap:'<p>Disk usage hits ext-storage-max-allocated-percent. GC activates in the background.</p>' },
+        { lit:[1], chip:'SCAN', cap:'<p>Walk oldest log segments. Identify live items (index still points here) vs dead (overwritten/deleted).</p>' },
+        { lit:[2], chip:'RELOCATE', cap:'<p>Live items copied to log tail (sequential write). Index updated to new offsets.</p>' },
+        { lit:[3], chip:'RECLAIM', cap:'<p>Old segment freed. Disk space restored for new writes.</p>' },
+        { lit:[4], chip:'EVICT', cap:'<p>If GC alone is insufficient: evict cold items. Engine notified via DELETE completion and reconciles.</p>' },
+      ],
+    },
+  },
+  stages: [], steps: [],
+},
+pressure: {
+  title: 'Under pressure', gauge: true,
+  steps: [
+    { frac:0.30, cap:`<p><b>Normal operation.</b> Memory below the spill threshold: no tiering activity. Commands see zero overhead beyond the header-bits check.</p>` },
+    { frac:0.60, cap:`<p><b>Spill zone.</b> The controller starts moving cold values to flash, batch-sized by a predictive model of projected memory (in-flight spill RAM is accounted). Clients unaffected.</p>` },
+    { frac:0.80, cap:`<p><b>Throttle band.</b> Writes arrive faster than spilling can drain. Client writes are rate-limited within a bounded band above maxmemory -- slowing producers to the drain rate instead of failing them. Reads unaffected.</p>` },
+    { frac:0.94, cap:`<p><b>OOM reject.</b> Past 1.2x maxmemory (hard cap), writes are rejected with -OOM. The spill rate could not keep up with the write rate. This is a hard safety bound -- it fires regardless of projected memory or in-flight credits. Reads still succeed (values fetched from flash). The system recovers as in-flight spills complete and free DRAM.</p>` },
+    { frac:0.60, cap:`<p><b>Storage full or slow?</b> The backend rejects submissions (backpressure) -> spilling pauses, the throttle tightens further. If no spillable items remain, writes get -OOM until GC reclaims space or in-flight spills complete. Storage GC reclaims space autonomously; the engine reconciles on the next touch. Every degraded state has defined, bounded behavior.</p>` },
+  ],
+},
+};
+
+/* ------------------- view/step machinery ------------------- */
+let view = 'states', idx = -1, timer = null;
+
+function setView(v) {
+  view = v; idx = -1;
+  if (timer) { clearInterval(timer); timer = null; $('b-play').innerHTML = '&#9654;'; }
+  document.querySelectorAll('.controls > button').forEach(b => b.classList.remove('active'));
+  $('b-' + v).classList.add('active');
+  // Clean up Storage Interfaces content if leaving that view
+  const ifcOld = document.getElementById('ifc-root');
+  if (ifcOld) { ifcOld.remove(); document.querySelector('.layout').style.display = ''; }
+  if (v === 'overview') {
+    $('stepctl').style.display = 'none';
+    hidePipelineHTML();
+    // Render the high-level overview diagram using HTML (not SVG)
+    const svg = $('stage');
+    svg.style.display = 'none';
+    let ov = document.getElementById('ov-container');
+    if (!ov) { ov = document.createElement('div'); ov.id = 'ov-container'; svg.parentNode.insertBefore(ov, svg); }
+    ov.className = 'ov-diagram';
+    ov.innerHTML = `
+      <!-- Notes above diagram -->
+      <div style="margin-bottom:14px;font-size:13.5px;color:var(--text)">
+        <span style="font-weight:700;color:var(--accent);font-size:15px">Data Tiering Architecture</span><br>
+        <span style="color:var(--muted);font-size:12.5px">Main thread never touches storage &middot; Serialization on IO threads &middot; Backend pluggable (native or module) &middot; Memory-resident keys: 3-bit check only</span>
+      </div>
+
+      <!-- All boxes in one forced horizontal row -->
+      <div class="ov-boxes-row">
+        <!-- Client -->
+        <div class="ov-box client" style="max-width:none;min-width:0">
+          <span class="ov-box-tag">CLIENT</span>
+          <div class="ov-inner">Redis protocol<small>GET / SET / DEL<br>any command</small></div>
+        </div>
+
+        <!-- Arrow -->
+        <div class="ov-conn" style="min-width:0">
+          <div style="display:flex;align-items:center"><div class="ov-c-line" style="width:36px"></div><div class="ov-c-head"></div></div>
+          <div class="ov-c-lbl">commands</div>
+        </div>
+
+        <!-- Main Thread -->
+        <div class="ov-box main" style="max-width:none;min-width:0">
+          <span class="ov-box-tag">VALKEY MAIN THREAD</span>
+          <div class="ov-inner hi">Command Processing<small>call() -> getCommand / setCommand / ...</small></div>
+          <div class="ov-inner hi">preCommandExec (KBC)<small>intercepts before execution<br>checks 3-bit residency state<br>blocks client if value on flash</small></div>
+          <div class="ov-inner hi">Spill Controller<small>LRU/LFU sampling in beforeSleep<br>selects cold values to move to flash</small></div>
+          <div class="ov-inner hi">Throttle + Memory Accounting<small>rate-limits writes under pressure<br>projected memory via Smith predictor</small></div>
+          <div class="ov-inner">Completion Processing<small>drains ring buffer in beforeSleep<br>applies state transitions</small></div>
+        </div>
+
+        <!-- Queues between threads -->
+        <div class="ov-queue">
+          <div class="ov-q-box down">Request Queue</div>
+          <div class="ov-q-arrow down">&rarr; robj*</div>
+          <div class="ov-q-label">MPSC lock-free<br>main enqueues</div>
+          <div style="height:8px"></div>
+          <div class="ov-q-arrow up">&larr; completions</div>
+          <div class="ov-q-box up">Completion Ring</div>
+          <div class="ov-q-label">IO writes, main drains<br>in beforeSleep</div>
+        </div>
+
+        <!-- IO Thread -->
+        <div class="ov-box iot" style="max-width:none;min-width:0">
+          <span class="ov-box-tag">TIERING IO THREAD</span>
+          <div class="ov-inner hi-r">Serialization / Deserialization<small>robj* &harr; bytes (RDB format)<br>runs here, never on main thread</small></div>
+          <div class="ov-inner hi-g">Storage Engine (FlashCache)<small>staging buffer + index + log<br>pluggable via storageType interface</small></div>
+          <div class="ov-inner">Completion Callback<small>fires bridge_on_completion<br>result into ring buffer</small></div>
+        </div>
+
+        <!-- Arrow -->
+        <div class="ov-conn gold" style="min-width:0">
+          <div style="display:flex;align-items:center"><div class="ov-c-line" style="width:36px;background:var(--warn)"></div><div class="ov-c-head"></div></div>
+          <div class="ov-c-lbl">async IO<br>(io_uring)</div>
+        </div>
+
+        <!-- Disk -->
+        <div class="ov-box disk" style="max-width:none;min-width:0">
+          <span class="ov-box-tag">NVMe DISK</span>
+          <div class="ov-inner">Cold Values<small>append-only log<br>O_DIRECT, no cache</small></div>
+        </div>
+      </div>
+    `;
+    // Hide side panel, make layout full-width for overview
+    document.querySelector('.panel').style.display = 'none';
+    document.querySelector('.layout').classList.add('full-width');
+  } else if (v === 'states') {
+    $('stepctl').style.display = 'none';
+    hidePipelineHTML();
+    document.querySelector('.panel').style.display = '';
+    document.querySelector('.layout').style.display = '';
+    document.querySelector('.layout').classList.remove('full-width');
+    const ovc = document.getElementById('ov-container');
+    if (ovc) ovc.remove();
+    drawStates();
+    $('p-title').textContent = 'Key state machine';
+    $('detail').innerHTML = `<p>Every key is in exactly one of 6 states, stored in <b>3 bits in the object header</b>. <code>ONLY_MEMORY</code> is implicit -- untiered keys carry no tracking cost.</p>
+      <p><b>Click any state</b> to see what it means, how keys enter and leave it, and what commands experience.</p>
+      <p>The invariant that makes it safe: a value is never destroyed until its replacement is durable, and every transition happens on the main thread when a completion is applied -- the IO thread never mutates the keyspace.</p>`;
+    $('hint').textContent = 'Behavior table per state verified against ext_storage.c:451-495.';
+  } else if (v === 'ifaces') {
+    $('stepctl').style.display = 'none';
+    hidePipelineHTML();
+    document.querySelector('.panel').style.display = 'none';
+    document.querySelector('.layout').style.display = 'none';
+    const ovc3 = document.getElementById('ov-container');
+    if (ovc3) ovc3.remove();
+    // Clone the ported compare-page content in at full width
+    const root = document.createElement('div');
+    root.id = 'ifc-root';
+    root.appendChild(document.getElementById('ifc-template').content.cloneNode(true));
+    const lay = document.querySelector('.layout');
+    lay.parentNode.insertBefore(root, lay.nextSibling);
+    ifcInit();
+  } else {
+    document.querySelector('.layout').style.display = '';
+    // Remove overview container if present
+    const ovc2 = document.getElementById('ov-container');
+    if (ovc2) ovc2.remove();
+    $('stage').style.display = '';
+    document.querySelector('.panel').style.display = '';
+    document.querySelector('.layout').classList.remove('full-width');
+    $('stepctl').style.display = 'flex';
+    const f = FLOWS[v];
+    if (v === 'spill' || v === 'fetch' || v === 'fc') {
+      hidePipelineHTML();
+      renderPipelineHTML(f);
+    } else {
+      hidePipelineHTML();
+      if (f.gauge) drawGauge(); else drawPipeline(f.stages, f.chip);
+    }
+    $('p-title').textContent = f.title;
+    $('detail').innerHTML = '<p>Press &rarr; to step through.</p>';
+    $('hint').textContent = f.gauge ? 'Marker shows used_memory relative to the configured bands.'
+      : f.custom === 'fc' ? 'Every config and metric named here is public: ext-storage-* configs, fc_* INFO fields.'
+      : 'Red stage = work on the backend IO thread, never the main thread.';
+    updateCount();
+  }
+}
+function updateCount() {
+  const f = FLOWS[view];
+  $('count').textContent = f ? (idx+1) + ' / ' + f.steps.length : '';
+}
+function step(d) {
+  if (view === 'states') return;
+  const f = FLOWS[view];
+  idx = Math.max(-1, Math.min(f.steps.length-1, idx+d));
+  if (idx < 0) { setView(view); return; }
+  const s = f.steps[idx];
+  if (view === 'spill' || view === 'fetch' || view === 'fc') {
+    pipelineStep(f, idx);
+  } else if (f.gauge) { gaugeMark(s.frac); }
+  else if (f.custom === 'fc') { fcLight(s.lit); }
+  else {
+    f.stages.forEach((st, i) => st._el.classList.toggle('lit', s.lit.includes(i)));
+    $('chiptext').textContent = s.chip;
+  }
+  $('detail').innerHTML = s.cap;
+  updateCount();
+}
+function play() {
+  if (timer) { clearInterval(timer); timer = null; $('b-play').innerHTML = '&#9654;'; return; }
+  if (view === 'states') setView('spill');
+  $('b-play').innerHTML = '&#10074;&#10074;';
+  step(1);
+  timer = setInterval(() => {
+    const f = FLOWS[view];
+    if (idx >= f.steps.length-1) {
+      const order = ['spill','fetch','fc','pressure'];
+      const i = order.indexOf(view);
+      if (i >= 0 && i < order.length-1) { setView(order[i+1]); step(1); }
+      else { clearInterval(timer); timer = null; $('b-play').innerHTML = '&#9654;'; }
+    } else step(1);
+  }, 4200);
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') step(1);
+  if (e.key === 'ArrowLeft') step(-1);
+});
+
+
+function renderPipelineHTML(flow) {
+  const svg = $('stage');
+  svg.style.display = 'none';
+  // Create or get the pipeline container
+  let container = document.getElementById('pipe-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'pipe-container';
+    svg.parentNode.insertBefore(container, svg);
+  }
+  container.innerHTML = '';
+  container.className = 'pipeline';
+  container.style.display = 'flex';
+
+  // For FlashCache view: sub-tabs first, then diagram/cards
+  if (view === 'fc') {
+    // Render sub-tabs at the TOP
+    if (flow.subflows) {
+      if (!flow._activeSub) flow._activeSub = 'fc-overview';
+      const subf = flow.subflows[flow._activeSub];
+      flow.stages = subf.stages;
+      flow.steps = subf.steps;
+
+      const tabs = document.createElement('div');
+      tabs.className = 'subtabs';
+      Object.entries(flow.subflows).forEach(([key, sf]) => {
+        const btn = document.createElement('button');
+        btn.textContent = sf.label;
+        btn.className = key === flow._activeSub ? 'active' : '';
+        btn.addEventListener('click', () => { flow._activeSub = key; idx = -1; setView(view); });
+        tabs.appendChild(btn);
+      });
+      container.appendChild(tabs);
+    }
+
+    const arch = document.createElement('div');
+    arch.className = 'fc-arch';
+    arch.innerHTML = `
+      <div class="fc-arch-title">FLASHCACHE STORAGE ENGINE</div>
+      <div class="fc-block">
+
+        <div class="fc-layer engine-l">
+          <span class="fc-layer-tag">API LAYER</span>
+          <div class="fc-row">
+            <div class="fc-comp">put(key, value, ttl)<small>write path entry</small></div>
+            <div class="fc-comp">get(key)<small>read path entry</small></div>
+            <div class="fc-comp">del(key)<small>delete / evict</small></div>
+            <div class="fc-comp">poll_completions()<small>drain finished ops</small></div>
+          </div>
+        </div>
+
+        <div class="fc-arrow"><div class="fa-line"></div><div class="fc-flow-label">write: update index + append &darr; &nbsp;&nbsp; read: lookup location &uarr;</div><div class="fa-line"></div><div class="fa-head"></div></div>
+
+        <div class="fc-layer dram-l">
+          <span class="fc-layer-tag">INDEX LAYER (DRAM)</span>
+          <div class="fc-row">
+            <div class="fc-comp">Hash Index<small>key_hash -> {location, offset, size, crc}<br>O(1) lookup &middot; grows dynamically<br>resolves: STAGING or LOG position</small></div>
+          </div>
+        </div>
+
+        <div class="fc-arrow"><div class="fa-line"></div><div class="fc-flow-label">write: points to staging slot &darr; &nbsp;&nbsp; read hit: direct from buffer &uarr;</div><div class="fa-line"></div><div class="fa-head"></div></div>
+
+        <div class="fc-layer dram-l">
+          <span class="fc-layer-tag">STAGING BUFFER LAYER (DRAM)</span>
+          <div class="fc-row">
+            <div class="fc-comp">Write Buffer<small>items appended here first<br>no per-item disk IO<br>size: ext-storage-max-buffered-write-size</small></div>
+            <div class="fc-comp">Flush Trigger<small>when buffer >= flush threshold<br>one sequential write to log<br>cfg: ext-storage-buffered-write-flush-threshold</small></div>
+          </div>
+        </div>
+
+        <div class="fc-arrow"><div class="fa-line"></div><div class="fc-flow-label">flush: one large sequential write &darr; &nbsp;&nbsp; read miss: single pread &uarr;</div><div class="fa-line"></div><div class="fa-head"></div></div>
+
+        <div class="fc-layer nvme-l">
+          <span class="fc-layer-tag">LOG LAYER (NVMe)</span>
+          <div class="fc-row">
+            <div class="fc-comp">Append-Only Log<small>segments written sequentially<br>no random writes ever<br>items addressed by offset</small></div>
+            <div class="fc-comp">GC (Garbage Collector)<small>walks old segments<br>relocates live items to tail<br>reclaims dead space<br>rate-bounded: min..max gc_rate</small></div>
+          </div>
+        </div>
+
+        <div class="fc-arrow"><div class="fa-line"></div><div class="fc-flow-label">io_uring / libaio submissions &darr;&uarr;</div><div class="fa-line"></div><div class="fa-head"></div></div>
+
+        <div class="fc-layer nvme-l">
+          <span class="fc-layer-tag">FILE IO LAYER</span>
+          <div class="fc-row">
+            <div class="fc-comp">Async IO Engine<small>io_uring (preferred) or libaio<br>submissions + completions<br>max in-flight: ext-storage-max-in-flight-reads</small></div>
+            <div class="fc-comp">NVMe Device<small>/dev/nvmeXn1<br>direct IO (O_DIRECT)<br>no page cache, no filesystem overhead</small></div>
+          </div>
+        </div>
+
+      </div>
+    `;
+    // Only show diagram for overview sub-tab
+    if (!flow._activeSub || flow._activeSub === 'fc-overview') {
+      container.appendChild(arch);
+    }
+  }
+
+  const cardsParent = container;
+
+  // Sub-flows already handled in the fc block above
+  let activeStages = flow.stages;
+  let activeSteps = flow.steps;
+
+  // State chip
+  const chip = document.createElement('div');
+  chip.className = 'pipe-state';
+  chip.id = 'pstate';
+  chip.textContent = flow.chip || '';
+  cardsParent.appendChild(chip);
+
+  activeStages.forEach((s, i) => {
+    const stages_ref = activeStages;
+    if (i > 0) {
+      const conn = document.createElement('div');
+      conn.className = 'pipe-conn';
+      conn.innerHTML = '<div class="conn-line"></div>'
+        + (s.connLabel ? '<span class="conn-label">' + s.connLabel + '</span>' : '')
+        + '<div class="conn-arrow"></div>';
+      cardsParent.appendChild(conn);
+    }
+    const card = document.createElement('div');
+    card.className = 'pipe-card' + (s.io ? ' io' : '');
+    card.id = 'pcard-' + i;
+    card.innerHTML = `<div class="pc-title">${s.name} <span class="tag">${s.io ? 'IO THREAD' : 'MAIN THREAD'}</span></div>
+      <div class="pc-sub">${s.sub}</div>
+      ${s.file ? '<div class="pc-file">' + s.file + '</div>' : ''}
+      ${s.pills ? '<div class="pc-pills">' + s.pills.map(p => '<span class="pill' + (p.hi ? ' hi' : '') + (p.ret ? ' ret' : '') + '">' + p.t + '</span>').join('') + '</div>' : ''}`;
+    if (s.code) {
+      const _s = s;
+      card.addEventListener('click', () => openModal(_s.name, _s.code, _s.file || ''));
+    }
+    cardsParent.appendChild(card);
+  });
+}
+function hidePipelineHTML() {
+  const c = document.getElementById('pipe-container');
+  if (c) c.remove();
+  $('stage').style.display = '';
+}
+function pipelineStep(flow, idx) {
+  flow.stages.forEach((s, i) => {
+    const el = document.getElementById('pcard-' + i);
+    if (el) el.classList.toggle('active', flow.steps[idx] && flow.steps[idx].lit.includes(i));
+  });
+  const ps = document.getElementById('pstate');
+  if (ps && flow.steps[idx]) ps.textContent = flow.steps[idx].chip || '';
+}
+function openModal(title, code, file) {
+  $('m-title').textContent = title;
+  $('m-file').textContent = file || '';
+  $('mcode').innerHTML = code;
+  $('overlay').style.display = 'flex';
+}
+function closeModal() { $('overlay').style.display = 'none'; }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+setView('overview');
+
+/* ===== Storage Interfaces tab (ported from dt-interfaces-compare.html) ===== */
+const IFC_PARTS = ['c-engine','c-bridge','c-dispatch','c-contract','c-native','c-modapi','c-module','k-call','k-call2','k-call3','k-native','k-reg','k-mod'];
+const IFC_CODE = {
+'c-engine': { t:'Tiering logic — where the calls originate', f:'src/ext_storage.c (spill :1205, fetch :625, drain :1053)', c:
+`<span class="cm">/* ---- SPILL call site (ext_storage.c:1195) ---- */</span>
+<span class="cm">/* Borrowed value robj — points to original value, no copy */</span>
+<span class="ty">void</span> *raw_value = <span class="fn">objectGetVal</span>(item);
+robj *value_ref = <span class="fn">zmalloc</span>(<span class="kw">sizeof</span>(robj));
+<span class="fn">objectSetVal</span>(value_ref, raw_value);  <span class="cm">/* points to ORIGINAL value! */</span>
+
+<span class="ty">int</span> rc = <span class="hl">extStorageBridge_submitPut</span>(<span class="fn">extStoragePhysicalDbId</span>(db_id),
+                                     key_ref, value_ref, expireMs);
+
+<span class="cm">/* ---- FETCH call site (ext_storage.c:625, inside preCommandExec) ---- */</span>
+<span class="ty">int</span> rc = <span class="hl">extStorageBridge_submitGet</span>(<span class="fn">extStoragePhysicalDbId</span>(current_db-&gt;id),
+                                     key_str);
+...
+<span class="fn">blockClientInUseOnKeys</span>(c, num_keys_to_block, blocking_keys);  <span class="cm">/* :641 */</span>
+
+<span class="cm">/* ---- DRAIN call site (ext_storage.c:1053, from beforeSleep) ---- */</span>
+<span class="kw">while</span> ((n = <span class="hl">extStorageBridge_pollCompletions</span>(
+            completed_storage_requests, BATCH_SIZE)) &gt; 0)
+    <span class="kw">for</span> (<span class="ty">int</span> j = 0; j &lt; n; j++)
+        <span class="fn">processOneCompletion</span>(completed_storage_requests[j]);`},
+
+'c-bridge': { t:'Bridge — forwards down, buffers completions back', f:'src/ext_storage_bridge.c (:138, :56)', c:
+`<span class="cm">/* ---- the forward: bridge API -&gt; dispatch API (:138) ---- */</span>
+<span class="ty">int</span> <span class="fn">extStorageBridge_submitPut</span>(<span class="ty">int</span> db_id, robj *key, robj *value,
+                               <span class="ty">int64_t</span> expire_ms) {
+    ...
+    <span class="ty">storageStatus</span> s = <span class="hl">storageSubmitPut</span>(db_id, (<span class="ty">void</span>*)key, 0,
+                                       (<span class="ty">void</span>*)value, 0, expire_ms, ctx);
+    <span class="cm">/* klen/vlen are 0: these are robj* pointers, not byte buffers */</span>
+}
+
+<span class="cm">/* ---- the way back: completion callback -&gt; ring buffer (:56) ---- */</span>
+<span class="cm">/* Called from the backend's IO thread */</span>
+<span class="kw">static void</span> <span class="fn">bridge_on_completion</span>(storageCompletion *c, <span class="ty">void</span> *privdata) {
+    <span class="ty">int</span> next = (comp_ring.head + 1) % BRIDGE_COMP_RING;
+    <span class="kw">if</span> (next != comp_ring.tail) {
+        comp_ring.ring[comp_ring.head] = *c;   <span class="cm">/* single producer, no mutex */</span>
+        comp_ring.head = next;
+    }
+}
+
+<span class="cm">/* ---- and the drain the main thread calls ---- */</span>
+<span class="ty">int</span> <span class="fn">extStorageBridge_pollCompletions</span>(ValkeyModuleExternalStorageMsg **out,
+                                      <span class="ty">int</span> max) {
+    <span class="fn">storagePollCompletions</span>(max);   <span class="cm">/* backend pushes into the ring... */</span>
+    <span class="cm">/* ...then the ring is read out into msgs for ext_storage.c */</span>
+}`},
+
+'c-dispatch': { t:'Dispatch — the hybrid router', f:'src/storage/storage_dispatch.c (:53, :63, :80)', c:
+`<span class="cm">/* ---- storageSubmitPut: async direct, or middleware-wrapped ---- */</span>
+<span class="ty">storageStatus</span> <span class="fn">storageSubmitPut</span>(<span class="ty">uint32_t</span> db_id,
+        <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+        <span class="kw">const void</span> *value, <span class="ty">size_t</span> vlen,
+        <span class="ty">int64_t</span> expire_ms, <span class="ty">void</span> *request_ctx) {
+    <span class="kw">if</span> (server_storage-&gt;<span class="hl">put_async</span>) {
+        <span class="kw">return</span> server_storage-&gt;<span class="hl">put_async</span>(server_storage_ctx, db_id,
+                                          key, klen, value, vlen,
+                                          expire_ms, request_ctx);
+    }
+    <span class="cm">/* else: sync backend — middleware queues the op and calls</span>
+<span class="cm">       type-&gt;put() from its own IO thread (storage_middleware.c) */</span>
+}
+
+<span class="ty">storageStatus</span> <span class="fn">storageSubmitGet</span>(...) {
+    <span class="kw">if</span> (server_storage-&gt;<span class="hl">get_async</span>)
+        <span class="kw">return</span> server_storage-&gt;<span class="hl">get_async</span>(server_storage_ctx, db_id,
+                                          key, klen, request_ctx);
+    ...
+}
+
+<span class="ty">int</span> <span class="fn">storagePollCompletions</span>(<span class="ty">int</span> max) {
+    <span class="kw">if</span> (server_storage-&gt;<span class="hl">poll_completions</span>)
+        <span class="kw">return</span> server_storage-&gt;<span class="hl">poll_completions</span>(server_storage_ctx, max);
+    ...
+}
+
+<span class="cm">/* server_storage / server_storage_ctx: set once by storageInit()</span>
+<span class="cm">   at startup — this is THE pointer both native and module fill */</span>`},
+
+'c-contract': { t:'struct storageType — the full contract', f:'src/storage/storage.h (VALKEY_STORAGE_VERSION 1)', c:
+`<span class="kw">typedef struct</span> <span class="ty">storageType</span> {
+    <span class="kw">const char</span> *name;
+    <span class="ty">int</span> version;
+
+    <span class="cm">/* Lifecycle */</span>
+    <span class="ty">void</span> *(*<span class="fn">open</span>)(storageConfig *cfg);
+    <span class="ty">void</span> (*<span class="fn">close</span>)(<span class="ty">void</span> *ctx);
+
+    <span class="cm">/* Sync KV ops (called from middleware IO thread). NULL if async-only. */</span>
+    <span class="ty">storageStatus</span> (*<span class="fn">put</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                         <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                         <span class="kw">const void</span> *value, <span class="ty">size_t</span> vlen, <span class="ty">int64_t</span> expire_ms);
+    <span class="ty">storageStatus</span> (*<span class="fn">get</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                         <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                         <span class="ty">void</span> **value, <span class="ty">size_t</span> *vlen, <span class="ty">int64_t</span> *expire_ms);
+    <span class="ty">storageStatus</span> (*<span class="fn">del</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                         <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen);
+
+    <span class="cm">/* Async KV ops (backend owns IO). NULL = use middleware with sync ops. */</span>
+    <span class="ty">storageStatus</span> (*<span class="hl">put_async</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="kw">const void</span> *value, <span class="ty">size_t</span> vlen,
+                               <span class="ty">int64_t</span> expire_ms, <span class="ty">void</span> *request_ctx);
+    <span class="ty">storageStatus</span> (*<span class="hl">get_async</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="ty">void</span> *request_ctx);
+    <span class="ty">storageStatus</span> (*<span class="hl">del_async</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="ty">void</span> *request_ctx);
+    <span class="ty">int</span> (*<span class="hl">poll_completions</span>)(<span class="ty">void</span> *ctx, <span class="ty">int</span> max);
+
+    <span class="cm">/* Optional */</span>
+    <span class="ty">int</span> (*<span class="fn">cron</span>)(<span class="ty">void</span> *ctx);
+    <span class="ty">void</span> (*<span class="fn">get_stats</span>)(<span class="ty">void</span> *ctx, storageStats *out);
+
+    <span class="cm">/* Snapshot support (all optional; NULL = snapshotting unsupported) */</span>
+    <span class="ty">void</span> (*<span class="fn">snapshot_hold</span>)(<span class="ty">void</span> *ctx);
+    <span class="ty">void</span> (*<span class="fn">snapshot_release</span>)(<span class="ty">void</span> *ctx);
+    <span class="ty">void</span> (*<span class="fn">gc_pause</span>)(<span class="ty">void</span> *ctx, <span class="ty">int</span> paused);
+    <span class="ty">storageStatus</span> (*<span class="fn">fork_read</span>)(<span class="ty">void</span> *ctx, <span class="ty">uint32_t</span> db_id,
+                               <span class="kw">const void</span> *key, <span class="ty">size_t</span> klen,
+                               <span class="ty">void</span> **value, <span class="ty">size_t</span> *vlen);
+} <span class="ty">storageType</span>;
+
+<span class="cm">/* Status codes */</span>
+STORAGE_OK = 0        <span class="cm">/* done */</span>
+STORAGE_NOT_FOUND = 1 <span class="cm">/* GET miss */</span>
+STORAGE_WOULDBLOCK = 2 <span class="cm">/* async op accepted */</span>
+STORAGE_ERR_IO = -1,  STORAGE_ERR_FULL = -2
+STORAGE_ERR_REJECTED = -3 <span class="cm">/* backpressure — caller retries */</span>`},
+
+'c-native': { t:'Native provider — how the struct is filled', f:'src/storage/storage_flashcache_real.c:502', c:
+`<span class="cm">/* storage_flashcache_real.c:502 — verbatim */</span>
+<span class="kw">static</span> <span class="ty">storageType</span> flashcache_real_type = {
+    .name = <span class="hl">"flashcache-real"</span>,
+    .version = VALKEY_STORAGE_VERSION,
+    .open = <span class="fn">fc_real_open</span>,
+    .close = <span class="fn">fc_real_close</span>,
+    .put = NULL, .get = NULL, .del = NULL,   <span class="cm">/* async-only */</span>
+    .put_async = <span class="fn">fc_real_put_async</span>,
+    .get_async = <span class="fn">fc_real_get_async</span>,
+    .del_async = <span class="fn">fc_real_del_async</span>,
+    .poll_completions = <span class="fn">fc_real_poll_completions</span>,
+    .cron = <span class="fn">fc_real_cron</span>,
+    .get_stats = NULL,
+    .snapshot_hold = <span class="fn">fc_real_snapshot_hold</span>,
+    .snapshot_release = <span class="fn">fc_real_snapshot_release</span>,
+    .gc_pause = <span class="fn">fc_real_gc_pause</span>,
+    .fork_read = <span class="fn">fc_real_fork_read</span>,
+};
+
+<span class="cm">/* :544 — the getter the bridge calls */</span>
+<span class="ty">storageType</span> *<span class="fn">storageGetFlashCacheRealType</span>(<span class="ty">void</span>) { <span class="kw">return</span> &flashcache_real_type; }
+
+<span class="cm">/* ============ selection at startup (ext_storage_bridge.c) ============ */</span>
+<span class="kw">if</span> (<span class="fn">moduleHasRegisteredStorageBackend</span>())
+    type = <span class="fn">moduleGetRegisteredStorageBackend</span>();   <span class="cm">/* module wins */</span>
+<span class="kw">else if</span> (strcmp(backend_name, <span class="hl">"flashcache"</span>) == 0)
+    type = <span class="fn">storageGetFlashCacheRealType</span>();
+<span class="kw">else if</span> (strcmp(backend_name, <span class="hl">"flashcache-mock"</span>) == 0)
+    type = <span class="fn">storageGetFlashCacheType</span>();  <span class="cm">/* in-memory mock — testing */</span>
+<span class="kw">else if</span> (strcmp(backend_name, <span class="hl">"rocksdb"</span>) == 0)
+    type = <span class="fn">storageGetRocksDBAsyncType</span>();`},
+
+'c-modapi': { t:'Module API — the load-time conduit', f:'src/valkeymodule.h · src/module.c:820', c:
+`<span class="cm">/* ============ src/valkeymodule.h ============ */</span>
+<span class="cm">/* New pluggable storage API — module registers a storageType struct.
+ * After registration, the engine calls the struct's function pointers
+ * directly (zero per-call overhead, same as native backends). */</span>
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="hl">ValkeyModule_RegisterStorageBackend</span>)(
+        ValkeyModuleCtx *ctx, <span class="ty">void</span> *storage_type);
+
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="hl">ValkeyModule_GetExternalStorageSerializationCallbacks</span>)(
+        ValkeyModuleCtx *ctx,
+        ValkeyModuleSerializeKeyCallback      *serialize_key,
+        ValkeyModuleSerializeValueCallback    *serialize_value,
+        ValkeyModuleDeserializeKeyCallback    *deserialize_key,
+        ValkeyModuleDeserializeValueCallback  *deserialize_value,
+        ValkeyModuleFreeSerializedKeyCallback *free_serialized_key,
+        ValkeyModuleFreeSerializedValueCallback *free_serialized_value);
+
+<span class="cm">/* ============ src/module.c:820 — the implementation ============ */</span>
+<span class="ty">int</span> <span class="fn">VM_RegisterStorageBackend</span>(ValkeyModuleCtx *ctx, <span class="ty">void</span> *storage_type);
+<span class="ty">int</span> <span class="fn">moduleHasRegisteredStorageBackend</span>(<span class="ty">void</span>);      <span class="cm">/* :834 */</span>
+<span class="ty">void</span> *<span class="fn">moduleGetRegisteredStorageBackend</span>(<span class="ty">void</span>);    <span class="cm">/* :839 */</span>
+
+<span class="cm">/* ============ legacy mechanism (also present) ============ */</span>
+<span class="cm">/* Request/response callbacks — predates RegisterStorageBackend.
+ * Engine pushes READ/DELETE/FLUSH_DB/FLUSH_ALL/FSYNC/START_SAVE/
+ * LOAD_SNAP/SHUTDOWN/EVICT; polls responses via res_callback. */</span>
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="fn">ValkeyModule_SubscribeToExternalStorage</span>)(
+        ValkeyModuleCtx *ctx, req_callback, res_callback);
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="fn">ValkeyModule_SubscribeToExternalStorageWithCallbacks</span>)(
+        ctx, req_callback, res_callback, <span class="cm">/* + 6 serde callbacks */</span>);
+VALKEYMODULE_API <span class="ty">int</span> (*<span class="fn">ValkeyModule_UnsubscribeFromExternalStorage</span>)(ctx);`},
+
+'c-module': { t:'Module provider — same struct, in Rust', f:'modules/flash-tiering/src/storage_type_bridge.rs', c:
+`<span class="cm">// C-layout struct, must match src/storage/storage.h</span>
+#[<span class="fn">repr</span>(C)]
+<span class="kw">pub struct</span> <span class="ty">StorageType</span> {
+    <span class="kw">pub</span> name: *<span class="kw">const</span> c_char,
+    <span class="kw">pub</span> version: c_int,
+    <span class="kw">pub</span> open:  Option&lt;<span class="kw">unsafe extern</span> <span class="hl">"C"</span> <span class="kw">fn</span>(*<span class="kw">mut</span> StorageConfig) -&gt; *<span class="kw">mut</span> c_void&gt;,
+    <span class="kw">pub</span> close: Option&lt;...&gt;,
+    <span class="kw">pub</span> put/get/del: Option&lt;...&gt;,            <span class="cm">// sync — set to None</span>
+    <span class="kw">pub</span> put_async / get_async / del_async / poll_completions: Option&lt;...&gt;,
+    <span class="kw">pub</span> cron / get_stats: Option&lt;...&gt;,
+}
+
+<span class="cm">// The static instance handed to the engine:</span>
+<span class="kw">static mut</span> NKS_STORAGE_TYPE: StorageType = StorageType {
+    name: b<span class="hl">"flash-tiering-rust\\0"</span>.as_ptr() <span class="kw">as</span> *<span class="kw">const</span> c_char,
+    version: 1,
+    open:  Some(<span class="fn">nks_open</span>),     <span class="cm">// captures engine's completion_fn</span>
+    close: Some(<span class="fn">nks_close</span>),
+    put: None, get: None, del: None,       <span class="cm">// async-only</span>
+    put_async: Some(<span class="fn">nks_put_async</span>),
+    get_async: Some(<span class="fn">nks_get_async</span>),
+    del_async: Some(<span class="fn">nks_del_async</span>),
+    poll_completions: Some(<span class="fn">nks_poll_completions</span>),
+    cron: None, get_stats: None,
+};
+
+<span class="cm">// Example: what a filled pointer does</span>
+<span class="kw">unsafe extern</span> <span class="hl">"C"</span> <span class="kw">fn</span> <span class="fn">nks_put_async</span>(_ctx, db_id, key, _klen,
+                                    value, _vlen, _ttl, request_ctx) -&gt; c_int {
+    <span class="kw">let</span> req = StorageRequest::WriteValue {
+        db_id, key_robj: key, value_robj: value,
+        request_context: request_ctx <span class="kw">as</span> u64 };
+    <span class="kw">match</span> state.dispatcher.<span class="fn">submit_request</span>(req) {
+        SubmitResult::Ok        =&gt; STORAGE_WOULDBLOCK,   <span class="cm">// accepted</span>
+        SubmitResult::Throttled =&gt; STORAGE_ERR_REJECTED, <span class="cm">// backpressure</span>
+    }
+}
+
+<span class="cm">// Registration at MODULE LOADEX (lib.rs):</span>
+<span class="kw">let</span> ptr = storage_type_bridge::<span class="fn">get_storage_type_ptr</span>();
+<span class="fn">register</span>(ctx, ptr);   <span class="cm">// ValkeyModule_RegisterStorageBackend</span>`},
+};
+const IFC_VIEWS = {
+both: { dim: [], title: 'Both paths', ex: `
+  <p>Follow one write down the stack: <b>tiering logic</b> calls <code>extStorageBridge_submitPut(key_robj, value_robj)</code> &rarr; the <b>bridge</b> forwards to <code>storageSubmitPut()</code> &rarr; <b>dispatch</b> resolves <code>server_storage-&gt;put_async(...)</code> &rarr; lands in whichever provider filled the <b class="y">storageType</b> struct.</p>
+  <p><b class="n">Native</b>: the struct is defined statically in the backend file, compiled in, chosen by <code>ext-storage-backend</code>.</p>
+  <p><b class="m">Module</b>: the identical struct layout, handed over once at load time. A registered module backend takes priority over the config.</p>
+  <p><i>Click any box to see its exact source.</i></p>` },
+
+native: { dim: ['c-modapi','c-module','k-reg','k-mod'], title: 'Native path', ex: `
+  <p>The backend defines <code>static storageType fc_type = { .put_async = fc_put, ... }</code>. At startup the bridge matches the config name and stores the pointer.</p>
+  <p>From then on: <code>storageSubmitPut()</code> &rarr; <code>type-&gt;put_async(...)</code> &mdash; a plain function-pointer call into compiled-in code.</p>
+  <p>Serialization needs no handoff: same address space, the IO thread calls the engine's callbacks directly.</p>` },
+
+module: { dim: ['c-native','k-native'], title: 'Module path', ex: `
+  <p>The module API has exactly <b class="m">two jobs, both at load time</b>:</p>
+  <p><b class="m">UP</b> &mdash; <code>RegisterStorageBackend(ctx, &amp;struct)</code>: carries the module's struct to the engine. It lands in the same slot a native struct would occupy.</p>
+  <p><b class="m">DOWN</b> &mdash; <code>GetExternalStorageSerializationCallbacks(...)</code>: hands the engine's robj*&harr;bytes functions to the module, so serialization still runs on the module's IO worker, never the main thread.</p>
+  <p>After these two calls, the module API's work is done.</p>` },
+
+runtime: { dim: ['c-modapi','k-reg','k-mod','k-native'], title: 'Call time &mdash; the punchline', ex: `
+  <p>At runtime, <b class="m">the module API is not on the path at all</b> (dimmed). Both providers are reached identically:</p>
+  <p><code>storageSubmitPut()</code> &rarr; <code>type-&gt;put_async(...)</code> &rarr; <code>fc_put</code> <i>or</i> <code>nks_put_async</code>.</p>
+  <p><b>Zero per-call overhead difference.</b> No message queue, no translation layer &mdash; the registration API moved a pointer once; it never moves data.</p>
+  <p>This is why a module-provided backend benchmarks the same as a native one, and why the registration API could stay tiny.</p>` },
+};
+function ifcSetView(v) {
+  document.querySelectorAll('#ifc-root .controls button').forEach(b => b.classList.remove('active'));
+  $('b-' + v).classList.add('active');
+  IFC_PARTS.forEach(id => $(id).classList.toggle('dimmed', IFC_VIEWS[v].dim.includes(id)));
+  $('v-title').innerHTML = IFC_VIEWS[v].title;
+  $('explain').innerHTML = IFC_VIEWS[v].ex;
+}
+function ifcInit() {
+  ['c-engine','c-bridge','c-dispatch','c-contract','c-native','c-modapi','c-module'].forEach(id =>
+    $(id).addEventListener('click', () => { const c = IFC_CODE[id]; openModal(c.t, c.c, c.f); }));
+  ifcSetView('both');
+}
+
+</script>
+
+<div id="overlay" onclick="if(event.target===this)closeModal()" style="position:fixed;inset:0;background:rgba(5,8,16,.75);display:none;align-items:center;justify-content:center;z-index:50;padding:24px">
+  <div id="modal" style="background:var(--panel);border:1px solid var(--accent);border-radius:14px;width:min(780px,94vw);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 18px 60px rgba(0,0,0,.6)">
+    <div style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border)">
+      <span style="font-weight:700;font-size:15px" id="m-title"></span>
+      <span id="m-file" style="font:11.5px ui-monospace,Menlo,monospace;color:var(--muted);flex:1"></span>
+      <button onclick="closeModal()" style="background:none;border:1px solid var(--border);color:var(--text);border-radius:7px;padding:3px 11px;cursor:pointer;font-size:13px">Close &nbsp;Esc</button>
+    </div>
+    <div id="mcode" style="overflow:auto;padding:18px 20px;font:13px/1.65 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#c9d6ee;background:#0a0f1a;border-radius:0 0 14px 14px"></div>
+  </div>
+</div>
+</body>
+</html>
