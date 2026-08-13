@@ -69,6 +69,36 @@ int extStoragePhysicalDbId(int logical_id);
 int extStorageLogicalDbId(int physical_id);
 void extStorageSwapDbIds(int id1, int id2);
 extern int ext_storage_spill_pool_active;
+
+/* ---------------------------------------------------------------------------
+ * Key spilling (ext-key-spill-enabled)
+ *
+ * An ONLY_FLASH key already has key + serialized value + TTL on the backend;
+ * the dict retains only key + tiered placeholder. Key spilling reclaims that
+ * remainder by dropping the dict entry ("demotion"). The key's state becomes
+ * implicit: not in dict, backend has it (tracked per-db in keys_spilled_count).
+ *
+ * Access path: a dict miss with keys_spilled_count > 0 re-materializes a
+ * tiered placeholder (extStorageRematerializePlaceholder) and the standard
+ * ONLY_FLASH fetch machinery takes over. A backend NOT_FOUND lands the key in
+ * keys_confirmed_absent, which the miss path consumes to serve a true miss.
+ * ---------------------------------------------------------------------------*/
+extern int ext_key_spill_enabled;
+extern int ext_storage_drop_pool_active; /* eviction-pool filter: sample ONLY_FLASH placeholders */
+
+/* Demote an ONLY_FLASH key: remove its dict entry without touching the
+ * backend. Returns 0 on success, -1 if the key is not droppable. */
+int extStorageDropDictEntry(serverDb *db, sds key);
+
+/* Re-insert a tiered placeholder for a key-spilled key (dict miss path).
+ * Returns the new entry in ONLY_FLASH state, or NULL on failure. */
+dbEntry *extStorageRematerializePlaceholder(serverDb *db, sds key);
+
+/* Settle a rematerialization probe on fetch completion: found -> the key was
+ * key-spilled, decrement the per-db count; NOT_FOUND -> it never was.
+ * Returns 1 if a probe was consumed, 0 otherwise. */
+int extStorageKeyspillSettleProbe(serverDb *db, sds key, int found_on_flash);
+
 extern char *ext_storage_backend;
 extern char *ext_storage_path;
 extern long long ext_storage_capacity_mb;

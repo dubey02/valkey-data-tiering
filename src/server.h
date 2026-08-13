@@ -912,6 +912,8 @@ typedef struct serverDb {
     dict *watched_keys;                   /* WATCHED keys for MULTI/EXEC CAS */
     /* keys_tiering_state removed — state is now in robj->tiering_state bitfield */
     hashtable *keys_confirmed_absent;     /* keys confirmed absent from storage (consumed on use, prevents blocking loops) */
+    long long keys_spilled_count;         /* keys that live only on flash (no dict entry); gates the miss-path flash consult */
+    hashtable *keyspill_probe;            /* keys with an in-flight fetch for a rematerialized placeholder (dict-miss consult) */
     int id;                               /* Database ID */
     struct {
         long long avg_ttl;    /* Average TTL, just for stats */

@@ -22,6 +22,7 @@ set test_dirs {
     unit
     unit/type
     unit/cluster
+    unit/data-tiering
     integration
 }
 

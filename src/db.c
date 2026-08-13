@@ -862,6 +862,7 @@ void flushdbCommand(client *c) {
      * crashes from deleting keys mid-spill. */
     if (ext_data_enabled) {
         extStorageBridge_flushDB(extStoragePhysicalDbId(c->db->id));
+        c->db->keys_spilled_count = 0; /* flash namespace wiped — no key-spilled keys remain */
     }
 
     /* flushdb should not flush the functions */
@@ -890,6 +891,9 @@ void flushallCommand(client *c) {
 
     if (ext_data_enabled) {
         extStorageBridge_flushAll();
+        for (int i = 0; i < server.dbnum; i++) {
+            if (server.db[i]) server.db[i]->keys_spilled_count = 0;
+        }
     }
 
     /* flushall should not flush the functions */
@@ -1823,12 +1827,14 @@ int dbSwapDatabases(int id1, int id2) {
     db1->keys = db2->keys;
     db1->expires = db2->expires;
     db1->keys_with_volatile_items = db2->keys_with_volatile_items;
+    db1->keys_spilled_count = db2->keys_spilled_count;
     copyDbExpiry(db1, db2);
 
 
     db2->keys = aux.keys;
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
+    db2->keys_spilled_count = aux.keys_spilled_count;
     copyDbExpiry(db2, &aux);
 
     /* Now we need to handle clients blocked on lists: as an effect
