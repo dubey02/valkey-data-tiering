@@ -137,6 +137,22 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 if [ "$DATATYPE" = "string" ]; then
     echo "[mixed-rw] Populating $KEYSPACE keys (sequential, OOM-resilient)..."
+    # Cap the populate's in-flight payload burst at ~2% of maxmemory. With
+    # large values (5MB legs) the default 50 concurrent writers put a
+    # ~250MB burst against maxmemory. Raw memory then rides the OOM-reject
+    # band faster than the spill controller can drain, and every retry
+    # rewrites already-spilled keys. Concurrency must shrink as item size
+    # grows: burst = clients * item_size.
+    _mm_raw="${MAXMEMORY%[bB]}"
+    _mm_bytes=$(numfmt --from=iec "${_mm_raw^^}" 2>/dev/null || echo $((512*1024*1024)))
+    _burst_budget=$(( _mm_bytes / 50 ))
+    _item_bytes=${ITEM_SIZE:-${DATASIZE:-400}}
+    _max_pop_clients=$(( _burst_budget / (_item_bytes > 0 ? _item_bytes : 1) ))
+    [ "$_max_pop_clients" -lt 1 ] && _max_pop_clients=1
+    if [ "$POPULATE_CLIENTS" -gt "$_max_pop_clients" ]; then
+        echo "[mixed-rw] Capping populate clients $POPULATE_CLIENTS -> $_max_pop_clients (item_size=$_item_bytes, burst budget=${_burst_budget}B)"
+        POPULATE_CLIENTS=$_max_pop_clients
+    fi
     # Keys accounted in the keyspace: dict-resident plus key-spilled. With
     # key spilling enabled, demoted keys leave the dict but remain on flash,
     # so DBSIZE alone undercounts a fully populated keyspace.
