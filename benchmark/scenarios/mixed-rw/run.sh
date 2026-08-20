@@ -137,17 +137,26 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 if [ "$DATATYPE" = "string" ]; then
     echo "[mixed-rw] Populating $KEYSPACE keys (sequential, OOM-resilient)..."
+    # Keys accounted in the keyspace: dict-resident plus key-spilled. With
+    # key spilling enabled, demoted keys leave the dict but remain on flash,
+    # so DBSIZE alone undercounts a fully populated keyspace.
+    effective_keys() {
+        local db ks
+        db=$(cli DBSIZE | grep -oP '[0-9]+')
+        ks=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1)
+        echo $(( ${db:-0} + ${ks:-0} ))
+    }
     for attempt in $(seq 1 100); do
         "$BENCH" -h "$VALKEY_HOST" -p "$VALKEY_PORT" \
             $SET_CMD -n "$KEYSPACE" -r "$KEYSPACE" $SET_CMD_ARGS $KS_FLAG \
             --sequential -c "$POPULATE_CLIENTS" -q $SET_CMD_TAIL >> "$RESULTS/populate.txt" 2>&1 || true
         sleep 2
-        DBSIZE=$(cli DBSIZE | grep -oP '[0-9]+')
+        DBSIZE=$(effective_keys)
         if [ "$DBSIZE" -ge "$KEYSPACE" ]; then
-            echo "[mixed-rw] Populate complete: DBSIZE=$DBSIZE (attempt $attempt)"
+            echo "[mixed-rw] Populate complete: keys=$DBSIZE (attempt $attempt)"
             break
         fi
-        echo "[mixed-rw] Populate attempt $attempt: DBSIZE=$DBSIZE/$KEYSPACE — retrying..."
+        echo "[mixed-rw] Populate attempt $attempt: keys=$DBSIZE/$KEYSPACE — retrying..."
     done
 
     # ── Workload: parallel GET + SET ──
@@ -247,10 +256,14 @@ else
 
     POP_ERRORS=$(grep -hoEi 'errors: [0-9]+' "$TMPDIR"/pop_*.txt 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}' || true)
     POP_ERRORS=${POP_ERRORS:-0}
+    # Count dict-resident plus key-spilled keys: with key spilling enabled,
+    # demoted keys leave the dict but remain on flash.
     DBSIZE=$(cli DBSIZE | grep -oP '[0-9]+')
+    KEYSPILLED=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1)
+    DBSIZE=$(( ${DBSIZE:-0} + ${KEYSPILLED:-0} ))
     OOM_REJECTS=$(cli INFO everything 2>/dev/null | grep -oP 'oom_reject_write_count:\K[0-9]+' || echo 0)
     OOM_REJECTS=${OOM_REJECTS:-0}
-    echo "[mixed-rw] Population: DBSIZE=$DBSIZE/$KEYSPACE pipe_errors=$POP_ERRORS oom_rejects=$OOM_REJECTS"
+    echo "[mixed-rw] Population: keys=$DBSIZE/$KEYSPACE pipe_errors=$POP_ERRORS oom_rejects=$OOM_REJECTS"
 
     if [ "$POP_ERRORS" -gt 0 ] || [ "$OOM_REJECTS" -gt 0 ] || [ "$DBSIZE" -lt "$KEYSPACE" ]; then
         echo "[mixed-rw] POPULATE ABORTED (OOM hard cap) — skipping workload."
