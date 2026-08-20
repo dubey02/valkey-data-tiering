@@ -37,6 +37,17 @@ typedef struct fcRequest {
     struct fcRequest *next;
 } fcRequest;
 
+/* One record captured at the snapshot cut. The bytes are COPIED at start
+ * time: that copy is what makes the cut a point in time. A later PUT or DEL
+ * mutates the live hashtable and cannot disturb an already captured record,
+ * which is how the mock discharges the same obligation the real backend meets
+ * with its expedite path. */
+typedef struct fcSnapRec {
+    uint32_t db_id;
+    char *key; size_t klen;
+    char *value; size_t vlen;
+} fcSnapRec;
+
 typedef struct fcCtx {
     fcEntry *buckets[FC_BUCKETS];
     pthread_mutex_t ht_lock;
@@ -56,6 +67,14 @@ typedef struct fcCtx {
     /* Snapshot support: park the worker (outside locks) around fork(). */
     volatile int snap_hold;
     volatile int snap_held;
+    /* Streaming snapshot state. Owned by the worker once snap_stream_active
+     * is set; the starting thread must not touch the array after that. */
+    storageSnapshotSink snap_sink;
+    fcSnapRec *snap_recs;
+    size_t snap_count;
+    size_t snap_pos;
+    volatile int snap_stream_active;
+    volatile int snap_stream_abort;
     storageCompletionFn completion_fn;
     void *completion_privdata;
 } fcCtx;
@@ -86,6 +105,9 @@ extern void extStorageInflightAddRam(size_t bytes);
 extern void extStorageOnSpillSerialize(size_t bytes);
 extern size_t objectComputeSize(void *key, void *value, int samples, int dbid);
 
+/* Defined below, next to the rest of the streaming snapshot code. */
+static int fc_snap_stream_step(fcCtx *ctx, int budget);
+
 static void *fc_worker(void *arg) {
     fcCtx *ctx = arg;
     while (1) {
@@ -97,8 +119,13 @@ static void *fc_worker(void *arg) {
             while (ctx->snap_hold && !ctx->shutdown) usleep(50);
             ctx->snap_held = 0;
         }
+        /* Advance an in flight snapshot before serving requests, in bounded
+         * batches so neither side starves the other. */
+        if (ctx->snap_stream_active) fc_snap_stream_step(ctx, 64);
+
         pthread_mutex_lock(&ctx->req_lock);
-        while (!ctx->req_head && !ctx->shutdown && !ctx->snap_hold)
+        while (!ctx->req_head && !ctx->shutdown && !ctx->snap_hold &&
+               !ctx->snap_stream_active)
             pthread_cond_wait(&ctx->req_cond, &ctx->req_lock);
         if (ctx->snap_hold) {
             pthread_mutex_unlock(&ctx->req_lock);
@@ -107,6 +134,13 @@ static void *fc_worker(void *arg) {
         if (ctx->shutdown && !ctx->req_head) {
             pthread_mutex_unlock(&ctx->req_lock);
             break;
+        }
+        if (!ctx->req_head) {
+            /* Runnable only because a snapshot is streaming: no request to
+             * serve this turn. Yield briefly and loop to emit more. */
+            pthread_mutex_unlock(&ctx->req_lock);
+            usleep(10);
+            continue;
         }
         fcRequest *req = ctx->req_head;
         ctx->req_head = req->next;
@@ -393,6 +427,128 @@ static storageStatus fc_fork_read(void *vctx, uint32_t db_id,
     return STORAGE_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * Streaming snapshot (mock): copy on snapshot.
+ * ---------------------------------------------------------------------------*/
+
+/* Release the captured array. Worker context, or start-path error unwind. */
+static void fc_snap_stream_free(fcCtx *ctx) {
+    if (!ctx->snap_recs) return;
+    for (size_t i = 0; i < ctx->snap_count; i++) {
+        storage_free(ctx->snap_recs[i].key);
+        storage_free(ctx->snap_recs[i].value);
+    }
+    storage_free(ctx->snap_recs);
+    ctx->snap_recs = NULL;
+    ctx->snap_count = ctx->snap_pos = 0;
+}
+
+static storageStatus fc_snapshot_stream_start(void *vctx, storageSnapshotSink *sink) {
+    fcCtx *ctx = vctx;
+    if (ctx->snap_stream_active) return STORAGE_ERR_REJECTED; /* one at a time */
+
+    /* Establish the cut: copy every live record under the hashtable lock.
+     * Holding ht_lock for the whole walk is what makes this atomic with
+     * respect to the worker's PUT/DEL handling. */
+    pthread_mutex_lock(&ctx->ht_lock);
+
+    size_t n = 0;
+    for (int b = 0; b < FC_BUCKETS; b++)
+        for (fcEntry *e = ctx->buckets[b]; e; e = e->next)
+            if (e->value && e->vlen) n++;
+
+    fcSnapRec *recs = n ? storage_malloc(n * sizeof(fcSnapRec)) : NULL;
+    if (n && !recs) {
+        pthread_mutex_unlock(&ctx->ht_lock);
+        return STORAGE_ERR_REJECTED;
+    }
+
+    size_t i = 0;
+    size_t total_bytes = 0;
+    for (int b = 0; b < FC_BUCKETS && i < n; b++) {
+        for (fcEntry *e = ctx->buckets[b]; e && i < n; e = e->next) {
+            if (!e->value || !e->vlen) continue;
+            recs[i].db_id = e->db_id;
+            recs[i].klen = e->klen;
+            recs[i].vlen = e->vlen;
+            recs[i].key = storage_malloc(e->klen);
+            recs[i].value = storage_malloc(e->vlen);
+            if (!recs[i].key || !recs[i].value) {
+                /* Unwind what we captured so far, then fail the start. */
+                storage_free(recs[i].key);
+                storage_free(recs[i].value);
+                ctx->snap_recs = recs;
+                ctx->snap_count = i;
+                fc_snap_stream_free(ctx);
+                pthread_mutex_unlock(&ctx->ht_lock);
+                return STORAGE_ERR_REJECTED;
+            }
+            memcpy(recs[i].key, e->key, e->klen);
+            memcpy(recs[i].value, e->value, e->vlen);
+            total_bytes += e->klen + e->vlen;
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&ctx->ht_lock);
+
+    ctx->snap_sink = *sink;
+    ctx->snap_recs = recs;
+    ctx->snap_count = i;
+    ctx->snap_pos = 0;
+    ctx->snap_stream_abort = 0;
+    if (sink->set_size_hint) sink->set_size_hint(sink->privdata, total_bytes);
+
+    /* Publish last, then wake the worker: it owns the array from here. */
+    ctx->snap_stream_active = 1;
+    pthread_mutex_lock(&ctx->req_lock);
+    pthread_cond_broadcast(&ctx->req_cond);
+    pthread_mutex_unlock(&ctx->req_lock);
+    return STORAGE_OK;
+}
+
+static void fc_snapshot_stream_abort(void *vctx) {
+    fcCtx *ctx = vctx;
+    if (!ctx->snap_stream_active) return; /* idempotent */
+    ctx->snap_stream_abort = 1;
+    pthread_mutex_lock(&ctx->req_lock);
+    pthread_cond_broadcast(&ctx->req_cond);
+    pthread_mutex_unlock(&ctx->req_lock);
+}
+
+/* Emit up to `budget` records. Worker context only. Returns 1 while the
+ * stream is still running, 0 once it has terminated (complete() fired).
+ *
+ * The budget makes the drain incremental so a large snapshot does not starve
+ * request traffic, matching how the real backend's snapshot advances on FC's
+ * cron alongside normal IO. */
+static int fc_snap_stream_step(fcCtx *ctx, int budget) {
+    if (!ctx->snap_stream_active) return 0;
+
+    if (ctx->snap_stream_abort || ctx->shutdown) {
+        ctx->snap_sink.complete(ctx->snap_sink.privdata, 0);
+        fc_snap_stream_free(ctx);
+        ctx->snap_stream_active = 0;
+        return 0;
+    }
+
+    while (budget-- > 0 && ctx->snap_pos < ctx->snap_count) {
+        if (!ctx->snap_sink.writable(ctx->snap_sink.privdata))
+            return 1; /* backpressure: retry on a later worker turn */
+        fcSnapRec *r = &ctx->snap_recs[ctx->snap_pos];
+        ctx->snap_sink.on_record(ctx->snap_sink.privdata, r->db_id,
+                                 r->key, r->klen, r->value, r->vlen);
+        ctx->snap_pos++;
+    }
+
+    if (ctx->snap_pos >= ctx->snap_count) {
+        ctx->snap_sink.complete(ctx->snap_sink.privdata, 1);
+        fc_snap_stream_free(ctx);
+        ctx->snap_stream_active = 0;
+        return 0;
+    }
+    return 1;
+}
+
 static storageType flashcache_type = {
     .name = "flashcache",
     .version = VALKEY_STORAGE_VERSION,
@@ -409,6 +565,8 @@ static storageType flashcache_type = {
     .snapshot_release = fc_snapshot_release,
     .gc_pause = fc_gc_pause,
     .fork_read = fc_fork_read,
+    .snapshot_stream_start = fc_snapshot_stream_start,
+    .snapshot_stream_abort = fc_snapshot_stream_abort,
 };
 
 storageType *storageGetFlashCacheType(void) { return &flashcache_type; }

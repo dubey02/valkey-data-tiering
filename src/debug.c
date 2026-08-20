@@ -30,6 +30,7 @@
 #include "server.h"
 #include "ext_storage.h"
 #include "ext_storage_bridge.h"
+#include "ext_snapshot.h"
 #include "util.h"
 #include "sha1.h" /* SHA1 is used for DEBUG DIGEST */
 #include "crc64.h"
@@ -1094,6 +1095,36 @@ void debugCommand(client *c) {
         }
         ext_storage_debug_pause_completions = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "ext-storage-stream-selftest") &&
+               (c->argc == 2 || c->argc == 3)) {
+        /* DEBUG EXT-STORAGE-STREAM-SELFTEST [timeout_ms] — drive the storage
+         * engine's streaming snapshot with a counting sink and report what came
+         * back. Verifies the engine side contract on its own, before any RDB
+         * plumbing is involved. Tests only. */
+        if (!ext_data_enabled) {
+            addReplyError(c, "ext-storage-enabled is not set");
+            return;
+        }
+        if (!extSnapshotStreamSupported()) {
+            addReplyError(c, "active storage engine does not support snapshot streaming");
+            return;
+        }
+        long long timeout_ms = 10000;
+        if (c->argc == 3 && getLongLongFromObjectOrReply(c, c->argv[2], &timeout_ms, NULL) != C_OK)
+            return;
+        extSnapshotSelfTestResult res;
+        if (extSnapshotStreamSelfTest((int)timeout_ms, &res) != C_OK) {
+            addReplyError(c, "failed to start snapshot stream");
+            return;
+        }
+        addReplyMapLen(c, 6);
+        addReplyBulkCString(c, "completed");   addReplyLongLong(c, res.completed);
+        addReplyBulkCString(c, "ok");          addReplyLongLong(c, res.ok);
+        addReplyBulkCString(c, "records");     addReplyLongLong(c, res.records);
+        addReplyBulkCString(c, "value_bytes"); addReplyLongLong(c, res.value_bytes);
+        addReplyBulkCString(c, "digest");
+        addReplyBulkSds(c, sdscatprintf(sdsempty(), "%llu", (unsigned long long)res.digest));
+        addReplyBulkCString(c, "elapsed_ms");  addReplyLongLong(c, res.elapsed_ms);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc == 3) {
         /* DEBUG SPILL <key> — manually spill a key to external storage */
         if (!ext_data_enabled) {

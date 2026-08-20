@@ -157,6 +157,10 @@ static void fc_get_callback(void *request_context, char *value,
 /* ---------------------------------------------------------------------------
  * IO thread — processes requests, calls FlashCache, runs cron
  * ---------------------------------------------------------------------------*/
+/* Defined below, next to the rest of the streaming snapshot code. Runs on this
+ * thread because every FlashCache call must come from the IO thread. */
+static void fc_snap_stream_begin_on_io_thread(void);
+
 static void *fc_io_worker(void *arg) {
     fcRealCtx *ctx = arg;
     pthread_setname_np(pthread_self(), "fc_io_worker");
@@ -266,6 +270,17 @@ static void *fc_io_worker(void *arg) {
                 }
                 /* Signal main thread: all IO complete + flush done */
                 atomic_store_explicit(&ctx->barrier_done, 1, memory_order_release);
+                continue;
+            }
+            case STORAGE_OP_SNAPSHOT_START: {
+                /* Must run here: flashcacheStartStreamBasedSave quiesces
+                 * pending IO and GC internally, which is only safe on the
+                 * thread that owns every other FlashCache call. */
+                fc_snap_stream_begin_on_io_thread();
+                continue;
+            }
+            case STORAGE_OP_SNAPSHOT_ABORT: {
+                flashcacheCancelSave();
                 continue;
             }
             }
@@ -499,6 +514,283 @@ static storageStatus fc_real_fork_read(void *vctx, uint32_t db_id,
     return STORAGE_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * Streaming snapshot (real FlashCache).
+ *
+ * FlashCache already produces a point in time stream via
+ * flashcacheStartStreamBasedSave. Two details drive this implementation:
+ *
+ *  1. SAVE TYPE MUST BE BGSAVE, NOT THREADSAVE. FlashCache's expedite path is
+ *     what preserves the pre-cut bytes of a record that gets overwritten,
+ *     deleted, or GC relocated before the snapshot cursor reaches it. In
+ *     threadsave mode (writer != NULL AND save type == THREADSAVE) expedite
+ *     degrades to a counter and DROPS the bytes, because replication carries
+ *     the mutation to the replica instead. Passing FC_SAVE_TYPE_BGSAVE with a
+ *     writer gives us stream transport with strict point in time semantics.
+ *
+ *  2. THE STREAM IS BYTES, THE SINK IS RECORDS. FlashCache hands us page
+ *     aligned chunks of a logical snapshot file: a metadata block followed by
+ *     serialized items (40 byte itemHeader, key, value). Chunk boundaries fall
+ *     wherever they like, so items split across chunks and we reassemble.
+ * ---------------------------------------------------------------------------*/
+
+/* Byte offset of data_section_start_offset within FlashCache's snapshot
+ * metadata block. The struct is private to snapshot_version_two.c, but its
+ * prefix is stable and asserted there: uint32_t version, uint32_t
+ * num_databases, size_t data_section_start_offset. We read just that field and
+ * sanity check it rather than mirroring the whole struct. */
+#define FC_SNAP_META_MIN_BYTES   16
+#define FC_SNAP_META_DATA_START  8
+
+typedef struct fcSnapStream {
+    storageSnapshotSink sink;
+    /* FlashCache stores the writer BY POINTER for the life of the snapshot,
+     * so it must not live on a stack frame. */
+    flashcacheSnapshotWriter writer;
+    flashcacheSnapshotSecret secret;
+
+    _Atomic int active;
+    _Atomic int abort_requested;
+    int seen_meta;
+    int saw_eof;
+    int failed;
+
+    size_t data_start;      /* first byte of the item section */
+    size_t next_offset;     /* offset we expect the next chunk to start at */
+
+    char *buf;              /* reassembly buffer, holds one partial item */
+    size_t len, cap;
+
+    size_t records;         /* records handed to the sink */
+    size_t skipped;         /* non key/value markers skipped */
+} fcSnapStream;
+
+/* One snapshot at a time, matching FlashCache's own single snapshot state. */
+static fcSnapStream g_snap;
+
+static int fc_snap_buf_append(fcSnapStream *s, const char *src, size_t n) {
+    if (s->len + n > s->cap) {
+        size_t cap = s->cap ? s->cap : 8192;
+        while (cap < s->len + n) cap *= 2;
+        char *nb = storage_realloc(s->buf, cap);
+        if (!nb) return 0;
+        s->buf = nb;
+        s->cap = cap;
+    }
+    memcpy(s->buf + s->len, src, n);
+    s->len += n;
+    return 1;
+}
+
+/* Drop the first n bytes of the reassembly buffer. */
+static void fc_snap_buf_consume(fcSnapStream *s, size_t n) {
+    if (n >= s->len) { s->len = 0; return; }
+    memmove(s->buf, s->buf + n, s->len - n);
+    s->len -= n;
+}
+
+/* Parse as many whole items out of the buffer as possible, emitting records.
+ * Leaves any trailing partial item in place for the next chunk. */
+static void fc_snap_parse(fcSnapStream *s) {
+    /* Metadata first: learn where the item section begins, then skip it. */
+    if (!s->seen_meta) {
+        if (s->len < FC_SNAP_META_MIN_BYTES) return;
+        size_t data_start = 0;
+        memcpy(&data_start, s->buf + FC_SNAP_META_DATA_START, sizeof(data_start));
+        /* The metadata block is page aligned and asserted to fit one page, so
+         * anything outside these bounds means the layout moved under us. Fail
+         * loudly rather than misparse the item stream. */
+        if (data_start == 0 || (data_start % FC_PAGESIZE) != 0 ||
+            data_start > (size_t)FC_PAGESIZE * 8) {
+            s->failed = 1;
+            return;
+        }
+        s->data_start = data_start;
+        s->seen_meta = 1;
+    }
+
+    /* Skip whatever remains of the metadata block. */
+    if (s->data_start > 0) {
+        size_t drop = s->len < s->data_start ? s->len : s->data_start;
+        fc_snap_buf_consume(s, drop);
+        s->data_start -= drop;
+        if (s->data_start > 0) return; /* still inside metadata */
+    }
+
+    while (!s->saw_eof && !s->failed) {
+        if (s->len < FC_ITEM_HEADER_LEN) return;
+
+        uint32_t flag = 0, dbid = 0;
+        size_t key_len = 0, value_len = 0;
+        memcpy(&flag,      s->buf + 4,  sizeof(flag));
+        memcpy(&key_len,   s->buf + 8,  sizeof(key_len));
+        memcpy(&value_len, s->buf + 16, sizeof(value_len));
+        memcpy(&dbid,      s->buf + 24, sizeof(dbid));
+
+        /* Items in the FC log (and therefore in the snapshot stream) are
+         * padded to FC_ITEM_ALIGNMENT_BYTES (8): serializeKeyValuePair
+         * allocates getAlignedSizeBytes(header+key+value), and
+         * extractTotalLenFromSerializedItem returns the ALIGNED size. Consume
+         * the aligned size or the parser desyncs on the padding after the
+         * first record whose payload is not a multiple of 8. */
+        size_t total = FC_ITEM_HEADER_LEN + key_len + value_len;
+        total = (total + 7) & ~(size_t)7;
+        /* A wildly out of range length means we lost stream alignment. Stop
+         * instead of walking off into the buffer. */
+        if (total < FC_ITEM_HEADER_LEN || key_len > (size_t)1 << 30 ||
+            value_len > (size_t)1 << 40) {
+            s->failed = 1;
+            return;
+        }
+        if (s->len < total) return; /* wait for the rest of this item */
+
+        if (flag & FC_EOF_INDICATOR) {
+            s->saw_eof = 1;
+            /* The snapshot file is page aligned, so padding can trail the EOF
+             * marker. Nothing after EOF is data: drop the whole buffer, and
+             * the write callback ignores any further chunks. */
+            s->len = 0;
+            return;
+        }
+        if (flag & (FC_SKIP_SEGMENT | FC_REPL_CMD_DELETE)) {
+            /* Skip markers pad the log to a page boundary; delete commands are
+             * a threadsave replication construct and should not appear under
+             * FC_SAVE_TYPE_BGSAVE. Neither is a record. */
+            s->skipped++;
+            fc_snap_buf_consume(s, total);
+            continue;
+        }
+        if (key_len == 0 || value_len == 0) { /* nothing to hand up */
+            s->skipped++;
+            fc_snap_buf_consume(s, total);
+            continue;
+        }
+
+        if (!s->sink.writable(s->sink.privdata)) {
+            /* Sink is full. Leave the item buffered and return: FlashCache
+             * polls is_writable before each write and will come back. */
+            return;
+        }
+        s->sink.on_record(s->sink.privdata, dbid,
+                          s->buf + FC_ITEM_HEADER_LEN, key_len,
+                          s->buf + FC_ITEM_HEADER_LEN + key_len, value_len);
+        s->records++;
+        fc_snap_buf_consume(s, total);
+    }
+}
+
+/* --- FlashCache writer trampolines. All run on the FC IO thread. --- */
+
+static void fc_snap_w_set_size(void *cctx, size_t size) {
+    fcSnapStream *s = cctx;
+    if (s->sink.set_size_hint) s->sink.set_size_hint(s->sink.privdata, size);
+}
+
+static int fc_snap_w_is_writable(void *cctx) {
+    fcSnapStream *s = cctx;
+    if (atomic_load_explicit(&s->abort_requested, memory_order_acquire) || s->failed)
+        return 0;
+    /* Report unwritable while an item is still buffered for backpressure, so
+     * FlashCache does not pile more on top of a sink that already said no. */
+    return s->sink.writable(s->sink.privdata);
+}
+
+static void fc_snap_w_write(void *cctx, size_t offset, char *buf, size_t buf_len) {
+    fcSnapStream *s = cctx;
+    if (s->failed) return;
+    /* Everything after the EOF marker is page padding, not data. Track the
+     * expected offset so the in-order check below stays satisfied. */
+    if (s->saw_eof) {
+        if (offset == s->next_offset) s->next_offset = offset + buf_len;
+        return;
+    }
+    /* The logical snapshot file is written strictly in order. If that ever
+     * stops holding, reassembly by append is wrong, so check it. */
+    if (offset != s->next_offset) {
+        s->failed = 1;
+        return;
+    }
+    s->next_offset = offset + buf_len;
+    if (!fc_snap_buf_append(s, buf, buf_len)) {
+        s->failed = 1;
+        return;
+    }
+    fc_snap_parse(s);
+}
+
+static void fc_snap_w_keep_alive(void *cctx) {
+    (void)cctx; /* replication link keepalive; unused for a local save */
+}
+
+static void fc_snap_w_complete(void *cctx, int completed) {
+    fcSnapStream *s = cctx;
+    /* Anything still buffered at completion is a partial item, which means the
+     * stream ended mid record. Treat as failure. */
+    int ok = completed && !s->failed &&
+             !atomic_load_explicit(&s->abort_requested, memory_order_acquire) &&
+             s->len == 0;
+    s->sink.complete(s->sink.privdata, ok);
+    storage_free(s->buf);
+    s->buf = NULL;
+    s->len = s->cap = 0;
+    atomic_store_explicit(&s->active, 0, memory_order_release);
+}
+
+/* Called on the IO thread in response to STORAGE_OP_SNAPSHOT_START. */
+static void fc_snap_stream_begin_on_io_thread(void) {
+    fcSnapStream *s = &g_snap;
+    s->writer.callback_context = s;
+    s->writer.set_snapshot_size = fc_snap_w_set_size;
+    s->writer.write = fc_snap_w_write;
+    s->writer.is_writable = fc_snap_w_is_writable;
+    s->writer.keep_alive = fc_snap_w_keep_alive;
+    s->writer.complete = fc_snap_w_complete;
+    /* FlashCache asserts (size > 0 && size <= FC_SNAPSHOT_MAX_SECRET_SIZE)
+     * unconditionally at snapshotV2StartSave -- an empty secret crashes the
+     * process. The secret exists for RDB/FDB pair correlation in the two file
+     * design; our stream lands in a single artifact, so any non empty value
+     * satisfies the contract. Use a random value rather than a constant so a
+     * future consumer cannot accidentally rely on it matching across saves. */
+    s->secret.size = 16;
+    for (size_t i = 0; i < s->secret.size; i++)
+        s->secret.secret[i] = (unsigned char)(rand() & 0xff);
+    flashcacheStartStreamBasedSave(&s->secret, &s->writer,
+                                   FC_SNAPSHOT_VERSION_TWO,
+                                   FC_SAVE_TYPE_BGSAVE, NULL);
+}
+
+static storageStatus fc_real_snapshot_stream_start(void *vctx, storageSnapshotSink *sink) {
+    fcRealCtx *ctx = vctx;
+    if (!ctx) return STORAGE_ERR_REJECTED;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_snap.active, &expected, 1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_acquire))
+        return STORAGE_ERR_REJECTED; /* one snapshot at a time */
+
+    /* Reset parse state before the IO thread can observe it. */
+    g_snap.sink = *sink;
+    atomic_store_explicit(&g_snap.abort_requested, 0, memory_order_relaxed);
+    g_snap.seen_meta = g_snap.saw_eof = g_snap.failed = 0;
+    g_snap.data_start = 0;
+    g_snap.next_offset = 0;
+    g_snap.len = 0;
+    g_snap.records = g_snap.skipped = 0;
+
+    fcRequest req = {.op = STORAGE_OP_SNAPSHOT_START};
+    fc_req_push(ctx, &req);
+    return STORAGE_OK;
+}
+
+static void fc_real_snapshot_stream_abort(void *vctx) {
+    fcRealCtx *ctx = vctx;
+    if (!ctx) return;
+    if (!atomic_load_explicit(&g_snap.active, memory_order_acquire)) return;
+    atomic_store_explicit(&g_snap.abort_requested, 1, memory_order_release);
+    fcRequest req = {.op = STORAGE_OP_SNAPSHOT_ABORT};
+    fc_req_push(ctx, &req);
+}
+
 static storageType flashcache_real_type = {
     .name = "flashcache-real",
     .version = VALKEY_STORAGE_VERSION,
@@ -515,6 +807,8 @@ static storageType flashcache_real_type = {
     .snapshot_release = fc_real_snapshot_release,
     .gc_pause = fc_real_gc_pause,
     .fork_read = fc_real_fork_read,
+    .snapshot_stream_start = fc_real_snapshot_stream_start,
+    .snapshot_stream_abort = fc_real_snapshot_stream_abort,
 };
 
 /* Drain all in-flight IO + execute flush on the IO thread.

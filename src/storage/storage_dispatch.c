@@ -117,3 +117,26 @@ storageStatus storageForkRead(uint32_t db_id, const void *key, size_t klen,
     if (!server_storage || !server_storage->fork_read) return STORAGE_NOT_FOUND;
     return server_storage->fork_read(server_storage_ctx, db_id, key, klen, value, vlen);
 }
+
+/* ---------------------------------------------------------------------------
+ * Streaming snapshot dispatch
+ * ---------------------------------------------------------------------------*/
+int storageSnapshotStreamSupported(void) {
+    return server_storage && server_storage->snapshot_stream_start &&
+           server_storage->snapshot_stream_abort;
+}
+
+storageStatus storageSnapshotStreamStart(storageSnapshotSink *sink) {
+    if (!storageSnapshotStreamSupported()) return STORAGE_ERR_REJECTED;
+    /* A sink missing any required callback is a programming error, not a
+     * runtime condition: fail before the backend freezes a cut it cannot
+     * report on. set_size_hint is the only optional member. */
+    if (!sink || !sink->on_record || !sink->writable || !sink->complete)
+        return STORAGE_ERR_REJECTED;
+    return server_storage->snapshot_stream_start(server_storage_ctx, sink);
+}
+
+void storageSnapshotStreamAbort(void) {
+    if (server_storage && server_storage->snapshot_stream_abort)
+        server_storage->snapshot_stream_abort(server_storage_ctx);
+}

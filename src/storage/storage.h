@@ -13,11 +13,13 @@
 #include "zmalloc.h"
 #define storage_malloc(sz) zmalloc(sz)
 #define storage_calloc(n,sz) zcalloc((n)*(sz))
+#define storage_realloc(p,sz) zrealloc(p,sz)
 #define storage_free(p) zfree(p)
 #else
 #include <stdlib.h>
 #define storage_malloc(sz) malloc(sz)
 #define storage_calloc(n,sz) calloc(n,sz)
+#define storage_realloc(p,sz) realloc(p,sz)
 #define storage_free(p) free(p)
 #endif
 
@@ -38,6 +40,12 @@ typedef enum {
 #define STORAGE_OP_GET 1
 #define STORAGE_OP_DEL 2
 #define STORAGE_OP_BARRIER 3  /* Drain barrier — no IO, just signals completion */
+/* Snapshot stream control. These exist as request ops because a backend that
+ * owns its own IO thread must issue every backend-library call from that
+ * thread; starting a stream inline from the main thread would race the
+ * worker inside the library. */
+#define STORAGE_OP_SNAPSHOT_START 4
+#define STORAGE_OP_SNAPSHOT_ABORT 5
 
 /* Completion delivered from IO to main thread */
 typedef struct storageCompletion {
@@ -81,6 +89,49 @@ typedef struct storageStats {
     uint64_t total_dels;
     uint64_t keys_stored;
 } storageStats;
+
+/* ---------------------------------------------------------------------------
+ * Streaming snapshot sink.
+ *
+ * The sink is RECORD oriented, not byte oriented. A backend decodes its own
+ * on-disk representation and hands up one whole record at a time. Two reasons:
+ *
+ *  1. Backend independence. The mock does not share the real backend's
+ *     serialized item layout, so a byte oriented sink would let mock tests
+ *     validate a framing that the real backend never emits.
+ *  2. The consumer needs records anyway. The RDB flash section is a sequence
+ *     of key/value entries, so an opaque byte image would have to be decoded
+ *     downstream regardless.
+ *
+ * No expiry or LRU metadata crosses this boundary. Values spill, keys do not,
+ * so the engine still owns every key's TTL and idle time in its own hashtable
+ * and stamps them when it writes the record out.
+ *
+ * Threading: on_record and writable are invoked on the BACKEND's IO thread.
+ * Implementations must not touch engine data structures. The record buffers
+ * are owned by the backend and are invalid once on_record returns, so an
+ * implementation that needs to retain them must copy.
+ * ---------------------------------------------------------------------------*/
+typedef struct storageSnapshotSink {
+    void *privdata;
+
+    /* Total record COUNT is not knowable up front, but the backend usually
+     * knows the byte size of the frozen range. Advisory only; may be 0. */
+    void (*set_size_hint)(void *privdata, size_t total_bytes);
+
+    /* Backpressure probe, called before every record. Return 0 to signal "not
+     * now". A backend is free to buffer, but buffering is bounded and the
+     * backend may abort the snapshot if the sink stays unwritable. */
+    int (*writable)(void *privdata);
+
+    /* One record, live as of the snapshot cut. Called exactly once per key. */
+    void (*on_record)(void *privdata, uint32_t db_id,
+                      const char *key, size_t klen,
+                      const char *value, size_t vlen);
+
+    /* Terminal, called exactly once. ok=1 success, ok=0 aborted or failed. */
+    void (*complete)(void *privdata, int ok);
+} storageSnapshotSink;
 
 /* The pluggable interface */
 typedef struct storageType {
@@ -147,6 +198,30 @@ typedef struct storageType {
     storageStatus (*fork_read)(void *ctx, uint32_t db_id,
                                const void *key, size_t klen,
                                void **value, size_t *vlen);
+
+    /* -----------------------------------------------------------------------
+     * Streaming snapshot (single cut, sink driven). Optional; NULL means the
+     * backend cannot stream and the engine falls back to the fork_read path.
+     *
+     * Contract the backend MUST honour:
+     *   - Establish a point in time cut at the instant of the start call.
+     *   - Deliver every record that is live at that cut, exactly once, with
+     *     its value as of the cut.
+     *   - A record mutated, deleted, or relocated after the cut but before
+     *     the producer reaches it must still be delivered with its PRE cut
+     *     value. (FlashCache satisfies this with its expedite path; RocksDB
+     *     would use GetSnapshot plus an iterator; the mock copies its map.)
+     *   - Records written after the cut must NOT be delivered.
+     *   - Invoke sink->complete exactly once, even on failure.
+     *
+     * Returns STORAGE_OK if the snapshot was started. The stream then runs
+     * asynchronously on the backend IO thread until complete() fires.
+     * -----------------------------------------------------------------------*/
+    storageStatus (*snapshot_stream_start)(void *ctx, storageSnapshotSink *sink);
+
+    /* Cancel an in flight stream. Idempotent. complete(privdata, 0) still
+     * fires. Safe to call after the stream has already finished. */
+    void (*snapshot_stream_abort)(void *ctx);
 } storageType;
 
 /* ---------------------------------------------------------------------------
@@ -172,6 +247,13 @@ void storageGcPause(int paused);
 storageStatus storageForkRead(uint32_t db_id, const void *key, size_t klen,
                               void **value, size_t *vlen);
 void storageCron(void);
+
+/* Streaming snapshot. storageSnapshotStreamSupported() is the capability probe
+ * the engine must consult before choosing the streaming path; it returns 0 on
+ * any backend that left the ops NULL, including the mock's degraded modes. */
+int storageSnapshotStreamSupported(void);
+storageStatus storageSnapshotStreamStart(storageSnapshotSink *sink);
+void storageSnapshotStreamAbort(void);
 
 /* Backend getters */
 storageType *storageGetFlashCacheType(void);          /* in-memory mock (testing) */
