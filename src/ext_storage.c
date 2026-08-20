@@ -148,6 +148,8 @@ static long long total_keys_dropped_from_dict = 0;  /* demotions: dict entry rem
 static long long total_keys_rematerialized = 0;     /* placeholders re-inserted on dict miss */
 static long long kbc_keyspill_miss_fetch = 0;       /* dict misses routed to a flash consult */
 static long long kbc_keyspill_absent_consumed = 0;  /* dict misses short-circuited by confirmed-absent */
+static long long kbc_progressive_drain_runs = 0;     /* scan pass 1 found blockers; inline completion drain ran */
+static long long kbc_progressive_drain_resolved = 0; /* drain resolved every blocker; command never parked */
 #define KEYSPILL_DROP_BATCH 512 /* max placeholder drops per spill pass (yield to event loop) */
 
 // Memory pressure metrics (non-static: accessed from evict.c)
@@ -547,7 +549,7 @@ static bool isEmbeddedObject(dbEntry *o) {
  * Side effect: may issue a READ or DELETE request to the module.
  * ---------------------------------------------------------------------------*/
 
-static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_delete_cmd) {
+static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_delete_cmd, int *cleared_via_absent) {
     kbc_total_calls++;
 
     TieringState state = extStorageGetState(db, key);
@@ -655,6 +657,7 @@ static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_del
             sdsfree((sds)absent);
             kbc_keyspill_absent_consumed++;
             kbc_confirmed_absent_count++;
+            if (cleared_via_absent) *cleared_via_absent = 1;
             return 0;
         }
         /* Re-materialize a placeholder in ONLY_FLASH; the caller's existing
@@ -683,14 +686,20 @@ static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_del
  * For keys in COPYING_TO_FLASH/COPYING_TO_MEMORY/PENDING_EVICT: just blocks.
  * ---------------------------------------------------------------------------*/
 
+static int scanKeysAndSubmit(client *c, serverDb *current_db, keyReference *keys, int num_keys,
+                             bool is_write_cmd, bool cmd_is_delete, robj **blocking_keys,
+                             sds *absent_cleared, int *absent_cleared_count);
+
 int preCommandExec(client *c) {
     if (!ext_data_enabled) return CMD_FILTER_ACCEPT;
 
-    /* NOTE: Completions are processed from beforeSleep() and the 1ms timer,
-     * NOT here. Processing completions here causes a race: a spill completion
-     * can mark a key TIERED, then keyBlocksClient misses it for a concurrent
-     * client in the same event loop tick. dt-poc also processes completions
-     * only from beforeSleep, not from preCommandExec. */
+    /* NOTE: Completions must NOT be processed in the middle of a key scan:
+     * a spill completion can nullify a key this scan already cleared as
+     * resident, so the command would execute against a freed value. The
+     * progressive drain below is safe because it runs strictly BETWEEN two
+     * complete scan passes — pass 2 revalidates every key against
+     * post-drain state, and nothing else can drain between pass 2 and
+     * command execution (the filter returns straight into the command). */
 
     /* Determine which keys block this client */
     serverDb *current_db = c->db;
@@ -724,7 +733,7 @@ int preCommandExec(client *c) {
 
             for (int j = 0; j < mc_num_keys; j++) {
                 sds key_str = objectGetVal(mc->argv[mc_keys[j].pos]);
-                if (keyBlocksClient(current_db, key_str, mc_is_write, false)) {
+                if (keyBlocksClient(current_db, key_str, mc_is_write, false, NULL)) {
                     blocking_keys[num_keys_to_block++] = mc->argv[mc_keys[j].pos];
 
                     TieringState state = extStorageGetState(current_db, key_str);
@@ -766,13 +775,79 @@ int preCommandExec(client *c) {
     /* Detect DEL/UNLINK commands for optimized delete path */
     bool is_delete_cmd = (c->cmd->proc == delCommand || c->cmd->proc == unlinkCommand);
 
-    int num_keys_to_block = 0;
     robj **blocking_keys = (robj **)zmalloc(sizeof(robj *) * num_keys);
+    /* Keys cleared through a confirmed-absent marker in pass 1. The marker
+     * is consume-on-read, so pass 2 must not re-probe these keys. */
+    sds *absent_cleared = (sds *)zmalloc(sizeof(sds) * num_keys);
+    int absent_cleared_count = 0;
+
+    int num_keys_to_block = scanKeysAndSubmit(c, current_db, keys, num_keys, is_write_cmd,
+                                              is_delete_cmd, blocking_keys,
+                                              absent_cleared, &absent_cleared_count);
+
+    /* Progressive drain. A consult for a key that is not on flash is
+     * answered by the backend from its in-memory index without disk IO,
+     * so its completion is often already queued by the time the submits
+     * above return. Pump the completion queue once, then re-scan. Keys
+     * whose READ resolved (value restored, or absence confirmed) drop out
+     * and the command proceeds without parking. The re-scan covers EVERY
+     * key, not only the blockers: a spill completion processed by the
+     * drain can make a previously cleared key non-resident, and pass 2
+     * must catch that before the command executes. */
+    if (num_keys_to_block > 0) {
+        kbc_progressive_drain_runs++;
+        processCompletedStorageRequests();
+        num_keys_to_block = scanKeysAndSubmit(c, current_db, keys, num_keys, is_write_cmd,
+                                              is_delete_cmd, blocking_keys,
+                                              absent_cleared, &absent_cleared_count);
+        if (num_keys_to_block == 0) kbc_progressive_drain_resolved++;
+    }
+
+    getKeysFreeResult(&result);
+    if (num_keys_to_block > 0) {
+        c->flag.pending_command = 1;
+        blockClientInUseOnKeys(c, num_keys_to_block, blocking_keys);
+    }
+    zfree(blocking_keys);
+    zfree(absent_cleared);
+    return num_keys_to_block > 0 ? CMD_FILTER_REJECT : CMD_FILTER_ACCEPT;
+}
+
+/* ---------------------------------------------------------------------------
+ * scanKeysAndSubmit — one full pass of preCommandExec's blocking decision
+ *
+ * Evaluates every key of the command, collects blockers into blocking_keys,
+ * and submits READ/DELETE requests for keys that need IO. Returns the number
+ * of blocking keys. Parking the client is the caller's job. That split lets
+ * the caller run a completion drain between two passes and only block the
+ * client if blockers survive the second pass.
+ * ---------------------------------------------------------------------------*/
+static int scanKeysAndSubmit(client *c, serverDb *current_db, keyReference *keys, int num_keys,
+                             bool is_write_cmd, bool cmd_is_delete, robj **blocking_keys,
+                             sds *absent_cleared, int *absent_cleared_count) {
+    int num_keys_to_block = 0;
 
     for (int i = 0; i < num_keys; i++) {
         sds key_str = objectGetVal(c->argv[keys[i].pos]);
 
-        if (!keyBlocksClient(current_db, key_str, is_write_cmd, is_delete_cmd)) {
+        /* Per-key delete flag. The probe and TTL conversions below rewrite
+         * it. The rewrite must not leak into the next key of a multi-key
+         * command: an expired key would convert a later key's READ into a
+         * destructive DELETE. */
+        bool is_delete_cmd = cmd_is_delete;
+
+        /* A key an earlier pass proved absent stays a plain miss. The
+         * absent marker is consume-on-read, so without this skip a second
+         * pass would re-probe (and re-fetch) a key already known missing. */
+        int already_cleared = 0;
+        for (int a = 0; a < *absent_cleared_count; a++) {
+            if (sdscmp(absent_cleared[a], key_str) == 0) { already_cleared = 1; break; }
+        }
+        if (already_cleared) continue;
+
+        int cleared_via_absent = 0;
+        if (!keyBlocksClient(current_db, key_str, is_write_cmd, is_delete_cmd, &cleared_via_absent)) {
+            if (cleared_via_absent) absent_cleared[(*absent_cleared_count)++] = key_str;
             continue;
         }
 
@@ -855,13 +930,7 @@ int preCommandExec(client *c) {
          * just block — IO is already in-flight, no new request needed. */
     }
 
-    getKeysFreeResult(&result);
-    if (num_keys_to_block > 0) {
-        c->flag.pending_command = 1;
-        blockClientInUseOnKeys(c, num_keys_to_block, blocking_keys);
-    }
-    zfree(blocking_keys);
-    return num_keys_to_block > 0 ? CMD_FILTER_REJECT : CMD_FILTER_ACCEPT;
+    return num_keys_to_block;
 }
 
 
@@ -1717,13 +1786,17 @@ sds genExternalStorageInfoString(sds info) {
         "total_keys_dropped_from_dict:%lld\r\n"
         "total_keys_rematerialized:%lld\r\n"
         "kbc_keyspill_miss_fetch:%lld\r\n"
-        "kbc_keyspill_absent_consumed:%lld\r\n",
+        "kbc_keyspill_absent_consumed:%lld\r\n"
+        "kbc_progressive_drain_runs:%lld\r\n"
+        "kbc_progressive_drain_resolved:%lld\r\n",
         ext_key_spill_enabled,
         keys_key_spilled,
         total_keys_dropped_from_dict,
         total_keys_rematerialized,
         kbc_keyspill_miss_fetch,
-        kbc_keyspill_absent_consumed);
+        kbc_keyspill_absent_consumed,
+        kbc_progressive_drain_runs,
+        kbc_progressive_drain_resolved);
     info = sdscatprintf(info,
         "total_num_items_spilled_to_ext_storage:%lld\r\n"
         "total_num_items_fetched_from_ext_storage:%lld\r\n"

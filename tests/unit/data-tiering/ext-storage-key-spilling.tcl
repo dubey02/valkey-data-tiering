@@ -283,6 +283,76 @@ start_server [list tags {"ext-storage" "ext-storage-key-spilling"} overrides [li
         assert_equal [expr {$matched + $evicted}] 8000
     }
 
+    # =========================================================================
+    # Duplicate-fetch suppression + progressive drain
+    # =========================================================================
+
+    test {KEYSPILL: concurrent GETs of the same spilled key submit one fetch} {
+        r config set maxmemory 10mb
+        r flushall
+        r set ks:dup "dupval_${padding}"
+        key_spill ks:dup
+        set miss_before [get_info_field kbc_keyspill_miss_fetch]
+
+        # Hold completions so both clients are provably parked on the key at
+        # the same time: the first GET rematerializes the probe and submits;
+        # the second must find the fetch in flight and park without a second
+        # submit (the probe's fetch-in-flight state is the in-flight signal).
+        r debug ext-storage-pause-completions 1
+        set rd1 [valkey_deferring_client]
+        set rd2 [valkey_deferring_client]
+        $rd1 get ks:dup
+        $rd2 get ks:dup
+        wait_for_blocked_clients_count 2
+        r debug ext-storage-pause-completions 0
+
+        assert_equal [$rd1 read] "dupval_${padding}"
+        assert_equal [$rd2 read] "dupval_${padding}"
+        $rd1 close
+        $rd2 close
+
+        # Exactly one dict miss was routed to a flash consult. The second
+        # client parked on the in-flight fetch instead of re-submitting.
+        assert_equal [expr {[get_info_field kbc_keyspill_miss_fetch] - $miss_before}] 1
+        assert_equal [r dbsize] 1
+    }
+
+    test {KEYSPILL: progressive drain counters are wired and consistent} {
+        r flushall
+        # A burst of misses on spilled and never-existed keys. Every pass-1
+        # blocker runs the inline drain, so runs must grow; resolved counts
+        # the opportunistic subset and can never exceed runs.
+        for {set i 0} {$i < 50} {incr i} {
+            r set "ks:pd:$i" "v${i}_${padding}"
+            key_spill "ks:pd:$i"
+        }
+        set runs_before [get_info_field kbc_progressive_drain_runs]
+        for {set i 0} {$i < 50} {incr i} {
+            assert_equal [r get "ks:pd:$i"] "v${i}_${padding}"
+            assert_equal [r get "ks:pd:never:$i"] {}
+        }
+        set runs [get_info_field kbc_progressive_drain_runs]
+        set resolved [get_info_field kbc_progressive_drain_resolved]
+        assert {$runs - $runs_before >= 50}
+        assert {$resolved >= 0 && $resolved <= $runs}
+        assert_equal [r dbsize] 50
+    }
+
+    test {KEYSPILL: multi-key command with expired spilled key does not corrupt neighbors} {
+        r flushall
+        # Regression for the per-key delete flag: an expired tiered key ahead
+        # of a healthy tiered key in one command must not convert the healthy
+        # key's READ into a destructive DELETE.
+        r set ks:mk:expired "gone_${padding}"
+        r pexpire ks:mk:expired 80
+        debug_spill ks:mk:expired
+        r set ks:mk:alive "alive_${padding}"
+        debug_spill ks:mk:alive
+        after 150
+        assert_equal [r mget ks:mk:expired ks:mk:alive] [list {} "alive_${padding}"]
+        assert_equal [r get ks:mk:alive] "alive_${padding}"
+    }
+
     test {KEYSPILL: server alive after all tests (no crash)} {
         r config set maxmemory 10mb
         r flushall
