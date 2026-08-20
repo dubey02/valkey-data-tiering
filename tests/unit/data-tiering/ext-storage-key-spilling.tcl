@@ -37,10 +37,17 @@ proc debug_spill {key {timeout 5000}} {
     }
 }
 
-# Spill a key and drop its dict entry: the full demotion sequence.
+# Spill a key and ensure its dict entry is dropped: the full demotion
+# sequence. With together-spill, the WRITE completion drops the entry
+# inline, so DEBUG KEYSPILL usually finds it already gone and errors.
+# Swallow that error; assert the demotion actually happened either way.
 proc key_spill {key} {
+    set dropped_before [get_info_field total_keys_dropped_from_dict]
     debug_spill $key
-    r debug keyspill $key
+    catch {r debug keyspill $key}
+    if {[get_info_field total_keys_dropped_from_dict] <= $dropped_before} {
+        error "Key '$key' was not demoted (no dict drop recorded)"
+    }
 }
 
 start_server [list tags {"ext-storage" "ext-storage-key-spilling"} overrides [list \
@@ -351,6 +358,45 @@ start_server [list tags {"ext-storage" "ext-storage-key-spilling"} overrides [li
         after 150
         assert_equal [r mget ks:mk:expired ks:mk:alive] [list {} "alive_${padding}"]
         assert_equal [r get ks:mk:alive] "alive_${padding}"
+    }
+
+    # =========================================================================
+    # Together-spill: drop at spill completion
+    # =========================================================================
+
+    test {KEYSPILL: value spill alone demotes the key (together-spill)} {
+        r config set maxmemory 10mb
+        r flushall
+        set drops_before [get_info_field total_keys_dropped_at_completion]
+        r set ks:tog "together_${padding}"
+        debug_spill ks:tog
+        # No DEBUG KEYSPILL: the WRITE completion itself dropped the entry.
+        assert_equal [r dbsize] 0
+        assert_equal [get_info_field keys_key_spilled] 1
+        assert_equal [expr {[get_info_field total_keys_dropped_at_completion] - $drops_before}] 1
+        assert_equal [r get ks:tog] "together_${padding}"
+        assert_equal [r dbsize] 1
+    }
+
+    test {KEYSPILL: a waiter blocked during spill keeps the dict entry} {
+        r flushall
+        set drops_before [get_info_field total_keys_dropped_at_completion]
+        r set ks:touch "touched_${padding}"
+        # Hold the spill completion in flight, then touch the key with a
+        # write. The write parks on the in-flight spill. When the completion
+        # lands, the waiter is the signal that the key is not cold: the
+        # entry must be kept so the drop does not race the re-execution.
+        r debug ext-storage-pause-completions 1
+        r debug spill ks:touch
+        set rd [valkey_deferring_client]
+        $rd set ks:touch "rewritten_${padding}"
+        wait_for_blocked_clients_count 1
+        r debug ext-storage-pause-completions 0
+        assert_equal [$rd read] "OK"
+        $rd close
+        assert_equal [r get ks:touch] "rewritten_${padding}"
+        assert_equal [expr {[get_info_field total_keys_dropped_at_completion] - $drops_before}] 0
+        assert_equal [r dbsize] 1
     }
 
     test {KEYSPILL: server alive after all tests (no crash)} {

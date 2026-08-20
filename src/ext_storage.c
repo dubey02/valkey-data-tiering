@@ -145,6 +145,7 @@ int ext_key_spill_enabled = 0;
 /* Flag: when set, evictionPoolPopulate samples only ONLY_FLASH placeholders */
 int ext_storage_drop_pool_active = 0;
 static long long total_keys_dropped_from_dict = 0;  /* demotions: dict entry removed, record stays on flash */
+static long long total_keys_dropped_at_completion = 0; /* subset of drops done inline at spill completion (together-spill) */
 static long long total_keys_rematerialized = 0;     /* placeholders re-inserted on dict miss */
 static long long kbc_keyspill_miss_fetch = 0;       /* dict misses routed to a flash consult */
 static long long kbc_keyspill_absent_consumed = 0;  /* dict misses short-circuited by confirmed-absent */
@@ -1013,6 +1014,21 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                         total_items_spilled_to_ext_storage++;
                         num_items_on_flash++;
                         extStorageSetState(db, key_name, TIERING_STATE_ONLY_FLASH, 0);
+
+                        /* Drop-at-completion: key and value spill together.
+                         * The LRU pool selected this key's value for spilling
+                         * because the key is cold, so reclaim the dict-side
+                         * remainder (dict slot + key + placeholder robj) in
+                         * the same step instead of waiting for the pressure
+                         * loop's stage 2. A blocked waiter means the key was
+                         * touched while the spill was in flight. It is not
+                         * cold, so keep the entry and let the waiter's
+                         * re-execution find the placeholder. */
+                        if (ext_key_spill_enabled && !blockedInUseClientsExistOnKey(key)) {
+                            if (extStorageDropDictEntry(db, key_name) == 0) {
+                                total_keys_dropped_at_completion++;
+                            }
+                        }
                     } else if (entry == NULL) {
                         /* Key was deleted during spill (shouldn't happen since we block DEL,
                          * but handle defensively). Remove state. */
@@ -1784,6 +1800,7 @@ sds genExternalStorageInfoString(sds info) {
         "ext_key_spill_enabled:%d\r\n"
         "keys_key_spilled:%lld\r\n"
         "total_keys_dropped_from_dict:%lld\r\n"
+        "total_keys_dropped_at_completion:%lld\r\n"
         "total_keys_rematerialized:%lld\r\n"
         "kbc_keyspill_miss_fetch:%lld\r\n"
         "kbc_keyspill_absent_consumed:%lld\r\n"
@@ -1792,6 +1809,7 @@ sds genExternalStorageInfoString(sds info) {
         ext_key_spill_enabled,
         keys_key_spilled,
         total_keys_dropped_from_dict,
+        total_keys_dropped_at_completion,
         total_keys_rematerialized,
         kbc_keyspill_miss_fetch,
         kbc_keyspill_absent_consumed,
