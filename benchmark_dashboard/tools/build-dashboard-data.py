@@ -26,6 +26,15 @@ DATASETS = {
     "mixed-rw/zipfian-1gb-ttl":      "zipfian-ttl-120",
     "mixed-rw/zipfian-1gb":          "zipfian-1gb",
     "mixed-rw/size-sweep-fc-100b":   "size-sweep-100b",
+    # Value Sizes tab (valid legs only: 500KB/5MB blocked by FC 1MB staging ceiling)
+    "mixed-rw/size-sweep-fc/datatype-string/item_size-5000": "size-sweep-5000",
+}
+
+# Tiering-latency configs -> data/tiering-latency/<stem>.*
+TL_DATASETS = {
+    "tiering-latency/idle":      "idle",
+    "tiering-latency/idle-hash": "idle-hash",
+    "tiering-latency/slam":      "slam",
 }
 
 def snapshots_keyspill(info_log):
@@ -75,5 +84,30 @@ def build(run_dir, out_dir):
                 f.writelines(lines)
         print(f"OK   {cfg} -> {stem}.* ({len(data)} samples)")
 
+def build_tl(run_dir, out_dir):
+    """Tiering-latency tab: data/tiering-latency/<stem>{.csv,-latency.csv,-server-latency.txt}"""
+    tl_dir = os.path.join(out_dir, "tiering-latency")
+    os.makedirs(tl_dir, exist_ok=True)
+    for cfg, stem in TL_DATASETS.items():
+        src = os.path.join(run_dir, cfg)
+        if not os.path.isdir(src):
+            print(f"SKIP {cfg} (missing)"); continue
+        shutil.copy(os.path.join(src, "metrics.csv"), os.path.join(tl_dir, stem + ".csv"))
+        out = open(os.path.join(src, "output.txt"), errors="ignore").read()
+        tp = re.search(r"Throughput:\s+(\d+)", out)
+        lat = re.search(r"Latency:\s+p50=([\d.]+)ms\s+p99=([\d.]+)ms\s+p99\.9=([\d.]+)ms\s+p100=([\d.]+)ms", out)
+        if tp and lat:
+            with open(os.path.join(tl_dir, stem + "-latency.csv"), "w") as f:
+                f.write("throughput_ops,p50_latency_ms,p99_latency_ms,p999_latency_ms,p100_latency_ms\n")
+                f.write(f"{tp.group(1)},{lat.group(1)},{lat.group(2)},{lat.group(3)},{lat.group(4)}\n")
+        fi = os.path.join(src, "final-info.txt")
+        if os.path.exists(fi):
+            lines = [l for l in open(fi, errors="ignore")
+                     if l.startswith("latency_percentiles_usec_")]
+            with open(os.path.join(tl_dir, stem + "-server-latency.txt"), "w") as f:
+                f.writelines(lines)
+        print(f"OK   {cfg} -> tiering-latency/{stem}.*")
+
 if __name__ == "__main__":
     build(sys.argv[1], sys.argv[2])
+    build_tl(sys.argv[1], sys.argv[2])
