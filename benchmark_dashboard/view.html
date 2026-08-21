@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Valkey Data Tiering — Benchmarks (unstable)</title>
+  <title>Valkey Data Tiering — Benchmarks (feat/key-spilling)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5"></script>
   <style>
@@ -137,7 +137,7 @@ const GITHUB_REPO = 'valkey-data-tiering';
 const DATA_PATH = 'benchmark_dashboard/data';
 
 // This branch's available scenarios (self-contained — no cross-branch manifest needed)
-const MY_SCENARIOS = ['policies', 'valuesizes', 'flashcache'];
+const MY_SCENARIOS = ['policies'];
 
 function rawUrl(branch, path) {
   return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${branch}/${path}`;
@@ -146,14 +146,14 @@ function rawUrl(branch, path) {
 // ============================================================
 // STATE
 // ============================================================
-const currentBranch = 'unstable';
+const currentBranch = 'feat/key-spilling';
 let currentScenario = 'policies';
 
 // ============================================================
 // SCENARIO TAB SYSTEM
 // ============================================================
 const ALL_SCENARIOS = [
-  { id: 'policies', label: 'Policies' },
+  { id: 'policies', label: 'Key Spilling' },
   { id: 'policymatrix', label: 'Policy Matrix' },
   { id: 'valuesizes', label: 'Value Sizes' },
   { id: 'flashcache', label: 'FlashCache Layer' },
@@ -239,8 +239,8 @@ const DATASETS = [
   { file: 'uniform-80-20.csv', label: 'Uniform 80/20', color: '#f97316' },
   { file: 'balanced-50-50.csv', label: 'Balanced 50/50', color: '#8b5cf6' },
   { file: 'zipfian-ttl-120.csv', label: 'Zipfian TTL=120', color: '#10b981' },
-  { file: 'size-sweep-500kb.csv', label: '500KB Values', color: '#ef4444' },
-  { file: 'size-sweep-500.csv', label: '500B (old sweep)', color: '#64748b' },
+  { file: 'zipfian-1gb.csv', label: 'Zipfian 1GB', color: '#ef4444' },
+  { file: 'size-sweep-100b.csv', label: '100B Values', color: '#64748b' },
 ];
 
 const METRICS = [
@@ -257,10 +257,14 @@ const METRICS = [
   'disk_read_merges_ps','disk_write_merges_ps','disk_r_await_ms','disk_w_await_ms',
   'disk_aqu_sz','disk_util_pct','disk_in_flight','disk_req_sz_kb',
   'throttle_total_throttled','throttle_queued_clients','throttle_current_rate','throttle_allowed_tps',
-  'spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes'
+  'spill_submitted_count','spill_serialized_count','mean_spill_ram','inflight_spill_ram_bytes',
+  'keys_key_spilled','total_keys_dropped_from_dict','total_keys_dropped_at_completion',
+  'total_keys_rematerialized','kbc_keyspill_miss_fetch','kbc_keyspill_absent_consumed',
+  'kbc_progressive_drain_runs','kbc_progressive_drain_resolved'
 ];
 
 const GROUPS = {
+  'Key Spilling': ['keys_key_spilled','total_keys_dropped_from_dict','total_keys_dropped_at_completion','total_keys_rematerialized','kbc_keyspill_miss_fetch','kbc_keyspill_absent_consumed','kbc_progressive_drain_runs','kbc_progressive_drain_resolved'],
   'Throughput': ['ops_per_sec','total_commands_delta','keyspace_hits','keyspace_misses'],
   'Memory': ['used_memory','used_memory_rss','maxmemory','mem_frag_ratio'],
   'Tiering': ['total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage','num_items_spilling_to_ext_storage','completion_read_ok','dram_value_hits','kbc_fetching_block','flash_admit_writes'],
@@ -274,6 +278,7 @@ const GROUPS = {
 };
 
 const DEFAULT_VISIBLE = new Set([
+  'keys_key_spilled','total_keys_dropped_at_completion',
   'ops_per_sec','used_memory','disk_util_pct',
   'total_num_items_spilled_to_ext_storage','total_num_items_fetched_from_ext_storage',
   'blocked_clients','valkey_cpu_total','_client_get_latency','_client_set_latency','_server_latency'
