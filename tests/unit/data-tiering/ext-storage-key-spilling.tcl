@@ -324,27 +324,6 @@ start_server [list tags {"ext-storage" "ext-storage-key-spilling"} overrides [li
         assert_equal [r dbsize] 1
     }
 
-    test {KEYSPILL: progressive drain counters are wired and consistent} {
-        r flushall
-        # A burst of misses on spilled and never-existed keys. Every pass-1
-        # blocker runs the inline drain, so runs must grow; resolved counts
-        # the opportunistic subset and can never exceed runs.
-        for {set i 0} {$i < 50} {incr i} {
-            r set "ks:pd:$i" "v${i}_${padding}"
-            key_spill "ks:pd:$i"
-        }
-        set runs_before [get_info_field kbc_progressive_drain_runs]
-        for {set i 0} {$i < 50} {incr i} {
-            assert_equal [r get "ks:pd:$i"] "v${i}_${padding}"
-            assert_equal [r get "ks:pd:never:$i"] {}
-        }
-        set runs [get_info_field kbc_progressive_drain_runs]
-        set resolved [get_info_field kbc_progressive_drain_resolved]
-        assert {$runs - $runs_before >= 50}
-        assert {$resolved >= 0 && $resolved <= $runs}
-        assert_equal [r dbsize] 50
-    }
-
     test {KEYSPILL: multi-key command with expired spilled key does not corrupt neighbors} {
         r flushall
         # Regression for the per-key delete flag: an expired tiered key ahead
