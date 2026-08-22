@@ -2949,6 +2949,8 @@ serverDb *createDatabase(int id) {
     db->watched_keys = dictCreate(&keylistDictType);
     /* keys_tiering_state removed — tiering state stored in robj->tiering_state */
     db->keys_confirmed_absent = hashtableCreate(&setHashtableType);
+    db->keys_spilled_count = 0;
+    db->keyspill_probe = hashtableCreate(&setHashtableType);
     db->id = id;
     resetDbExpiryState(db);
     return db;

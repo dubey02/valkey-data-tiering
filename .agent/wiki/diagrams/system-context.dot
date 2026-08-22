@@ -1,4 +1,4 @@
-// System context — NKS tiering. Source: src/storage.h, DATA-TIERING.md, ext_storage.c
+// System context — data tiering. Source: src/storage.h, DATA-TIERING.md, ext_storage.c
 // Render: dot -Tpng system-context.dot -o system-context.png
 digraph system_context {
     rankdir=TB;

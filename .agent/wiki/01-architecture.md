@@ -1,5 +1,5 @@
 ---
-title: NKS Data Tiering — Architecture
+title: Data Tiering — Architecture
 status: active
 sources:
   - src/ext_storage.c
@@ -97,7 +97,7 @@ edges:
     created: 2026-06-03
 ---
 
-# NKS Data Tiering — Architecture
+# Data Tiering — Architecture
 
 > The engine runs the state machine and spill/fetch decisions on the main thread; the
 > backend does disk I/O on its own thread(s); they communicate through a completion queue

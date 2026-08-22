@@ -1141,6 +1141,24 @@ void debugCommand(client *c) {
             VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_WRITE);
         total_items_spilling_to_ext_storage++;
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "keyspill") && c->argc == 3) {
+        /* DEBUG KEYSPILL <key> — drop the dict entry of an ONLY_FLASH key
+         * (key-spill demotion). The key then lives only on flash. */
+        if (!ext_data_enabled) {
+            addReplyError(c, "ext-storage-enabled is not set");
+            return;
+        }
+        if (!ext_key_spill_enabled) {
+            addReplyError(c, "ext-key-spill-enabled is not set");
+            return;
+        }
+        sds key = objectGetVal(c->argv[2]);
+        if (extStorageDropDictEntry(c->db, key) != 0) {
+            addReplyError(c, "key is not droppable (must exist and be in ONLY_FLASH state; "
+                             "use DEBUG SPILL first and wait for the spill to complete)");
+            return;
+        }
+        addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "force-free-primary-async") && c->argc == 3) {
         server.debug_force_free_primary_async = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);

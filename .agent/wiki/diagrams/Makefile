@@ -16,6 +16,14 @@
 DOT    ?= dot
 DOCKER ?= docker
 IMAGE  ?= mermaid-render:local
+# Graphviz resolves the label font (Helvetica) through fontconfig. When
+# FONTCONFIG_PATH is unset, some environments log "Fontconfig error: Cannot load
+# default config file" and silently fall back to a symbol font -- the diagram
+# renders with correct boxes and edges but every label comes out as dingbats.
+# Pin it so a bad render cannot be mistaken for a good one. Override if your
+# fontconfig lives elsewhere.
+FONTCONFIG_PATH ?= /etc/fonts
+export FONTCONFIG_PATH
 # SCALE = device-pixel multiplier for crisp (hi-DPI) PNGs; BG = page background.
 SCALE  ?= 3
 BG     ?= white

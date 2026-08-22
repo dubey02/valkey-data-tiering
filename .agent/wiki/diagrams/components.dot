@@ -1,4 +1,4 @@
-// Component graph — NKS tiering modules and engine touch-points.
+// Component graph — data tiering modules and engine touch-points.
 // Source: src/ext_storage*.{c,h}, src/storage.h, src/evict.c, object.c, rdb.c, blocked.c
 // Render: dot -Tpng components.dot -o components.png
 digraph components {

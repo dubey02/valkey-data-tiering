@@ -1,7 +1,6 @@
 # WIKI.md — Schema & Maintenance Guide
 
-This is the **schema layer** of an LLM-maintained wiki for Valkey **non-key-spilling
-(NKS) data tiering**. It tells any LLM agent how this wiki is structured and how to
+This is the **schema layer** of an LLM-maintained wiki for Valkey **data tiering**. It tells any LLM agent how this wiki is structured and how to
 keep it current. Read this file first in every session before editing the wiki.
 
 Pattern: [karpathy/llm-wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).
@@ -40,10 +39,11 @@ Pattern: [karpathy/llm-wiki](https://gist.github.com/karpathy/442a6bf555914893e9
 
 ## Scope
 
-- **NKS only.** Keys always stay in the dict; only *values* spill to flash.
+- **v1 scope: values only.** Keys always stay in the dict; only *values* spill to flash.
+  Key spilling is a possible future config and is out of scope for these pages.
 - **Ignore key-spilling entirely.** Do not document, compare against, or reference the
   key-spilling / DT branch. If a legacy source describes key-spilling, extract only the
-  NKS-relevant parts.
+  in-scope parts.
 
 ## Directory structure
 
@@ -52,7 +52,7 @@ Pattern: [karpathy/llm-wiki](https://gist.github.com/karpathy/442a6bf555914893e9
   WIKI.md            # this file — schema
   index.md           # catalog: every page, one-line summary, by category
   log.md             # append-only timeline: ## [date] ingest|query|lint | <what>
-  00-overview.md     # L0 — what NKS tiering is, mental model
+  00-overview.md     # L0 — what data tiering is, mental model
   01-architecture.md # L1 — system context, threads, event-loop integration
   components/        # L2 — one page per subsystem
   interfaces/        # L3 — precise API reference, 1:1 with headers

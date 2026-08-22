@@ -270,6 +270,16 @@ static uint64_t getAccessCount(sds key) {
     dictEntry *de = dictFind(twohit_counts, key);
     return de ? dictGetUnsignedIntegerVal(de) : 0;
 }
+/* Key spilling (see ext_storage.h). Gated by ext-key-spill-enabled. */
+int ext_key_spill_enabled = 0;
+/* Flag: when set, evictionPoolPopulate samples only ONLY_FLASH placeholders */
+int ext_storage_drop_pool_active = 0;
+static long long total_keys_dropped_from_dict = 0;  /* demotions: dict entry removed, record stays on flash */
+static long long total_keys_dropped_at_completion = 0; /* subset of drops done inline at spill completion (together-spill) */
+static long long total_keys_rematerialized = 0;     /* placeholders re-inserted on dict miss */
+static long long kbc_keyspill_miss_fetch = 0;       /* dict misses routed to a flash consult */
+static long long kbc_keyspill_absent_consumed = 0;  /* dict misses short-circuited by confirmed-absent */
+#define KEYSPILL_DROP_BATCH 512 /* max placeholder drops per spill pass (yield to event loop) */
 
 // Memory pressure metrics (non-static: accessed from evict.c)
 long long oom_reject_write_count = 0;
@@ -395,15 +405,30 @@ void extStorageRecoveryItem(void *engine_ctx, uint32_t db_id,
     UNUSED(engine_ctx);
     UNUSED(vlen);
 
+    int logical_id = extStorageLogicalDbId((int)db_id);
+    serverAssert(logical_id >= 0 && logical_id < server.dbnum);
+    serverDb *db = createDatabaseIfNeeded(logical_id);
+
+    /* Key spilling: INDEX-ONLY recovery. No dict entry is materialized —
+     * the key lives implicitly on flash. A later dict miss (gated by
+     * keys_spilled_count > 0) re-materializes a placeholder probe and the
+     * standard fetch machinery restores the value (see
+     * extStorageRematerializePlaceholder / extStorageKeyspillSettleProbe).
+     * This skips ALL per-key DRAM allocation at boot: no key sds, no robj,
+     * no dict insert — the FC index rebuilt by the backend scan is the only
+     * per-key state. */
+    if (ext_key_spill_enabled) {
+        db->keys_spilled_count++;
+        num_items_on_flash++;
+        fast_boot_recovered_keys++;
+        return;
+    }
+
     int obj_type = rdbTypeToObjType(value_first_byte);
     if (obj_type < 0) {
         fast_boot_skipped_items++;
         return;
     }
-
-    int logical_id = extStorageLogicalDbId((int)db_id);
-    serverAssert(logical_id >= 0 && logical_id < server.dbnum);
-    serverDb *db = createDatabaseIfNeeded(logical_id);
 
     sds key_sds = sdsnewlen(key, klen);
     robj *val = createObject(OBJ_STRING, sdsnewlen("", 0));
@@ -431,6 +456,86 @@ long long extStorageFastBootRecoveredKeys(void) {
 int extStorageFastBootPerformed(void) {
     extern int storageRecoveryPerformed(void); /* storage/storage_dispatch.c */
     return storageRecoveryPerformed();
+}
+
+/* ---------------------------------------------------------------------------
+ * Key spilling — demotion and re-materialization
+ *
+ * extStorageDropDictEntry: remove the dict entry of an ONLY_FLASH key. The
+ * backend record (key + serialized value + TTL, written at spill time) is the
+ * complete key-spilled representation, so nothing is sent to the backend.
+ * ONLY_FLASH guarantees no client waits on the key (waiters exist only on
+ * COPYING_* / PENDING_* states) and no IO is in flight.
+ *
+ * extStorageRematerializePlaceholder: inverse first step on a dict miss.
+ * Re-inserts a tiered placeholder in ONLY_FLASH state; the standard fetch
+ * machinery (preCommandExec submit, READ completion restore / NOT_FOUND
+ * cleanup, sync-fetch rescue) then applies unchanged.
+ * ---------------------------------------------------------------------------*/
+
+int extStorageDropDictEntry(serverDb *db, sds key) {
+    if (!ext_key_spill_enabled) return -1;
+    int dict_index = getKVStoreIndexForKey(key);
+    void *found = NULL;
+    if (!kvstoreHashtableFind(db->keys, dict_index, key, &found)) return -1;
+    dbEntry *entry = found;
+    if (!objectIsTiered(entry) || entry->tiering_state != TIERING_STATE_ONLY_FLASH) return -1;
+
+    /* A stale confirmed-absent marker (from an earlier throttled submit) would
+     * make the miss path deny a key that provably exists on flash. Purge it. */
+    void *stale = NULL;
+    if (hashtablePop(db->keys_confirmed_absent, key, &stale)) sdsfree((sds)stale);
+
+    if (entry->type == OBJ_HASH) dbUntrackKeyWithVolatileItems(db, entry);
+
+    /* Main-thread-synchronous: nothing can interleave between the find above
+     * and this pop. */
+    hashtablePosition pos;
+    void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, key, &pos);
+    serverAssert(ref != NULL && *ref == (void *)entry);
+    kvstoreHashtableTwoPhasePopDelete(db->keys, dict_index, &pos);
+    if (objectGetExpire(entry) != -1) {
+        bool deleted = kvstoreHashtableDelete(db->expires, dict_index, key);
+        serverAssert(deleted);
+    }
+    decrRefCount(entry); /* frees placeholder sds + robj (tiered-aware) */
+
+    db->keys_spilled_count++;
+    total_keys_dropped_from_dict++;
+    return 0;
+}
+
+dbEntry *extStorageRematerializePlaceholder(serverDb *db, sds key) {
+    robj *placeholder = createObject(OBJ_STRING, sdsnewlen("", 0));
+    /* Mirror dbAddInternal minus signalKeyAsReady and the keyspace "new"
+     * notification — the key is returning from flash, not being created. */
+    placeholder = objectSetKeyAndExpire(placeholder, key, -1);
+    initObjectLRUOrLFU(placeholder);
+    int dict_index = getKVStoreIndexForKey(key);
+    if (!kvstoreHashtableAdd(db->keys, dict_index, placeholder)) {
+        decrRefCount(placeholder);
+        return NULL;
+    }
+    placeholder->encoding = OBJ_ENCODING_TIERED;
+    placeholder->tiering_state = TIERING_STATE_ONLY_FLASH;
+    /* keys_spilled_count is NOT decremented here: this placeholder is a probe
+     * — the key may never have been key-spilled at all. The READ completion
+     * settles the count: found -> the key was key-spilled, decrement;
+     * NOT_FOUND -> it never was, count untouched. */
+    hashtableAdd(db->keyspill_probe, sdsdup(key));
+    total_keys_rematerialized++;
+    return placeholder;
+}
+
+/* READ completion for `key` observed. If the key had an in-flight
+ * rematerialization probe, consume it and settle the key-spilled count.
+ * Returns 1 if a probe was consumed, 0 otherwise. */
+int extStorageKeyspillSettleProbe(serverDb *db, sds key, int found_on_flash) {
+    void *probe = NULL;
+    if (!hashtablePop(db->keyspill_probe, key, &probe)) return 0;
+    sdsfree((sds)probe);
+    if (found_on_flash && db->keys_spilled_count > 0) db->keys_spilled_count--;
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -793,6 +898,29 @@ static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_del
         return 1;
     }
 
+    /* Key not in dict. With key spilling enabled it may still live on flash
+     * with no DRAM trace. */
+    if (ext_key_spill_enabled && db->keys_spilled_count > 0 && extStorageBridge_isReady()) {
+        /* One-shot true-miss marker left by a NOT_FOUND completion — consume
+         * it so the re-executed command sees a plain miss instead of looping
+         * back into a fetch. */
+        void *absent = NULL;
+        if (hashtablePop(db->keys_confirmed_absent, key, &absent)) {
+            sdsfree((sds)absent);
+            kbc_keyspill_absent_consumed++;
+            kbc_confirmed_absent_count++;
+            return 0;
+        }
+        /* Re-materialize a placeholder in ONLY_FLASH; the caller's existing
+         * ONLY_FLASH branch submits the fetch (or delete) and the standard
+         * completion path restores the value or confirms absence. */
+        if (extStorageRematerializePlaceholder(db, key) != NULL) {
+            kbc_keyspill_miss_fetch++;
+            kbc_key_may_exist_true_count++;
+            return 1;
+        }
+    }
+
     /* Key not in dict — it doesn't exist (TRUE MISS). Non-key-spilling keeps all
      * keys in the dict, so if it's not there, it's not on flash either. This is NOT
      * a DRAM hit: count it as confirmed-absent and EXCLUDE it from dram_value_hits
@@ -809,14 +937,16 @@ static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_del
  * For keys in COPYING_TO_FLASH/COPYING_TO_MEMORY/PENDING_EVICT: just blocks.
  * ---------------------------------------------------------------------------*/
 
+static int scanKeysAndSubmit(client *c, serverDb *current_db, keyReference *keys, int num_keys,
+                             bool is_write_cmd, bool cmd_is_delete, robj **blocking_keys);
+
 int preCommandExec(client *c) {
     if (!ext_data_enabled) return CMD_FILTER_ACCEPT;
 
     /* NOTE: Completions are processed from beforeSleep() and the 1ms timer,
-     * NOT here. Processing completions here causes a race: a spill completion
-     * can mark a key TIERED, then keyBlocksClient misses it for a concurrent
-     * client in the same event loop tick. dt-poc also processes completions
-     * only from beforeSleep, not from preCommandExec. */
+     * NOT here. Processing completions here races the key scan: a spill
+     * completion can nullify a key the scan already cleared as resident,
+     * so the command would execute against a freed value. */
 
     /* Determine which keys block this client */
     serverDb *current_db = c->db;
@@ -895,11 +1025,39 @@ int preCommandExec(client *c) {
     /* Detect DEL/UNLINK commands for optimized delete path */
     bool is_delete_cmd = (c->cmd->proc == delCommand || c->cmd->proc == unlinkCommand);
 
-    int num_keys_to_block = 0;
     robj **blocking_keys = (robj **)zmalloc(sizeof(robj *) * num_keys);
+
+    int num_keys_to_block = scanKeysAndSubmit(c, current_db, keys, num_keys, is_write_cmd,
+                                              is_delete_cmd, blocking_keys);
+
+    getKeysFreeResult(&result);
+    if (num_keys_to_block > 0) {
+        c->flag.pending_command = 1;
+        blockClientInUseOnKeys(c, num_keys_to_block, blocking_keys);
+    }
+    zfree(blocking_keys);
+    return num_keys_to_block > 0 ? CMD_FILTER_REJECT : CMD_FILTER_ACCEPT;
+}
+
+/* ---------------------------------------------------------------------------
+ * scanKeysAndSubmit — one full pass of preCommandExec's blocking decision
+ *
+ * Evaluates every key of the command, collects blockers into blocking_keys,
+ * and submits READ/DELETE requests for keys that need IO. Returns the number
+ * of blocking keys. Parking the client is the caller's job.
+ * ---------------------------------------------------------------------------*/
+static int scanKeysAndSubmit(client *c, serverDb *current_db, keyReference *keys, int num_keys,
+                             bool is_write_cmd, bool cmd_is_delete, robj **blocking_keys) {
+    int num_keys_to_block = 0;
 
     for (int i = 0; i < num_keys; i++) {
         sds key_str = objectGetVal(c->argv[keys[i].pos]);
+
+        /* Per-key delete flag. The probe and TTL conversions below rewrite
+         * it. The rewrite must not leak into the next key of a multi-key
+         * command: an expired key would convert a later key's READ into a
+         * destructive DELETE. */
+        bool is_delete_cmd = cmd_is_delete;
 
         if (!keyBlocksClient(current_db, key_str, is_write_cmd, is_delete_cmd)) {
             continue;
@@ -927,6 +1085,18 @@ int preCommandExec(client *c) {
                 msg_type = VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_DELETE;
             } else {
                 msg_type = VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ;
+            }
+
+            /* Key-spill probe: existence is unknown, so even DEL must go
+             * through READ — a DELETE completion cannot distinguish
+             * never-existed from deleted, and DEL must reply 0 for the
+             * former. Fetch is destructive (read-and-delete), so a found
+             * record is consumed and the re-executed DEL deletes the
+             * restored DRAM entry with the correct reply. */
+            void *probe_found;
+            if (ext_key_spill_enabled && hashtableFind(current_db->keyspill_probe, key_str, &probe_found)) {
+                msg_type = VALKEYMODULE_EXTERNAL_STORAGE_MSG_TYPE_READ;
+                is_delete_cmd = false;
             }
 
             /* Fix: check TTL before fetching from flash. If key is expired,
@@ -975,13 +1145,7 @@ int preCommandExec(client *c) {
          * just block — IO is already in-flight, no new request needed. */
     }
 
-    getKeysFreeResult(&result);
-    if (num_keys_to_block > 0) {
-        c->flag.pending_command = 1;
-        blockClientInUseOnKeys(c, num_keys_to_block, blocking_keys);
-    }
-    zfree(blocking_keys);
-    return num_keys_to_block > 0 ? CMD_FILTER_REJECT : CMD_FILTER_ACCEPT;
+    return num_keys_to_block;
 }
 
 
@@ -1064,6 +1228,21 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                         total_items_spilled_to_ext_storage++;
                         num_items_on_flash++;
                         extStorageSetState(db, key_name, TIERING_STATE_ONLY_FLASH, 0);
+
+                        /* Drop-at-completion: key and value spill together.
+                         * The LRU pool selected this key's value for spilling
+                         * because the key is cold, so reclaim the dict-side
+                         * remainder (dict slot + key + placeholder robj) in
+                         * the same step instead of waiting for the pressure
+                         * loop's stage 2. A blocked waiter means the key was
+                         * touched while the spill was in flight. It is not
+                         * cold, so keep the entry and let the waiter's
+                         * re-execution find the placeholder. */
+                        if (ext_key_spill_enabled && !blockedInUseClientsExistOnKey(key)) {
+                            if (extStorageDropDictEntry(db, key_name) == 0) {
+                                total_keys_dropped_at_completion++;
+                            }
+                        }
                     } else if (entry == NULL) {
                         /* Key was deleted during spill (shouldn't happen since we block DEL,
                          * but handle defensively). Remove state. */
@@ -1082,6 +1261,7 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                 if (state == TIERING_STATE_PENDING_EVICT) {
                     /* Eviction was requested while fetch was in-flight.
                      * Discard fetched value and evict the key. */
+                    if (ext_key_spill_enabled) extStorageKeyspillSettleProbe(db, key_name, msg->value != NULL);
                     completion_pending_evict_count++;
                     if (msg->value != NULL) {
                         decrRefCount((robj*)msg->value);
@@ -1102,6 +1282,9 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
 
                 robj *new_value = (robj*)msg->value;
                 if (new_value != NULL) {
+                    /* The record existed on flash — a rematerialization probe
+                     * (if any) is confirmed: the key WAS key-spilled. */
+                    if (ext_key_spill_enabled) extStorageKeyspillSettleProbe(db, key_name, 1);
                     dbEntry *entry = dbFind(db, key_name);
 
                     /* Check if key expired while being fetched — don't promote,
@@ -1341,7 +1524,10 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                      * branch re-marks it ONLY_FLASH forever). Live-reproduced
                      * via SWAPDB; also reachable via real FlashCache GC. */
                     completion_read_miss++;
-                    if (num_items_on_flash > 0) num_items_on_flash--;
+                    /* A missed probe for a never-spilled key was never counted
+                     * in num_items_on_flash — don't decrement for it. */
+                    int was_probe = ext_key_spill_enabled ? extStorageKeyspillSettleProbe(db, key_name, 0) : 0;
+                    if (!was_probe && num_items_on_flash > 0) num_items_on_flash--;
                     hashtableAdd(db->keys_confirmed_absent, sdsdup(key_name));
                     extStorageRemoveState(db, key_name);
                     dbEntry *miss_entry = dbFind(db, key_name);
@@ -1863,6 +2049,34 @@ static long long spillFillToProjected(void) {
         if (spill_submitted >= 64) break;  /* cold-start brake: yield to event loop */
     }
     ext_storage_spill_pool_active = 0;
+
+    /* Stage 2 — key spilling. Value spill alone could not reach the setpoint
+     * (candidate exhaustion or submit backpressure above). Reclaim the
+     * dict-side remainder of already-spilled keys (dict slot + key + tiered
+     * placeholder) by dropping their entries; the flash record is already the
+     * complete key-spilled representation. Drops free RAM synchronously, so
+     * projected memory is a live loop input here (unlike async value spills). */
+    if (ext_key_spill_enabled && extStorageProjectedMemory() > server.maxmemory) {
+        ext_storage_drop_pool_active = 1;
+        int drops_this_pass = 0;
+        int drop_skipped = 0;
+        while (extStorageProjectedMemory() > server.maxmemory) {
+            int drop_dbid;
+            int drop_slot;
+            sds drop_key = findBestEvictionCandidate(spillPoolLRU, &drop_dbid, &drop_slot);
+            if (drop_key == NULL) break;
+            /* Pool may carry stale stage-1 candidates (ONLY_MEMORY keys);
+             * the drop validates state and we skip, bounded like stage 1. */
+            if (extStorageDropDictEntry(server.db[drop_dbid], drop_key) != 0) {
+                if (++drop_skipped >= EVPOOL_SIZE) break;
+                continue;
+            }
+            drop_skipped = 0;
+            if (++drops_this_pass >= KEYSPILL_DROP_BATCH) break; /* yield to event loop */
+        }
+        ext_storage_drop_pool_active = 0;
+    }
+
     return total_items_spilling_to_ext_storage;
 }
 
@@ -2099,6 +2313,25 @@ void extStorageFreeTransientValues(void) {
 
 sds genExternalStorageInfoString(sds info) {
     if (!ext_data_enabled) return info;
+    long long keys_key_spilled = 0;
+    for (int i = 0; i < server.dbnum; i++) {
+        if (server.db[i]) keys_key_spilled += server.db[i]->keys_spilled_count;
+    }
+    info = sdscatprintf(info,
+        "ext_key_spill_enabled:%d\r\n"
+        "keys_key_spilled:%lld\r\n"
+        "total_keys_dropped_from_dict:%lld\r\n"
+        "total_keys_dropped_at_completion:%lld\r\n"
+        "total_keys_rematerialized:%lld\r\n"
+        "kbc_keyspill_miss_fetch:%lld\r\n"
+        "kbc_keyspill_absent_consumed:%lld\r\n",
+        ext_key_spill_enabled,
+        keys_key_spilled,
+        total_keys_dropped_from_dict,
+        total_keys_dropped_at_completion,
+        total_keys_rematerialized,
+        kbc_keyspill_miss_fetch,
+        kbc_keyspill_absent_consumed);
     info = sdscatprintf(info,
         "ext_storage_fast_boot:%d\r\n"
         "fast_boot_recovered_keys:%lld\r\n"

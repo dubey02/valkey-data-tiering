@@ -961,6 +961,14 @@ int blockedInUseClientWithPendingDeleteExists(robj *key) {
     return 0;
 }
 
+/* Return 1 if any client is blocked in-use on this key. Used by data
+ * tiering's drop-at-completion path: a waiter means the key was touched
+ * while its spill was in flight, so it is not cold and its dict entry
+ * should be kept. */
+int blockedInUseClientsExistOnKey(robj *key) {
+    return keyToClients_getBlockedClientsList(key) != NULL;
+}
+
 /* Returns 1 if any blocked-in-use client with a pending DEL or UNLINK
  * targets database id1 or id2. Used by SWAPDB's data-tiering guard: a
  * blocked DEL re-executes against its logical db index after its flash

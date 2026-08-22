@@ -148,6 +148,7 @@ static struct config {
     struct hdr_histogram *latency_histogram;
     struct hdr_histogram *current_sec_latency_histogram;
     struct hdr_histogram *rps_histogram;
+    const char *latency_dump; /* --latency-dump <file>: write full hdr percentile spectrum */
     _Atomic int is_fetching_slots;
     _Atomic int is_updating_slots;
     _Atomic int slots_last_update;
@@ -1302,6 +1303,15 @@ static void showReport(void) {
         printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
         printf("%s: %.2f requests per second, p50=%.3f msec\n", config.title, reqpersec, p50);
     }
+    if (config.latency_dump) {
+        FILE *fp = fopen(config.latency_dump, "w");
+        if (fp) {
+            /* Value unit: microseconds (values recorded in usec). CLASSIC
+             * format prints value/percentile/total_count per line. */
+            hdr_percentiles_print(config.latency_histogram, fp, 10, 1.0, CLASSIC);
+            fclose(fp);
+        }
+    }
 }
 
 static void initBenchmarkThreads(void) {
@@ -1764,6 +1774,9 @@ int parseOptions(int argc, char **argv) {
                 exit(1);
             }
             config.requests = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--latency-dump")) {
+            if (lastarg) goto invalid;
+            config.latency_dump = argv[++i];
         } else if (!strcmp(argv[i], "--duration")) {
             if (lastarg) goto invalid;
             if (config.requests > 0) {

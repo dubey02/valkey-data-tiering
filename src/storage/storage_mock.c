@@ -181,11 +181,12 @@ static void *fc_worker(void *arg) {
             uint32_t bucket = fc_hash(req->db_id, key_bytes, key_len);
 
             pthread_mutex_lock(&ctx->ht_lock);
-            fcEntry *e = ctx->buckets[bucket];
-            while (e) {
-                if (e->db_id == req->db_id && e->klen == (size_t)key_len &&
-                    memcmp(e->key, key_bytes, key_len) == 0) break;
-                e = e->next;
+            fcEntry **gpp = &ctx->buckets[bucket];
+            fcEntry *e = NULL;
+            while (*gpp) {
+                if ((*gpp)->db_id == req->db_id && (*gpp)->klen == (size_t)key_len &&
+                    memcmp((*gpp)->key, key_bytes, key_len) == 0) { e = *gpp; break; }
+                gpp = &(*gpp)->next;
             }
             if (e) {
                 /* Deserialize value bytes back to robj* */
@@ -193,6 +194,12 @@ static void *fc_worker(void *arg) {
                 comp.vlen = e->vlen;
                 comp.expire_ms = e->expire_ms;
                 comp.status = STORAGE_OK;
+                /* Real FlashCache FC_READ is destructive (read-and-delete):
+                 * logReadFromIndexEntry removes the index entry for READ and
+                 * DELETE alike. Mirror that, or stale flash copies linger and
+                 * (with key spilling) resurrect deleted keys via the miss path. */
+                *gpp = e->next;
+                storage_free(e->key); storage_free(e->value); storage_free(e);
             } else {
                 comp.status = STORAGE_NOT_FOUND;
             }

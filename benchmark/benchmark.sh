@@ -32,6 +32,7 @@ METRICS=true
 TAG="$(date +%Y%m%d-%H%M%S)"
 REMOTE=false
 EZBENCH=false
+KEYSPILL=false
 CONFIG_NAME=default
 
 # Parse flags
@@ -41,6 +42,7 @@ while [[ "${1:-}" == --* ]]; do
         --tag) TAG="$2"; shift 2 ;;
         --remote) REMOTE=true; shift ;;
         --ezbench) EZBENCH=true; shift ;;
+        --keyspill) KEYSPILL=true; shift ;;
         --config) CONFIG_NAME="$2"; shift 2 ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
@@ -344,6 +346,7 @@ if [ "$REMOTE" = true ]; then
     echo "→ Running benchmark on remote host..."
     REMOTE_FLAGS=""
     [ "$METRICS" = false ] && REMOTE_FLAGS="--no-metrics"
+    [ "$KEYSPILL" = true ] && REMOTE_FLAGS="$REMOTE_FLAGS --keyspill"
     REMOTE_FLAGS="$REMOTE_FLAGS --tag $TAG --config $CONFIG_NAME"
     $SSH "cd $EC2_REMOTE_DIR && chmod +x benchmark.sh valkey-server valkey-cli valkey-benchmark tools/trace-replay tools/metrics-collector/metrics-collector.sh 2>/dev/null; ./benchmark.sh $REMOTE_FLAGS $*"
 
@@ -381,6 +384,12 @@ run_scenario() {
     local CONFIG="$DIR/scenarios/$FOLDER/configs/$CFG_NAME.env"
     [ -f "$CONFIG" ] || { echo "Config not found: $CONFIG"; return 1; }
     source "$CONFIG"
+
+    # --keyspill: enable key spilling on top of whatever the config sets.
+    # Only meaningful for tiering configs; harmless no-op flag otherwise.
+    if [ "$KEYSPILL" = true ] && [[ "${SERVER_EXTRA_ARGS:-}" == *--ext-storage-enabled* ]]; then
+        SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS} --ext-key-spill-enabled yes"
+    fi
 
     # ─── Generic sweep support ───
     if [[ -z "${_SWEEP_ACTIVE:-}" ]]; then

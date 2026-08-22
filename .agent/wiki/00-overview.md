@@ -1,5 +1,5 @@
 ---
-title: NKS Data Tiering — Overview
+title: Data Tiering — Overview
 status: active
 sources:
   - DATA-TIERING.md
@@ -45,10 +45,11 @@ edges:
     created: 2026-06-05
 ---
 
-# NKS Data Tiering — Overview
+# Data Tiering — Overview
 
-> Non-key-spilling (NKS) tiering keeps every key in the dict and spills only its *value*
+> Data tiering keeps every key in the dict and spills only its *value*
 > to external storage (flash), so keyspace metadata operations never touch disk.
+> Eventually key-spilling can be supported, but v1 is scoped to retaining keys in memory.
 
 ![System context](diagrams/system-context.png)
 
@@ -74,8 +75,9 @@ regardless of whether the command actually needs the value.
 | `DEL` / `UNLINK` | async delete from flash, **no fetch** ([delete](flows/delete.md)) |
 | `GET` / `SET` / `EXISTS` / `TYPE` / `TTL` / `EXPIRE` / any single-key command | **block + fetch** the value, then execute |
 
-Because the key never leaves the dict, NKS still avoids the bloom filter that key-spilling needs
-to answer key-existence, and `SCAN`/`DBSIZE`/`DEL` never touch flash. **This wiki documents NKS only.**
+Because the key never leaves the dict, v1 avoids the bloom filter that key-spilling would need
+to answer key-existence, and `SCAN`/`DBSIZE`/`DEL` never touch flash. **This wiki documents the
+v1 (value-only) design.**
 
 > ⚠️ CONTRADICTION: `DATA-TIERING.md` describes metadata commands (`EXISTS`/`TYPE`/`TTL`) as
 > answerable from RAM with no fetch — the intended payoff of keeping keys in the dict. The

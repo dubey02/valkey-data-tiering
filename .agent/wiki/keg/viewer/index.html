@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>KEG — NKS Data Tiering Wiki Graph</title>
+<title>KEG — Data Tiering Wiki Graph</title>
 <script>
 window.onerror = function (m, s, l, c, e) {
   var d = document.createElement("pre");
@@ -47,7 +47,8 @@ window.onerror = function (m, s, l, c, e) {
 <body>
 <div id="app">
   <div id="sidebar">
-    <h1>KEG — NKS Tiering Graph</h1>
+    <h1>KEG — Data Tiering Graph</h1>
+    <a href="../../docs/index.html" style="display:block;margin:0 0 8px;padding:5px 8px;background:#313244;border:1px solid #45475a;border-radius:4px;color:#a6e3a1;text-decoration:none;font-size:11px;text-align:center">📖 Book view — read the wiki top-to-bottom</a>
     <div>
       <span class="mode-tab active" data-mode="graph">Graph</span>
       <span class="mode-tab" data-mode="triage">Triage</span>
@@ -235,12 +236,13 @@ function openPage(id, record) {
   if (record !== false && docCur && docCur !== id) docHist.push(docCur);
   docCur = id;
   document.getElementById("doc-back").style.visibility = docHist.length ? "visible" : "hidden";
+  const WIKI_ROOT = "../../";  // viewer lives at keg/viewer/; pages resolve from the wiki root
   const dir = id.includes("/") ? id.slice(0, id.lastIndexOf("/")) : "";
-  fetch("/" + id).then(r => r.ok ? r.text() : Promise.reject(r.status)).then(t => {
+  fetch(WIKI_ROOT + id).then(r => r.ok ? r.text() : Promise.reject(r.status)).then(t => {
     t = t.replace(/^---\n[\s\S]*?\n---\n/, "");                       // drop frontmatter
     let html = marked.parse(t);
-    const prefix = dir ? `/${dir}/` : "/";
-    html = html.replace(/(src|href)="(?!https?:|\/|#)([^"]+)"/g, `$1="${prefix}$2"`); // relative -> root-absolute
+    const prefix = WIKI_ROOT + (dir ? `${dir}/` : "");
+    html = html.replace(/(src|href)="(?!https?:|\/|#)([^"]+)"/g, `$1="${prefix}$2"`); // relative -> wiki-root-relative
     document.getElementById("doc-title").textContent = id;
     document.getElementById("doc-body").innerHTML = html;
     document.getElementById("doc").style.display = "block";

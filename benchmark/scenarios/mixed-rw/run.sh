@@ -137,17 +137,51 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 if [ "$DATATYPE" = "string" ]; then
     echo "[mixed-rw] Populating $KEYSPACE keys (sequential, OOM-resilient)..."
+    # Cap the populate's in-flight payload burst at ~2% of maxmemory. With
+    # large values (5MB legs) the default 50 concurrent writers put a
+    # ~250MB burst against maxmemory. Raw memory then rides the OOM-reject
+    # band faster than the spill controller can drain, and every retry
+    # rewrites already-spilled keys. Concurrency must shrink as item size
+    # grows: burst = clients * item_size.
+    _mm_raw="${MAXMEMORY%[bB]}"
+    _mm_bytes=$(numfmt --from=iec "${_mm_raw^^}" 2>/dev/null || echo $((512*1024*1024)))
+    _burst_budget=$(( _mm_bytes / 50 ))
+    _item_bytes=${ITEM_SIZE:-${DATASIZE:-400}}
+    _max_pop_clients=$(( _burst_budget / (_item_bytes > 0 ? _item_bytes : 1) ))
+    [ "$_max_pop_clients" -lt 1 ] && _max_pop_clients=1
+    if [ "$POPULATE_CLIENTS" -gt "$_max_pop_clients" ]; then
+        echo "[mixed-rw] Capping populate clients $POPULATE_CLIENTS -> $_max_pop_clients (item_size=$_item_bytes, burst budget=${_burst_budget}B)"
+        POPULATE_CLIENTS=$_max_pop_clients
+    fi
+    # Keys accounted in the keyspace: dict-resident plus key-spilled. With
+    # key spilling enabled, demoted keys leave the dict but remain on flash,
+    # so DBSIZE alone undercounts a fully populated keyspace.
+    effective_keys() {
+        local db ks
+        db=$(cli DBSIZE | grep -oP '[0-9]+')
+        ks=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1)
+        echo $(( ${db:-0} + ${ks:-0} ))
+    }
     for attempt in $(seq 1 100); do
         "$BENCH" -h "$VALKEY_HOST" -p "$VALKEY_PORT" \
             $SET_CMD -n "$KEYSPACE" -r "$KEYSPACE" $SET_CMD_ARGS $KS_FLAG \
             --sequential -c "$POPULATE_CLIENTS" -q $SET_CMD_TAIL >> "$RESULTS/populate.txt" 2>&1 || true
         sleep 2
-        DBSIZE=$(cli DBSIZE | grep -oP '[0-9]+')
+        # No-tiering baseline: dataset intentionally exceeds maxmemory; one full
+        # populate pass + active evictions == done (full keyspace can never be resident).
+        if [ "${POPULATE_ACCEPT_EVICTIONS:-0}" = "1" ]; then
+            EVICTED=$(cli INFO stats | grep -oP '^evicted_keys:\K[0-9]+' | head -1)
+            if [ "${EVICTED:-0}" -gt 0 ]; then
+                echo "[mixed-rw] Populate complete (eviction steady-state): dbsize=$(effective_keys) evicted=$EVICTED (attempt $attempt)"
+                break
+            fi
+        fi
+        DBSIZE=$(effective_keys)
         if [ "$DBSIZE" -ge "$KEYSPACE" ]; then
-            echo "[mixed-rw] Populate complete: DBSIZE=$DBSIZE (attempt $attempt)"
+            echo "[mixed-rw] Populate complete: keys=$DBSIZE (attempt $attempt)"
             break
         fi
-        echo "[mixed-rw] Populate attempt $attempt: DBSIZE=$DBSIZE/$KEYSPACE — retrying..."
+        echo "[mixed-rw] Populate attempt $attempt: keys=$DBSIZE/$KEYSPACE — retrying..."
     done
 
     # ── Workload: parallel GET + SET ──
@@ -247,10 +281,14 @@ else
 
     POP_ERRORS=$(grep -hoEi 'errors: [0-9]+' "$TMPDIR"/pop_*.txt 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}' || true)
     POP_ERRORS=${POP_ERRORS:-0}
+    # Count dict-resident plus key-spilled keys: with key spilling enabled,
+    # demoted keys leave the dict but remain on flash.
     DBSIZE=$(cli DBSIZE | grep -oP '[0-9]+')
+    KEYSPILLED=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1)
+    DBSIZE=$(( ${DBSIZE:-0} + ${KEYSPILLED:-0} ))
     OOM_REJECTS=$(cli INFO everything 2>/dev/null | grep -oP 'oom_reject_write_count:\K[0-9]+' || echo 0)
     OOM_REJECTS=${OOM_REJECTS:-0}
-    echo "[mixed-rw] Population: DBSIZE=$DBSIZE/$KEYSPACE pipe_errors=$POP_ERRORS oom_rejects=$OOM_REJECTS"
+    echo "[mixed-rw] Population: keys=$DBSIZE/$KEYSPACE pipe_errors=$POP_ERRORS oom_rejects=$OOM_REJECTS"
 
     if [ "$POP_ERRORS" -gt 0 ] || [ "$OOM_REJECTS" -gt 0 ] || [ "$DBSIZE" -lt "$KEYSPACE" ]; then
         echo "[mixed-rw] POPULATE ABORTED (OOM hard cap) — skipping workload."
