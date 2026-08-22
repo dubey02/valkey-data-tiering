@@ -52,6 +52,41 @@ typedef struct flashcacheRecoveryStats {
  * -1 on IO error or if the staging buffer is not empty. */
 int logWriteSuperblock(struct flashcacheLog *log, char const *superblock_filename);
 
+/* ---------------------------------------------------------------------------
+ * Index reflection (fast boot without a log scan).
+ *
+ * At clean shutdown, AFTER the staging buffer is drained, logWriteIndexFile()
+ * serializes the in-memory index of every database (bucket geometry + the
+ * 8-byte logEntry per item) plus the SipHash seed and the allocated-bytes
+ * accounting to a sidecar file. Bucket indices and collision hashes are
+ * seed-dependent, so the seed MUST travel with the index.
+ *
+ * On the next boot, logRecoverFromIndexFile() restores the hasher seed, the
+ * log window (from the superblock), the exact index geometry, and all chains
+ * — no log scan, no key bytes touched. Because the index stores hashes only
+ * (no keys), this path can NOT feed keyspace entries to the engine: it is
+ * only usable when the engine runs in key-spilling mode (implicit keys,
+ * dict-miss consult). The per-db item counts are reported via counts_cb.
+ * Both sidecar files are consumed (unlinked) at the start of recovery.
+ * ---------------------------------------------------------------------------*/
+
+/* Per-db live-item count callback for index-file recovery. */
+typedef void (*flashcacheRecoveryCountsCallback)(void *ctx, uint32_t dbid, size_t count);
+
+/* Serialize the index to the sidecar. Pumps any in-progress incremental
+ * index growth to completion first (bucket indices must reflect one stable
+ * geometry). Returns 0 on success, -1 on failure. */
+int logWriteIndexFile(struct flashcacheLog *log, char const *index_filename);
+
+/* Restore the index from the sidecar written at the previous clean shutdown.
+ * Must run after logCreate and before any traffic. Requires a valid matching
+ * superblock (for the log window). Returns 0 on success; -1 when either file
+ * is missing/invalid (caller falls back to log-scan recovery or cold start —
+ * the log offsets are left reset in that case). */
+int logRecoverFromIndexFile(struct flashcacheLog *log,
+        char const *superblock_filename, char const *index_filename,
+        flashcacheRecoveryCountsCallback counts_cb, void *counts_cb_ctx);
+
 /* Recover the index (and feed the engine) from an existing log using the
  * superblock. Must run after logCreate and before any write traffic.
  * Returns 0 on success; -1 if the superblock is missing/invalid or the scan

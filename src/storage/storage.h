@@ -67,6 +67,12 @@ typedef void (*storageRecoveryItemFn)(void *engine_ctx, uint32_t db_id,
                                       const void *key, size_t klen,
                                       uint8_t value_first_byte, size_t vlen);
 
+/* Fast-boot index reflection: per-db live-item count callback, fired instead
+ * of per-item callbacks when the backend restores its index directly from
+ * the sidecar written at the previous clean shutdown (no keys available). */
+typedef void (*storageRecoveryCountsFn)(void *engine_ctx, uint32_t db_id,
+                                        size_t count);
+
 /* Config passed to open() */
 typedef struct storageConfig {
     const char *path;
@@ -83,6 +89,12 @@ typedef struct storageConfig {
     int fast_boot;
     storageRecoveryItemFn recovery_item_fn;
     void *recovery_item_ctx;
+    /* Index reflection: when index_only is set (engine tracks keys
+     * implicitly / key-spilling), open() first tries restoring the index
+     * directly from the index sidecar (O(index) — no log scan), reporting
+     * per-db counts via recovery_counts_fn; falls back to the log scan. */
+    int index_only;
+    storageRecoveryCountsFn recovery_counts_fn;
     /* FlashCache tuning (passed through to backend) */
     size_t index_size;                 /* initial index entries per DB */
     uint32_t max_allocated_percent;    /* GC triggers at this % full */

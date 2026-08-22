@@ -97,6 +97,8 @@ int extStorageBridge_init(const char *backend_name, const char *path, size_t cap
         .fast_boot = ext_storage_fast_boot,
         .recovery_item_fn = extStorageRecoveryItem,
         .recovery_item_ctx = NULL,
+        .index_only = ext_key_spill_enabled,
+        .recovery_counts_fn = extStorageRecoveryCounts,
         .index_size = (size_t)ext_storage_index_size,
         .max_allocated_percent = (uint32_t)ext_storage_max_allocated_percent,
         .max_in_flight_reads = (uint32_t)ext_storage_max_in_flight_reads,

@@ -15,6 +15,8 @@
 /* Non-static internals reused from index.c (same pattern as snapshot_version_one.c) */
 extern indexEntry *indexAddLogEntry(flashcacheIndex *index, size_t hash_bucket_idx, logEntry *log_entry);
 extern size_t getIndexHash(flashcacheIndex *index, char const *key, size_t key_len);
+extern int indexGrowIfRequired(flashcacheIndex *index);
+extern size_t indexTableSize(flashcacheIndex *index);
 
 #define FC_SUPERBLOCK_MAGIC   (0xFC0DE5B10CULL)
 #define FC_SUPERBLOCK_VERSION (1u)
@@ -437,5 +439,276 @@ int logRecoverFromLog(struct flashcacheLog *log, char const *superblock_filename
 
     dedupRelease(&dedup);
     fcFree(reader.buf);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Index reflection: serialize/restore the in-memory index (see recovery.h).
+ *
+ * File layout (little-endian, packed):
+ *   fcIndexFileHeader
+ *   per db: fcIndexFileDbHeader, then for each non-empty bucket:
+ *     u64 bucket_idx, u32 chain_len, chain_len x logEntry (8B each)
+ *   per db terminated by bucket_idx == UINT64_MAX
+ *   u32 crc32c over all preceding bytes
+ * ---------------------------------------------------------------------------*/
+#include "include/hash.h"
+
+#define FC_INDEXFILE_MAGIC   (0xFC1DECF11E5ULL)
+#define FC_INDEXFILE_VERSION (1u)
+
+typedef struct __attribute__((packed)) {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t num_databases;
+    uint64_t log_size_bytes;
+    uint8_t  hash_seed[FLASHCACHE_HASHER_SEED_SIZE];
+    uint64_t allocated_log_size_bytes;
+    uint64_t total_num_items;
+} fcIndexFileHeader;
+
+typedef struct __attribute__((packed)) {
+    uint32_t base_size_bits;
+    uint32_t collision_bits_used;
+    uint64_t num_items;
+    uint64_t allocated_bytes;
+} fcIndexFileDbHeader;
+
+typedef struct {
+    FILE *fp;
+    uint32_t crc;
+    flashcache_crc_function crc_fn;
+    int failed;
+} idxWriter;
+
+static void idxWrite(idxWriter *w, void const *buf, size_t len) {
+    if (w->failed) return;
+    if (fwrite(buf, 1, len, w->fp) != len) { w->failed = 1; return; }
+    w->crc = w->crc_fn(w->crc, (char const *)buf, len);
+}
+
+int logWriteIndexFile(struct flashcacheLog *log, char const *index_filename) {
+    flashcacheAssert(log != NULL);
+    flashcacheAssert(index_filename != NULL);
+
+    if (stagingBufferGetTotalItemSize(log->staging_buffer) != 0 ||
+            !fioRequestIsEmpty(&(log->log_flush_fio_request))) {
+        flashcacheLogger(FC_LL_WARNING,
+                "Index file write refused: staging buffer or log flush still busy");
+        return -1;
+    }
+
+    /* Bucket indices must reflect one stable geometry: drive any in-progress
+     * (or newly needed) incremental growth to completion. */
+    for (uint32_t d = 0; d < log->num_databases; d++) {
+        while (indexGrowIfRequired(log->index_list[d])) { /* advance */ }
+    }
+
+    char tmp_name[4096];
+    int n = snprintf(tmp_name, sizeof(tmp_name), "%s.tmp", index_filename);
+    if (n < 0 || (size_t)n >= sizeof(tmp_name)) return -1;
+
+    FILE *fp = fopen(tmp_name, "wb");
+    if (fp == NULL) {
+        flashcacheLogger(FC_LL_WARNING, "Index file: fopen(%s) failed: %d", tmp_name, errno);
+        return -1;
+    }
+    idxWriter w = { .fp = fp, .crc = 0, .crc_fn = log->crc_function, .failed = 0 };
+
+    fcIndexFileHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = FC_INDEXFILE_MAGIC;
+    hdr.version = FC_INDEXFILE_VERSION;
+    hdr.num_databases = log->num_databases;
+    hdr.log_size_bytes = log->log_size_bytes;
+    log->hasher.get_seed(hdr.hash_seed);
+    hdr.allocated_log_size_bytes = log->allocated_log_size_bytes;
+    hdr.total_num_items = log->num_items;
+    idxWrite(&w, &hdr, sizeof(hdr));
+
+    for (uint32_t d = 0; d < log->num_databases; d++) {
+        flashcacheIndex *index = log->index_list[d];
+        fcIndexFileDbHeader dbh;
+        memset(&dbh, 0, sizeof(dbh));
+        dbh.base_size_bits = (uint32_t)index->base_size_bits;
+        dbh.collision_bits_used = (uint32_t)index->collision_bits_used;
+        dbh.num_items = index->num_items;
+        dbh.allocated_bytes = log->allocated_log_size_bytes_per_db[d];
+        idxWrite(&w, &dbh, sizeof(dbh));
+
+        size_t table_size = indexTableSize(index);
+        for (size_t b = 0; b < table_size; b++) {
+            indexEntry *e = index->table[b];
+            if (e == NULL) continue;
+            uint32_t chain_len = 0;
+            for (indexEntry *it = e; it; it = it->next) chain_len++;
+            uint64_t bucket_idx = (uint64_t)b;
+            idxWrite(&w, &bucket_idx, sizeof(bucket_idx));
+            idxWrite(&w, &chain_len, sizeof(chain_len));
+            for (indexEntry *it = e; it; it = it->next) {
+                /* All entries are on-flash at clean shutdown (staging drained). */
+                flashcacheAssert(it->item_entry.log_entry.on_flash);
+                idxWrite(&w, &(it->item_entry.log_entry), sizeof(logEntry));
+            }
+        }
+        uint64_t terminator = UINT64_MAX;
+        idxWrite(&w, &terminator, sizeof(terminator));
+    }
+
+    uint32_t crc = w.crc;
+    if (!w.failed && fwrite(&crc, 1, sizeof(crc), fp) != sizeof(crc)) w.failed = 1;
+    int rc = (!w.failed && fflush(fp) == 0 && fsync(fileno(fp)) == 0) ? 0 : -1;
+    fclose(fp);
+    if (rc != 0 || rename(tmp_name, index_filename) != 0) {
+        flashcacheLogger(FC_LL_WARNING, "Index file: write/rename failed: %d", errno);
+        unlink(tmp_name);
+        return -1;
+    }
+    flashcacheLogger(FC_LL_NOTICE, "Index file written: items=[%lu] file=[%s]",
+            log->num_items, index_filename);
+    return 0;
+}
+
+/* Restore one db's exact bucket geometry on an EMPTY index. */
+static void indexRestoreGeometry(flashcacheIndex *index, uint32_t base_size_bits,
+        uint32_t collision_bits_used) {
+    flashcacheAssert(index->num_items == 0);
+    size_t new_size = (size_t)1 << (base_size_bits + collision_bits_used);
+    fcFree(index->table);
+    index->table = (indexEntry **)fcCalloc(new_size, sizeof(indexEntry *));
+    flashcacheAssert(index->table != NULL);
+    index->base_size_bits = base_size_bits;
+    index->collision_bits_used = collision_bits_used;
+    index->num_hash_bucket_used = 0;
+}
+
+int logRecoverFromIndexFile(struct flashcacheLog *log,
+        char const *superblock_filename, char const *index_filename,
+        flashcacheRecoveryCountsCallback counts_cb, void *counts_cb_ctx) {
+    flashcacheAssert(log != NULL);
+    flashcacheAssert(log->num_items == 0); /* must run before any traffic */
+
+    fcSuperblock sb;
+    if (readSuperblock(log, superblock_filename, &sb) != 0) {
+        flashcacheLogger(FC_LL_NOTICE,
+                "Index recovery: no valid superblock at [%s]", superblock_filename);
+        return -1;
+    }
+
+    /* Read the whole index file, then consume BOTH sidecars immediately —
+     * whatever happens next, a future boot must never reuse this state. */
+    FILE *fp = fopen(index_filename, "rb");
+    if (fp == NULL) return -1;
+    fseek(fp, 0, SEEK_END);
+    long fsz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsz < (long)(sizeof(fcIndexFileHeader) + sizeof(uint32_t))) { fclose(fp); return -1; }
+    char *buf = (char *)fcMalloc((size_t)fsz);
+    flashcacheAssert(buf != NULL);
+    size_t got = fread(buf, 1, (size_t)fsz, fp);
+    fclose(fp);
+    unlink(index_filename);
+    unlink(superblock_filename);
+    if (got != (size_t)fsz) { fcFree(buf); return -1; }
+
+    /* Validate */
+    uint32_t stored_crc;
+    memcpy(&stored_crc, buf + fsz - sizeof(uint32_t), sizeof(uint32_t));
+    uint32_t crc = log->crc_function(0, buf, (size_t)fsz - sizeof(uint32_t));
+    fcIndexFileHeader hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+    if (crc != stored_crc || hdr.magic != FC_INDEXFILE_MAGIC ||
+            hdr.version != FC_INDEXFILE_VERSION ||
+            hdr.num_databases != log->num_databases ||
+            hdr.log_size_bytes != log->log_size_bytes) {
+        flashcacheLogger(FC_LL_WARNING, "Index recovery: invalid index file [%s]", index_filename);
+        fcFree(buf);
+        return -1;
+    }
+
+    uint64_t t0 = log->monotonic_clock_us();
+
+    /* Bucket indices and collision hashes were computed under the previous
+     * process's SipHash seed — restore it before anything hashes. */
+    log->hasher.init(hdr.hash_seed);
+
+    log->head_offset = sb.head_offset;
+    log->tail_offset = sb.tail_offset;
+    log->allocated_log_size_bytes = hdr.allocated_log_size_bytes;
+
+    char const *p = buf + sizeof(hdr);
+    char const *end = buf + fsz - sizeof(uint32_t);
+    int rc = 0;
+    for (uint32_t d = 0; d < log->num_databases && rc == 0; d++) {
+        if (p + sizeof(fcIndexFileDbHeader) > end) { rc = -1; break; }
+        fcIndexFileDbHeader dbh;
+        memcpy(&dbh, p, sizeof(dbh));
+        p += sizeof(dbh);
+
+        flashcacheIndex *index = log->index_list[d];
+        indexRestoreGeometry(index, dbh.base_size_bits, dbh.collision_bits_used);
+        log->allocated_log_size_bytes_per_db[d] = dbh.allocated_bytes;
+        size_t table_size = indexTableSize(index);
+
+        for (;;) {
+            if (p + sizeof(uint64_t) > end) { rc = -1; break; }
+            uint64_t bucket_idx;
+            memcpy(&bucket_idx, p, sizeof(bucket_idx));
+            p += sizeof(bucket_idx);
+            if (bucket_idx == UINT64_MAX) break; /* db terminator */
+            uint32_t chain_len;
+            if (p + sizeof(chain_len) > end || bucket_idx >= table_size) { rc = -1; break; }
+            memcpy(&chain_len, p, sizeof(chain_len));
+            p += sizeof(chain_len);
+            if (chain_len == 0 || p + (size_t)chain_len * sizeof(logEntry) > end) { rc = -1; break; }
+            for (uint32_t i = 0; i < chain_len; i++) {
+                logEntry le;
+                memcpy(&le, p, sizeof(le));
+                p += sizeof(le);
+                indexAddLogEntry(index, (size_t)bucket_idx, &le);
+            }
+        }
+        if (rc == 0) {
+            if (index->num_items != dbh.num_items) {
+                flashcacheLogger(FC_LL_WARNING,
+                        "Index recovery: db [%u] item count mismatch [%lu] vs [%lu]",
+                        d, index->num_items, (unsigned long)dbh.num_items);
+                rc = -1;
+                break;
+            }
+            log->num_items += dbh.num_items;
+            if (counts_cb != NULL && dbh.num_items > 0) {
+                counts_cb(counts_cb_ctx, d, (size_t)dbh.num_items);
+            }
+        }
+    }
+    fcFree(buf);
+
+    if (rc != 0) {
+        /* Corrupt mid-restore: too risky to serve — reset to cold start. */
+        flashcacheLogger(FC_LL_WARNING, "Index recovery: parse failed; cold start");
+        for (uint32_t d = 0; d < log->num_databases; d++) {
+            /* leak-free reset: free chains inserted so far */
+            flashcacheIndex *index = log->index_list[d];
+            size_t ts = indexTableSize(index);
+            for (size_t b = 0; b < ts; b++) {
+                indexEntry *e = index->table[b];
+                while (e) { indexEntry *nx = e->next; fcFree(e); e = nx; }
+                index->table[b] = NULL;
+            }
+            index->num_items = 0;
+            index->num_hash_bucket_used = 0;
+            log->allocated_log_size_bytes_per_db[d] = 0;
+        }
+        log->num_items = 0;
+        log->allocated_log_size_bytes = 0;
+        log->head_offset = 0;
+        log->tail_offset = 0;
+        return -1;
+    }
+
+    flashcacheLogger(FC_LL_NOTICE,
+            "Index recovery complete: items=[%lu] restore_us=[%lu]",
+            log->num_items, log->monotonic_clock_us() - t0);
     return 0;
 }

@@ -90,6 +90,7 @@ typedef struct fcRealCtx {
     int fast_boot;                     /* persist superblock at close */
     int recovery_performed;            /* 1 = open() recovered from log */
     char superblock_path[4096];
+    char index_path[4096];
     storageRecoveryItemFn recovery_item_fn;
     void *recovery_item_ctx;
 } fcRealCtx;
@@ -419,19 +420,32 @@ static void *fc_real_open(storageConfig *cfg) {
         flashcacheSetConfig(&fc_cfg);
     }
 
-    /* Fast boot: attempt log-scan recovery from the previous clean shutdown.
-     * This MUST run before the IO thread starts — the recovery scan and the
-     * engine feed callback both run synchronously on the calling (main)
-     * thread, and FlashCache is single-threaded. */
+    /* Fast boot: attempt recovery from the previous clean shutdown. This
+     * MUST run before the IO thread starts — recovery and the engine feed
+     * callbacks run synchronously on the calling (main) thread, and
+     * FlashCache is single-threaded.
+     * Preference order: index reflection (O(index), keyspill/index-only
+     * engines) then log scan (O(log bytes), works for all engines). */
     ctx->fast_boot = cfg->fast_boot;
     snprintf(ctx->superblock_path, sizeof(ctx->superblock_path), "%s.superblock", path);
+    snprintf(ctx->index_path, sizeof(ctx->index_path), "%s.index", path);
     ctx->recovery_item_fn = cfg->recovery_item_fn;
     ctx->recovery_item_ctx = cfg->recovery_item_ctx;
     ctx->recovery_performed = 0;
     if (cfg->fast_boot) {
-        if (flashcacheRecoverFromLog(ctx->superblock_path,
-                fc_recovery_item_trampoline, ctx) == 0) {
-            ctx->recovery_performed = 1;
+        if (cfg->index_only &&
+            flashcacheRecoverFromIndexFile(ctx->superblock_path, ctx->index_path,
+                (flashcacheRecoveryCountsCallback)cfg->recovery_counts_fn,
+                cfg->recovery_item_ctx) == 0) {
+            ctx->recovery_performed = 2; /* 2 = index reflection */
+        } else {
+            /* A stale index file is unusable without its superblock (both
+             * are consumed together); remove leftovers before scanning. */
+            unlink(ctx->index_path);
+            if (flashcacheRecoverFromLog(ctx->superblock_path,
+                    fc_recovery_item_trampoline, ctx) == 0) {
+                ctx->recovery_performed = 1; /* 1 = log scan */
+            }
         }
     }
 
@@ -457,10 +471,11 @@ static void fc_real_close(void *opaque) {
     atomic_store_explicit(&ctx->shutdown, 1, memory_order_release);
     pthread_join(ctx->io_thread, NULL);
     /* Single-threaded from here on. Flush the staging buffer, drain in-flight
-     * IO, and persist the superblock so the next boot can recover. */
+     * IO, and persist the superblock + index reflection for the next boot. */
     if (ctx->fast_boot) {
         flashcacheFsyncBufferedWrites();
         flashcacheWriteSuperblock(ctx->superblock_path);
+        flashcacheWriteIndexFile(ctx->index_path);
     }
     flashcacheTearDown();
     storage_free(ctx);

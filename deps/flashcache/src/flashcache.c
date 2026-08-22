@@ -237,6 +237,19 @@ int flashcacheRecoverFromLog(char const *superblock_filename,
             item_cb, item_cb_ctx, NULL);
 }
 
+int flashcacheWriteIndexFile(char const *index_filename) {
+    flashcacheAssert(flashcache_context.log != NULL);
+    return logWriteIndexFile(flashcache_context.log, index_filename);
+}
+
+int flashcacheRecoverFromIndexFile(char const *superblock_filename,
+        char const *index_filename,
+        flashcacheRecoveryCountsCallback counts_cb, void *counts_cb_ctx) {
+    flashcacheAssert(flashcache_context.log != NULL);
+    return logRecoverFromIndexFile(flashcache_context.log, superblock_filename,
+            index_filename, counts_cb, counts_cb_ctx);
+}
+
 
 void flashcacheNotifyRedisLayerSnapshotCompletion() {
     logCompleteThreadsaveReplication(flashcache_context.log);

@@ -93,6 +93,8 @@ void extStorageRecoveryItem(void *engine_ctx, uint32_t db_id,
                             uint8_t value_first_byte, size_t vlen);
 long long extStorageFastBootRecoveredKeys(void);
 int extStorageFastBootPerformed(void);
+void extStorageRecoveryCounts(void *engine_ctx, uint32_t db_id, size_t count);
+extern int ext_key_spill_enabled;
 extern int ext_storage_spill_pool_active;
 
 /* ---------------------------------------------------------------------------

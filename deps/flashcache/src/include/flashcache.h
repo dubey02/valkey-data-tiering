@@ -212,6 +212,21 @@ int flashcacheWriteSuperblock(char const *superblock_filename);
 int flashcacheRecoverFromLog(char const *superblock_filename,
         flashcacheRecoveryItemCallback item_cb, void *item_cb_ctx);
 
+/*!\brief Serialize the in-memory index to a sidecar file (call after
+ * flashcacheFsyncBufferedWrites, alongside the superblock). Returns 0/-1. */
+int flashcacheWriteIndexFile(char const *index_filename);
+
+/* Per-db live-item count callback for index-file recovery. */
+typedef void (*flashcacheRecoveryCountsCallback)(void *ctx, uint32_t dbid, size_t count);
+
+/*!\brief Restore the index directly from the sidecar written at the previous
+ * clean shutdown — no log scan, no key bytes. Only usable when the hosting
+ * engine tracks keys implicitly (key-spilling): the index holds hashes, not
+ * keys. Consumes both sidecar files. Returns 0 on success, -1 to fall back. */
+int flashcacheRecoverFromIndexFile(char const *superblock_filename,
+        char const *index_filename,
+        flashcacheRecoveryCountsCallback counts_cb, void *counts_cb_ctx);
+
 /**!\brief Notifies Redis layer Snapshot completion
  *
  * @Returns : Void

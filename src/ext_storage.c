@@ -451,6 +451,23 @@ long long extStorageFastBootRecoveredKeys(void) {
     return fast_boot_recovered_keys;
 }
 
+static int fast_boot_index_restored = 0; /* 1 = booted via index reflection (no scan) */
+
+/* Index-reflection recovery feed: one call per db with the live-item count.
+ * Fired instead of per-item callbacks when the backend restored its index
+ * directly from the sidecar (no key bytes available — key-spilling only). */
+void extStorageRecoveryCounts(void *engine_ctx, uint32_t db_id, size_t count) {
+    UNUSED(engine_ctx);
+    serverAssert(ext_key_spill_enabled); /* index-only boot requires implicit keys */
+    int logical_id = extStorageLogicalDbId((int)db_id);
+    serverAssert(logical_id >= 0 && logical_id < server.dbnum);
+    serverDb *db = createDatabaseIfNeeded(logical_id);
+    db->keys_spilled_count += (long long)count;
+    num_items_on_flash += (long long)count;
+    fast_boot_recovered_keys += (long long)count;
+    fast_boot_index_restored = 1;
+}
+
 /* 1 when the backend rebuilt the store from the previous clean shutdown's
  * log during extStorage_init (loadDataFromDisk then skips RDB/AOF). */
 int extStorageFastBootPerformed(void) {
@@ -2336,11 +2353,13 @@ sds genExternalStorageInfoString(sds info) {
         "ext_storage_fast_boot:%d\r\n"
         "fast_boot_recovered_keys:%lld\r\n"
         "fast_boot_skipped_items:%lld\r\n"
-        "fast_boot_duplicate_items:%lld\r\n",
+        "fast_boot_duplicate_items:%lld\r\n"
+        "fast_boot_index_restored:%d\r\n",
         ext_storage_fast_boot,
         fast_boot_recovered_keys,
         fast_boot_skipped_items,
-        fast_boot_duplicate_items);
+        fast_boot_duplicate_items,
+        fast_boot_index_restored);
     info = sdscatprintf(info,
         "total_num_items_spilled_to_ext_storage:%lld\r\n"
         "total_num_items_fetched_from_ext_storage:%lld\r\n"
