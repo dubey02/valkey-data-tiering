@@ -5088,6 +5088,13 @@ int finishShutdown(void) {
 
     moduleUnloadAllModules();
 
+    /* Close the ext-storage backend: drains queued spills, flushes the
+     * staging buffer, and (with ext-storage-fast-boot) persists the
+     * clean-shutdown superblock the next boot recovers from. */
+    if (ext_data_enabled) {
+        extStorageBridge_shutdown();
+    }
+
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
     return C_OK;
 
@@ -7377,6 +7384,22 @@ int checkForSentinelMode(int argc, char **argv, char *exec_name) {
 /* Function called at startup to load RDB or AOF file in memory. */
 void loadDataFromDisk(void) {
     ustime_t start = ustime();
+    /* Fast boot: the storage backend already rebuilt the keyspace from its
+     * flash log during extStorage_init() (TIERED placeholders; values stay
+     * on flash and are fetched lazily). Skip RDB/AOF load entirely — the
+     * flash log IS the persistence for fast-boot deployments. */
+    if (ext_data_enabled && ext_storage_fast_boot && extStorageFastBootPerformed()) {
+        serverLog(LL_NOTICE,
+                  "Fast boot: %lld keys recovered from ext storage log in %.3f seconds; "
+                  "skipping RDB/AOF load",
+                  extStorageFastBootRecoveredKeys(), (float)(ustime() - start) / 1000000);
+        return;
+    }
+    if (ext_data_enabled && ext_storage_fast_boot) {
+        serverLog(LL_NOTICE,
+                  "Fast boot requested but no valid superblock/log recovery available; "
+                  "falling back to normal load");
+    }
     if (server.aof_state == AOF_ON) {
         int ret = loadAppendOnlyFiles(server.aof_manifest);
         if (ret == AOF_FAILED || ret == AOF_OPEN_ERR) exit(1);

@@ -5,6 +5,7 @@
 #include "include/hash.h"
 #include "include/index.h"
 #include "include/snapshot_exporter.h"
+#include "include/recovery.h"
 
 typedef struct flashcacheContext {
     flashcacheLog *log;
@@ -223,6 +224,19 @@ void flashcacheGetConfig(flashcacheConfig *config) {
 void flashcacheFsyncBufferedWrites() {
     logFsyncBufferedWrites(flashcache_context.log);
 }
+
+int flashcacheWriteSuperblock(char const *superblock_filename) {
+    flashcacheAssert(flashcache_context.log != NULL);
+    return logWriteSuperblock(flashcache_context.log, superblock_filename);
+}
+
+int flashcacheRecoverFromLog(char const *superblock_filename,
+        flashcacheRecoveryItemCallback item_cb, void *item_cb_ctx) {
+    flashcacheAssert(flashcache_context.log != NULL);
+    return logRecoverFromLog(flashcache_context.log, superblock_filename,
+            item_cb, item_cb_ctx, NULL);
+}
+
 
 void flashcacheNotifyRedisLayerSnapshotCompletion() {
     logCompleteThreadsaveReplication(flashcache_context.log);

@@ -85,6 +85,13 @@ typedef struct fcRealCtx {
     int eviction_enabled;      /* 0 = noeviction policy: GC runs but doesn't delete keys from engine */
     storageCompletionFn completion_fn;
     void *completion_privdata;
+
+    /* Fast boot (clean-shutdown superblock + log-scan recovery) */
+    int fast_boot;                     /* persist superblock at close */
+    int recovery_performed;            /* 1 = open() recovered from log */
+    char superblock_path[4096];
+    storageRecoveryItemFn recovery_item_fn;
+    void *recovery_item_ctx;
 } fcRealCtx;
 
 static fcRealCtx *g_fc_ctx = NULL;
@@ -315,6 +322,18 @@ static void fc_log(int level, const char *fmt, ...) { (void)level; (void)fmt; }
 /* ---------------------------------------------------------------------------
  * storageType interface
  * ---------------------------------------------------------------------------*/
+/* Adapts flashcacheRecoveryItemCallback to the engine's storageRecoveryItemFn.
+ * Runs synchronously on the opening (main) thread during recovery. */
+static void fc_recovery_item_trampoline(void *opaque, uint32_t dbid,
+        char const *key, size_t key_len, uint8_t value_first_byte,
+        size_t value_len) {
+    fcRealCtx *ctx = opaque;
+    if (ctx->recovery_item_fn != NULL) {
+        ctx->recovery_item_fn(ctx->recovery_item_ctx, dbid, key, key_len,
+                              value_first_byte, value_len);
+    }
+}
+
 static void *fc_real_open(storageConfig *cfg) {
     fcRealCtx *ctx = storage_calloc(1, sizeof(fcRealCtx));
     atomic_init(&ctx->req_head, 0);
@@ -384,14 +403,49 @@ static void *fc_real_open(storageConfig *cfg) {
         flashcacheSetConfig(&fc_cfg);
     }
 
+    /* Fast boot: attempt log-scan recovery from the previous clean shutdown.
+     * This MUST run before the IO thread starts — the recovery scan and the
+     * engine feed callback both run synchronously on the calling (main)
+     * thread, and FlashCache is single-threaded. */
+    ctx->fast_boot = cfg->fast_boot;
+    snprintf(ctx->superblock_path, sizeof(ctx->superblock_path), "%s.superblock", path);
+    ctx->recovery_item_fn = cfg->recovery_item_fn;
+    ctx->recovery_item_ctx = cfg->recovery_item_ctx;
+    ctx->recovery_performed = 0;
+    if (cfg->fast_boot) {
+        if (flashcacheRecoverFromLog(ctx->superblock_path,
+                fc_recovery_item_trampoline, ctx) == 0) {
+            ctx->recovery_performed = 1;
+        }
+    }
+
     pthread_create(&ctx->io_thread, NULL, fc_io_worker, ctx);
     return ctx;
 }
 
+static int fc_real_recovery_performed(void *opaque) {
+    fcRealCtx *ctx = opaque;
+    return ctx->recovery_performed;
+}
+
 static void fc_real_close(void *opaque) {
     fcRealCtx *ctx = opaque;
+    /* Drain the request ring first so queued spills land before we persist
+     * the clean-shutdown window (the worker keeps consuming until we flip
+     * the shutdown flag). */
+    while (atomic_load_explicit(&ctx->req_head, memory_order_acquire) !=
+           atomic_load_explicit(&ctx->req_tail, memory_order_acquire)) {
+        struct timespec ts = {0, 100000};
+        nanosleep(&ts, NULL);
+    }
     atomic_store_explicit(&ctx->shutdown, 1, memory_order_release);
     pthread_join(ctx->io_thread, NULL);
+    /* Single-threaded from here on. Flush the staging buffer, drain in-flight
+     * IO, and persist the superblock so the next boot can recover. */
+    if (ctx->fast_boot) {
+        flashcacheFsyncBufferedWrites();
+        flashcacheWriteSuperblock(ctx->superblock_path);
+    }
     flashcacheTearDown();
     storage_free(ctx);
     g_fc_ctx = NULL;
@@ -518,6 +572,7 @@ static storageType flashcache_real_type = {
     .snapshot_release = fc_real_snapshot_release,
     .gc_pause = fc_real_gc_pause,
     .fork_read = fc_real_fork_read,
+    .recovery_performed = fc_real_recovery_performed,
 };
 
 /* Drain all in-flight IO + execute flush on the IO thread.

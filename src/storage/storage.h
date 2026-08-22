@@ -59,6 +59,14 @@ typedef struct storageCompletion {
 
 typedef void (*storageCompletionFn)(storageCompletion *c, void *privdata);
 
+/* Fast-boot recovery: one callback per live item recovered from the backend's
+ * persistent log at open time. value_first_byte is the first byte of the
+ * stored value payload (the engine's DUMP-format type byte); the value itself
+ * is NOT read into memory. */
+typedef void (*storageRecoveryItemFn)(void *engine_ctx, uint32_t db_id,
+                                      const void *key, size_t klen,
+                                      uint8_t value_first_byte, size_t vlen);
+
 /* Config passed to open() */
 typedef struct storageConfig {
     const char *path;
@@ -68,6 +76,13 @@ typedef struct storageConfig {
     int eviction_enabled;  /* 0 = noeviction (flash never deletes data) */
     storageCompletionFn completion_fn;
     void *completion_privdata;
+    /* Fast boot (clean-shutdown superblock + log-scan recovery).
+     * When fast_boot is set, open() attempts recovery from the previous
+     * clean shutdown's log, invoking recovery_item_fn once per live item,
+     * and close() persists the superblock for the next boot. */
+    int fast_boot;
+    storageRecoveryItemFn recovery_item_fn;
+    void *recovery_item_ctx;
     /* FlashCache tuning (passed through to backend) */
     size_t index_size;                 /* initial index entries per DB */
     uint32_t max_allocated_percent;    /* GC triggers at this % full */
@@ -151,6 +166,11 @@ typedef struct storageType {
     storageStatus (*fork_read)(void *ctx, uint32_t db_id,
                                const void *key, size_t klen,
                                void **value, size_t *vlen);
+
+    /* Fast-boot recovery (optional). Returns 1 if open() successfully
+     * recovered the store from the previous clean shutdown (the engine may
+     * then skip its own persistence load for tiered keys), 0 otherwise. */
+    int (*recovery_performed)(void *ctx);
 } storageType;
 
 /* ---------------------------------------------------------------------------
@@ -176,6 +196,10 @@ void storageGcPause(int paused);
 storageStatus storageForkRead(uint32_t db_id, const void *key, size_t klen,
                               void **value, size_t *vlen);
 void storageCron(void);
+
+/* Fast-boot recovery: 1 if the backend recovered the store from the previous
+ * clean shutdown during storageInit (see storageConfig.fast_boot). */
+int storageRecoveryPerformed(void);
 
 /* Backend getters */
 storageType *storageGetFlashCacheType(void);          /* in-memory mock (testing) */

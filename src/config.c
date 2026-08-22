@@ -3378,6 +3378,7 @@ standardConfig static_configs[] = {
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
     createBoolConfig("ext-storage-enabled", NULL, IMMUTABLE_CONFIG, ext_data_enabled, 0, NULL, NULL),
+    createBoolConfig("ext-storage-fast-boot", NULL, IMMUTABLE_CONFIG, ext_storage_fast_boot, 0, NULL, NULL),
 
     /* String Configs */
     createStringConfig("ext-storage-backend", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, ext_storage_backend, "", NULL, NULL),

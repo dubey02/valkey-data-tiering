@@ -188,11 +188,36 @@ void flashcacheGetConfig(flashcacheConfig *config);
  */
 void flashcacheFsyncBufferedWrites();
 
+/* ---------------------------------------------------------------------------
+ * Clean-shutdown superblock + log-scan recovery (fast boot).
+ * See include/recovery.h for the protocol and limitations.
+ * ---------------------------------------------------------------------------*/
+typedef void (*flashcacheRecoveryItemCallback)(void *ctx, uint32_t dbid,
+        char const *key, size_t key_len, uint8_t value_first_byte,
+        size_t value_len);
+
+typedef struct flashcacheRecoveryStats flashcacheRecoveryStats;
+
+/*!\brief Persist the clean-shutdown superblock. Call after
+ * flashcacheFsyncBufferedWrites() and before flashcacheTearDown().
+ * Returns 0 on success, -1 on failure. */
+int flashcacheWriteSuperblock(char const *superblock_filename);
+
+/*!\brief Rebuild the index (and feed the engine one callback per live item)
+ * by scanning the existing log, using the superblock written at the previous
+ * clean shutdown. Must be called after flashcacheInit() and before any
+ * traffic. The superblock is consumed (unlinked) by this call. Returns 0 on
+ * success; -1 when no valid superblock exists or the scan failed (the store
+ * is then in normal cold-start state). */
+int flashcacheRecoverFromLog(char const *superblock_filename,
+        flashcacheRecoveryItemCallback item_cb, void *item_cb_ctx);
+
 /**!\brief Notifies Redis layer Snapshot completion
  *
  * @Returns : Void
  */
 void flashcacheNotifyRedisLayerSnapshotCompletion();
+
 
 /**!\brief Invokes the snapshot export process for FDB
  *

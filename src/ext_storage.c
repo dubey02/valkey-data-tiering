@@ -94,6 +94,7 @@ static long long ext_storage_timer_id = AE_ERR;
 int ext_data_enabled = 0;
 int ext_storage_admission_policy = EXT_STORAGE_ADMISSION_DRAM;
 int ext_storage_promotion_policy = EXT_STORAGE_PROMOTION_ALWAYS;
+int ext_storage_fast_boot = 0; /* skip RDB load; rebuild keyspace from the flash log */
 int items_spillover_batch_size = 10;
 char *ext_storage_backend = NULL;
 char *ext_storage_path = NULL;
@@ -337,6 +338,102 @@ void extStorageRemoveState(serverDb *db, sds key) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Fast boot (ext-storage-fast-boot): keyspace recovery from the flash log.
+ *
+ * On a clean shutdown the backend persists a superblock; on the next boot the
+ * backend scans its log and invokes extStorageRecoveryItem() once per live
+ * item — BEFORE the IO thread starts and before loadDataFromDisk(). We create
+ * a TIERED placeholder dict entry per item (same shape the spill-completion
+ * path produces: empty-sds value, OBJ_ENCODING_TIERED, state ONLY_FLASH) so
+ * the value stays on flash and is fetched lazily on first access. RDB load is
+ * then skipped entirely (see loadDataFromDisk).
+ *
+ * POC limitations (documented in deps/flashcache recovery.h): no TTLs (not in
+ * the log), no delete tombstones (deleted-but-uncompacted keys resurrect),
+ * and DRAM-resident values that never spilled are NOT recovered — fast boot
+ * assumes admission=flash workloads.
+ * ---------------------------------------------------------------------------*/
+static long long fast_boot_recovered_keys = 0;
+static long long fast_boot_skipped_items = 0;   /* unknown/unsupported type byte */
+static long long fast_boot_duplicate_items = 0; /* should be 0: backend dedups  */
+
+/* Map an RDB DUMP-format type byte (rdb.h enum RdbType — the first byte of
+ * the spilled payload, see extStorageSerializeValue) to an OBJ_* type for the
+ * placeholder entry. Returns -1 for types we cannot host (module values). */
+static int rdbTypeToObjType(uint8_t rdb_type) {
+    switch (rdb_type) {
+    case RDB_TYPE_STRING: return OBJ_STRING;
+    case RDB_TYPE_LIST:
+    case RDB_TYPE_LIST_ZIPLIST:
+    case RDB_TYPE_LIST_QUICKLIST:
+    case RDB_TYPE_LIST_QUICKLIST_2: return OBJ_LIST;
+    case RDB_TYPE_SET:
+    case RDB_TYPE_SET_INTSET:
+    case RDB_TYPE_SET_LISTPACK: return OBJ_SET;
+    case RDB_TYPE_ZSET:
+    case RDB_TYPE_ZSET_2:
+    case RDB_TYPE_ZSET_ZIPLIST:
+    case RDB_TYPE_ZSET_LISTPACK: return OBJ_ZSET;
+    case RDB_TYPE_HASH:
+    case RDB_TYPE_HASH_ZIPMAP:
+    case RDB_TYPE_HASH_ZIPLIST:
+    case RDB_TYPE_HASH_LISTPACK:
+    case RDB_TYPE_HASH_2: return OBJ_HASH;
+    case RDB_TYPE_STREAM_LISTPACKS:
+    case RDB_TYPE_STREAM_LISTPACKS_2:
+    case RDB_TYPE_STREAM_LISTPACKS_3: return OBJ_STREAM;
+    default: return -1;
+    }
+}
+
+/* Backend recovery feed: one call per live item found in the flash log.
+ * Runs synchronously on the main thread during extStorage_init(), before
+ * any client traffic and before loadDataFromDisk(). */
+void extStorageRecoveryItem(void *engine_ctx, uint32_t db_id,
+                            const void *key, size_t klen,
+                            uint8_t value_first_byte, size_t vlen) {
+    UNUSED(engine_ctx);
+    UNUSED(vlen);
+
+    int obj_type = rdbTypeToObjType(value_first_byte);
+    if (obj_type < 0) {
+        fast_boot_skipped_items++;
+        return;
+    }
+
+    int logical_id = extStorageLogicalDbId((int)db_id);
+    serverAssert(logical_id >= 0 && logical_id < server.dbnum);
+    serverDb *db = createDatabaseIfNeeded(logical_id);
+
+    sds key_sds = sdsnewlen(key, klen);
+    robj *val = createObject(OBJ_STRING, sdsnewlen("", 0));
+    val->type = obj_type;
+    val->encoding = OBJ_ENCODING_TIERED;
+    val->tiering_state = TIERING_STATE_ONLY_FLASH;
+
+    if (dbAddRDBLoad(db, key_sds, &val)) {
+        num_items_on_flash++;
+        fast_boot_recovered_keys++;
+    } else {
+        /* Backend dedup should make this unreachable; count defensively. */
+        fast_boot_duplicate_items++;
+        decrRefCount(val);
+    }
+    sdsfree(key_sds);
+}
+
+long long extStorageFastBootRecoveredKeys(void) {
+    return fast_boot_recovered_keys;
+}
+
+/* 1 when the backend rebuilt the store from the previous clean shutdown's
+ * log during extStorage_init (loadDataFromDisk then skips RDB/AOF). */
+int extStorageFastBootPerformed(void) {
+    extern int storageRecoveryPerformed(void); /* storage/storage_dispatch.c */
+    return storageRecoveryPerformed();
+}
+
+/* ---------------------------------------------------------------------------
  * Metrics — keyBlocksClient decision path
  * ---------------------------------------------------------------------------*/
 static long long kbc_in_memory_count = 0;
@@ -525,10 +622,19 @@ void extStorage_init(void) {
     if (ext_storage_backend && ext_storage_backend[0]) backend = ext_storage_backend;
     const char *path = (ext_storage_path && ext_storage_path[0]) ? ext_storage_path : "/tmp/valkey-flash.db";
     size_t capacity = (size_t)ext_storage_capacity_mb * 1024 * 1024;
+    ustime_t bridge_init_start = ustime();
     if (extStorageBridge_init(backend, path, capacity) != 0) {
         serverLog(LL_WARNING, "Failed to initialize storage backend '%s', disabling tiering", backend);
         ext_data_enabled = 0;
         return;
+    }
+    if (ext_storage_fast_boot && extStorageFastBootPerformed()) {
+        serverLog(LL_NOTICE,
+                  "Fast boot: recovered %lld keys from the flash log (%lld skipped, "
+                  "%lld duplicates) in %.3f seconds",
+                  fast_boot_recovered_keys, fast_boot_skipped_items,
+                  fast_boot_duplicate_items,
+                  (float)(ustime() - bridge_init_start) / 1000000);
     }
 
     completed_storage_requests = zcalloc(COMPLETED_STORAGE_REQUESTS_PROCESSING_BATCH_SIZE * sizeof(ValkeyModuleExternalStorageMsg*));
@@ -1993,6 +2099,15 @@ void extStorageFreeTransientValues(void) {
 
 sds genExternalStorageInfoString(sds info) {
     if (!ext_data_enabled) return info;
+    info = sdscatprintf(info,
+        "ext_storage_fast_boot:%d\r\n"
+        "fast_boot_recovered_keys:%lld\r\n"
+        "fast_boot_skipped_items:%lld\r\n"
+        "fast_boot_duplicate_items:%lld\r\n",
+        ext_storage_fast_boot,
+        fast_boot_recovered_keys,
+        fast_boot_skipped_items,
+        fast_boot_duplicate_items);
     info = sdscatprintf(info,
         "total_num_items_spilled_to_ext_storage:%lld\r\n"
         "total_num_items_fetched_from_ext_storage:%lld\r\n"

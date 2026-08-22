@@ -84,6 +84,15 @@ int extStorageLogicalDbId(int physical_id);
 void extStorageSwapDbIds(int id1, int id2);
 extern int ext_storage_admission_policy;
 extern int ext_storage_promotion_policy;
+extern int ext_storage_fast_boot;
+
+/* Fast boot: backend recovery feed callback (one live item per call) and the
+ * recovered-keys counter used by loadDataFromDisk's skip log line. */
+void extStorageRecoveryItem(void *engine_ctx, uint32_t db_id,
+                            const void *key, size_t klen,
+                            uint8_t value_first_byte, size_t vlen);
+long long extStorageFastBootRecoveredKeys(void);
+int extStorageFastBootPerformed(void);
 extern int ext_storage_spill_pool_active;
 extern char *ext_storage_backend;
 extern char *ext_storage_path;

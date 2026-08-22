@@ -97,6 +97,11 @@ int storageSnapshotSupported(void) {
            server_storage->snapshot_hold && server_storage->snapshot_release;
 }
 
+int storageRecoveryPerformed(void) {
+    return server_storage && server_storage->recovery_performed &&
+           server_storage->recovery_performed(server_storage_ctx);
+}
+
 void storageSnapshotHold(void) {
     if (server_storage && server_storage->snapshot_hold)
         server_storage->snapshot_hold(server_storage_ctx);
