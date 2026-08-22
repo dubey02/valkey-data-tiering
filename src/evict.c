@@ -529,7 +529,12 @@ int performEvictions(void) {
     int replicas = listLength(server.replicas);
     int result = EVICT_FAIL;
 
-    if (getMaxmemoryState(&mem_reported, NULL, &mem_tofree, NULL) == C_OK) {
+    // Without external storage this is upstream behavior: memory under the limit
+    // means nothing to do (mem_tofree is only valid when this returns C_ERR).
+    // With tiering the spill controller owns pressure decisions below.
+    if (getMaxmemoryState(&mem_reported, NULL, &mem_tofree, NULL) == C_OK && !ext_data_enabled) {
+        result = EVICT_OK;
+        goto update_metrics;
     }
 
     // If external storage is enabled, handle memory pressure via spilling — not eviction.
