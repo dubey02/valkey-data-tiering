@@ -205,6 +205,22 @@ static void *fc_io_worker(void *arg) {
                 if (key_len > 0 && val_len > 0) {
                     flashcacheReturnCode rc = flashcachePutItem(
                         req.db_id, key_bytes, (size_t)key_len, val_bytes, (size_t)val_len);
+                    /* FC_ERR_THROTTLED is BACKPRESSURE, not failure: the
+                     * staging buffer is full and a flush is draining it.
+                     * Pump cron (which completes the in-flight flush) and
+                     * retry, instead of failing the spill and permanently
+                     * stranding the value in DRAM. Bounded by shutdown.
+                     * Note: a snapshot hold request arriving while we spin
+                     * here waits until this item is accepted — acceptable,
+                     * since staging drains independently of the main thread. */
+                    while (rc == FC_ERR_THROTTLED &&
+                           !atomic_load_explicit(&ctx->shutdown, memory_order_acquire)) {
+                        flashcacheRunCronTasks();
+                        struct timespec bp = {0, 200000}; /* 200µs */
+                        nanosleep(&bp, NULL);
+                        rc = flashcachePutItem(
+                            req.db_id, key_bytes, (size_t)key_len, val_bytes, (size_t)val_len);
+                    }
                     comp.status = (rc == FC_OK) ? STORAGE_OK : STORAGE_ERR_IO;
                 } else {
                     comp.status = STORAGE_ERR_IO;
@@ -459,7 +475,10 @@ static storageStatus fc_real_put_async(void *opaque, uint32_t db_id,
     fcRealCtx *ctx = opaque;
     fcRequest req = {.op = STORAGE_OP_PUT, .db_id = db_id, .key_robj = (void*)key,
                      .value_robj = (void*)value, .expire_ms = expire_ms, .request_ctx = request_ctx};
-    fc_req_push(ctx, &req);
+    /* Ring full = submission rejected. Surface it so the engine's submit
+     * path cleans up and counts the failure — a silent drop here leaks the
+     * borrowed refs and strands the key in COPYING_TO_FLASH forever. */
+    if (fc_req_push(ctx, &req) != 0) return STORAGE_ERR_FULL;
     return STORAGE_WOULDBLOCK;
 }
 
