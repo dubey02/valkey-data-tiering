@@ -1,0 +1,5 @@
+label,arm,conns,n,boot_s,touch_s,misses
+v512,tiered,100conn,2000000,0.072,24.006,0
+v512,vanilla,100conn,2000000,2.497,15.144,0
+v4k,tiered,100conn,1000000,0.049,13.810,0
+v4k,vanilla,100conn,1000000,5.258,9.236,0
