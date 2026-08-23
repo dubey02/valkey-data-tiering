@@ -115,6 +115,13 @@ configEnum aof_fsync_enum[] = {
     {"no", AOF_FSYNC_NO},
     {NULL, 0}};
 
+/* Client-ack WAL fsync policy (values match WAL_FSYNC_* in storage_wal.h:
+ * 0 = always, 1 = everysec). */
+configEnum ext_storage_wal_fsync_enum[] = {
+    {"always", 0},
+    {"everysec", 1},
+    {NULL, 0}};
+
 configEnum shutdown_on_sig_enum[] = {
     {"default", SHUTDOWN_NOFLAGS},
     {"save", SHUTDOWN_SAVE},
@@ -2763,6 +2770,13 @@ int updateRequirePass(const char **err) {
     return 1;
 }
 
+/* Propagate a runtime ext-storage-wal-fsync change to the WAL writer. */
+static int updateExtStorageWalFsync(const char **err) {
+    UNUSED(err);
+    extStorageWalApplyFsyncPolicy();
+    return 1;
+}
+
 int updateAppendFsync(const char **err) {
     UNUSED(err);
     if (server.aof_fsync == AOF_FSYNC_ALWAYS) {
@@ -3379,6 +3393,7 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
     createBoolConfig("ext-storage-enabled", NULL, IMMUTABLE_CONFIG, ext_data_enabled, 0, NULL, NULL),
     createBoolConfig("ext-storage-fast-boot", NULL, IMMUTABLE_CONFIG, ext_storage_fast_boot, 0, NULL, NULL),
+    createBoolConfig("ext-storage-wal-enabled", NULL, IMMUTABLE_CONFIG, ext_storage_wal_enabled, 0, NULL, NULL),
     createBoolConfig("ext-key-spill-enabled", NULL, MODIFIABLE_CONFIG, ext_key_spill_enabled, 0, NULL, NULL),
 
     /* String Configs */
@@ -3427,6 +3442,7 @@ standardConfig static_configs[] = {
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, updateMaxmemoryPolicy),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, updateAppendFsync),
+    createEnumConfig("ext-storage-wal-fsync", NULL, MODIFIABLE_CONFIG, ext_storage_wal_fsync_enum, ext_storage_wal_fsync, 0, NULL, updateExtStorageWalFsync),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, 0, NULL, NULL),
     createEnumConfig("enable-protected-configs", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_protected_configs, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),

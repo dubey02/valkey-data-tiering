@@ -2520,6 +2520,7 @@ sds genExternalStorageInfoString(sds info) {
         (unsigned long)(twohit_counts ? dictSize(twohit_counts) : 0));
 
     info = genExternalStorageSnapshotInfoString(info);
+    info = genExtStorageWalInfoString(info);
     return info;
 }
 

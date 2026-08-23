@@ -1448,6 +1448,14 @@ void enterExecutionUnit(int update_cached_time, ustime_t us) {
 
 void exitExecutionUnit(void) {
     --server.execution_nesting;
+    /* Client-ack WAL: the outermost execution unit (a command, a whole
+     * EXEC, a whole script -- nested call()s stay inside it) just ended;
+     * serialize + submit its dirty keys as one framed WAL blob and stamp
+     * the issuing client. Two cheap checks keep this off the hot path when
+     * the WAL is disabled or the unit wrote nothing. */
+    if (server.execution_nesting == 0 && ext_storage_wal_enabled &&
+        extStorageWalDirtyPending())
+        extStorageWalEmitUnit();
 }
 
 void checkChildrenDone(void) {

@@ -57,6 +57,22 @@ extern int ext_data_enabled;
 extern int ext_storage_debug_pause_completions; /* DEBUG EXT-STORAGE-PAUSE-COMPLETIONS (tests only) */
 extern long long num_items_on_flash; /* values currently on external storage */
 
+/* ---------------------------------------------------------------------------
+ * Client-ack WAL (fast-boot Phase 3 steps 6-7, ext_storage_wal.c).
+ * Contract: a client-visible reply to a write implies durable commit.
+ * ---------------------------------------------------------------------------*/
+extern int ext_storage_wal_enabled;
+extern int ext_storage_wal_fsync; /* 0 = always, 1 = everysec */
+int extStorageWalInit(const char *flash_path);
+void extStorageWalShutdown(void);
+int extStorageWalActive(void);
+void extStorageWalSignalDirty(serverDb *db, robj *key); /* signalModifiedKey hook */
+void extStorageWalEmitUnit(void);       /* exitExecutionUnit hook (nesting==0) */
+int extStorageWalDirtyPending(void);    /* cheap guard for the emit hook */
+int extStorageWalReplyGated(client *c); /* networking.c reply-release gate */
+void extStorageWalApplyFsyncPolicy(void);
+sds genExtStorageWalInfoString(sds info);
+
 /* Mid-execution synchronous fetch (.agent/knowledge/sync-fetch-design.md).
  * Drives the IO for `key` to completion on the calling (main) thread, deferring
  * other keys' completions. On return the key is either resident or absent —

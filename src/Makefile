@@ -513,6 +513,8 @@ ENGINE_SERVER_OBJ = \
     storage/storage_middleware.o \
     storage/storage_mock.o \
     storage/storage_flashcache_real.o \
+    storage/storage_wal.o \
+    ext_storage_wal.o \
     fifo.o \
     functions.o \
     geo.o \

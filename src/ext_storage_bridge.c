@@ -117,6 +117,15 @@ int extStorageBridge_init(const char *backend_name, const char *path, size_t cap
     }
 
     serverLog(LL_NOTICE, "ext_storage_bridge: initialized backend '%s' at %s", backend_name, path);
+
+    /* Client-ack WAL (Phase 3 steps 6-7): opened alongside the backend so
+     * <path>.wal sits next to the flash file. Failure is fatal when the
+     * config demands it -- silently running without the WAL would break the
+     * "+OK implies durable" contract. */
+    if (ext_storage_wal_enabled && extStorageWalInit(path) != 0) {
+        serverLog(LL_WARNING, "ext_storage_bridge: WAL init failed at '%s.wal'", path);
+        return -1;
+    }
     return 0;
 }
 
@@ -325,8 +334,10 @@ int extStorageBridge_forkRead(int db_id, sds key, char **payload, size_t *plen) 
 }
 
 void extStorageBridge_shutdown(void) {
+    /* Drain + fsync + stop the WAL writer before backend teardown: every
+     * submitted blob lands durably. */
+    extStorageWalShutdown();
     storageShutdown();
-
 }
 
 int extStorageBridge_flushDB(int db_id) {

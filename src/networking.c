@@ -357,6 +357,7 @@ client *createClient(connection *conn) {
     c->module_data = NULL;
     c->mstate = NULL;
     c->woff = 0;
+    c->wal_lsn = 0;
     c->peerid = NULL;
     c->sockname = NULL;
     c->client_list_node = NULL;
@@ -3096,6 +3097,13 @@ int postWriteToClient(client *c) {
 int writeToClient(client *c) {
     if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return C_OK;
 
+    /* Client-ack WAL: a previously installed write handler (socket
+     * backpressure on an earlier large reply) must not flush bytes of a
+     * not-yet-durable write. Returning C_OK leaves the handler installed;
+     * the connection stays writable so it re-fires until durable (fsync
+     * is 100us-1ms scale -- a few spurious wakeups). */
+    if (c->wal_lsn && extStorageWalReplyGated(c)) return C_OK;
+
     c->nwritten = 0;
     c->write_flags = 0;
 
@@ -3111,6 +3119,9 @@ int writeToClient(client *c) {
 /* Write event handler. Just send data to the client. */
 void sendReplyToClient(connection *conn) {
     client *c = connGetPrivateData(conn);
+    /* Client-ack WAL: don't hand a not-yet-durable buffer to an IO thread
+     * (writeToClient has its own guard for the direct path). */
+    if (c->wal_lsn && extStorageWalReplyGated(c)) return;
     if (trySendWriteToIOThreads(c) == C_OK) return;
     writeToClient(c);
 }
@@ -3329,6 +3340,13 @@ int handleClientsWithPendingWrites(void) {
         if (c->flag.close_asap) continue;
 
         if (c->io_read_state == CLIENT_PENDING_IO) continue;
+
+        /* Client-ack WAL: this client's last write is not yet durable --
+         * withhold its reply bytes. The node stays in clients_pending_write
+         * (we have not unlinked it), so the next beforeSleep retries; the
+         * WAL writer's wakeup pipe ends the epoll sleep when the durable
+         * LSN advances. */
+        if (c->wal_lsn && extStorageWalReplyGated(c)) continue;
 
         c->flag.pending_write = 0;
         listUnlinkNode(server.clients_pending_write, ln);

@@ -1324,6 +1324,10 @@ typedef struct client {
     int multibulklen;    /* Number of multi bulk arguments left to read. */
     long bulklen;        /* Length of bulk argument in multi bulk request. */
     long long woff;      /* Last write global replication offset. */
+    uint64_t wal_lsn;    /* Client-ack WAL: commit LSN of this client's last
+                          * write unit. Reply bytes are withheld until the
+                          * WAL durable LSN covers it (ext_storage_wal.c);
+                          * 0 = nothing gated. */
     cmdQueue cmd_queue;  /* Parsed commands queue */
     /* Command execution state and command information */
     struct serverCommand *cmd;        /* Current command. */

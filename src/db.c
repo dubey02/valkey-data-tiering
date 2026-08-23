@@ -785,6 +785,10 @@ void signalModifiedKey(client *c, serverDb *db, robj *key) {
      * modification through to flash instead of discarding it. No-op (single
      * branch) outside the transient window. */
     if (ext_data_enabled) extStorageMarkTransientDirty(db, key);
+    /* Client-ack WAL: record this key in the current execution unit's dirty
+     * set; the unit's final key states are WAL-logged (and the reply gated
+     * on their durability) when the outermost unit exits. */
+    if (ext_storage_wal_enabled) extStorageWalSignalDirty(db, key);
 }
 
 void signalFlushedDb(int dbid, int async) {
