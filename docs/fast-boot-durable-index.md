@@ -95,6 +95,12 @@ O_DIRECT, "durable" = "flushed out of the staging buffer" (+ device-cache
 fsync); the loss window is precisely staging-buffer residency, so the knob is
 flush/ack cadence:
 
+> **Superseded as the ack mechanism by the client-ack WAL (section below)**,
+> which moves durability to command time with group-committed fdatasync on a
+> dedicated fd — decoupling ack latency from staging-flush cadence entirely.
+> The flush-cadence knob remains relevant only as a bound on WAL retirement
+> lag (how long WAL segments stay live before the main log covers them).
+
     ext-storage-flush everysec   (default) ack at staging-buffer write; a
                                  time-based flush (io-thread cron) bounds
                                  buffer residency -> bounded <=1s loss
@@ -134,10 +140,113 @@ capacity — bounds both delta-replay time and GC fence pressure), whichever
 first. Write cost is small and sequential: 11B/key (22MB per 2M keys) + a
 rename; skipped entirely if no mutations since the last generation.
 
+## Client-ack WAL (durability contract: +OK implies durable)
+
+Supersedes gap 4's flush-cadence knob as the ack mechanism. Contract: a
+client-visible reply to a write (`+OK` from SET, the EXEC reply array, a
+script's return) implies that write is durably committed. Scope is fixed:
+**admission=flash, promotion=never** — assumed everywhere below; every write
+eventually reaches the main log, which is what makes WAL retirement bounded.
+
+The main log cannot provide low-latency durability directly: it is O_DIRECT
+and page-aligned, so per-write durability means either waiting on the 4MB
+staging flush (high ack latency) or page-padding small flushes (write
+amplification + log fragmentation). The WAL decouples the two: big lazy
+sequential batches for the permanent log, compact synchronous appends for
+durability.
+
+### Write path
+
+1. **Submit at write time**: command execution serializes the dirty write
+   (same FC item bytes: header + crc32c + dbid + key + value; deletes are
+   tombstone records) and submits to FC via the request ring. This replaces
+   the beforeSleep spill controller as the submission point for dirty data
+   (and collapses the dirty-transient double-spill race class). The FC
+   request ring becomes the durability path for every write: ring-full
+   backpressure surfaces as ack latency, by design.
+2. **io thread**: pops the ring in FIFO order, appends the record to the WAL
+   (buffered write, own fd) AND to the staging buffer, group-commits with one
+   `fdatasync` per completion-pump cycle (or timer), then posts the
+   completion carrying the durable LSN high-water mark.
+3. **LSN-gated reply release** (main thread): the write executes fully —
+   dict updated, reply written into the client output buffer — nothing
+   parks or re-executes (blocked-client machinery cannot suspend mid-EXEC or
+   mid-script). The client is stamped with the LSN of its last write;
+   `handleClientsWithPendingWrites` skips clients whose stamp exceeds the
+   durable LSN learned from the completion pump. Valkey already defers all
+   reply bytes to the post-beforeSleep write phase, so the gate adds only
+   the fsync latency, amortized across every write in the iteration.
+
+fsync policy is the AOF-style knob, applied to the WAL fd:
+`always` = fdatasync before every completion batch (zero loss for acked
+writes); `everysec` = timer-batched (<=1s window, replies released without
+waiting).
+
+### Transaction-group framing
+
+Motivation: the WAL is a per-key item log and replay is per-record
+last-write-wins, so a crash can leave a **partial transaction** durable
+(6 of an EXEC's 10 SETs fsync'd). No acked-durability violation — the EXEC
+reply was LSN-gated on the whole group and never released — but recovery
+would apply a torn transaction, which vanilla AOF avoids by truncating an
+incomplete trailing MULTI at load. Framing restores that atomicity.
+
+Format — three record kinds distinguished by a flags byte in the WAL record
+header:
+
+    STANDALONE item/tombstone   applies directly at replay (the common case,
+                                zero framing overhead)
+    GROUP_BEGIN                 { lsn u64, group_seq u64 }
+    IN_GROUP item/tombstone     body identical to STANDALONE
+    GROUP_COMMIT                { group_seq u64, record_count u32,
+                                  group_crc u32 (crc32c over member CRCs) }
+
+Rules:
+
+- **Group = one atomic execution unit** that emits more than one WAL record:
+  an EXEC, a script invocation, or a single command dirtying multiple keys
+  (MSET, LMPOP, ...). Units emitting exactly one record stay STANDALONE;
+  units emitting zero records emit no framing at all.
+- **Contiguity is structural, not enforced**: the main thread executes the
+  unit atomically and pushes its records to the ring back-to-back;
+  the io thread appends in FIFO ring order — so a group's records are
+  contiguous in the WAL and replay buffering is a single pending group, not
+  a map.
+- **Ack gating**: the client's LSN stamp is the GROUP_COMMIT record's LSN, so
+  the reply releases only when the entire group is durable. fsync boundaries
+  may land mid-group (timer); harmless — the commit marker, not the fsync,
+  is the atomicity token.
+- **Replay**: STANDALONE applies immediately; IN_GROUP records buffer until a
+  GROUP_COMMIT with matching group_seq, record_count, and group_crc, then
+  apply in order; an unterminated or mismatched group truncates the WAL at
+  its GROUP_BEGIN (everything from there on was never acked — LSN gating
+  guarantees it). Any CRC break likewise truncates at the break.
+- **Segment rotation only at group boundaries**: rotation is deferred until
+  the open group's commit record is appended, so a group never spans
+  segments and per-segment retirement stays trivial.
+
+### Retirement and recovery
+
+A WAL record is dead once its item is durable in the main log — i.e. once
+the head journal records a flush covering its log offset. Under
+admission=flash every write spills, so retirement is continuous: two
+ping-pong segments of ~staging-buffer size, a segment recycled when every
+record in it is covered by the durable head. Bytes are written twice
+(WAL + log) but IOPS are trivial — buffered sequential + one fdatasync per
+group commit.
+
+Boot composes with everything above: checkpoint load -> log delta replay
+[checkpoint.head, durable head) -> **WAL tail replay** on top, last-write-
+wins, framing rules applied. The 26-72ms boot is preserved; the WAL tail is
+at most two staging-buffer-sized segments.
+
 ## What this deliberately does not do
 
-- No per-item sequence numbers / log format changes (head journal avoids it).
-- No separate index-mutation WAL (redundant with the log).
+- No per-item sequence numbers / log format changes in the MAIN log (head
+  journal avoids it; LSNs live only in the WAL).
+- No index-mutation WAL — index inserts remain derivable from the main log.
+  The client-ack WAL journals *data* for the ack contract; it is not a
+  second index journal.
 - No on-disk index structure (B-tree/LSM) — the index stays a RAM hash;
   disk holds snapshots + the natural log.
 - TTLs still absent from the log (pre-existing gap, orthogonal).
@@ -150,11 +259,19 @@ rename; skipped entirely if no mutations since the last generation.
 3. **Periodic checkpoint** — generations, tmp+rename, reuse 3-lite serializer.
 4. **GC space-reuse fence** — two-generation rule.
 5. **Boot delta-replay path** + fallback ladder.
-6. **flush policy config** + INFO counters (checkpoint age/duration, delta
-   bytes replayed, journal lag, fence-held bytes).
-7. **Crash matrix**: kill -9 during {steady write, staging flush, checkpoint
-   write, GC relocation, delete burst}; assert keyspace equivalence against a
-   synchronous oracle, x {everysec, always} flush policies.
+6. **Client-ack WAL, write side** — submit-at-write-time, io-thread append +
+   group-commit fdatasync, LSN-gated reply release, STANDALONE records only
+   (single-key writes ack durably end-to-end).
+7. **Transaction-group framing** — GROUP_BEGIN/IN_GROUP/GROUP_COMMIT,
+   boundary-aligned segment rotation, torn-group truncation at replay.
+8. **WAL retirement + boot replay** — segment recycling against the head
+   journal's durable head; WAL tail replay in the boot ladder; INFO counters
+   (checkpoint age/duration, delta bytes replayed, journal lag, fence-held
+   bytes, WAL size / retirement lag / fsyncs-per-sec).
+9. **Crash matrix**: kill -9 during {steady write, staging flush, checkpoint
+   write, GC relocation, delete burst, mid-EXEC, mid-group-fsync}; assert
+   keyspace equivalence against a synchronous oracle — acked writes present,
+   unacked transactions all-or-nothing — x {everysec, always} WAL policies.
 
 ## Open issue carried on this branch
 
