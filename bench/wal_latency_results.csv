@@ -1,0 +1,8 @@
+# Client-ack WAL gating cost: SET 512B, 50 conns, NO pipelining, 200k ops
+# host,arm,rps,avg_ms,min_ms,p50_ms,p95_ms,p99_ms,max_ms,wal_fsyncs,writes_per_fsync,gated_releases
+r7gd.4xlarge,off,137931,0.292,0.064,0.295,0.447,0.503,2.911,0,-,0
+r7gd.4xlarge,everysec,101061,0.432,0.120,0.423,0.671,0.719,1.975,2,-,0
+r7gd.4xlarge,always,91491,0.504,0.088,0.519,0.711,0.791,4.735,14168,14.1,200000
+desktop-throttled,off,48274,0.947,0.248,0.975,1.463,1.567,8.447,0,-,0
+desktop-throttled,everysec,40266,1.158,0.328,1.111,1.711,1.831,92.159,5,-,0
+desktop-throttled,always,8034,6.162,2.784,6.175,6.623,7.615,149.503,7956,25.1,200000
