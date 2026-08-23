@@ -25,6 +25,7 @@
 #include "flashcache.h"
 #include "flashcache_common.h"
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
@@ -89,6 +90,9 @@ typedef struct fcRealCtx {
     /* Fast boot (clean-shutdown superblock + log-scan recovery) */
     int fast_boot;                     /* persist superblock at close */
     int recovery_performed;            /* 1 = open() recovered from log */
+    size_t checkpoint_interval_bytes;
+    _Atomic int checkpoint_req;
+    _Atomic uint64_t checkpoint_gen;
     char superblock_path[4096];
     char index_path[4096];
     storageRecoveryItemFn recovery_item_fn;
@@ -301,6 +305,14 @@ static void *fc_io_worker(void *arg) {
 
         /* Run FlashCache cron (GC, async read completions) */
         flashcacheRunCronTasks();
+        if (ctx->fast_boot &&
+            (atomic_load_explicit(&ctx->checkpoint_req, memory_order_acquire) ||
+             (ctx->checkpoint_interval_bytes > 0 &&
+              flashcacheCheckpointDue(ctx->checkpoint_interval_bytes)))) {
+            if (flashcacheCheckpoint(ctx->index_path) == 0)
+                atomic_fetch_add_explicit(&ctx->checkpoint_gen, 1, memory_order_release);
+            atomic_store_explicit(&ctx->checkpoint_req, 0, memory_order_release);
+        }
 
         /* If no work was done, brief sleep to avoid busy-spin */
         if (!did_work && !flashcacheShouldRunCronTasksImmediately()) {
@@ -334,7 +346,18 @@ static uint64_t fc_clock(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
-static void fc_log(int level, const char *fmt, ...) { (void)level; (void)fmt; }
+static void fc_log(int level, const char *fmt, ...) {
+    /* FC_LL_*: DEBUG=0 VERBOSE=1 NOTICE=2 WARNING=3 (see flashcache_common.h).
+     * Forward NOTICE+ so recovery/checkpoint/GC events reach the server log. */
+    if (level < 2) return;
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    extern void _serverLog(int level, const char *fmt, ...);
+    _serverLog(level >= 3 ? 3 /*LL_WARNING*/ : 2 /*LL_NOTICE*/, "FC: %s", buf);
+}
 
 /* ---------------------------------------------------------------------------
  * storageType interface
@@ -427,6 +450,9 @@ static void *fc_real_open(storageConfig *cfg) {
      * Preference order: index reflection (O(index), keyspill/index-only
      * engines) then log scan (O(log bytes), works for all engines). */
     ctx->fast_boot = cfg->fast_boot;
+    ctx->checkpoint_interval_bytes = cfg->checkpoint_interval_bytes;
+    atomic_store(&ctx->checkpoint_req, 0);
+    atomic_store(&ctx->checkpoint_gen, 0);
     snprintf(ctx->superblock_path, sizeof(ctx->superblock_path), "%s.superblock", path);
     snprintf(ctx->index_path, sizeof(ctx->index_path), "%s.index", path);
     ctx->recovery_item_fn = cfg->recovery_item_fn;
@@ -447,6 +473,14 @@ static void *fc_real_open(storageConfig *cfg) {
                 (flashcacheRecoveryCountsCallback)cfg->recovery_counts_fn,
                 cfg->recovery_item_ctx) == 0) {
             ctx->recovery_performed = 2; /* 2 = index reflection */
+            /* Crash boot from a checkpoint: replay the log delta written
+             * after the checkpoint (no-op when the superblock was present). */
+            if (flashcacheRecoverDelta(fc_recovery_item_trampoline, ctx) != 0) {
+                /* Torn delta tail: state up to the failure point is applied;
+                 * the durable window head already bounds what we trust. */
+                flashcacheLogger(FC_LL_WARNING,
+                        "Delta replay stopped early; serving prefix");
+            }
         } else {
             /* A stale index file is unusable without its superblock (both
              * are consumed together); remove leftovers before scanning. */
@@ -470,6 +504,16 @@ static void *fc_real_open(storageConfig *cfg) {
 static int fc_real_recovery_performed(void *opaque) {
     fcRealCtx *ctx = opaque;
     return ctx->recovery_performed;
+}
+
+static void fc_real_request_checkpoint(void *opaque) {
+    fcRealCtx *ctx = opaque;
+    atomic_store_explicit(&ctx->checkpoint_req, 1, memory_order_release);
+}
+
+static uint64_t fc_real_checkpoint_generation(void *opaque) {
+    fcRealCtx *ctx = opaque;
+    return atomic_load_explicit(&ctx->checkpoint_gen, memory_order_acquire);
 }
 
 static void fc_real_close(void *opaque) {
@@ -621,6 +665,8 @@ static storageType flashcache_real_type = {
     .gc_pause = fc_real_gc_pause,
     .fork_read = fc_real_fork_read,
     .recovery_performed = fc_real_recovery_performed,
+    .request_checkpoint = fc_real_request_checkpoint,
+    .checkpoint_generation = fc_real_checkpoint_generation,
 };
 
 /* Drain all in-flight IO + execute flush on the IO thread.

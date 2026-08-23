@@ -97,6 +97,17 @@ int storageSnapshotSupported(void) {
            server_storage->snapshot_hold && server_storage->snapshot_release;
 }
 
+void storageRequestCheckpoint(void) {
+    if (server_storage && server_storage->request_checkpoint)
+        server_storage->request_checkpoint(server_storage_ctx);
+}
+
+uint64_t storageCheckpointGeneration(void) {
+    if (server_storage && server_storage->checkpoint_generation)
+        return server_storage->checkpoint_generation(server_storage_ctx);
+    return 0;
+}
+
 int storageRecoveryPerformed(void) {
     return server_storage && server_storage->recovery_performed &&
            server_storage->recovery_performed(server_storage_ctx);

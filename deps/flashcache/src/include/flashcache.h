@@ -223,6 +223,9 @@ typedef void (*flashcacheRecoveryCountsCallback)(void *ctx, uint32_t dbid, size_
  * clean shutdown — no log scan, no key bytes. Only usable when the hosting
  * engine tracks keys implicitly (key-spilling): the index holds hashes, not
  * keys. Consumes both sidecar files. Returns 0 on success, -1 to fall back. */
+int flashcacheRecoverDelta(flashcacheRecoveryItemCallback item_cb, void *ctx);
+int flashcacheCheckpoint(char const *index_filename);
+int flashcacheCheckpointDue(size_t interval_bytes);
 int flashcacheRecoverFromIndexFile(char const *superblock_filename,
         char const *index_filename,
         flashcacheRecoveryCountsCallback counts_cb, void *counts_cb_ctx);

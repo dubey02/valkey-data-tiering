@@ -71,6 +71,12 @@ void extStorageWalEmitUnit(void);       /* exitExecutionUnit hook (nesting==0) *
 int extStorageWalDirtyPending(void);    /* cheap guard for the emit hook */
 int extStorageWalReplyGated(client *c); /* networking.c reply-release gate */
 void extStorageWalApplyFsyncPolicy(void);
+void extStorageWalCron(void);           /* retirement: serverCron hook */
+void extStorageWalNoteSpillSubmit(int dbid, const char *key, size_t klen);
+void extStorageWalNoteSpillDurable(int dbid, const char *key, size_t klen);
+int extStorageSpillKeyAsync(int dbid, sds key);
+extern long long ext_storage_checkpoint_mb;
+extern long long ext_storage_wal_max_mb;
 sds genExtStorageWalInfoString(sds info);
 
 /* Mid-execution synchronous fetch (.agent/knowledge/sync-fetch-design.md).

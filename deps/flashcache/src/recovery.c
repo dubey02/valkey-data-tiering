@@ -689,7 +689,7 @@ int logRecoverFromLog(struct flashcacheLog *log, char const *superblock_filename
 #include "include/hash.h"
 
 #define FC_INDEXFILE_MAGIC   (0xFC1DECF11E5ULL)
-#define FC_INDEXFILE_VERSION (1u)
+#define FC_INDEXFILE_VERSION (2u)
 
 typedef struct __attribute__((packed)) {
     uint64_t magic;
@@ -699,6 +699,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  hash_seed[FLASHCACHE_HASHER_SEED_SIZE];
     uint64_t allocated_log_size_bytes;
     uint64_t total_num_items;
+    /* v2 (checkpoints): the log window at serialize time. On a crash boot the
+     * index file is a CHECKPOINT: state is exact for [tail_offset, head_offset)
+     * and the delta [head_offset, durable head from the head journal) is
+     * replayed on top by logRecoverDelta(). */
+    uint64_t head_offset;
+    uint64_t tail_offset;
 } fcIndexFileHeader;
 
 typedef struct __attribute__((packed)) {
@@ -758,6 +764,8 @@ int logWriteIndexFile(struct flashcacheLog *log, char const *index_filename) {
     log->hasher.get_seed(hdr.hash_seed);
     hdr.allocated_log_size_bytes = log->allocated_log_size_bytes;
     hdr.total_num_items = log->num_items;
+    hdr.head_offset = log->head_offset;
+    hdr.tail_offset = log->tail_offset;
     idxWrite(&w, &hdr, sizeof(hdr));
 
     for (uint32_t d = 0; d < log->num_databases; d++) {
@@ -822,11 +830,25 @@ int logRecoverFromIndexFile(struct flashcacheLog *log,
     flashcacheAssert(log != NULL);
     flashcacheAssert(log->num_items == 0); /* must run before any traffic */
 
+    /* Clean-shutdown boot: superblock present, index file is exact, no delta.
+     * Crash boot (checkpoints, step 3): no superblock — the index file is the
+     * last checkpoint; the durable window head comes from the head journal
+     * and the delta [checkpoint head, durable head) is replayed by the
+     * caller via logRecoverDelta() using the offsets we leave in
+     * log->recovery_delta_{from,to}. */
     fcSuperblock sb;
-    if (readSuperblock(log, superblock_filename, &sb) != 0) {
+    int have_superblock = (readSuperblock(log, superblock_filename, &sb) == 0);
+    uint64_t journal_head = 0, journal_tail = 0;
+    if (!have_superblock) {
+        if (logHeadJournalReadLast(log, &journal_head, &journal_tail) != 0) {
+            flashcacheLogger(FC_LL_NOTICE,
+                    "Index recovery: no superblock and no head journal; "
+                    "cannot bound durable window");
+            return -1;
+        }
         flashcacheLogger(FC_LL_NOTICE,
-                "Index recovery: no valid superblock at [%s]", superblock_filename);
-        return -1;
+                "Index recovery: crash boot from checkpoint; journal head=[%lu]",
+                journal_head);
     }
 
     /* Read the whole index file, then consume BOTH sidecars immediately —
@@ -866,8 +888,19 @@ int logRecoverFromIndexFile(struct flashcacheLog *log,
      * process's SipHash seed — restore it before anything hashes. */
     log->hasher.init(hdr.hash_seed);
 
-    log->head_offset = sb.head_offset;
-    log->tail_offset = sb.tail_offset;
+    if (have_superblock) {
+        log->head_offset = sb.head_offset;
+        log->tail_offset = sb.tail_offset;
+        log->recovery_delta_from = 0;
+        log->recovery_delta_to = 0;
+    } else {
+        /* Checkpoint state covers [hdr.tail, hdr.head); durable bytes extend
+         * to the journal head. Caller replays the delta. */
+        log->head_offset = journal_head;
+        log->tail_offset = hdr.tail_offset;
+        log->recovery_delta_from = hdr.head_offset;
+        log->recovery_delta_to = journal_head;
+    }
     log->allocated_log_size_bytes = hdr.allocated_log_size_bytes;
 
     char const *p = buf + sizeof(hdr);
@@ -945,4 +978,165 @@ int logRecoverFromIndexFile(struct flashcacheLog *log,
             "Index recovery complete: items=[%lu] restore_us=[%lu]",
             log->num_items, log->monotonic_clock_us() - t0);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Checkpoints (fast-boot durability step 3).
+ *
+ * logCheckpoint(): force-flush staging (fsync barrier), append a head-journal
+ * record naming the durable window, then serialize the index (tmp+rename).
+ * Runs on the io thread, so it is atomic w.r.t. puts, flushes and GC.
+ *
+ * logRecoverDelta(): boot-time replay of [from, to) on top of a restored
+ * checkpoint index. Items are head-inserted (indexAddLogEntry) — exactly the
+ * shadowing semantics the live put path (indexAddItem) uses for overwrites —
+ * and GC relocations, being appends, are handled identically. Tombstones
+ * remove the newest matching entry (collision-hash match, verified against
+ * the log bytes when the key fits in one fetch).
+ * ---------------------------------------------------------------------------*/
+
+static size_t fc_ckpt_head_baseline = 0;
+static int fc_ckpt_baseline_set = 0;
+
+int logCheckpointDue(struct flashcacheLog *log, size_t interval_bytes) {
+    if (interval_bytes == 0) return 0;
+    if (!fc_ckpt_baseline_set) {
+        fc_ckpt_head_baseline = log->head_offset;
+        fc_ckpt_baseline_set = 1;
+        return 0;
+    }
+    size_t appended = (log->head_offset + log->log_size_bytes -
+                       fc_ckpt_head_baseline) % log->log_size_bytes;
+    return appended >= interval_bytes;
+}
+
+int logCheckpoint(struct flashcacheLog *log, char const *index_filename) {
+    uint64_t t0 = recoveryNowUs(log);
+    /* Durability barrier: every index entry we serialize must reference
+     * bytes that are on disk. */
+    logFsyncBufferedWrites(log);
+    logHeadJournalAppend(log);
+    if (logWriteIndexFile(log, index_filename) != 0) return -1;
+    fc_ckpt_head_baseline = log->head_offset;
+    fc_ckpt_baseline_set = 1;
+    flashcacheLogger(FC_LL_NOTICE,
+            "Checkpoint: index serialized at head=[%lu] items=[%lu] us=[%lu]",
+            log->head_offset, log->num_items, recoveryNowUs(log) - t0);
+    return 0;
+}
+
+/* Remove the newest index entry for (dbid, key): collision-hash match down
+ * the bucket chain, with the match verified against the log bytes when the
+ * key region fits in one fetch. Returns 1 if an entry was removed. */
+static int deltaTombstone(struct flashcacheLog *log, scanReader *reader,
+        uint32_t dbid, char const *key, size_t key_len) {
+    flashcacheIndex *index = log->index_list[dbid];
+    uint64_t ch = computeCollisionHash(log->hasher.hash_function, key, key_len);
+    indexEntry *e = indexGetHeadEntry(index, key, key_len);
+    for (; e != NULL; e = e->next) {
+        logEntry *le = &e->item_entry.log_entry;
+        logEntry ch_probe;
+        memset(&ch_probe, 0, sizeof(ch_probe));
+        ch_probe.hash = ch; /* truncate exactly like storage does */
+        if (!le->on_flash || le->hash != ch_probe.hash) continue;
+        size_t off = expandTrimmedLogOffset(le->trimmed_log_offset);
+        char *item = scanFetch(reader, off, FC_ITEM_HEADER_LEN + 4096);
+        if (item != NULL && validateHeaderInSerializedItem(item, log->crc_function)) {
+            char *ik = NULL; size_t ikl = 0;
+            extractKeyFromSerializedItem(item, &ik, &ikl);
+            if (ikl != key_len || memcmp(ik, key, key_len) != 0) continue;
+        } /* fetch failed: trust the collision hash */
+        indexDeleteItem(index, key, key_len, e);
+        if (log->num_items > 0) log->num_items--;
+        return 1;
+    }
+    return 0;
+}
+
+int logRecoverDelta(struct flashcacheLog *log, size_t from_off, size_t to_off,
+        flashcacheRecoveryItemCallback item_cb, void *item_cb_ctx) {
+    size_t span = (to_off + log->log_size_bytes - from_off) % log->log_size_bytes;
+    if (span == 0) return 0;
+    uint64_t t0 = recoveryNowUs(log);
+
+    scanReader reader;
+    reader.fd = log->fio_context->fd;
+    reader.buf = (char *)fcPosixMemalign(FC_PAGESIZE, RECOVERY_CHUNK_BYTES);
+    flashcacheAssert(reader.buf != NULL);
+    reader.buf_base = 0;
+    reader.buf_len = 0;
+    reader.log_size = log->log_size_bytes;
+
+    size_t off = from_off, remaining = span;
+    long items = 0, tombs = 0;
+    int rc = 0;
+    while (remaining > 0) {
+        char *item = scanFetch(&reader, off, FC_ITEM_HEADER_LEN);
+        if (item == NULL || !validateHeaderInSerializedItem(item, log->crc_function)) {
+            flashcacheLogger(FC_LL_WARNING,
+                    "Delta recovery: bad header at [%lu]; aborting", off);
+            rc = -1; break;
+        }
+        uint32_t flag = getFlagInSerializedItem(item);
+        size_t total_len = extractTotalLenFromSerializedItem(item);
+        if (total_len == 0 || (flag & FC_EOF_INDICATOR)) { rc = -1; break; }
+
+        if (flag & FC_REPL_CMD_DELETE) {
+            item = scanFetch(&reader, off, total_len);
+            if (item == NULL || !validateKeyInSerializedItem(item, log->crc_function)) { rc = -1; break; }
+            char *key = NULL; size_t key_len = 0;
+            extractKeyFromSerializedItem(item, &key, &key_len);
+            uint32_t dbid = extractDbidFromSerializedItem(item);
+            if (dbid >= log->num_databases) { rc = -1; break; }
+            deltaTombstone(log, &reader, dbid, key, key_len);
+            tombs++;
+        } else if (!(flag & FC_SKIP_SEGMENT)) {
+            item = scanFetch(&reader, off, total_len);
+            if (item == NULL || !validateKeyInSerializedItem(item, log->crc_function)) { rc = -1; break; }
+            char *key = NULL, *value = NULL;
+            size_t key_len = 0, value_len = 0;
+            extractKeyFromSerializedItem(item, &key, &key_len);
+            extractValueFromSerializedItem(item, &value, &value_len);
+            uint32_t dbid = extractDbidFromSerializedItem(item);
+            if (dbid >= log->num_databases || key_len == 0) { rc = -1; break; }
+
+            flashcacheIndex *index = log->index_list[dbid];
+            logEntry le;
+            memset(&le, 0, sizeof(le));
+            le.on_flash = 1;
+            le.hash = computeCollisionHash(log->hasher.hash_function, key, key_len);
+            size_t pages = ((off % FC_PAGESIZE) + total_len + FC_PAGESIZE - 1) / FC_PAGESIZE;
+            size_t additional_pages = pages - 1;
+            if (additional_pages > FC_MAX_ADDITIONAL_PAGES) additional_pages = FC_MAX_ADDITIONAL_PAGES;
+            le.additional_pages = additional_pages;
+            le.trimmed_log_offset = trimLogOffset(off);
+            size_t bucket = getIndexHash(index, key, key_len);
+            while (indexGrowIfRequired(index)) { /* keep geometry current */ }
+            indexAddLogEntry(index, bucket, &le);
+            log->num_items++;
+            log->allocated_log_size_bytes += total_len;
+            log->allocated_log_size_bytes_per_db[dbid] += total_len;
+            if (item_cb != NULL) {
+                item_cb(item_cb_ctx, dbid, key, key_len,
+                        value_len > 0 ? (uint8_t)value[0] : 0, value_len);
+            }
+            items++;
+        }
+
+        size_t next = off + total_len;
+        if (flag & FC_LAST_ITEM_BEFORE_NEXT_PAGE_BOUNDARY)
+            next = getCeilPageAlignedOffset(next);
+        next %= log->log_size_bytes;
+        size_t consumed = (next + log->log_size_bytes - off) % log->log_size_bytes;
+        if (consumed == 0) { rc = -1; break; }
+        if (consumed > remaining) consumed = remaining;
+        remaining -= consumed;
+        off = next;
+    }
+    fcFree(reader.buf);
+    flashcacheLogger(rc == 0 ? FC_LL_NOTICE : FC_LL_WARNING,
+            "Delta recovery: [%lu, %lu) span=[%lu] items=[%ld] tombstones=[%ld] "
+            "rc=[%d] us=[%lu]",
+            from_off, to_off, span, items, tombs, rc, recoveryNowUs(log) - t0);
+    return rc;
 }

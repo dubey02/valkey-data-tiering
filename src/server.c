@@ -1713,6 +1713,8 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
      * however to try every second is enough in case of 'hz' is set to
      * a higher frequency. */
     run_with_period(1000) {
+        /* Client-ack WAL retirement (fast-boot step 8). */
+        extStorageWalCron();
         if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
             server.aof_last_write_status == C_ERR) {
             flushAppendOnlyFile(0);

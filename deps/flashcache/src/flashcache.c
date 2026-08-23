@@ -250,6 +250,22 @@ int flashcacheRecoverFromIndexFile(char const *superblock_filename,
             index_filename, counts_cb, counts_cb_ctx);
 }
 
+int flashcacheRecoverDelta(flashcacheRecoveryItemCallback item_cb, void *ctx) {
+    struct flashcacheLog *log = flashcache_context.log;
+    if (log->recovery_delta_from == log->recovery_delta_to) return 0;
+    return logRecoverDelta(log, log->recovery_delta_from,
+            log->recovery_delta_to, item_cb, ctx);
+}
+
+int flashcacheCheckpoint(char const *index_filename) {
+    return logCheckpoint(flashcache_context.log, index_filename);
+}
+
+int flashcacheCheckpointDue(size_t interval_bytes) {
+    return logCheckpointDue(flashcache_context.log, interval_bytes);
+}
+
+
 void flashcacheSetFastBootDurability(int enabled) {
     flashcacheAssert(flashcache_context.log != NULL);
     logSetFastBootDurability(flashcache_context.log, enabled);

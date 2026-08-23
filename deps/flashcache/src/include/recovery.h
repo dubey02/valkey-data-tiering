@@ -86,6 +86,10 @@ int logWriteIndexFile(struct flashcacheLog *log, char const *index_filename);
  * superblock (for the log window). Returns 0 on success; -1 when either file
  * is missing/invalid (caller falls back to log-scan recovery or cold start —
  * the log offsets are left reset in that case). */
+int logRecoverDelta(struct flashcacheLog *log, size_t from_off, size_t to_off,
+        flashcacheRecoveryItemCallback item_cb, void *item_cb_ctx);
+int logCheckpoint(struct flashcacheLog *log, char const *index_filename);
+int logCheckpointDue(struct flashcacheLog *log, size_t interval_bytes);
 int logRecoverFromIndexFile(struct flashcacheLog *log,
         char const *superblock_filename, char const *index_filename,
         flashcacheRecoveryCountsCallback counts_cb, void *counts_cb_ctx);

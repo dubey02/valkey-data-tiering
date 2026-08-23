@@ -218,6 +218,8 @@ typedef struct walState {
     int open;
     /* stats (writer thread writes; readers tolerate staleness) */
     _Atomic uint64_t st_records, st_groups, st_units, st_bytes, st_fsyncs;
+    _Atomic int truncate_req;
+    _Atomic uint64_t truncate_gen;
     _Atomic uint64_t st_ring_full_stalls;
 } walState;
 
@@ -345,6 +347,16 @@ static void *wal_writer_thread(void *arg) {
             break;
 
         if (!did_work) {
+            if (atomic_load_explicit(&W.truncate_req, memory_order_acquire)) {
+                /* Ring is empty and everything submitted has been appended;
+                 * the caller verified durable == last before requesting. */
+                if (ftruncate(W.fd, WAL_FILE_MAGIC_LEN) == 0) {
+                    atomic_store(&W.st_bytes, 0);
+                }
+                atomic_store_explicit(&W.truncate_req, 0, memory_order_release);
+                atomic_fetch_add_explicit(&W.truncate_gen, 1,
+                                          memory_order_release);
+            }
             struct timespec ts = {0, 50000}; /* 50us */
             nanosleep(&ts, NULL);
         }
@@ -420,4 +432,134 @@ void walClose(void) {
     close(W.wakeup_pipe[0]);
     close(W.wakeup_pipe[1]);
     W.open = 0;
+}
+
+
+uint64_t walActiveBytes(void) {
+    if (!W.open) return 0;
+    return atomic_load_explicit(&W.st_bytes, memory_order_relaxed);
+}
+
+int walTruncateActive(void) {
+    if (!W.open) return -1;
+    uint64_t gen0 = atomic_load_explicit(&W.truncate_gen, memory_order_acquire);
+    atomic_store_explicit(&W.truncate_req, 1, memory_order_release);
+    for (int i = 0; i < 20000; i++) { /* <=1s */
+        if (atomic_load_explicit(&W.truncate_gen, memory_order_acquire) != gen0)
+            return 0;
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
+    atomic_store_explicit(&W.truncate_req, 0, memory_order_release);
+    return -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Boot replay (step 8). Streaming, framing-aware, torn-tail tolerant.
+ * ---------------------------------------------------------------------------*/
+
+typedef struct { uint32_t dbid, klen, vlen; char *body; uint8_t flags; } walReplayRec;
+
+static int wal_replay_parse_item(const char *body, uint32_t body_len,
+                                 uint32_t *dbid, uint32_t *klen, uint32_t *vlen) {
+    if (body_len < 12) return -1;
+    memcpy(dbid, body, 4); memcpy(klen, body + 4, 4); memcpy(vlen, body + 8, 4);
+    if ((uint64_t)12 + *klen + *vlen != body_len) return -1;
+    return 0;
+}
+
+long walReplayFile(const char *path, walReplayRecordFn cb, void *ctx) {
+    FILE *fp = fopen(path, "rb");
+    if (fp == NULL) return -1;
+    char magic[WAL_FILE_MAGIC_LEN];
+    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic) ||
+        memcmp(magic, WAL_FILE_MAGIC, sizeof(magic)) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    long applied = 0;
+    /* Pending (uncommitted) group buffer */
+    walReplayRec *grp = NULL;
+    int grp_n = 0, grp_cap = 0;
+    uint32_t grp_chain_crc = 0;
+    uint64_t grp_seq = 0;
+    int in_group = 0;
+
+    for (;;) {
+        unsigned char hdr[WAL_RECORD_HDR_SIZE];
+        size_t got = fread(hdr, 1, sizeof(hdr), fp);
+        if (got != sizeof(hdr)) break; /* clean EOF or torn header: stop */
+        uint32_t rec_crc, body_len; uint64_t lsn; uint8_t kind, flags;
+        memcpy(&rec_crc, hdr, 4); memcpy(&body_len, hdr + 4, 4);
+        memcpy(&lsn, hdr + 8, 8); kind = hdr[16]; flags = hdr[17];
+        (void)lsn;
+        if (body_len > (256u << 20)) break; /* implausible: torn */
+        char *body = malloc(body_len ? body_len : 1);
+        if (body_len && fread(body, 1, body_len, fp) != body_len) {
+            free(body);
+            break; /* torn body */
+        }
+        uint32_t crc = walCrc32c(0, hdr + 4, sizeof(hdr) - 4);
+        crc = walCrc32c(crc, body, body_len);
+        if (crc != rec_crc) { free(body); break; } /* torn/corrupt: stop */
+
+        if (kind == WAL_REC_STANDALONE) {
+            if (in_group) { free(body); break; } /* framing violation */
+            uint32_t dbid, klen, vlen;
+            if (wal_replay_parse_item(body, body_len, &dbid, &klen, &vlen) != 0) {
+                free(body);
+                break;
+            }
+            cb(ctx, dbid, body + 12, klen, body + 12 + klen, vlen,
+               (flags & WAL_RFLAG_TOMBSTONE) != 0);
+            applied++;
+            free(body);
+        } else if (kind == WAL_REC_GROUP_BEGIN) {
+            if (in_group || body_len != 8) { free(body); break; }
+            memcpy(&grp_seq, body, 8);
+            in_group = 1; grp_n = 0; grp_chain_crc = 0;
+            free(body);
+        } else if (kind == WAL_REC_IN_GROUP) {
+            if (!in_group) { free(body); break; }
+            uint32_t dbid, klen, vlen;
+            if (wal_replay_parse_item(body, body_len, &dbid, &klen, &vlen) != 0) {
+                free(body);
+                break;
+            }
+            if (grp_n == grp_cap) {
+                grp_cap = grp_cap ? grp_cap * 2 : 8;
+                grp = realloc(grp, grp_cap * sizeof(*grp));
+            }
+            grp[grp_n].dbid = dbid; grp[grp_n].klen = klen;
+            grp[grp_n].vlen = vlen; grp[grp_n].body = body;
+            grp[grp_n].flags = flags;
+            grp_n++;
+            grp_chain_crc = walCrc32c(grp_chain_crc, &rec_crc, 4);
+        } else if (kind == WAL_REC_GROUP_COMMIT) {
+            if (!in_group || body_len != 16) { free(body); break; }
+            uint64_t seq; uint32_t count, chain;
+            memcpy(&seq, body, 8); memcpy(&count, body + 8, 4);
+            memcpy(&chain, body + 12, 4);
+            free(body);
+            if (seq != grp_seq || (int)count != grp_n || chain != grp_chain_crc)
+                break; /* torn group: drop whole, stop */
+            for (int i = 0; i < grp_n; i++) {
+                cb(ctx, grp[i].dbid, grp[i].body + 12, grp[i].klen,
+                   grp[i].body + 12 + grp[i].klen, grp[i].vlen,
+                   (grp[i].flags & WAL_RFLAG_TOMBSTONE) != 0);
+                applied++;
+                free(grp[i].body);
+            }
+            grp_n = 0; in_group = 0;
+        } else {
+            free(body);
+            break; /* unknown kind: stop */
+        }
+    }
+    /* Unterminated trailing group: drop whole (nothing past GROUP_BEGIN was
+     * ever acked -- the ack stamp is the GROUP_COMMIT LSN). */
+    for (int i = 0; i < grp_n; i++) free(grp[i].body);
+    free(grp);
+    fclose(fp);
+    return applied;
 }

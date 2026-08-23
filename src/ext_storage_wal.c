@@ -38,6 +38,7 @@
 #include "server.h"
 #include "ext_storage.h"
 #include "storage/storage_wal.h"
+#include "storage/storage.h"
 
 /* Configs (registered in config.c) */
 int ext_storage_wal_enabled = 0;
@@ -46,6 +47,25 @@ int ext_storage_wal_fsync = WAL_FSYNC_ALWAYS;
 static int wal_active = 0; /* enabled AND successfully opened */
 
 /* Stats */
+long long ext_storage_checkpoint_mb = 1024; /* config: 0 = disabled */
+long long ext_storage_wal_max_mb = 1024;     /* config: retirement threshold */
+
+/* Retirement table (step 8): (dbid,key) -> {acked_lsn, lsn_at_submit}.
+ * An entry exists while the key has an acked write whose bytes may not yet
+ * be durable in the main log. Erased at spill completion iff no newer ack
+ * arrived after the spill was submitted (the spill serialized the current
+ * value, covering every ack up to the submission stamp). */
+/* Value is a single state bit: 0 = DIRTY (acked, spill not yet submitted
+ * since the last ack), 1 = COVERED (a spill/Del serialized the current
+ * value after the last ack). "lsn_at_submit == acked_lsn" from the design
+ * reduces to exactly this bit. */
+#define WAL_KEY_DIRTY 0
+#define WAL_KEY_COVERED 1
+static dict *wal_dirty_table = NULL;
+static char wal_path_buf[4096];
+static char wal_replay_path[4096];
+static long long wal_truncations = 0;
+static long long wal_replayed_records = 0;
 static long long wal_units_emitted = 0;
 static long long wal_tombstones = 0;
 static long long wal_gated_releases = 0;
@@ -60,6 +80,7 @@ static long long wal_gated_releases = 0;
 typedef struct walDirtyKey {
     int dbid;
     sds key; /* owned copy */
+    int tombstone;
 } walDirtyKey;
 
 static walDirtyKey *dirty_keys = NULL;
@@ -67,6 +88,53 @@ static int dirty_count = 0;
 static int dirty_cap = 0;
 
 int extStorageWalDirtyPending(void) { return dirty_count; }
+
+static sds walDirtyTableKey(int dbid, const char *key, size_t klen) {
+    sds k = sdsnewlen(NULL, 0);
+    k = sdscatlen(k, &dbid, sizeof(dbid));
+    k = sdscatlen(k, key, klen);
+    return k;
+}
+
+static dictType walDirtyDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = dictEntryDestructorSdsKey,
+};
+
+/* Mark (dbid,key) DIRTY: an ack whose bytes may not yet be in the main log. */
+static void walDirtyUpsert(int dbid, const char *key, size_t klen, uint64_t lsn) {
+    (void)lsn;
+    if (wal_dirty_table == NULL) return;
+    sds k = walDirtyTableKey(dbid, key, klen);
+    dictEntry *de = dictFind(wal_dirty_table, k);
+    if (de != NULL) {
+        dictSetUnsignedIntegerVal(de, WAL_KEY_DIRTY);
+        sdsfree(k);
+    } else {
+        de = dictAddRaw(wal_dirty_table, k, NULL);
+        if (de != NULL) dictSetUnsignedIntegerVal(de, WAL_KEY_DIRTY);
+        else sdsfree(k);
+    }
+}
+
+void extStorageWalNoteSpillSubmit(int dbid, const char *key, size_t klen) {
+    if (!wal_active || wal_dirty_table == NULL) return;
+    sds k = walDirtyTableKey(dbid, key, klen);
+    dictEntry *de = dictFind(wal_dirty_table, k);
+    if (de != NULL) dictSetUnsignedIntegerVal(de, WAL_KEY_COVERED);
+    sdsfree(k);
+}
+
+void extStorageWalNoteSpillDurable(int dbid, const char *key, size_t klen) {
+    if (!wal_active || wal_dirty_table == NULL) return;
+    sds k = walDirtyTableKey(dbid, key, klen);
+    dictEntry *de = dictFind(wal_dirty_table, k);
+    if (de != NULL && dictGetUnsignedIntegerVal(de) == WAL_KEY_COVERED)
+        dictDelete(wal_dirty_table, k);
+    sdsfree(k);
+}
 
 void extStorageWalSignalDirty(serverDb *db, robj *key) {
     if (!wal_active) return;
@@ -121,6 +189,7 @@ void extStorageWalEmitUnit(void) {
              * Skip. (TTL changes are not WAL-carried; same pre-existing gap
              * as the flash log itself.) */
             sdsfree(dk->key);
+            dk->key = NULL;
             continue;
         }
         if (val != NULL) {
@@ -137,15 +206,45 @@ void extStorageWalEmitUnit(void) {
             walBlobAddItem(b, (uint32_t)dk->dbid, dk->key, sdslen(dk->key),
                            NULL, 0, 1);
             wal_tombstones++;
+            dk->tombstone = 1;
         }
-        sdsfree(dk->key);
     }
-    dirty_count = 0;
 
     char *buf = NULL;
     size_t len = 0;
     uint64_t commit_lsn = walBlobFinalize(b, &buf, &len);
     walBlobFree(b);
+    /* Retirement bookkeeping (step 8): every key in this unit now has an
+     * acked record at commit_lsn. Tombstones are stamped submitted
+     * immediately: their backend Del was issued during the unit, so the
+     * next checkpoint's flush barrier covers them. */
+    for (int i = 0; i < dirty_count; i++) {
+        walDirtyKey *dk = &dirty_keys[i];
+        if (dk->key == NULL) continue;
+        if (commit_lsn != 0) {
+            walDirtyUpsert(dk->dbid, dk->key, sdslen(dk->key), commit_lsn);
+            /* Coverage at emit time:
+             * - tombstone: the backend Del was submitted during the unit.
+             * - COPYING_TO_FLASH: flash admission submitted the spill during
+             *   the unit (setKey CREATE branch), and the state machine
+             *   blocks further writes until it completes, so that spill
+             *   covers this ack. All other states: a later spill submission
+             *   stamps coverage via extStorageWalNoteSpillSubmit(). */
+            int covered = dk->tombstone;
+            if (!covered) {
+                serverDb *cdb = server.db[dk->dbid];
+                if (cdb != NULL &&
+                    extStorageGetState(cdb, dk->key) == TIERING_STATE_COPYING_TO_FLASH)
+                    covered = 1;
+            }
+            if (covered)
+                extStorageWalNoteSpillSubmit(dk->dbid, dk->key, sdslen(dk->key));
+        }
+        sdsfree(dk->key);
+        dk->key = NULL;
+        dk->tombstone = 0;
+    }
+    dirty_count = 0;
     if (commit_lsn == 0) return;
 
     walSubmit(buf, len, commit_lsn);
@@ -187,10 +286,109 @@ static void walWakeupReadable(aeEventLoop *el, int fd, void *privdata,
 /* ---------------------------------------------------------------------------
  * Lifecycle
  * ---------------------------------------------------------------------------*/
+/* Step 8 boot replay: apply one surviving WAL record into the engine.
+ * Items land in the dict as ordinary (dirty) keys -- the normal spill
+ * pipeline re-persists them -- and register in the retirement table so the
+ * .replay file survives until a checkpoint has flushed them to the log.
+ * File order == LSN order, so sequential apply is last-write-wins. */
+static void wal_boot_apply(void *ctx, uint32_t dbid, const void *key,
+                           size_t klen, const void *val, size_t vlen,
+                           int tombstone) {
+    (void)ctx;
+    if (dbid >= (uint32_t)server.dbnum) return;
+    serverDb *db = createDatabaseIfNeeded(dbid);
+    robj keyobj;
+    sds key_sds = sdsnewlen(key, klen);
+    initStaticStringObject(keyobj, key_sds);
+    if (tombstone) {
+        if (dbFind(db, key_sds) != NULL) dbDelete(db, &keyobj);
+        /* Kill any flash copy too (idempotent; appends an FC tombstone). */
+        extStorageBridge_submitDel(dbid, key_sds);
+        walDirtyUpsert(dbid, key_sds, klen, 1);
+        {
+            sds tk = walDirtyTableKey(dbid, key_sds, klen);
+            dictEntry *tde = dictFind(wal_dirty_table, tk);
+            if (tde != NULL) dictSetUnsignedIntegerVal(tde, WAL_KEY_COVERED);
+            sdsfree(tk);
+        }
+        sdsfree(key_sds);
+        wal_replayed_records++;
+        return;
+    }
+    /* Deserialize the DUMP payload the emit path produced. */
+    rio payload;
+    rioInitWithBuffer(&payload, (sds)val); /* borrowed window */
+    payload.io.buffer.ptr = sdsnewlen(val, vlen);
+    robj *obj = NULL;
+    int type = rdbLoadObjectType(&payload);
+    if (type != -1)
+        obj = rdbLoadObject(type, &payload, key_sds, dbid, NULL, RDBFLAGS_NONE, 0);
+    sdsfree(payload.io.buffer.ptr);
+    if (obj == NULL) {
+        serverLog(LL_WARNING, "ext-storage-wal: replay: bad payload for a key; skipped");
+        sdsfree(key_sds);
+        return;
+    }
+    if (dbFind(db, key_sds) != NULL) dbDelete(db, &keyobj); /* stub or older value */
+    if (!dbAddRDBLoad(db, key_sds, &obj)) {
+        decrRefCount(obj);
+        sdsfree(key_sds);
+        return;
+    }
+    /* key_sds ownership passed to the dict. Register for retirement. */
+    walDirtyUpsert(dbid, key, klen, 1);
+    wal_replayed_records++;
+}
+
+/* Merge <wal> onto <wal>.replay (records only; strip the magic of the
+ * second file) so exactly one replay file exists across repeated crashes. */
+static void wal_merge_into_replay(const char *wal, const char *replay) {
+    FILE *src = fopen(wal, "rb");
+    if (src == NULL) return;
+    FILE *dst = fopen(replay, "ab");
+    if (dst == NULL) { fclose(src); return; }
+    if (ftell(dst) == 0) {
+        /* fresh .replay: keep a valid header */
+        fwrite(WAL_FILE_MAGIC, 1, WAL_FILE_MAGIC_LEN, dst);
+    }
+    fseek(src, WAL_FILE_MAGIC_LEN, SEEK_SET);
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, dst);
+    fclose(dst);
+    fclose(src);
+    unlink(wal);
+}
+
 int extStorageWalInit(const char *flash_path) {
     if (!ext_storage_wal_enabled) return 0;
     char wal_path[4096];
     snprintf(wal_path, sizeof(wal_path), "%s.wal", flash_path);
+    snprintf(wal_path_buf, sizeof(wal_path_buf), "%s", wal_path);
+    snprintf(wal_replay_path, sizeof(wal_replay_path), "%s.replay", wal_path);
+
+    wal_dirty_table = dictCreate(&walDirtyDictType);
+
+    /* Step 8: replay acked-but-possibly-unflushed records from the previous
+     * run BEFORE opening the fresh WAL. Chronological: .replay (older crash
+     * evidence) first, then the leftover active WAL, which is then merged
+    * into .replay -- the files are only deleted once a checkpoint's flush
+     * barrier has re-persisted their content into the main log. */
+    long r1 = 0, r2 = 0;
+    if (access(wal_replay_path, F_OK) == 0)
+        r1 = walReplayFile(wal_replay_path, wal_boot_apply, NULL);
+    if (access(wal_path, F_OK) == 0) {
+        r2 = walReplayFile(wal_path, wal_boot_apply, NULL);
+        wal_merge_into_replay(wal_path, wal_replay_path);
+    }
+    if (r1 > 0 || r2 > 0) {
+        serverLog(LL_NOTICE,
+                  "ext-storage-wal: boot replay applied %ld records "
+                  "(%ld from prior crash evidence); retained at %s until "
+                  "checkpointed",
+                  r1 + r2, r1, wal_replay_path);
+    }
+
     int wakeup_fd = -1;
     if (walOpen(wal_path, ext_storage_wal_fsync, &wakeup_fd) != 0) {
         serverLog(LL_WARNING, "ext-storage-wal: failed to open %s", wal_path);
@@ -213,6 +411,10 @@ int extStorageWalInit(const char *flash_path) {
 }
 
 void extStorageWalShutdown(void) {
+    if (wal_dirty_table != NULL) {
+        dictRelease(wal_dirty_table);
+        wal_dirty_table = NULL;
+    }
     if (!wal_active) return;
     walClose();
     wal_active = 0;
@@ -223,6 +425,79 @@ int extStorageWalActive(void) { return wal_active; }
 /* Runtime fsync-policy propagation (MODIFIABLE config apply hook). */
 void extStorageWalApplyFsyncPolicy(void) {
     if (wal_active) walSetFsyncPolicy(ext_storage_wal_fsync);
+}
+
+/* Retirement cron (step 8): when the WAL (or leftover replay evidence)
+ * exceeds the threshold, request an FC checkpoint (io thread: flush barrier
+ * + head journal + index serialize). Once it completes, every table entry
+ * whose spill was submitted before the barrier is durable in the log: sweep
+ * them; if the table empties, the WAL content is fully covered -> truncate
+ * the active file and delete the replay evidence. */
+static uint64_t wal_ckpt_gen_target = 0;
+static int wal_retire_state = 0; /* 0=idle 1=awaiting checkpoint */
+
+void extStorageWalCron(void) {
+    if (!wal_active) return;
+    int replay_pending = (access(wal_replay_path, F_OK) == 0);
+    /* Drain DIRTY entries: keys acked (often boot-replayed) whose spill was
+     * never submitted -- without memory pressure the spill controller ignores
+     * them, which would pin the WAL forever. Submit spills directly, bounded
+     * per tick; ring backpressure just defers to the next tick. Keys no
+     * longer in the dict already completed their round trip (spilled +
+     * dropped, or deleted with the Del submitted) -> COVERED. */
+    if (wal_dirty_table != NULL && dictSize(wal_dirty_table) > 0) {
+        int budget = 20000;
+        dictIterator *pit = dictGetSafeIterator(wal_dirty_table);
+        dictEntry *pde;
+        while (budget > 0 && (pde = dictNext(pit)) != NULL) {
+            if (dictGetUnsignedIntegerVal(pde) != WAL_KEY_DIRTY) continue;
+            sds tk = dictGetKey(pde);
+            int dbid;
+            memcpy(&dbid, tk, sizeof(dbid));
+            sds key = sdsnewlen(tk + sizeof(dbid), sdslen(tk) - sizeof(dbid));
+            serverDb *db = (dbid >= 0 && dbid < server.dbnum) ? server.db[dbid] : NULL;
+            if (db == NULL || dbFind(db, key) == NULL) {
+                dictSetUnsignedIntegerVal(pde, WAL_KEY_COVERED);
+            } else {
+                /* Failure = ring backpressure or currently ineligible (state
+                 * machine, embedded floor): skip, retry next tick. NOTE: a
+                 * value below the spill floor is DRAM-retained by design and
+                 * pins the WAL until it is deleted or grows -- covering
+                 * DRAM-retained state is checkpoint work beyond this POC. */
+                extStorageSpillKeyAsync(dbid, key);
+            }
+            /* on success spillItemAsync stamped COVERED via NoteSpillSubmit */
+            sdsfree(key);
+            budget--;
+        }
+        dictReleaseIterator(pit);
+    }
+    if (wal_retire_state == 0) {
+        uint64_t threshold = (uint64_t)ext_storage_wal_max_mb * 1024 * 1024;
+        if ((walActiveBytes() > threshold || replay_pending)) {
+            wal_ckpt_gen_target = storageCheckpointGeneration() + 1;
+            storageRequestCheckpoint();
+            wal_retire_state = 1;
+        }
+        return;
+    }
+    if (storageCheckpointGeneration() < wal_ckpt_gen_target) return;
+    /* Sweep: submitted-before-barrier entries are durable now. */
+    dictIterator *it = dictGetSafeIterator(wal_dirty_table);
+    dictEntry *de;
+    while ((de = dictNext(it)) != NULL) {
+        if (dictGetUnsignedIntegerVal(de) == WAL_KEY_COVERED)
+            dictDelete(wal_dirty_table, dictGetKey(de));
+    }
+    dictReleaseIterator(it);
+    if (dictSize(wal_dirty_table) == 0 &&
+        walDurableLsn() == walLastAssignedLsn()) {
+        if (walTruncateActive() == 0) {
+            unlink(wal_replay_path);
+            wal_truncations++;
+        }
+    }
+    wal_retire_state = 0;
 }
 
 sds genExtStorageWalInfoString(sds info) {
@@ -242,7 +517,11 @@ sds genExtStorageWalInfoString(sds info) {
         "wal_last_lsn:%llu\r\n"
         "wal_durable_lsn:%llu\r\n"
         "wal_gated_releases:%lld\r\n"
-        "wal_ring_full_stalls:%llu\r\n",
+        "wal_ring_full_stalls:%llu\r\n"
+        "wal_active_bytes:%llu\r\n"
+        "wal_dirty_keys:%lu\r\n"
+        "wal_truncations:%lld\r\n"
+        "wal_replayed_records:%lld\r\n",
         wal_active,
         ext_storage_wal_fsync == WAL_FSYNC_ALWAYS ? "always" : "everysec",
         wal_units_emitted, (unsigned long long)st.records,
@@ -250,6 +529,10 @@ sds genExtStorageWalInfoString(sds info) {
         (unsigned long long)st.bytes, (unsigned long long)st.fsyncs,
         (unsigned long long)walLastAssignedLsn(),
         (unsigned long long)walDurableLsn(), wal_gated_releases,
-        (unsigned long long)st.ring_full_stalls);
+        (unsigned long long)st.ring_full_stalls,
+        (unsigned long long)walActiveBytes(),
+        (unsigned long)(wal_dirty_table ? dictSize(wal_dirty_table) : 0),
+        wal_truncations,
+        wal_replayed_records);
     return info;
 }

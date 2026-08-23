@@ -226,6 +226,10 @@ typedef struct flashcacheLog {
 
     // The offset of the head of the log on flash
     size_t head_offset;
+    /* Set by logRecoverFromIndexFile on a crash boot from a checkpoint:
+     * the caller must replay [recovery_delta_from, recovery_delta_to). */
+    size_t recovery_delta_from;
+    size_t recovery_delta_to;
 
     // Items are written to flash asynchronously. This variable points to the new head offset
     // once items that are inflight of being written to flash are successfully written.

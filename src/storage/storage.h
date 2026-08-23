@@ -87,6 +87,7 @@ typedef struct storageConfig {
      * clean shutdown's log, invoking recovery_item_fn once per live item,
      * and close() persists the superblock for the next boot. */
     int fast_boot;
+    size_t checkpoint_interval_bytes; /* 0 = periodic checkpoints disabled */
     storageRecoveryItemFn recovery_item_fn;
     void *recovery_item_ctx;
     /* Index reflection: when index_only is set (engine tracks keys
@@ -183,6 +184,8 @@ typedef struct storageType {
      * recovered the store from the previous clean shutdown (the engine may
      * then skip its own persistence load for tiered keys), 0 otherwise. */
     int (*recovery_performed)(void *ctx);
+    void (*request_checkpoint)(void *ctx);        /* async; io thread executes */
+    uint64_t (*checkpoint_generation)(void *ctx); /* completed checkpoint count */
 } storageType;
 
 /* ---------------------------------------------------------------------------
@@ -212,6 +215,8 @@ void storageCron(void);
 /* Fast-boot recovery: 1 if the backend recovered the store from the previous
  * clean shutdown during storageInit (see storageConfig.fast_boot). */
 int storageRecoveryPerformed(void);
+void storageRequestCheckpoint(void);
+uint64_t storageCheckpointGeneration(void);
 
 /* Backend getters */
 storageType *storageGetFlashCacheType(void);          /* in-memory mock (testing) */

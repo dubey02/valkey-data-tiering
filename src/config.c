@@ -3443,6 +3443,8 @@ standardConfig static_configs[] = {
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, updateMaxmemoryPolicy),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, updateAppendFsync),
     createEnumConfig("ext-storage-wal-fsync", NULL, MODIFIABLE_CONFIG, ext_storage_wal_fsync_enum, ext_storage_wal_fsync, 0, NULL, updateExtStorageWalFsync),
+    createLongLongConfig("ext-storage-checkpoint-mb", NULL, IMMUTABLE_CONFIG, 0, 4194304, ext_storage_checkpoint_mb, 1024, INTEGER_CONFIG, NULL, NULL),
+    createLongLongConfig("ext-storage-wal-max-mb", NULL, MODIFIABLE_CONFIG, 16, 4194304, ext_storage_wal_max_mb, 1024, INTEGER_CONFIG, NULL, NULL),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, 0, NULL, NULL),
     createEnumConfig("enable-protected-configs", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_protected_configs, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),

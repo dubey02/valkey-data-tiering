@@ -97,6 +97,24 @@ void walSetFsyncPolicy(int fsync_policy);
 void walClose(void);
 int walIsOpen(void);
 
+/* ---- Boot replay + retirement (step 8) ---- */
+/* Called per surviving record, in file order (file order == LSN order, so
+ * applying sequentially is last-write-wins). Framing-aware: STANDALONE
+ * applies immediately, group members only once their GROUP_COMMIT validates;
+ * a torn tail or torn group truncates the rest. */
+typedef void (*walReplayRecordFn)(void *ctx, uint32_t dbid, const void *key,
+                                  size_t klen, const void *val, size_t vlen,
+                                  int tombstone);
+/* Standalone (writer need not be open). Returns applied record count, or -1
+ * if the file cannot be opened / has a bad magic. */
+long walReplayFile(const char *path, walReplayRecordFn cb, void *ctx);
+/* Truncate the ACTIVE WAL back to the file header at a writer-safe point
+ * (ring empty, durable == last). Caller must guarantee all current content
+ * is durable elsewhere. Returns 0 on success, -1 on timeout. */
+int walTruncateActive(void);
+/* Bytes appended to the active WAL since open (reset by truncate). */
+uint64_t walActiveBytes(void);
+
 /* Stats (INFO) */
 typedef struct walStats {
     uint64_t records, groups, units, bytes, fsyncs, ring_full_stalls;

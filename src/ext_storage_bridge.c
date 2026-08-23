@@ -106,6 +106,7 @@ int extStorageBridge_init(const char *backend_name, const char *path, size_t cap
         .max_gc_rate = (uint32_t)ext_storage_max_gc_rate,
         .max_buffered_write_size = (size_t)ext_storage_max_buffered_write_size,
         .buffered_write_flush_threshold = (size_t)ext_storage_buffered_write_flush_threshold,
+        .checkpoint_interval_bytes = (size_t)ext_storage_checkpoint_mb * 1024 * 1024,
     };
 
     /* Module's open() is safe to call (just stores completion_fn).

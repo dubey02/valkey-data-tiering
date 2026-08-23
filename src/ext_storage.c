@@ -1223,6 +1223,7 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                 } else {
                     /* Spill OK — free RAM value, mark as ONLY_FLASH */
                     completion_write_ok++;
+                    extStorageWalNoteSpillDurable(db->id, key_name, sdslen(key_name));
                     consecutive_spill_failures = 0; /* Backend is healthy */
                     dbEntry *entry = dbFind(db, key_name);
                     if (entry != NULL && !objectIsTiered(entry)) {
@@ -1844,7 +1845,16 @@ static int spillItemAsync(sds key, int db_id) {
      * unconditional decrement in the WRITE completion handler. */
     total_items_spilling_to_ext_storage++;
     consecutive_spill_failures = 0; /* Submission accepted — reset failure counter */
+    /* WAL retirement (step 8): the spill serialized the key's CURRENT value,
+     * covering every ack up to this point. */
+    extStorageWalNoteSpillSubmit(db_id, key, sdslen(key));
     return 0;
+}
+
+/* WAL retirement pump (step 8): submit a spill for a key the WAL still
+ * covers. spillItemAsync performs all eligibility checks itself. */
+int extStorageSpillKeyAsync(int dbid, sds key) {
+    return spillItemAsync(key, dbid);
 }
 
 /* ---------------------------------------------------------------------------
