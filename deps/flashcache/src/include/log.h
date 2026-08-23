@@ -180,6 +180,9 @@ typedef struct logMetrics {
     // Number of times DELETE item was requested
     size_t num_delete_request;
 
+    // Number of delete tombstones appended to the log (fast-boot durability)
+    size_t num_delete_tombstones_appended;
+
     // Number of times DELETE item was requested
     size_t num_optimized_deletes;
 
@@ -314,6 +317,11 @@ typedef struct flashcacheLog {
     // Flag to enable/disable optimization of resetting head/tail offset.
     // Currently it is for controlling unit tests for debugging. Enabled by default.
     int should_reset_head_tail_offset_of_log;
+
+    /* Fast-boot durability (Phase 3 steps 1+2): when set, deleteItem appends
+     * a FC_REPL_CMD_DELETE tombstone to the log and each completed staging
+     * flush appends a head-journal record. See include/recovery.h. */
+    int fast_boot_durability;
 
     // An instance of the log iterator.
     flashcacheLogIterator *log_iterator;

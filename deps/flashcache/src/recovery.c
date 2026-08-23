@@ -34,6 +34,172 @@ typedef struct __attribute__((packed)) {
 } fcSuperblock;
 
 /* ---------------------------------------------------------------------------
+ * Head journal (see recovery.h). io-thread only; file-static state is fine.
+ *
+ * File layout: fcHeadjFileHeader at offset 0, then packed 40-byte
+ * fcHeadjRecord entries appended per staging-buffer flush completion.
+ * ---------------------------------------------------------------------------*/
+#define FC_HEADJ_MAGIC          (0xFC4EADull)
+#define FC_HEADJ_VERSION        (1u)
+#define FC_HEADJ_REC_MAGIC      (0x4EAD4ECDu)
+
+typedef struct __attribute__((packed)) {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t num_databases;
+    uint64_t log_size_bytes;
+    uint32_t reserved;
+    uint32_t crc; /* crc32c over bytes up to but excluding this field */
+} fcHeadjFileHeader;
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t seq;
+    uint64_t head_offset;
+    uint64_t tail_offset;
+    uint64_t num_items;   /* disambiguates head==tail: 0 = empty, >0 = full */
+    uint32_t reserved;
+    uint32_t crc; /* crc32c over bytes up to but excluding this field */
+} fcHeadjRecord;
+
+static struct {
+    int configured;
+    int fd;              /* O_APPEND for record writes */
+    uint32_t seq;
+    char path[4096];
+} fc_headj = { 0, -1, 0, {0} };
+
+void logSetFastBootDurability(struct flashcacheLog *log, int enabled) {
+    flashcacheAssert(log != NULL);
+    log->fast_boot_durability = enabled ? 1 : 0;
+}
+
+int logHeadJournalConfigure(char const *headj_filename) {
+    flashcacheAssert(headj_filename != NULL);
+    int n = snprintf(fc_headj.path, sizeof(fc_headj.path), "%s", headj_filename);
+    if (n < 0 || (size_t)n >= sizeof(fc_headj.path)) return -1;
+    if (fc_headj.fd >= 0) close(fc_headj.fd);
+    /* No O_TRUNC: boot must be able to read the previous run's records. */
+    fc_headj.fd = open(fc_headj.path, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if (fc_headj.fd < 0) {
+        flashcacheLogger(FC_LL_WARNING, "Head journal: open(%s) failed: %d",
+                fc_headj.path, errno);
+        fc_headj.configured = 0;
+        return -1;
+    }
+    fc_headj.configured = 1;
+    fc_headj.seq = 0;
+    return 0;
+}
+
+static void headjWriteRecord(struct flashcacheLog *log) {
+    fcHeadjRecord rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.magic = FC_HEADJ_REC_MAGIC;
+    rec.seq = ++fc_headj.seq;
+    rec.head_offset = log->head_offset;
+    rec.tail_offset = log->tail_offset;
+    rec.num_items = log->num_items;
+    rec.crc = log->crc_function(0, (char const *)&rec, offsetof(fcHeadjRecord, crc));
+    ssize_t w = write(fc_headj.fd, &rec, sizeof(rec)); /* O_APPEND */
+    if (w != (ssize_t)sizeof(rec) || fdatasync(fc_headj.fd) != 0) {
+        flashcacheLogger(FC_LL_WARNING, "Head journal: record write failed: %d", errno);
+    }
+}
+
+void logHeadJournalAppend(struct flashcacheLog *log) {
+    if (!fc_headj.configured || fc_headj.fd < 0) return;
+    /* The O_DIRECT flush bypassed the page cache but not necessarily the
+     * device volatile cache; the record must never claim durability that
+     * does not exist yet. */
+    if (fsync(log->fio_context->fd) != 0) {
+        flashcacheLogger(FC_LL_WARNING, "Head journal: fsync(log) failed: %d; "
+                "skipping record", errno);
+        return;
+    }
+    headjWriteRecord(log);
+}
+
+void logHeadJournalReset(struct flashcacheLog *log) {
+    if (!fc_headj.configured || fc_headj.fd < 0) return;
+    if (ftruncate(fc_headj.fd, 0) != 0) {
+        flashcacheLogger(FC_LL_WARNING, "Head journal: truncate failed: %d", errno);
+        return;
+    }
+    fc_headj.seq = 0;
+    fcHeadjFileHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = FC_HEADJ_MAGIC;
+    hdr.version = FC_HEADJ_VERSION;
+    hdr.num_databases = log->num_databases;
+    hdr.log_size_bytes = log->log_size_bytes;
+    hdr.crc = log->crc_function(0, (char const *)&hdr, offsetof(fcHeadjFileHeader, crc));
+    ssize_t w = write(fc_headj.fd, &hdr, sizeof(hdr)); /* O_APPEND, file empty */
+    if (w != (ssize_t)sizeof(hdr)) {
+        flashcacheLogger(FC_LL_WARNING, "Head journal: header write failed: %d", errno);
+        return;
+    }
+    /* One record for the current window so a crash immediately after this
+     * point still recovers (idempotent replay of the same window). Durability
+     * of the log bytes was established by whoever produced this window
+     * (recovery scan read them; a flush fsync'd them). */
+    headjWriteRecord(log);
+    if (fdatasync(fc_headj.fd) != 0) {
+        flashcacheLogger(FC_LL_WARNING, "Head journal: fdatasync failed: %d", errno);
+    }
+}
+
+/* num_items of the last valid record read by logHeadJournalReadLast, for
+ * head==tail disambiguation (0 = empty window, >0 = exactly-full log). */
+static uint64_t fc_headj_last_num_items = 0;
+
+int logHeadJournalReadLast(struct flashcacheLog *log, uint64_t *head_offset,
+        uint64_t *tail_offset) {
+    flashcacheAssert(head_offset != NULL && tail_offset != NULL);
+    if (!fc_headj.configured || fc_headj.fd < 0) return -1;
+
+    fcHeadjFileHeader hdr;
+    ssize_t got = pread(fc_headj.fd, &hdr, sizeof(hdr), 0);
+    if (got != (ssize_t)sizeof(hdr)) return -1;
+    if (hdr.magic != FC_HEADJ_MAGIC || hdr.version != FC_HEADJ_VERSION) return -1;
+    if (hdr.crc != log->crc_function(0, (char const *)&hdr, offsetof(fcHeadjFileHeader, crc))) return -1;
+    if (hdr.log_size_bytes != log->log_size_bytes ||
+            hdr.num_databases != log->num_databases) {
+        flashcacheLogger(FC_LL_WARNING,
+                "Head journal config mismatch: journal log_size=[%lu] dbs=[%u] "
+                "vs current log_size=[%lu] dbs=[%u]",
+                hdr.log_size_bytes, hdr.num_databases,
+                log->log_size_bytes, log->num_databases);
+        return -1;
+    }
+
+    int found = 0;
+    uint64_t best_items = 0;
+    off_t off = (off_t)sizeof(hdr);
+    fcHeadjRecord rec;
+    while (pread(fc_headj.fd, &rec, sizeof(rec), off) == (ssize_t)sizeof(rec)) {
+        off += (off_t)sizeof(rec);
+        if (rec.magic != FC_HEADJ_REC_MAGIC) continue;
+        if (rec.crc != log->crc_function(0, (char const *)&rec, offsetof(fcHeadjRecord, crc))) {
+            continue; /* torn/partial append: skip, keep the previous best */
+        }
+        if (rec.head_offset >= log->log_size_bytes ||
+                rec.tail_offset >= log->log_size_bytes) {
+            continue;
+        }
+        *head_offset = rec.head_offset;
+        *tail_offset = rec.tail_offset;
+        best_items = rec.num_items;
+        if (rec.seq > fc_headj.seq) fc_headj.seq = rec.seq;
+        found = 1;
+    }
+    if (found) {
+        fc_headj_last_num_items = best_items;
+    }
+    return found ? 0 : -1;
+}
+
+/* ---------------------------------------------------------------------------
  * Superblock write (clean shutdown)
  * ---------------------------------------------------------------------------*/
 int logWriteSuperblock(struct flashcacheLog *log, char const *superblock_filename) {
@@ -202,6 +368,28 @@ static void dedupPut(dedupTable *t, uint32_t dbid, char const *key, size_t key_l
     dedupGrowIfNeeded(t);
 }
 
+/* Delete tombstone replay: remove the key's entry if present. Returns 1 when
+ * an entry was removed (the tombstone killed a live copy in the window). A
+ * miss is normal: the insert may predate the window's tail (already GC'd). */
+static int dedupDelete(dedupTable *t, uint32_t dbid, char const *key, size_t key_len) {
+    uint64_t h = t->hash_fn(key, key_len);
+    size_t b = h & (t->num_buckets - 1);
+    dedupEntry **pp = &t->buckets[b];
+    while (*pp) {
+        dedupEntry *e = *pp;
+        if (e->full_hash == h && e->dbid == dbid && e->key_len == key_len &&
+                memcmp(e->key, key, key_len) == 0) {
+            *pp = e->next;
+            fcFree(e);
+            t->num_entries--;
+            t->num_stale++;
+            return 1;
+        }
+        pp = &e->next;
+    }
+    return 0;
+}
+
 static void dedupRelease(dedupTable *t) {
     for (size_t i = 0; i < t->num_buckets; i++) {
         dedupEntry *e = t->buckets[i];
@@ -266,15 +454,35 @@ int logRecoverFromLog(struct flashcacheLog *log, char const *superblock_filename
     memset(stats, 0, sizeof(*stats));
 
     fcSuperblock sb;
-    if (readSuperblock(log, superblock_filename, &sb) != 0) {
+    int clean_shutdown = 1;
+    if (readSuperblock(log, superblock_filename, &sb) == 0) {
+        /* Consume the superblock immediately: whatever happens next, a future
+         * boot must never reuse this window. */
+        unlink(superblock_filename);
+    } else {
+        /* Crash path (fast-boot durability step 2): no clean-shutdown
+         * superblock; take the durable window from the head journal. Every
+         * byte in [tail, head) named by the last valid record was flushed
+         * O_DIRECT and fsync'd before the record was written. */
+        uint64_t jh = 0, jt = 0;
+        if (logHeadJournalReadLast(log, &jh, &jt) != 0) {
+            flashcacheLogger(FC_LL_NOTICE,
+                    "Recovery: no valid superblock at [%s] and no usable head "
+                    "journal; cold start", superblock_filename);
+            return -1;
+        }
+        clean_shutdown = 0;
+        memset(&sb, 0, sizeof(sb));
+        sb.log_size_bytes = log->log_size_bytes;
+        sb.num_databases = log->num_databases;
+        sb.head_offset = jh;
+        sb.tail_offset = jt;
+        sb.num_items = fc_headj_last_num_items;
+        unlink(superblock_filename); /* stale leftovers, if any */
         flashcacheLogger(FC_LL_NOTICE,
-                "Recovery: no valid superblock at [%s]; cold start", superblock_filename);
-        return -1;
+                "Recovery: crash recovery via head journal: head=[%lu] tail=[%lu]",
+                jh, jt);
     }
-
-    /* Consume the superblock immediately: whatever happens next, a future
-     * boot must never reuse this window. */
-    unlink(superblock_filename);
 
     size_t active = (sb.head_offset + sb.log_size_bytes - sb.tail_offset) % sb.log_size_bytes;
     if (active == 0 && sb.num_items > 0) active = sb.log_size_bytes; /* exactly-full log */
@@ -325,7 +533,31 @@ int logRecoverFromLog(struct flashcacheLog *log, char const *superblock_filename
             break;
         }
 
-        if (!(flag & FC_SKIP_SEGMENT) && !(flag & FC_REPL_CMD_DELETE)) {
+        if (flag & FC_REPL_CMD_DELETE) {
+            /* Delete tombstone (fast-boot durability step 1): remove the
+             * key's live copy from the dedup table. Scan order == write
+             * order, so any re-insert after the delete re-adds it. */
+            item = scanFetch(&reader, off, total_len);
+            if (item == NULL || !validateKeyInSerializedItem(item, log->crc_function)) {
+                flashcacheLogger(FC_LL_WARNING,
+                        "Recovery: bad tombstone at offset [%lu]; aborting scan", off);
+                rc = -1;
+                break;
+            }
+            char *key = NULL;
+            size_t key_len = 0;
+            extractKeyFromSerializedItem(item, &key, &key_len);
+            uint32_t dbid = extractDbidFromSerializedItem(item);
+            if (dbid >= log->num_databases || key_len == 0) {
+                flashcacheLogger(FC_LL_WARNING,
+                        "Recovery: bad tombstone dbid/key_len at offset [%lu]; aborting scan", off);
+                rc = -1;
+                break;
+            }
+            if (dedupDelete(&dedup, dbid, key, key_len)) {
+                stats->tombstones_applied++;
+            }
+        } else if (!(flag & FC_SKIP_SEGMENT)) {
             /* A real kv item (bit FC_LAST_ITEM_BEFORE_NEXT_PAGE_BOUNDARY may
              * also be set — it is a padding hint, the item is still real). */
             item = scanFetch(&reader, off, total_len);
@@ -432,10 +664,12 @@ int logRecoverFromLog(struct flashcacheLog *log, char const *superblock_filename
     stats->finalize_us = recoveryNowUs(log) - t1;
 
     flashcacheLogger(FC_LL_NOTICE,
-            "Recovery complete: scanned=[%lu] live=[%lu] stale=[%lu] bytes=[%lu] "
-            "scan_us=[%lu] finalize_us=[%lu]",
+            "Recovery complete (%s): scanned=[%lu] live=[%lu] stale=[%lu] "
+            "tombstones_applied=[%lu] bytes=[%lu] scan_us=[%lu] finalize_us=[%lu]",
+            clean_shutdown ? "clean superblock" : "head journal",
             stats->items_scanned, stats->items_live, stats->items_stale,
-            stats->bytes_scanned, stats->scan_us, stats->finalize_us);
+            stats->tombstones_applied, stats->bytes_scanned,
+            stats->scan_us, stats->finalize_us);
 
     dedupRelease(&dedup);
     fcFree(reader.buf);

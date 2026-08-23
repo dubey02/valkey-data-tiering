@@ -6,6 +6,7 @@
 
 #include "include/serialization.h"
 #include "include/log.h"
+#include "include/recovery.h"
 #include "include/util.h"
 #include "include/crc.h"
 #include "include/snapshot_manager.h"
@@ -196,7 +197,10 @@ void logFlushStagingBufferIfRequired(flashcacheLog *log, size_t threshold) {
 
         log->head_entry_being_flushed_to_flash = entry;
         size_t trimmed_log_offset = trimLogOffset(log->head_offset + pos);
-        flashcacheAssert(getFlagInSerializedItem(entry->item) == 0);
+        /* kv items are staged with flag 0; delete tombstones carry
+         * FC_REPL_CMD_DELETE (fast-boot durability). */
+        flashcacheAssert(getFlagInSerializedItem(entry->item) == 0 ||
+                getFlagInSerializedItem(entry->item) == FC_REPL_CMD_DELETE);
         memcpy(buf + pos, entry->item, entry->item_len);
 
         size_t additional_pages = getNumberPagesRequiredToReadItem(pos, entry->item_len) - 1;
@@ -220,8 +224,10 @@ void logFlushStagingBufferIfRequired(flashcacheLog *log, size_t threshold) {
     size_t head_offset_increment_size = buffer_size;
     if (pos > 0) {
         // Mark the last entry of the block so that we can skip empty portion of the last page
-        // during garbage collection
-        updateFlagInSerializedItem(buf + last_entry_pos, FC_LAST_ITEM_BEFORE_NEXT_PAGE_BOUNDARY,
+        // during garbage collection. OR with the existing flag: the last entry may be a delete
+        // tombstone whose FC_REPL_CMD_DELETE bit must survive.
+        updateFlagInSerializedItem(buf + last_entry_pos,
+                getFlagInSerializedItem(buf + last_entry_pos) | FC_LAST_ITEM_BEFORE_NEXT_PAGE_BOUNDARY,
                 log->crc_function);
     } else {
         if (isHeadWrappedToStartOfLogFile(log)) {
@@ -353,6 +359,32 @@ static size_t getCollisionHashFromIndexEntry(indexEntry *index_entry) {
     return collision_hash;
 }
 
+/* Fast-boot durability step 1: append a delete tombstone to the log so that a
+ * post-crash log replay does not resurrect this key. The tombstone is a
+ * header+key record flagged FC_REPL_CMD_DELETE (format-reserved). It gets a
+ * staging-buffer entry but deliberately NO index entry (index_entry == NULL is
+ * the discriminator at flush completion) and is never counted in num_items or
+ * allocated bytes: it is garbage from birth and GC reclaims its bytes when the
+ * tail passes it. Scan order == write order, so GC (which consumes strictly
+ * from the tail) always drops the older instances of the key before or with
+ * the tombstone -- a window scan can never see an insert without the
+ * tombstone that killed it. Bypasses the write throttle: deletes must not
+ * fail, and the record is tiny. */
+static void appendDeleteTombstone(flashcacheLog *log, uint32_t dbid,
+        char const *key, size_t key_len) {
+    if (!log->fast_boot_durability || key == NULL || key_len == 0) {
+        return;
+    }
+    char *item = NULL;
+    size_t item_len = 0;
+    serializeKeyValuePairWithFlag(dbid, key, key_len, NULL, 0, &item, &item_len,
+            log->crc_function, FC_REPL_CMD_DELETE);
+    stagingBufferAddItem(log->staging_buffer, item, item_len, dbid);
+    updateStagingBufferSizeMetric(log->staging_buffer->total_item_size);
+    log->metrics.num_delete_tombstones_appended++;
+    logFlushStagingBufferIfRequired(log, log->staging_buffer_flush_size_threshold_bytes);
+}
+
 static void deleteItem(flashcacheLog *log, uint32_t dbid, char *key, size_t key_len,
         indexEntry *index_entry) {
     /* If the index_entry was being fetched as part of a different read request,
@@ -393,6 +425,9 @@ static void deleteItem(flashcacheLog *log, uint32_t dbid, char *key, size_t key_
     }
     indexDeleteItem(log->index_list[dbid], key, key_len, index_entry);
     log->num_items--;
+    /* Covers all index-removing paths: client DELETE, destructive fetch
+     * (promotion), and GC eviction. */
+    appendDeleteTombstone(log, dbid, key, key_len);
 }
 
 static void deleteItemAndFreeKey(flashcacheLog *log, uint32_t dbid, char *key, size_t key_len,
@@ -916,6 +951,7 @@ flashcacheReturnCode logCreate(flashcacheLog **flashcache_log, char const *log_f
     log->head_offset = 0;
     log->tail_offset = 0;
     log->should_reset_head_tail_offset_of_log = 1;
+    log->fast_boot_durability = 0;
     log->allocated_log_size_bytes_per_db = (size_t *) fcCalloc(sizeof(size_t), num_databases);
     flashcacheAssert(log->allocated_log_size_bytes_per_db != NULL);
     log->allocated_log_size_bytes = 0;
@@ -1087,12 +1123,18 @@ flashcacheReturnCode logRunCronTasks(flashcacheLog *log) {
             // Iterate over the staging buffer entries that had been written to flash
             stagingBufferEntry *entry = log->head_entry_being_flushed_to_flash;
             while (entry) {
-                // Overwrite the index's item_entry to change it from a stagingBufferEntry to a logEntry because
-                // the item now resides in flash. The logEntry members were prepared when the fio request was submitted.
-                memcpy(&(entry->index_entry->item_entry.log_entry), &(entry->log_entry),
-                        sizeof(entry->log_entry));
-                // Increment the log size, move the pointer forward, and free the now unnecessary staging buffer entry
-                incrementAllocatedLogSize(log, entry->user_data, entry->item_len);
+                if (entry->index_entry != NULL) {
+                    // Overwrite the index's item_entry to change it from a stagingBufferEntry to a logEntry because
+                    // the item now resides in flash. The logEntry members were prepared when the fio request was submitted.
+                    memcpy(&(entry->index_entry->item_entry.log_entry), &(entry->log_entry),
+                            sizeof(entry->log_entry));
+                    // Increment the log size, move the pointer forward, and free the now unnecessary staging buffer entry
+                    incrementAllocatedLogSize(log, entry->user_data, entry->item_len);
+                }
+                /* index_entry == NULL: a delete tombstone (fast-boot durability).
+                 * It is garbage from birth: no index update, no allocated-size
+                 * accounting -- GC reclaims its bytes with the rest of the
+                 * stale data. */
                 stagingBufferEntry *last_entry = entry;
                 entry = entry->next;
                 deleteEntryFromStagingBuffer(log, last_entry, 1);
@@ -1104,6 +1146,11 @@ flashcacheReturnCode logRunCronTasks(flashcacheLog *log) {
             fioRequestClear(fio_request);
             log->head_offset = log->head_offset_after_flush_succeed;
             flashcacheAssert(log->head_entry_being_flushed_to_flash == NULL);
+            /* Fast-boot durability step 2: the flushed bytes are on flash;
+             * record the new durable window in the head journal. */
+            if (log->fast_boot_durability) {
+                logHeadJournalAppend(log);
+            }
         } else if (id == FC_GARBAGE_COLLECTION_LOG_READ_REQUEST_IDENTIFIER) {
             flashcacheAssert(fio_request == &(log->log_iterator->log_file_fio_request));
             // Core GC logic is executed by processReadItem which is called by logIteratorCron at the end of
@@ -1625,6 +1672,15 @@ void logFlush(flashcacheLog *log, uint64_t dbid) {
                 0, NOT_RUNNING, 0, log->hasher.hash_function);
     }
     resetHeadTailOffsetOfLogIfRequired(log);  // Reset the head and tail offset of the log if required.
+    /* Fast-boot durability: the window may have jumped (full flush resets
+     * offsets); void all prior journal records so a crash cannot replay them.
+     * KNOWN GAP: a per-db FLUSHDB while other DBs still hold items is not
+     * represented in the log, so a post-crash scan resurrects the flushed
+     * db's keys (needs a FLUSHDB marker record; deferred to the checkpoint
+     * work). */
+    if (log->fast_boot_durability) {
+        logHeadJournalReset(log);
+    }
     log->garbage_collector_info.can_start_garbage_collection = 1;
 }
 

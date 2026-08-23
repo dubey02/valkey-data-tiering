@@ -24,9 +24,11 @@
  *    later crash can never resurrect a stale window.
  *
  * Known POC limitations (by design, see engine-side docs):
- *  - deletes are index-only (no log tombstones): deleted-but-uncompacted keys
- *    are resurrected. Test workloads must avoid deletes.
  *  - TTLs are not stored in the log.
+ *  - Per-db FLUSHDB (with other DBs still holding items) is not represented
+ *    in the log; a post-crash scan resurrects the flushed db's keys. (Full
+ *    flush resets the window, which the head journal records, so the ALL
+ *    case is safe.)
  * ---------------------------------------------------------------------------*/
 
 struct flashcacheLog;
@@ -42,6 +44,7 @@ typedef struct flashcacheRecoveryStats {
     size_t items_scanned;   /* every kv record seen in the active window   */
     size_t items_live;      /* survivors after last-write-wins dedup       */
     size_t items_stale;     /* overwritten copies discarded by dedup       */
+    size_t tombstones_applied; /* delete tombstones applied during replay  */
     size_t bytes_scanned;   /* active-window bytes walked                  */
     uint64_t scan_us;       /* wall time: scan + dedup                     */
     uint64_t finalize_us;   /* wall time: index rebuild + callbacks        */
@@ -95,5 +98,51 @@ int logRecoverFromIndexFile(struct flashcacheLog *log,
 int logRecoverFromLog(struct flashcacheLog *log, char const *superblock_filename,
         flashcacheRecoveryItemCallback item_cb, void *item_cb_ctx,
         flashcacheRecoveryStats *stats);
+
+/* ---------------------------------------------------------------------------
+ * Head journal (fast boot Phase 3 step 2: crash-safe log window).
+ *
+ * The log is circular, so after a crash a scan cannot locate the durable head
+ * without help; the clean-shutdown superblock only exists after a clean stop.
+ * The head journal is a tiny append-only sidecar (<path>.headj): one 32-byte
+ * record per completed staging-buffer flush, written on the io thread AFTER
+ * the flush's O_DIRECT write has completed and the log fd has been fsync'd
+ * (device volatile cache). The last CRC-valid record therefore names a window
+ * {tail, head} whose bytes are fully durable: recorded head is exact (head
+ * only advances via flushes, each of which appends a record); recorded tail
+ * is <= the real tail (GC may have advanced it since), which is safe because
+ * freed-but-not-overwritten bytes contain only stale, CRC-valid items that
+ * last-write-wins replay discards -- an overwrite of that region can only
+ * happen via a head-advancing flush, which would have appended a newer
+ * record first.
+ *
+ * Lifecycle: configured (path) before logCreate side effects; reset (truncate
+ * + file header) after every successful recovery and on cold start, so stale
+ * windows from a previous lap are never replayed; appended on each flush
+ * completion and after logFlush() resets the window. All calls are io-thread
+ * only. When never configured/enabled, all hooks are no-ops.
+ * ---------------------------------------------------------------------------*/
+
+/* Enable fast-boot durability plumbing: delete tombstones in the log +
+ * head-journal appends. Call once, before traffic. */
+void logSetFastBootDurability(struct flashcacheLog *log, int enabled);
+
+/* Set the journal sidecar path and open/create the file. Does NOT truncate
+ * (boot must be able to read the previous run's records). Returns 0/-1. */
+int logHeadJournalConfigure(char const *headj_filename);
+
+/* Append one {head, tail} record for the current window. io-thread only.
+ * No-op when unconfigured. */
+void logHeadJournalAppend(struct flashcacheLog *log);
+
+/* Truncate the journal, rewrite the file header, and append one record for
+ * the current window. Called after recovery / cold start / logFlush. */
+void logHeadJournalReset(struct flashcacheLog *log);
+
+/* Read the last CRC-valid record from the journal into {head, tail}.
+ * Validates the file header against the live log geometry. Returns 0 when a
+ * usable record exists, -1 otherwise. */
+int logHeadJournalReadLast(struct flashcacheLog *log, uint64_t *head_offset,
+        uint64_t *tail_offset);
 
 #endif /* __FLASHCACHE_RECOVERY_H */

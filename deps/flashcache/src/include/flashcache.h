@@ -227,6 +227,19 @@ int flashcacheRecoverFromIndexFile(char const *superblock_filename,
         char const *index_filename,
         flashcacheRecoveryCountsCallback counts_cb, void *counts_cb_ctx);
 
+/* Fast-boot durability (crash-safe recovery, steps 1+2):
+ *  - SetFastBootDurability(1) turns on delete tombstones in the log and
+ *    head-journal appends at every staging-flush completion.
+ *  - HeadJournalConfigure sets/opens the journal sidecar (<flash>.headj);
+ *    call BEFORE recovery so a crashed previous run's window can be read.
+ *  - HeadJournalReset voids all prior records and stamps the current window;
+ *    call AFTER recovery (any outcome) so stale windows are never replayed.
+ * With these enabled, flashcacheRecoverFromLog also recovers after a crash
+ * (no superblock) using the journal's durable window. */
+void flashcacheSetFastBootDurability(int enabled);
+int flashcacheHeadJournalConfigure(char const *headj_filename);
+void flashcacheHeadJournalReset();
+
 /**!\brief Notifies Redis layer Snapshot completion
  *
  * @Returns : Void

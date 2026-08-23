@@ -250,6 +250,20 @@ int flashcacheRecoverFromIndexFile(char const *superblock_filename,
             index_filename, counts_cb, counts_cb_ctx);
 }
 
+void flashcacheSetFastBootDurability(int enabled) {
+    flashcacheAssert(flashcache_context.log != NULL);
+    logSetFastBootDurability(flashcache_context.log, enabled);
+}
+
+int flashcacheHeadJournalConfigure(char const *headj_filename) {
+    return logHeadJournalConfigure(headj_filename);
+}
+
+void flashcacheHeadJournalReset() {
+    flashcacheAssert(flashcache_context.log != NULL);
+    logHeadJournalReset(flashcache_context.log);
+}
+
 
 void flashcacheNotifyRedisLayerSnapshotCompletion() {
     logCompleteThreadsaveReplication(flashcache_context.log);

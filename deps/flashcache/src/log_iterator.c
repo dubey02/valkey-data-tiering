@@ -70,7 +70,10 @@ static void processReadItem(flashcacheLogIterator *log_iterator) {
 
         size_t last_offset = offset;
         offset += total_item_len;
-        if (item_flag == FC_LAST_ITEM_BEFORE_NEXT_PAGE_BOUNDARY) {
+        /* Bit-test, not equality: the last item of a flush block may combine
+         * FC_LAST_ITEM_BEFORE_NEXT_PAGE_BOUNDARY with FC_REPL_CMD_DELETE
+         * (delete tombstones, fast-boot durability). */
+        if (item_flag & FC_LAST_ITEM_BEFORE_NEXT_PAGE_BOUNDARY) {
             offset = getCeilPageAlignedOffset(offset);
         }
 

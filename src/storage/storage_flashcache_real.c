@@ -433,6 +433,15 @@ static void *fc_real_open(storageConfig *cfg) {
     ctx->recovery_item_ctx = cfg->recovery_item_ctx;
     ctx->recovery_performed = 0;
     if (cfg->fast_boot) {
+        /* Crash-safe durability (Phase 3 steps 1+2): delete tombstones in the
+         * log + head journal. Configure the journal BEFORE recovery so a
+         * crashed previous run's durable window can be read (log-scan
+         * fallback when the clean-shutdown superblock is absent). */
+        char headj_path[4096];
+        snprintf(headj_path, sizeof(headj_path), "%s.headj", path);
+        flashcacheSetFastBootDurability(1);
+        flashcacheHeadJournalConfigure(headj_path);
+
         if (cfg->index_only &&
             flashcacheRecoverFromIndexFile(ctx->superblock_path, ctx->index_path,
                 (flashcacheRecoveryCountsCallback)cfg->recovery_counts_fn,
@@ -447,6 +456,11 @@ static void *fc_real_open(storageConfig *cfg) {
                 ctx->recovery_performed = 1; /* 1 = log scan */
             }
         }
+        /* Void the previous lap's journal records and stamp the final window
+         * (recovered head/tail, or 0/0 on cold start). Must happen for every
+         * outcome: new writes will overwrite old log bytes, so old records
+         * must never be replayable. */
+        flashcacheHeadJournalReset();
     }
 
     pthread_create(&ctx->io_thread, NULL, fc_io_worker, ctx);
