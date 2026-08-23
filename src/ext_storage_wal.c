@@ -458,11 +458,16 @@ void extStorageWalCron(void) {
             serverDb *db = (dbid >= 0 && dbid < server.dbnum) ? server.db[dbid] : NULL;
             if (db == NULL || dbFind(db, key) == NULL) {
                 dictSetUnsignedIntegerVal(pde, WAL_KEY_COVERED);
-            } else {
-                /* Failure = ring backpressure or currently ineligible (state
-                 * machine, embedded floor): skip, retry next tick. NOTE: a
+            } else if (extStorageGetState(db, key) == TIERING_STATE_ONLY_MEMORY) {
+                /* Only pump state-quiescent keys. Submitting a spill while a
+                 * fetch is in flight (COPYING_TO_MEMORY) clobbers the state
+                 * machine: the READ completion asserts and the parked client
+                 * never wakes (seen on r7gd postboot + local crash matrix).
+                 * COPYING_TO_FLASH already covers us (stamped at emit);
+                 * other states resolve and get picked up next tick.
+                 * Failure here = ring backpressure or embedded floor: a
                  * value below the spill floor is DRAM-retained by design and
-                 * pins the WAL until it is deleted or grows -- covering
+                 * pins the WAL until deleted or grown -- covering
                  * DRAM-retained state is checkpoint work beyond this POC. */
                 extStorageSpillKeyAsync(dbid, key);
             }

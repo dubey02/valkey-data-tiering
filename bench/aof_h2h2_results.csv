@@ -1,0 +1,8 @@
+arm,phase,dist,ops,wall_s,tps,get_rps,set_rps,notes
+tiered,boot-fresh,-,-,0.01,-,-,-,-
+tiered,populate,sequential,13107200,508.67,25770.48,-,25770.48,dbsize=0
+tiered,mixed-full,uniform,2000000,65.86,30367,16780.21,15186.03,-
+tiered,crash-boot,-,-,1.05,-,-,-,tailmark_survivors=200/200;du=80G;dbsize=23162
+tiered,postboot,zipfian,1000000,189.18,5286,0,0,misses_delta=0
+tiered,postboot,gaussian,1000000,0.00,0,0,0,misses_delta=0
+tiered,postboot,uniform,1000000,0.00,0,0,0,misses_delta=0
