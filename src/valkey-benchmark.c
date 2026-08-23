@@ -174,6 +174,9 @@ static struct config {
     int zipfian;          /* 0=uniform (default), 1=zipfian */
     double zipfian_alpha; /* Zipfian exponent (default 1.0) */
     double *zipfian_cdf;  /* Precomputed CDF table */
+    /* Gaussian access pattern: mean = keyspacelen/2, sigma = keyspacelen/sigma_div */
+    int gaussian;             /* 0=off (default), 1=gaussian */
+    double gaussian_sigma_div; /* sigma divisor (default 16.0) */
 } config;
 
 /* Locations of the placeholders __rand_int__, __rand_1st__,
@@ -510,6 +513,26 @@ static uint64_t zipfianSample(void) {
     return (uint64_t)lo;
 }
 
+/* Gaussian (normal) key distribution: hot band centered on the middle of the
+ * keyspace. mean = keyspacelen/2, sigma = keyspacelen/gaussian_sigma_div.
+ * Box-Muller transform; out-of-range samples are reflected back into
+ * [0, keyspacelen). Uses random() like the other samplers. */
+static uint64_t gaussianSample(void) {
+    double n = (double)config.keyspacelen;
+    double mean = n / 2.0;
+    double sigma = n / config.gaussian_sigma_div;
+    double u1, u2;
+    do {
+        u1 = ((double)random() + 1.0) / ((double)RAND_MAX + 2.0); /* (0,1) */
+        u2 = (double)random() / (double)RAND_MAX;
+    } while (u1 <= 0.0);
+    double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+    long k = (long)(mean + z * sigma);
+    if (k < 0) k = -k;                     /* reflect below 0 */
+    if (k >= config.keyspacelen) k %= config.keyspacelen; /* wrap extremes */
+    return (uint64_t)k;
+}
+
 static void replacePlaceholder(const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter) {
     if (count == 0) return;
 
@@ -519,6 +542,8 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
             key = atomic_fetch_add_explicit(key_counter, 1, memory_order_relaxed);
         } else if (config.zipfian) {
             key = zipfianSample();
+        } else if (config.gaussian) {
+            key = gaussianSample();
         } else {
             key = random();
         }
@@ -1857,6 +1882,12 @@ int parseOptions(int argc, char **argv) {
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 config.zipfian_alpha = atof(argv[++i]);
             }
+        } else if (!strcmp(argv[i], "--gaussian")) {
+            config.gaussian = 1;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                config.gaussian_sigma_div = atof(argv[++i]);
+                if (config.gaussian_sigma_div <= 0) config.gaussian_sigma_div = 16.0;
+            }
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -2340,6 +2371,8 @@ int main(int argc, char **argv) {
     config.replace_placeholders = 0;
     config.keyspacelen = 0;
     config.sequential_replacement = 0;
+    config.zipfian_alpha = 1.0;      /* was uninitialized: bare --zipfian silently degenerated to uniform */
+    config.gaussian_sigma_div = 16.0;
     config.quiet = 0;
     config.csv = 0;
     config.loop = 0;

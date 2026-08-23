@@ -1,0 +1,15 @@
+arm,phase,dist,ops,wall_s,tps,get_rps,set_rps,notes
+vanilla,boot-fresh,-,-,0.01,-,-,-,-
+vanilla,populate,sequential,13107200,185.36,70735.41,-,70735.41,dbsize=13107200
+vanilla,mixed-full,uniform,2000000,27.56,72569,36295.00,36295.00,-
+vanilla,crash-boot,-,-,68.27,-,-,-,tailmark_survivors=200/200;du=55G;dbsize=13107400
+vanilla,postboot,zipfian,1000000,14.17,70572,36300.28,36302.91,misses_delta=0
+vanilla,postboot,gaussian,1000000,14.79,67613,33827.21,33827.21,misses_delta=0
+vanilla,postboot,uniform,1000000,14.78,67659,33836.37,33838.66,misses_delta=0
+tiered,boot-fresh,-,-,0.01,-,-,-,-
+tiered,populate,sequential,13107200,368.24,35599.88,-,35599.88,dbsize=0
+tiered,mixed-full,uniform,2000000,45.34,44111,23764.26,22059.47,-
+tiered,crash-boot,-,-,54.90,-,-,-,tailmark_survivors=157/200;du=131G;dbsize=157
+tiered,postboot,zipfian,1000000,43.73,22868,11741.50,11537.48,misses_delta=0
+tiered,postboot,gaussian,1000000,25.30,39526,20371.58,19766.75,misses_delta=0
+tiered,postboot,uniform,1000000,22.80,43860,23766.52,21938.48,misses_delta=0
