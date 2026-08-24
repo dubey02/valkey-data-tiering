@@ -279,3 +279,77 @@ Tiered fetch path kills client connections at value sizes >=16KB under >=32
 connections (timing-sensitive; invisible under strace; <=4KB clean to 200
 conns; vanilla clean). Root cause TBD — orthogonal to this design but must be
 fixed before any durability claims are benchmarked at those sizes.
+
+---
+
+# Phase 3: results and status (2026-08-24)
+
+All nine implementation steps are complete and gated. Scope throughout:
+admission=flash, promotion=never, key-spilling on.
+
+## Boot-to-serving (r7gd.4xlarge, instance-store NVMe)
+
+| Boot mode | 50GB @ 4KB (13.1M keys) | Mechanism |
+|---|---|---|
+| Clean shutdown | 26-72ms | index sidecar reflection |
+| **Crash (kill -9)** | **1.05s** | checkpoint (14.5M entries) + 283MB delta scan + 29.2k-record WAL replay |
+| vanilla RDB cold | 2.5-20.9s | full parse (dataset-size bound) |
+| vanilla AOF-always crash | 68.3s | full AOF replay |
+
+Crash boot is O(checkpoint load + delta + WAL tail), independent of
+dataset size: 65x faster than vanilla AOF replay with the same
+"+OK implies durable" contract.
+
+## Durability contract (the client-ack WAL)
+
+- Acked-write oracle after kill -9: **200/200** (vanilla AOF-always parity;
+  was 157/200 before step 8).
+- Crash matrix (step 9): 10/10 -- acked singletons always present, EVAL
+  groups all-or-nothing (torn groups dropped whole), acked deletes honored.
+- Write-path cost on real NVMe (512B, 50 conns, no pipelining):
+  always-mode 91.5k TPS / p99 0.79ms vs 137.9k no-WAL baseline; only 9%
+  below everysec. Group commit ~14 writes/fsync.
+- 50GB @ 4KB 50/50 steady state: tiered WAL-always 44.1k TPS vs vanilla
+  AOF-always 72.6k, at ~2MB vs ~60GB boot DRAM.
+
+## Checkpoints (forked, step 3 + stall fix)
+
+io thread pays barrier+fork only (15-66ms measured at 19M items); a
+malloc-free CoW child serializes off-thread (600-800ms). Under a pure
+write workload the synchronous version caused 3-4s full write outages
+per checkpoint; forked version: zero zero-throughput windows, +9.5% TPS.
+WAL retirement sweeps only entries whose coverage epoch precedes the
+checkpoint request (the fork-time flush barrier makes exactly those
+durable in the log).
+
+## Bugs found and fixed along the way
+
+1. FC_ERR_THROTTLED = permanent DRAM stranding (268k/320k keys lost at
+   64KB) -- backpressure retry (2dc7821).
+2. extStorageBridge_shutdown had zero callers -- queued spills dropped at
+   every shutdown (8e3df08).
+3. Staging assert rejected flagged records; page-boundary marker
+   overwrote the flag word; GC flag compare used == not bit-test -- all
+   three would have silently broken tombstones (65eb22076).
+4. ext-storage-capacity-mb default (1GiB) exhaustion livelocks all writes
+   with no client-visible error (documented; needs error-or-evict).
+5. valkey-benchmark zipfian_alpha never defaulted: bare --zipfian
+   silently ran uniform (1d2ac4bb).
+6. Retirement pump clobbered COPYING_TO_MEMORY on in-flight fetches --
+   READ-completion assert (dbcfccd9).
+7. fc_req_push return ignored on GET/DEL: ring-full silently dropped the
+   fetch, permanently wedging the key (fe94395a5) -- the wedged-fetch P1.
+8. fc_log was a no-op: every FC recovery/GC/checkpoint log line had been
+   discarded since the backend was written (7e154c51).
+
+## Remaining known limits
+
+- Values below the spill floor are DRAM-retained and pin the WAL
+  (covering DRAM state is future checkpoint work).
+- Delta-replay overwrites leave shadowed index entries until GC ages
+  them out (bounded, one-shot per crash).
+- Checkpoint child reaping assumes no competing waitpid(-1) reaper
+  (true under save ''/no AOF); needs a shared child registry.
+- Zipfian read workloads convoy on hot keys under promotion=never
+  (22.9k vs 43.9k uniform post-boot) -- a promotion policy recovers this.
+- Capacity exhaustion needs a client-visible error instead of a livelock.
