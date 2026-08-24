@@ -167,15 +167,6 @@ if [ "$DATATYPE" = "string" ]; then
             $SET_CMD -n "$KEYSPACE" -r "$KEYSPACE" $SET_CMD_ARGS $KS_FLAG \
             --sequential -c "$POPULATE_CLIENTS" -q $SET_CMD_TAIL >> "$RESULTS/populate.txt" 2>&1 || true
         sleep 2
-        # No-tiering baseline: dataset intentionally exceeds maxmemory; one full
-        # populate pass + active evictions == done (full keyspace can never be resident).
-        if [ "${POPULATE_ACCEPT_EVICTIONS:-0}" = "1" ]; then
-            EVICTED=$(cli INFO stats | grep -oP '^evicted_keys:\K[0-9]+' | head -1)
-            if [ "${EVICTED:-0}" -gt 0 ]; then
-                echo "[mixed-rw] Populate complete (eviction steady-state): dbsize=$(effective_keys) evicted=$EVICTED (attempt $attempt)"
-                break
-            fi
-        fi
         DBSIZE=$(effective_keys)
         if [ "$DBSIZE" -ge "$KEYSPACE" ]; then
             echo "[mixed-rw] Populate complete: keys=$DBSIZE (attempt $attempt)"
