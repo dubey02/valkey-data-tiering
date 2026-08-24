@@ -47,6 +47,8 @@ int ext_storage_wal_fsync = WAL_FSYNC_ALWAYS;
 static int wal_active = 0; /* enabled AND successfully opened */
 
 /* Stats */
+extern _Atomic long fc_dbg_push_fail_get, fc_dbg_push_fail_del,
+       fc_dbg_push_fail_put, fc_dbg_get_submitted, fc_dbg_get_dispatched;
 long long ext_storage_checkpoint_mb = 1024; /* config: 0 = disabled */
 long long ext_storage_wal_max_mb = 1024;     /* config: retirement threshold */
 
@@ -446,7 +448,11 @@ void extStorageWalCron(void) {
      * longer in the dict already completed their round trip (spilled +
      * dropped, or deleted with the Del submitted) -> COVERED. */
     if (wal_dirty_table != NULL && dictSize(wal_dirty_table) > 0) {
-        int budget = 20000;
+        /* Cap well below the backend request ring (4096): a pump burst that
+         * saturates the ring starves client fetches (measured: 60k futile
+         * push attempts + a dropped GET per crash boot at budget 20000).
+         * Un-pumped keys simply wait for the next tick. */
+        int budget = 1024;
         dictIterator *pit = dictGetSafeIterator(wal_dirty_table);
         dictEntry *pde;
         while (budget > 0 && (pde = dictNext(pit)) != NULL) {
@@ -526,7 +532,12 @@ sds genExtStorageWalInfoString(sds info) {
         "wal_active_bytes:%llu\r\n"
         "wal_dirty_keys:%lu\r\n"
         "wal_truncations:%lld\r\n"
-        "wal_replayed_records:%lld\r\n",
+        "wal_replayed_records:%lld\r\n"
+        "dbg_push_fail_get:%ld\r\n"
+        "dbg_push_fail_del:%ld\r\n"
+        "dbg_push_fail_put:%ld\r\n"
+        "dbg_get_submitted:%ld\r\n"
+        "dbg_get_dispatched:%ld\r\n",
         wal_active,
         ext_storage_wal_fsync == WAL_FSYNC_ALWAYS ? "always" : "everysec",
         wal_units_emitted, (unsigned long long)st.records,
@@ -538,6 +549,9 @@ sds genExtStorageWalInfoString(sds info) {
         (unsigned long long)walActiveBytes(),
         (unsigned long)(wal_dirty_table ? dictSize(wal_dirty_table) : 0),
         wal_truncations,
-        wal_replayed_records);
+        wal_replayed_records,
+        atomic_load(&fc_dbg_push_fail_get), atomic_load(&fc_dbg_push_fail_del),
+        atomic_load(&fc_dbg_push_fail_put), atomic_load(&fc_dbg_get_submitted),
+        atomic_load(&fc_dbg_get_dispatched));
     return info;
 }

@@ -1520,6 +1520,10 @@ void cronUpdateMemoryStats(void) {
     if (zmalloc_used_memory() > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used_memory();
 
     run_with_period(100) {
+        /* Client-ack WAL retirement (fast-boot step 8): 10Hz so a large
+         * boot-replay backlog drains at ~10k keys/s while each burst stays
+         * far below the backend request ring (1024 vs 4096). */
+        extStorageWalCron();
         /* Sample the RSS and other metrics here since this is a relatively slow call.
          * We must sample the zmalloc_used at the same time we take the rss, otherwise
          * the frag ratio calculate may be off (ratio of two samples at different times) */
@@ -1713,8 +1717,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
      * however to try every second is enough in case of 'hz' is set to
      * a higher frequency. */
     run_with_period(1000) {
-        /* Client-ack WAL retirement (fast-boot step 8). */
-        extStorageWalCron();
+
         if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
             server.aof_last_write_status == C_ERR) {
             flushAppendOnlyFile(0);

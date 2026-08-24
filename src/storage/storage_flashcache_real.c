@@ -104,11 +104,19 @@ static fcRealCtx *g_fc_ctx = NULL;
 /* ---------------------------------------------------------------------------
  * Request ring push/pop (SPSC — Valkey main thread is single-threaded)
  * ---------------------------------------------------------------------------*/
+_Atomic long fc_dbg_push_fail_get = 0, fc_dbg_push_fail_del = 0,
+             fc_dbg_push_fail_put = 0, fc_dbg_get_submitted = 0,
+             fc_dbg_get_dispatched = 0;
+
 static int fc_req_push(fcRealCtx *ctx, fcRequest *req) {
     int head = atomic_load_explicit(&ctx->req_head, memory_order_relaxed);
     int next = (head + 1) % FC_REQ_RING;
-    if (next == atomic_load_explicit(&ctx->req_tail, memory_order_acquire))
+    if (next == atomic_load_explicit(&ctx->req_tail, memory_order_acquire)) {
+        if (req->op == STORAGE_OP_GET) atomic_fetch_add(&fc_dbg_push_fail_get, 1);
+        else if (req->op == STORAGE_OP_DEL) atomic_fetch_add(&fc_dbg_push_fail_del, 1);
+        else atomic_fetch_add(&fc_dbg_push_fail_put, 1);
         return -1; /* full */
+    }
     ctx->req_ring[head] = *req;
     atomic_store_explicit(&ctx->req_head, next, memory_order_release);
     return 0;
@@ -254,6 +262,7 @@ static void *fc_io_worker(void *arg) {
                 break;
             }
             case STORAGE_OP_GET: {
+                atomic_fetch_add(&fc_dbg_get_dispatched, 1);
                 char *key_bytes = NULL;
                 int key_len = extStorageSerializeKey(req.key_robj, &key_bytes);
                 if (key_len > 0) {
@@ -563,7 +572,17 @@ static storageStatus fc_real_get_async(void *opaque, uint32_t db_id,
     fcRequest req = {.op = STORAGE_OP_GET, .db_id = db_id, .key_robj = (void*)key,
                      .value_robj = NULL, .expire_ms = 0, .request_ctx = request_ctx,
                      .get_flags = flags};
-    fc_req_push(ctx, &req);
+    atomic_fetch_add(&fc_dbg_get_submitted, 1);
+    /* THE WEDGE FIX (P1): a dropped GET leaves the key in COPYING_TO_MEMORY
+     * forever -- the engine waits for a completion that never comes, and
+     * every later access to the key parks behind that state. Reads must
+     * never be lost: spin until the ring has space. The io thread drains it
+     * in microseconds, and the retirement pump (the only producer that can
+     * saturate the ring) is budget-capped below the ring size. */
+    while (fc_req_push(ctx, &req) != 0) {
+        struct timespec ts = {0, 50000}; /* 50us */
+        nanosleep(&ts, NULL);
+    }
     return STORAGE_WOULDBLOCK;
 }
 
@@ -574,7 +593,12 @@ static storageStatus fc_real_del_async(void *opaque, uint32_t db_id,
     fcRealCtx *ctx = opaque;
     fcRequest req = {.op = STORAGE_OP_DEL, .db_id = db_id, .key_robj = (void*)key,
                      .value_robj = NULL, .expire_ms = 0, .request_ctx = request_ctx};
-    fc_req_push(ctx, &req);
+    /* Same contract as GET: a dropped Del is a durability hole (a stale
+     * flash copy resurrects under fast-boot recovery). Never drop. */
+    while (fc_req_push(ctx, &req) != 0) {
+        struct timespec ts = {0, 50000};
+        nanosleep(&ts, NULL);
+    }
     return STORAGE_WOULDBLOCK;
 }
 
