@@ -1,6 +1,7 @@
 #ifndef __FLASHCACHE_H
 #define __FLASHCACHE_H
 
+#include <sys/types.h>
 #include <stdlib.h>
 
 #include "include/flashcache_common.h"
@@ -225,6 +226,8 @@ typedef void (*flashcacheRecoveryCountsCallback)(void *ctx, uint32_t dbid, size_
  * keys. Consumes both sidecar files. Returns 0 on success, -1 to fall back. */
 int flashcacheRecoverDelta(flashcacheRecoveryItemCallback item_cb, void *ctx);
 int flashcacheCheckpoint(char const *index_filename);
+pid_t flashcacheCheckpointFork(char const *index_filename);
+void flashcacheCheckpointForkResult(int success);
 int flashcacheCheckpointDue(size_t interval_bytes);
 int flashcacheRecoverFromIndexFile(char const *superblock_filename,
         char const *index_filename,

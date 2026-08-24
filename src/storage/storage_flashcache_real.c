@@ -26,6 +26,8 @@
 #include "flashcache_common.h"
 #include <pthread.h>
 #include <stdarg.h>
+#include <sys/wait.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
@@ -93,6 +95,7 @@ typedef struct fcRealCtx {
     size_t checkpoint_interval_bytes;
     _Atomic int checkpoint_req;
     _Atomic uint64_t checkpoint_gen;
+    pid_t checkpoint_child; /* io-thread only */
     char superblock_path[4096];
     char index_path[4096];
     storageRecoveryItemFn recovery_item_fn;
@@ -314,12 +317,29 @@ static void *fc_io_worker(void *arg) {
 
         /* Run FlashCache cron (GC, async read completions) */
         flashcacheRunCronTasks();
-        if (ctx->fast_boot &&
+        /* Forked checkpoints: fire when due (one child at a time), then
+         * poll non-blockingly. The io thread only pays the barrier+fork
+         * cost (~ms); serialization happens in the CoW child. NOTE: relies
+         * on no other reaper harvesting our pid -- true under save ""/no
+         * AOF; a shared child registry is the production follow-up. */
+        if (ctx->checkpoint_child > 0) {
+            int status = 0;
+            pid_t r = waitpid(ctx->checkpoint_child, &status, WNOHANG);
+            if (r == ctx->checkpoint_child || (r < 0 && errno == ECHILD)) {
+                int ok = (r == ctx->checkpoint_child) &&
+                         WIFEXITED(status) && WEXITSTATUS(status) == 0;
+                flashcacheCheckpointForkResult(ok);
+                if (ok)
+                    atomic_fetch_add_explicit(&ctx->checkpoint_gen, 1,
+                                              memory_order_release);
+                ctx->checkpoint_child = 0;
+            }
+        } else if (ctx->fast_boot &&
             (atomic_load_explicit(&ctx->checkpoint_req, memory_order_acquire) ||
              (ctx->checkpoint_interval_bytes > 0 &&
               flashcacheCheckpointDue(ctx->checkpoint_interval_bytes)))) {
-            if (flashcacheCheckpoint(ctx->index_path) == 0)
-                atomic_fetch_add_explicit(&ctx->checkpoint_gen, 1, memory_order_release);
+            ctx->checkpoint_child = flashcacheCheckpointFork(ctx->index_path);
+            if (ctx->checkpoint_child < 0) ctx->checkpoint_child = 0;
             atomic_store_explicit(&ctx->checkpoint_req, 0, memory_order_release);
         }
 
@@ -462,6 +482,7 @@ static void *fc_real_open(storageConfig *cfg) {
     ctx->checkpoint_interval_bytes = cfg->checkpoint_interval_bytes;
     atomic_store(&ctx->checkpoint_req, 0);
     atomic_store(&ctx->checkpoint_gen, 0);
+    ctx->checkpoint_child = 0;
     snprintf(ctx->superblock_path, sizeof(ctx->superblock_path), "%s.superblock", path);
     snprintf(ctx->index_path, sizeof(ctx->index_path), "%s.index", path);
     ctx->recovery_item_fn = cfg->recovery_item_fn;

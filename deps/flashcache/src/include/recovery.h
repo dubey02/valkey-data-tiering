@@ -1,6 +1,7 @@
 #ifndef __FLASHCACHE_RECOVERY_H
 #define __FLASHCACHE_RECOVERY_H
 
+#include <sys/types.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -89,6 +90,8 @@ int logWriteIndexFile(struct flashcacheLog *log, char const *index_filename);
 int logRecoverDelta(struct flashcacheLog *log, size_t from_off, size_t to_off,
         flashcacheRecoveryItemCallback item_cb, void *item_cb_ctx);
 int logCheckpoint(struct flashcacheLog *log, char const *index_filename);
+pid_t logCheckpointFork(struct flashcacheLog *log, char const *index_filename);
+void logCheckpointForkResult(struct flashcacheLog *log, int success);
 int logCheckpointDue(struct flashcacheLog *log, size_t interval_bytes);
 int logRecoverFromIndexFile(struct flashcacheLog *log,
         char const *superblock_filename, char const *index_filename,

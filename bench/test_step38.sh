@@ -71,7 +71,7 @@ sleep 2  # let io-thread idle path take a checkpoint
 # small post-checkpoint delta
 $SRC/valkey-benchmark -p $PORT -t set -r 100000 -n 3000 -c 20 -d 4096 -q >/dev/null 2>&1
 for i in $(seq 1 50); do $CLI set "t4tail:$i" "$V" >/dev/null; done
-grep -q 'Checkpoint: index serialized' $D/server.log && ok "runtime checkpoint taken" || bad "no runtime checkpoint"
+grep -qE 'Checkpoint: (index serialized|child completed)' $D/server.log && ok "runtime checkpoint taken" || bad "no runtime checkpoint"
 kill9
 T0=$(date +%s.%N)
 start_srv --ext-storage-checkpoint-mb 64

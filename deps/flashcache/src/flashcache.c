@@ -261,6 +261,14 @@ int flashcacheCheckpoint(char const *index_filename) {
     return logCheckpoint(flashcache_context.log, index_filename);
 }
 
+pid_t flashcacheCheckpointFork(char const *index_filename) {
+    return logCheckpointFork(flashcache_context.log, index_filename);
+}
+
+void flashcacheCheckpointForkResult(int success) {
+    logCheckpointForkResult(flashcache_context.log, success);
+}
+
 int flashcacheCheckpointDue(size_t interval_bytes) {
     return logCheckpointDue(flashcache_context.log, interval_bytes);
 }

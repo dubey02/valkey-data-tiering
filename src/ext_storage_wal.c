@@ -62,7 +62,17 @@ long long ext_storage_wal_max_mb = 1024;     /* config: retirement threshold */
  * value after the last ack). "lsn_at_submit == acked_lsn" from the design
  * reduces to exactly this bit. */
 #define WAL_KEY_DIRTY 0
-#define WAL_KEY_COVERED 1
+/* COVERED values carry the epoch they were covered in: (epoch << 1) | 1.
+ * The retirement sweep only erases entries covered strictly BEFORE the
+ * checkpoint request: those spills preceded the checkpoint's flush barrier
+ * (which runs at fork time, after the request) and are therefore durable in
+ * the log. Entries covered later may still be staging-resident when the
+ * (forked, asynchronous) checkpoint completes -- erasing them would let the
+ * WAL truncate away their only durable copy. */
+static uint64_t wal_cover_epoch = 1;
+#define WAL_COVERED_VAL() ((wal_cover_epoch << 1) | 1)
+#define WAL_IS_COVERED(v) ((v) & 1)
+#define WAL_COVER_EPOCH_OF(v) ((v) >> 1)
 static dict *wal_dirty_table = NULL;
 static char wal_path_buf[4096];
 static char wal_replay_path[4096];
@@ -125,7 +135,7 @@ void extStorageWalNoteSpillSubmit(int dbid, const char *key, size_t klen) {
     if (!wal_active || wal_dirty_table == NULL) return;
     sds k = walDirtyTableKey(dbid, key, klen);
     dictEntry *de = dictFind(wal_dirty_table, k);
-    if (de != NULL) dictSetUnsignedIntegerVal(de, WAL_KEY_COVERED);
+    if (de != NULL) dictSetUnsignedIntegerVal(de, WAL_COVERED_VAL());
     sdsfree(k);
 }
 
@@ -133,7 +143,7 @@ void extStorageWalNoteSpillDurable(int dbid, const char *key, size_t klen) {
     if (!wal_active || wal_dirty_table == NULL) return;
     sds k = walDirtyTableKey(dbid, key, klen);
     dictEntry *de = dictFind(wal_dirty_table, k);
-    if (de != NULL && dictGetUnsignedIntegerVal(de) == WAL_KEY_COVERED)
+    if (de != NULL && WAL_IS_COVERED(dictGetUnsignedIntegerVal(de)))
         dictDelete(wal_dirty_table, k);
     sdsfree(k);
 }
@@ -310,7 +320,7 @@ static void wal_boot_apply(void *ctx, uint32_t dbid, const void *key,
         {
             sds tk = walDirtyTableKey(dbid, key_sds, klen);
             dictEntry *tde = dictFind(wal_dirty_table, tk);
-            if (tde != NULL) dictSetUnsignedIntegerVal(tde, WAL_KEY_COVERED);
+            if (tde != NULL) dictSetUnsignedIntegerVal(tde, WAL_COVERED_VAL());
             sdsfree(tk);
         }
         sdsfree(key_sds);
@@ -436,6 +446,7 @@ void extStorageWalApplyFsyncPolicy(void) {
  * them; if the table empties, the WAL content is fully covered -> truncate
  * the active file and delete the replay evidence. */
 static uint64_t wal_ckpt_gen_target = 0;
+static uint64_t wal_ckpt_request_epoch = 0;
 static int wal_retire_state = 0; /* 0=idle 1=awaiting checkpoint */
 
 void extStorageWalCron(void) {
@@ -463,7 +474,7 @@ void extStorageWalCron(void) {
             sds key = sdsnewlen(tk + sizeof(dbid), sdslen(tk) - sizeof(dbid));
             serverDb *db = (dbid >= 0 && dbid < server.dbnum) ? server.db[dbid] : NULL;
             if (db == NULL || dbFind(db, key) == NULL) {
-                dictSetUnsignedIntegerVal(pde, WAL_KEY_COVERED);
+                dictSetUnsignedIntegerVal(pde, WAL_COVERED_VAL());
             } else if (extStorageGetState(db, key) == TIERING_STATE_ONLY_MEMORY) {
                 /* Only pump state-quiescent keys. Submitting a spill while a
                  * fetch is in flight (COPYING_TO_MEMORY) clobbers the state
@@ -487,6 +498,10 @@ void extStorageWalCron(void) {
         uint64_t threshold = (uint64_t)ext_storage_wal_max_mb * 1024 * 1024;
         if ((walActiveBytes() > threshold || replay_pending)) {
             wal_ckpt_gen_target = storageCheckpointGeneration() + 1;
+            /* Coverage boundary: only entries covered before this instant
+             * are provably flushed by the checkpoint's fork-time barrier. */
+            wal_ckpt_request_epoch = wal_cover_epoch;
+            wal_cover_epoch++;
             storageRequestCheckpoint();
             wal_retire_state = 1;
         }
@@ -497,7 +512,8 @@ void extStorageWalCron(void) {
     dictIterator *it = dictGetSafeIterator(wal_dirty_table);
     dictEntry *de;
     while ((de = dictNext(it)) != NULL) {
-        if (dictGetUnsignedIntegerVal(de) == WAL_KEY_COVERED)
+        uint64_t v = dictGetUnsignedIntegerVal(de);
+        if (WAL_IS_COVERED(v) && WAL_COVER_EPOCH_OF(v) <= wal_ckpt_request_epoch)
             dictDelete(wal_dirty_table, dictGetKey(de));
     }
     dictReleaseIterator(it);

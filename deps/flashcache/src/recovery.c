@@ -1140,3 +1140,183 @@ int logRecoverDelta(struct flashcacheLog *log, size_t from_off, size_t to_off,
             from_off, to_off, span, items, tombs, rc, recoveryNowUs(log) - t0);
     return rc;
 }
+
+/* ---------------------------------------------------------------------------
+ * Forked checkpoint (io-thread stall fix).
+ *
+ * The synchronous logCheckpoint() serializes the whole index on the io
+ * thread: ~876ms at 14.5M items (measured, r7gd), during which spills and
+ * fetches stall -- and under WAL-always, client acks with them. Instead:
+ * do the cheap barrier work on the io thread, then fork() and let a
+ * copy-on-write child serialize the frozen index, exactly valkey's bgsave
+ * pattern.
+ *
+ * The child MUST be malloc-free: another thread may hold the allocator
+ * lock at fork time, so any malloc in the child deadlocks. The serializer
+ * below uses open/write/fsync/rename syscalls and a stack buffer only --
+ * no stdio, no logger, no flashcacheAssert.
+ * ---------------------------------------------------------------------------*/
+
+typedef struct {
+    int fd;
+    uint32_t crc;
+    flashcache_crc_function crc_fn;
+    int failed;
+    size_t len;
+    char buf[65536];
+} fdWriter;
+
+static void fdwFlush(fdWriter *w) {
+    size_t off = 0;
+    while (off < w->len) {
+        ssize_t n = write(w->fd, w->buf + off, w->len - off);
+        if (n <= 0) { w->failed = 1; return; }
+        off += (size_t)n;
+    }
+    w->len = 0;
+}
+
+static void fdwWrite(fdWriter *w, void const *buf, size_t len) {
+    if (w->failed) return;
+    w->crc = w->crc_fn(w->crc, (char const *)buf, len);
+    char const *p = buf;
+    while (len > 0 && !w->failed) {
+        size_t room = sizeof(w->buf) - w->len;
+        size_t take = len < room ? len : room;
+        memcpy(w->buf + w->len, p, take);
+        w->len += take;
+        p += take;
+        len -= take;
+        if (w->len == sizeof(w->buf)) fdwFlush(w);
+    }
+}
+
+/* Child-side body. Returns 0 on success. Malloc-free, logger-free. */
+static int checkpointChildSerialize(struct flashcacheLog *log,
+        char const *index_filename, char const *tmp_name) {
+    fdWriter w;
+    w.fd = open(tmp_name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (w.fd < 0) return -1;
+    w.crc = 0;
+    w.crc_fn = log->crc_function;
+    w.failed = 0;
+    w.len = 0;
+
+    fcIndexFileHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = FC_INDEXFILE_MAGIC;
+    hdr.version = FC_INDEXFILE_VERSION;
+    hdr.num_databases = log->num_databases;
+    hdr.log_size_bytes = log->log_size_bytes;
+    log->hasher.get_seed(hdr.hash_seed);
+    hdr.allocated_log_size_bytes = log->allocated_log_size_bytes;
+    hdr.total_num_items = log->num_items;
+    hdr.head_offset = log->head_offset;
+    hdr.tail_offset = log->tail_offset;
+    fdwWrite(&w, &hdr, sizeof(hdr));
+
+    for (uint32_t d = 0; d < log->num_databases && !w.failed; d++) {
+        flashcacheIndex *index = log->index_list[d];
+        fcIndexFileDbHeader dbh;
+        memset(&dbh, 0, sizeof(dbh));
+        dbh.base_size_bits = (uint32_t)index->base_size_bits;
+        dbh.collision_bits_used = (uint32_t)index->collision_bits_used;
+        dbh.num_items = index->num_items;
+        dbh.allocated_bytes = log->allocated_log_size_bytes_per_db[d];
+        fdwWrite(&w, &dbh, sizeof(dbh));
+
+        size_t table_size = indexTableSize(index);
+        for (size_t b = 0; b < table_size && !w.failed; b++) {
+            indexEntry *e = index->table[b];
+            if (e == NULL) continue;
+            uint32_t chain_len = 0;
+            for (indexEntry *it = e; it; it = it->next) chain_len++;
+            uint64_t bucket_idx = (uint64_t)b;
+            fdwWrite(&w, &bucket_idx, sizeof(bucket_idx));
+            fdwWrite(&w, &chain_len, sizeof(chain_len));
+            for (indexEntry *it = e; it; it = it->next) {
+                if (!it->item_entry.log_entry.on_flash) { w.failed = 1; break; }
+                fdwWrite(&w, &(it->item_entry.log_entry), sizeof(logEntry));
+            }
+        }
+        uint64_t terminator = UINT64_MAX;
+        fdwWrite(&w, &terminator, sizeof(terminator));
+    }
+
+    uint32_t crc = w.crc;
+    /* trailing CRC is not itself CRC'd: append without accumulating */
+    if (!w.failed) {
+        char const *p = (char const *)&crc;
+        size_t len = sizeof(crc);
+        while (len > 0 && !w.failed) {
+            size_t room = sizeof(w.buf) - w.len;
+            size_t take = len < room ? len : room;
+            memcpy(w.buf + w.len, p, take);
+            w.len += take; p += take; len -= take;
+            if (w.len == sizeof(w.buf)) fdwFlush(&w);
+        }
+    }
+    if (!w.failed) fdwFlush(&w);
+    if (!w.failed && fsync(w.fd) != 0) w.failed = 1;
+    close(w.fd);
+    if (w.failed || rename(tmp_name, index_filename) != 0) {
+        unlink(tmp_name);
+        return -1;
+    }
+    return 0;
+}
+
+/* Parent side (io thread): barrier + journal + growth pump, then fork.
+ * Returns the child pid (>0), or -1 on failure / not ready. The caller polls
+ * the pid with waitpid(WNOHANG) and reports the outcome via
+ * logCheckpointForkResult(). */
+pid_t logCheckpointFork(struct flashcacheLog *log, char const *index_filename) {
+    uint64_t t0 = recoveryNowUs(log);
+    logFsyncBufferedWrites(log);
+    logHeadJournalAppend(log);
+    if (stagingBufferGetTotalItemSize(log->staging_buffer) != 0 ||
+            !fioRequestIsEmpty(&(log->log_flush_fio_request))) {
+        flashcacheLogger(FC_LL_WARNING,
+                "Checkpoint fork: staging still busy after barrier; skipping");
+        return -1;
+    }
+    for (uint32_t d = 0; d < log->num_databases; d++) {
+        while (indexGrowIfRequired(log->index_list[d])) { /* advance */ }
+    }
+    static char tmp_name[4096];
+    int n = snprintf(tmp_name, sizeof(tmp_name), "%s.tmp", index_filename);
+    if (n < 0 || (size_t)n >= sizeof(tmp_name)) return -1;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* CHILD: frozen CoW view; syscalls + stack only. */
+        _exit(checkpointChildSerialize(log, index_filename, tmp_name) == 0 ? 0 : 1);
+    }
+    if (pid < 0) {
+        flashcacheLogger(FC_LL_WARNING, "Checkpoint fork failed: %d", errno);
+        return -1;
+    }
+    /* The checkpoint content is the state AT the fork: advance the cadence
+     * baseline now. On child failure the caller rolls it back. */
+    fc_ckpt_head_baseline = log->head_offset;
+    fc_ckpt_baseline_set = 1;
+    flashcacheLogger(FC_LL_NOTICE,
+            "Checkpoint: forked child [%d] at head=[%lu] items=[%lu] "
+            "(io-thread prep us=[%lu])",
+            (int)pid, log->head_offset, log->num_items,
+            recoveryNowUs(log) - t0);
+    return pid;
+}
+
+void logCheckpointForkResult(struct flashcacheLog *log, int success) {
+    if (!success) {
+        /* Re-arm: retry at the next due evaluation. */
+        fc_ckpt_baseline_set = 0;
+        flashcacheLogger(FC_LL_WARNING, "Checkpoint child failed");
+    } else {
+        flashcacheLogger(FC_LL_NOTICE,
+                "Checkpoint: child completed; index file at head baseline [%lu]",
+                fc_ckpt_head_baseline);
+    }
+    (void)log;
+}
