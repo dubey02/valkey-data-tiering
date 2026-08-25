@@ -159,7 +159,7 @@ if [ "$DATATYPE" = "string" ]; then
     effective_keys() {
         local db ks
         db=$(cli DBSIZE | grep -oP '[0-9]+')
-        ks=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1)
+        ks=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1 || true)
         echo $(( ${db:-0} + ${ks:-0} ))
     }
     for attempt in $(seq 1 100); do
@@ -275,7 +275,7 @@ else
     # Count dict-resident plus key-spilled keys: with key spilling enabled,
     # demoted keys leave the dict but remain on flash.
     DBSIZE=$(cli DBSIZE | grep -oP '[0-9]+')
-    KEYSPILLED=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1)
+    KEYSPILLED=$(cli INFO everything 2>/dev/null | grep -oP '^keys_key_spilled:\K[0-9]+' | head -1 || true)
     DBSIZE=$(( ${DBSIZE:-0} + ${KEYSPILLED:-0} ))
     OOM_REJECTS=$(cli INFO everything 2>/dev/null | grep -oP 'oom_reject_write_count:\K[0-9]+' || echo 0)
     OOM_REJECTS=${OOM_REJECTS:-0}
