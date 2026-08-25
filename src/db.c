@@ -92,7 +92,8 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
      * (flash miss / pending deletion) is reported as a normal key miss. */
     if (val && ext_data_enabled &&
         ((flags & LOOKUP_SYNCFETCH) || server.execution_nesting > 1) &&
-        (objectIsTiered(val) || val->tiering_state != TIERING_STATE_ONLY_MEMORY)) {
+        (objectIsTiered(val) || (val->tiering_state != TIERING_STATE_ONLY_MEMORY &&
+                                 val->tiering_state != TIERING_STATE_WARM))) {
         extStorageSyncFetch(db, objectGetVal(key));
         val = dbFindWithDictIndex(db, objectGetVal(key), dict_index);
         if (val && objectIsTiered(val)) val = NULL;
@@ -499,6 +500,12 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
          * happen in command context; waiters blocked by KBC on PENDING_DELETION
          * must be released once the entry is actually gone. */
         int was_pending_deletion = (val->tiering_state == TIERING_STATE_PENDING_DELETION);
+        /* Data tiering warm retention: a WARM key holds a valid flash copy —
+         * removing the dict entry must remove the flash copy too, or it is
+         * orphaned (space leak / resurrection hazard). */
+        if (val->tiering_state == TIERING_STATE_WARM) {
+            extStorageWarmOnDelete(db, objectGetVal(key));
+        }
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
         incrRefCount(val);
@@ -784,7 +791,10 @@ void signalModifiedKey(client *c, serverDb *db, robj *key) {
      * 2hit-50k first hit), mark it dirty so the beforeSleep revert writes the
      * modification through to flash instead of discarding it. No-op (single
      * branch) outside the transient window. */
-    if (ext_data_enabled) extStorageMarkTransientDirty(db, key);
+    if (ext_data_enabled) {
+        extStorageMarkTransientDirty(db, key);
+        extStorageWarmMarkDirty(db, key);
+    }
     /* Client-ack WAL: record this key in the current execution unit's dirty
      * set; the unit's final key states are WAL-logged (and the reply gated
      * on their durability) when the outermost unit exits. */

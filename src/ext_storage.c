@@ -154,6 +154,25 @@ long long transient_write_throughs = 0;          /* transient entries overwritte
 long long transient_write_through_retained = 0;  /* write-throughs kept in DRAM (unspillable value; stale flash copy deleted) */
 long long total_permanent_promotions = 0;       /* fetches that promoted to DRAM (promotion=always) */
 
+/* Warm retention (promotion=never + ext-storage-warm-retention yes):
+ * clean resident copies of flash-backed keys. Config default off — behavior
+ * is bit-for-bit unchanged unless enabled. */
+int ext_storage_warm_retention = 0;             /* config: ext-storage-warm-retention */
+int ext_storage_warm_pool_active = 0;           /* evictionPoolPopulate filter: WARM only */
+long long warm_keys_resident = 0;               /* current WARM keys (approximate across FLUSHDB) */
+long long warm_installs_fetch = 0;              /* WARM installs from fetch completions */
+long long warm_installs_spill = 0;              /* WARM retentions at spill completions */
+long long warm_demotions = 0;                   /* WARM → ONLY_FLASH drops (free reclaim) */
+long long warm_dirty_flips = 0;                 /* WARM → ONLY_MEMORY on client write */
+long long warm_hits = 0;                        /* reads served from a WARM resident value */
+long long warm_flash_dels = 0;                  /* flash-copy deletes for deleted WARM keys */
+long long warm_flash_del_failures = 0;          /* submitDel rejected (ring full) — orphan left */
+
+static inline int warmModeActive(void) {
+    return ext_data_enabled && ext_storage_warm_retention &&
+           ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_NEVER;
+}
+
 /* ---------------------------------------------------------------------------
  * Transient Value Tracking (promotion='never')
  *
@@ -891,6 +910,15 @@ static int keyBlocksClient(serverDb *db, sds key, bool is_write_cmd, bool is_del
         serverLog(LL_DEBUG, "KBC: key blocked due to ONLY_FLASH state");
         return 1;
 
+    case TIERING_STATE_WARM:
+        /* Warm retention: value resident AND clean copy on flash. Reads hit
+         * RAM; writes proceed (signalModifiedKey flips to ONLY_MEMORY); DEL
+         * proceeds (dbGenericDelete submits the flash-copy delete). */
+        if (!is_write_cmd && !is_delete_cmd) warm_hits++;
+        kbc_in_memory_count++;
+        dram_value_hits++;
+        return 0;
+
     case TIERING_STATE_ONLY_MEMORY:
     default:
         break;
@@ -1226,7 +1254,21 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                     extStorageWalNoteSpillDurable(db->id, key_name, sdslen(key_name));
                     consecutive_spill_failures = 0; /* Backend is healthy */
                     dbEntry *entry = dbFind(db, key_name);
-                    if (entry != NULL && !objectIsTiered(entry)) {
+                    if (entry != NULL && !objectIsTiered(entry) &&
+                        warmModeActive() &&
+                        (server.maxmemory == 0 || extStorageProjectedMemory() <= server.maxmemory)) {
+                        /* Warm retention: flash now holds the value (write OK), so
+                         * the RAM copy is clean. With memory slack, keep it resident
+                         * as WARM instead of tombstoning — future reads are dict
+                         * hits, and the drop stays free. Under pressure (projected
+                         * over maxmemory) fall through to the tombstone path so the
+                         * spill frees RAM exactly as today. */
+                        total_items_spilled_to_ext_storage++;
+                        num_items_on_flash++;
+                        extStorageSetState(db, key_name, TIERING_STATE_WARM, 0);
+                        warm_installs_spill++;
+                        warm_keys_resident++;
+                    } else if (entry != NULL && !objectIsTiered(entry)) {
                         /* Free the original in-RAM value by its real type (string
                          * OR compound: list/set/hash/zset/stream), reclaiming the
                          * RAM, then tombstone the entry as ONLY_FLASH. */
@@ -1326,6 +1368,38 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                     completion_read_ok++;
 
                     if (ext_storage_promotion_policy == EXT_STORAGE_PROMOTION_NEVER) {
+                        /* --- WARM RETENTION (promotion='never' + warm-retention) ---
+                         * Install the fetched value as a clean WARM resident: no
+                         * transient bookkeeping, no sweep, no revert. The PEEK
+                         * fetch preserved the flash copy, so RAM == flash and the
+                         * key can be dropped for free under pressure. A client
+                         * write flips it to ONLY_MEMORY via signalModifiedKey. */
+                        if (warmModeActive() && entry != NULL && objectIsTiered(entry)) {
+                            void *placeholder = objectGetVal(entry);
+                            if (placeholder != NULL) sdsfree((sds)placeholder);
+                            if (new_value->hasembval) {
+                                objectSetVal(entry, sdsdup((sds)objectGetVal(new_value)));
+                                entry->encoding = OBJ_ENCODING_RAW;
+                                entry->type = new_value->type;
+                                decrRefCount(new_value);
+                            } else {
+                                objectSetVal(entry, objectGetVal(new_value));
+                                entry->encoding = new_value->encoding;
+                                entry->type = new_value->type;
+                                new_value->refcount = 0;
+                                zfree(new_value);
+                            }
+                            if (msg->ttl > 0) {
+                                setExpire(NULL, db, key, msg->ttl);
+                            }
+                            total_items_fetched_from_ext_storage++;
+                            warm_installs_fetch++;
+                            warm_keys_resident++;
+                            /* num_items_on_flash unchanged: the copy is still on flash */
+                            extStorageSetState(db, key_name, TIERING_STATE_WARM, 0);
+                            total_items_fetching_from_ext_storage--;
+                            break;
+                        }
                         /* --- TRANSIENT PROMOTION (promotion='never') ---
                          * Install value temporarily so lookupKey works during
                          * processUnblockedClients(). Track old placeholder so we
@@ -1688,6 +1762,7 @@ void extStorageSyncFetch(serverDb *db, sds key) {
         if (entry == NULL) goto done_absent; /* deleted / never existed */
 
         TieringState state = extStorageGetState(db, key);
+        if (state == TIERING_STATE_WARM) goto done_resident; /* warm: value in RAM */
         if (state == TIERING_STATE_ONLY_MEMORY) {
             if (!objectIsTiered(entry)) goto done_resident;
             /* TIERED encoding with no state entry — normalize and fetch. */
@@ -1925,6 +2000,17 @@ int extStorageEvictFlashKey(serverDb *db, sds key) {
         /* Already in-flight or already pending eviction — skip */
         return -1;
 
+    case TIERING_STATE_WARM: {
+        /* Warm resident: FC wants the flash copy gone. The value is safe in
+         * RAM — drop the flash copy and mark the key dirty (ONLY_MEMORY). */
+        int rc = extStorageBridge_submitDel(extStoragePhysicalDbId(db->id), key);
+        if (rc != 0) return -1;
+        extStorageRemoveState(db, key);
+        if (warm_keys_resident > 0) warm_keys_resident--;
+        if (num_items_on_flash > 0) num_items_on_flash--;
+        return 0;
+    }
+
     case TIERING_STATE_ONLY_MEMORY:
     default:
         /* Not on flash — caller should use normal eviction */
@@ -1993,6 +2079,14 @@ int extStoragePerformEvictions(int *result) {
         return 1;
     }
 
+    /* Warm residents are reclaimable for free (demote, no IO) — never OOM-reject
+     * while any exist. Checked before the dict-vs-flash heuristic below, which a
+     * fully-warm cache defeats (every key is both in dict AND on flash). */
+    if (warmModeActive() && warm_keys_resident > 0) {
+        *result = C_OK;
+        return 1;
+    }
+
     /* Cheap check: if DBSIZE > num_items_on_flash, there are keys with values
      * in memory that could potentially be spilled. Avoids expensive sampling. */
     long long total_keys = 0;
@@ -2036,8 +2130,93 @@ int extStoragePerformEvictions(int *result) {
  * if the disk can't drain, completions lag, RAW used_memory (not projected) climbs
  * into the throttle band, which is the throttle's job, not this loop's.
  * ---------------------------------------------------------------------------*/
+/* ---------------------------------------------------------------------------
+ * Warm retention helpers
+ * ---------------------------------------------------------------------------*/
+
+/* Drop a WARM key's RAM copy: free the value, tombstone the entry, state →
+ * ONLY_FLASH. Zero IO — the flash copy is valid by the WARM invariant. */
+static int warmDemoteKey(serverDb *db, sds key) {
+    dbEntry *entry = dbFind(db, key);
+    if (entry == NULL || objectIsTiered(entry)) return -1;
+    if (extStorageGetState(db, key) != TIERING_STATE_WARM) return -1;
+
+    if (entry->hasembval) {
+        objectUnembedVal(entry);
+    } else {
+        robj *old = createObject(entry->type, objectGetVal(entry));
+        old->encoding = entry->encoding;
+        objectSetVal(entry, NULL);
+        decrRefCount(old);
+    }
+    entry->encoding = OBJ_ENCODING_TIERED;
+    objectSetVal(entry, sdsnewlen("", 0));
+    extStorageSetState(db, key, TIERING_STATE_ONLY_FLASH, 0);
+    warm_demotions++;
+    if (warm_keys_resident > 0) warm_keys_resident--;
+    return 0;
+}
+
+/* Pressure reclaim, warm-first: drop clean WARM keys (free, synchronous) until
+ * projected memory is back under maxmemory. Runs BEFORE the spill loop so the
+ * cheapest reclaim happens first and spills are reserved for dirty keys. */
+static void warmDemoteToProjected(void) {
+    if (!warmModeActive() || warm_keys_resident <= 0) return;
+    if (server.maxmemory == 0) return;
+    if (extStorageProjectedMemory() <= server.maxmemory) return;
+
+    ext_storage_warm_pool_active = 1;
+    int skipped = 0, demoted = 0;
+    while (extStorageProjectedMemory() > server.maxmemory && warm_keys_resident > 0) {
+        int best_dbid;
+        int best_slot;
+        sds best_key = findBestEvictionCandidate(spillPoolLRU, &best_dbid, &best_slot);
+        if (best_key == NULL) break;
+        /* Pool may hold stale entries from the spill filter — re-validate. */
+        if (warmDemoteKey(server.db[best_dbid], best_key) != 0) {
+            if (++skipped < EVPOOL_SIZE) continue;
+            break;
+        }
+        skipped = 0;
+        if (++demoted >= 256) break; /* yield to event loop */
+    }
+    ext_storage_warm_pool_active = 0;
+}
+
+/* Called from signalModifiedKey(): a client wrote a WARM key. The RAM copy is
+ * now the authority and the flash copy is stale — flip to ONLY_MEMORY (dirty).
+ * The next spill supersedes the flash entry. num_items_on_flash is decremented
+ * here and re-incremented by that spill's completion (same convention as the
+ * transient write-through). */
+void extStorageWarmMarkDirty(serverDb *db, robj *key) {
+    if (!warmModeActive() || warm_keys_resident <= 0) return;
+    sds key_str = (sds)objectGetVal(key);
+    if (extStorageGetState(db, key_str) != TIERING_STATE_WARM) return;
+    extStorageRemoveState(db, key_str); /* → ONLY_MEMORY (dirty) */
+    warm_dirty_flips++;
+    if (warm_keys_resident > 0) warm_keys_resident--;
+    if (num_items_on_flash > 0) num_items_on_flash--;
+    /* KNOWN GAP (prototype): if the key is DELETED before it respills, the
+     * stale flash entry is orphaned (space leak; resurrectable only under
+     * log-scan recovery, which this branch does not do). */
+}
+
+/* Called from dbGenericDelete(): a WARM key is being removed from the dict.
+ * Its flash copy must go too, or a fetch-path resurrection/space leak remains. */
+void extStorageWarmOnDelete(serverDb *db, sds key) {
+    if (!ext_data_enabled) return;
+    if (extStorageBridge_submitDel(extStoragePhysicalDbId(db->id), key) == 0) {
+        warm_flash_dels++;
+    } else {
+        warm_flash_del_failures++; /* ring full — orphan left on flash */
+    }
+    if (warm_keys_resident > 0) warm_keys_resident--;
+    if (num_items_on_flash > 0) num_items_on_flash--;
+}
+
 static long long spillFillToProjected(void) {
     if (server.maxmemory_policy == MAXMEMORY_NO_EVICTION) return total_items_spilling_to_ext_storage;
+    warmDemoteToProjected(); /* warm-first reclaim: free drops before spill writes */
     if (extStorageProjectedMemory() <= server.maxmemory) return total_items_spilling_to_ext_storage;
 
     ext_storage_spill_pool_active = 1;
@@ -2515,6 +2694,14 @@ sds genExternalStorageInfoString(sds info) {
         "transient_write_throughs:%lld\r\n"
         "transient_write_through_retained:%lld\r\n"
         "total_permanent_promotions:%lld\r\n"
+        "warm_keys_resident:%lld\r\n"
+        "warm_installs_fetch:%lld\r\n"
+        "warm_installs_spill:%lld\r\n"
+        "warm_demotions:%lld\r\n"
+        "warm_dirty_flips:%lld\r\n"
+        "warm_hits:%lld\r\n"
+        "warm_flash_dels:%lld\r\n"
+        "warm_flash_del_failures:%lld\r\n"
         "promotion_filtered_onehit:%lld\r\n"
         "promotion_2hit_admitted:%lld\r\n"
         "twohit_window_distinct_keys:%lu\r\n",
@@ -2525,6 +2712,14 @@ sds genExternalStorageInfoString(sds info) {
         transient_write_throughs,
         transient_write_through_retained,
         total_permanent_promotions,
+        warm_keys_resident,
+        warm_installs_fetch,
+        warm_installs_spill,
+        warm_demotions,
+        warm_dirty_flips,
+        warm_hits,
+        warm_flash_dels,
+        warm_flash_del_failures,
         promotion_filtered_onehit,
         promotion_2hit_admitted,
         (unsigned long)(twohit_counts ? dictSize(twohit_counts) : 0));
