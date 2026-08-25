@@ -26,6 +26,8 @@
 #include "flashcache_common.h"
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -323,7 +325,28 @@ static uint64_t fc_clock(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
-static void fc_log(int level, const char *fmt, ...) { (void)level; (void)fmt; }
+/* Forward FlashCache log output into the server log.
+ *
+ * This was a no-op stub, which made every FlashCache assert undiagnosable:
+ * flashcacheAssert writes its state dump through this callback and then
+ * deliberately crashes (*(char *)-1 = 'x'), so with a no-op logger the crash
+ * arrives with no message at all. FC levels 0-3 (DEBUG, VERBOSE, NOTICE,
+ * WARNING) match Valkey's LL_* values one to one, so the level passes through.
+ * serverLog is a macro over _serverLog in server.h; this file avoids pulling
+ * in server.h, so declare the underlying function. Runs on the FC IO thread;
+ * _serverLog is already used from bio and module threads, so that is fine. */
+extern void _serverLog(int level, const char *fmt, ...);
+
+static void fc_log(int level, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    _serverLog(level, "%s", buf);
+}
 
 /* ---------------------------------------------------------------------------
  * storageType interface
