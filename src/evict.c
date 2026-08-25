@@ -139,6 +139,9 @@ int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEn
         } else if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
             /* In this case the sooner the expire the better. */
             idle = ULLONG_MAX - objectGetExpire(o);
+        } else if (ext_storage_warm_pool_active) {
+            /* Warm reclaim under noeviction: demote coldest WARM keys first. */
+            idle = objectGetIdleness(o);
         } else {
             serverPanic("Unknown eviction policy in evictionPoolPopulate()");
         }
@@ -392,7 +395,8 @@ sds findBestEvictionCandidate(struct evictionPoolEntry *pool, int *bestdbid, int
     serverDb *db;
 
     if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
-        server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+        server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL ||
+        ext_storage_warm_pool_active) {
         while (bestkey == NULL) {
             unsigned long total_keys = 0;
 
@@ -403,7 +407,8 @@ sds findBestEvictionCandidate(struct evictionPoolEntry *pool, int *bestdbid, int
                 db = server.db[i];
                 if (db == NULL) continue;
                 kvstore *kvs;
-                if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS ||
+                    ext_storage_warm_pool_active) {
                     kvs = db->keys;
                 } else {
                     kvs = db->expires;
@@ -442,7 +447,8 @@ sds findBestEvictionCandidate(struct evictionPoolEntry *pool, int *bestdbid, int
                 *bestdbid = pool[k].dbid;
 
                 kvstore *kvs;
-                if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS ||
+                    ext_storage_warm_pool_active) {
                     kvs = server.db[*bestdbid]->keys;
                 } else {
                     kvs = server.db[*bestdbid]->expires;

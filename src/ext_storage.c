@@ -2223,8 +2223,12 @@ void extStorageWarmOnDelete(serverDb *db, sds key) {
 }
 
 static long long spillFillToProjected(void) {
-    if (server.maxmemory_policy == MAXMEMORY_NO_EVICTION) return total_items_spilling_to_ext_storage;
+    /* Warm demotion drops a clean DRAM copy of a flash-durable value — no data
+     * is destroyed, so it is legal (and required) under noeviction: with warm
+     * retention, spill completions retain instead of dropping, making this loop
+     * the ONLY reclaim. It must run before the noeviction bail. */
     warmDemoteToProjected(); /* warm-first reclaim: free drops before spill writes */
+    if (server.maxmemory_policy == MAXMEMORY_NO_EVICTION) return total_items_spilling_to_ext_storage;
     if (extStorageProjectedMemory() <= server.maxmemory) return total_items_spilling_to_ext_storage;
 
     ext_storage_spill_pool_active = 1;
