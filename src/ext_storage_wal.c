@@ -566,12 +566,21 @@ void extStorageWalCron(void) {
     if (wal_retire_state == 0) {
         uint64_t threshold = (uint64_t)ext_storage_wal_max_mb * 1024 * 1024;
         int sealed_pending = (wal_seg_lo < walActiveSegGen());
-        if (walActiveBytes() > threshold || replay_pending || sealed_pending) {
+        int urgent = (walActiveBytes() > threshold || replay_pending);
+        if (urgent || sealed_pending) {
             /* Rate limit: a retirement round costs a checkpoint (fork +
-             * child serialize). Back-to-back rounds add nothing -- coverage
-             * accrues between rounds, not during them. */
+             * child serialize -- at 14.5M items that's a real io-thread and
+             * CoW hit). Urgent rounds (active file over threshold, replay
+             * evidence pending) run at the short interval; rounds whose only
+             * purpose is releasing already-sealed segments are housekeeping
+             * and must not dominate the fork budget: a pinned min_seg
+             * otherwise re-triggers a fork every interval for as long as
+             * one un-covered entry exists (observed: fork every 2.8s
+             * throughout mixed-full, cratering TPS to 6k). */
             mstime_t now_ms = mstime();
-            if (now_ms - wal_last_ckpt_request_ms < WAL_CKPT_MIN_INTERVAL_MS)
+            mstime_t min_interval = urgent ? WAL_CKPT_MIN_INTERVAL_MS
+                                           : WAL_CKPT_MIN_INTERVAL_MS * 15;
+            if (now_ms - wal_last_ckpt_request_ms < min_interval)
                 return;
             wal_last_ckpt_request_ms = now_ms;
             /* Seal the active file if it is over threshold, so this round's
