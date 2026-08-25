@@ -57,22 +57,29 @@ long long ext_storage_wal_max_mb = 1024;     /* config: retirement threshold */
  * be durable in the main log. Erased at spill completion iff no newer ack
  * arrived after the spill was submitted (the spill serialized the current
  * value, covering every ack up to the submission stamp). */
-/* Value is a single state bit: 0 = DIRTY (acked, spill not yet submitted
- * since the last ack), 1 = COVERED (a spill/Del serialized the current
- * value after the last ack). "lsn_at_submit == acked_lsn" from the design
- * reduces to exactly this bit. */
-#define WAL_KEY_DIRTY 0
-/* COVERED values carry the epoch they were covered in: (epoch << 1) | 1.
+/* Value packs three fields:
+ *   bit  0      : covered (a spill/Del serialized the current value after
+ *                 the last ack)
+ *   bits 1..32  : cover epoch (meaningful when covered; see below)
+ *   bits 33..63 : WAL segment generation of the ack that (last) dirtied the
+ *                 entry. 0 = boot-replay evidence (.replay file). Used to
+ *                 decide which sealed WAL segments still back un-retired
+ *                 acks and must be kept for crash replay.
  * The retirement sweep only erases entries covered strictly BEFORE the
  * checkpoint request: those spills preceded the checkpoint's flush barrier
  * (which runs at fork time, after the request) and are therefore durable in
  * the log. Entries covered later may still be staging-resident when the
  * (forked, asynchronous) checkpoint completes -- erasing them would let the
- * WAL truncate away their only durable copy. */
+ * WAL retire away their only durable copy. */
 static uint64_t wal_cover_epoch = 1;
-#define WAL_COVERED_VAL() ((wal_cover_epoch << 1) | 1)
+#define WAL_EPOCH_MASK 0x1FFFFFFFEULL /* bits 1..32 */
+#define WAL_SEG_SHIFT 33
+#define WAL_DIRTY_VAL(seg) ((uint64_t)(seg) << WAL_SEG_SHIFT)
+#define WAL_COVERED_VAL(old) \
+    (((old) & ~(WAL_EPOCH_MASK | 1ULL)) | ((wal_cover_epoch << 1) & WAL_EPOCH_MASK) | 1ULL)
 #define WAL_IS_COVERED(v) ((v) & 1)
-#define WAL_COVER_EPOCH_OF(v) ((v) >> 1)
+#define WAL_COVER_EPOCH_OF(v) (((v) & WAL_EPOCH_MASK) >> 1)
+#define WAL_SEG_OF(v) ((v) >> WAL_SEG_SHIFT)
 static dict *wal_dirty_table = NULL;
 static char wal_path_buf[4096];
 static char wal_replay_path[4096];
@@ -115,18 +122,22 @@ static dictType walDirtyDictType = {
     .entryDestructor = dictEntryDestructorSdsKey,
 };
 
-/* Mark (dbid,key) DIRTY: an ack whose bytes may not yet be in the main log. */
-static void walDirtyUpsert(int dbid, const char *key, size_t klen, uint64_t lsn) {
-    (void)lsn;
+/* Mark (dbid,key) DIRTY: an ack whose bytes may not yet be in the main log.
+ * <seg> is the WAL segment generation holding the ack's record (0 = the
+ * .replay evidence file, for boot-replayed entries). Stamping an older seg
+ * than the record's true location is safe (retains more); newer is not --
+ * callers stamp BEFORE submitting the record, and rotation only ever moves
+ * later records to later segments, so the stamp is always <= actual. */
+static void walDirtyUpsert(int dbid, const char *key, size_t klen, uint64_t seg) {
     if (wal_dirty_table == NULL) return;
     sds k = walDirtyTableKey(dbid, key, klen);
     dictEntry *de = dictFind(wal_dirty_table, k);
     if (de != NULL) {
-        dictSetUnsignedIntegerVal(de, WAL_KEY_DIRTY);
+        dictSetUnsignedIntegerVal(de, WAL_DIRTY_VAL(seg));
         sdsfree(k);
     } else {
         de = dictAddRaw(wal_dirty_table, k, NULL);
-        if (de != NULL) dictSetUnsignedIntegerVal(de, WAL_KEY_DIRTY);
+        if (de != NULL) dictSetUnsignedIntegerVal(de, WAL_DIRTY_VAL(seg));
         else sdsfree(k);
     }
 }
@@ -135,7 +146,9 @@ void extStorageWalNoteSpillSubmit(int dbid, const char *key, size_t klen) {
     if (!wal_active || wal_dirty_table == NULL) return;
     sds k = walDirtyTableKey(dbid, key, klen);
     dictEntry *de = dictFind(wal_dirty_table, k);
-    if (de != NULL) dictSetUnsignedIntegerVal(de, WAL_COVERED_VAL());
+    if (de != NULL)
+        dictSetUnsignedIntegerVal(de,
+            WAL_COVERED_VAL(dictGetUnsignedIntegerVal(de)));
     sdsfree(k);
 }
 
@@ -234,7 +247,8 @@ void extStorageWalEmitUnit(void) {
         walDirtyKey *dk = &dirty_keys[i];
         if (dk->key == NULL) continue;
         if (commit_lsn != 0) {
-            walDirtyUpsert(dk->dbid, dk->key, sdslen(dk->key), commit_lsn);
+            walDirtyUpsert(dk->dbid, dk->key, sdslen(dk->key),
+                           walActiveSegGen());
             /* Coverage at emit time:
              * - tombstone: the backend Del was submitted during the unit.
              * - COPYING_TO_FLASH: flash admission submitted the spill during
@@ -316,11 +330,13 @@ static void wal_boot_apply(void *ctx, uint32_t dbid, const void *key,
         if (dbFind(db, key_sds) != NULL) dbDelete(db, &keyobj);
         /* Kill any flash copy too (idempotent; appends an FC tombstone). */
         extStorageBridge_submitDel(dbid, key_sds);
-        walDirtyUpsert(dbid, key_sds, klen, 1);
+        walDirtyUpsert(dbid, key_sds, klen, 0); /* seg 0 = .replay evidence */
         {
             sds tk = walDirtyTableKey(dbid, key_sds, klen);
             dictEntry *tde = dictFind(wal_dirty_table, tk);
-            if (tde != NULL) dictSetUnsignedIntegerVal(tde, WAL_COVERED_VAL());
+            if (tde != NULL)
+                dictSetUnsignedIntegerVal(tde,
+                    WAL_COVERED_VAL(dictGetUnsignedIntegerVal(tde)));
             sdsfree(tk);
         }
         sdsfree(key_sds);
@@ -347,8 +363,9 @@ static void wal_boot_apply(void *ctx, uint32_t dbid, const void *key,
         sdsfree(key_sds);
         return;
     }
-    /* key_sds ownership passed to the dict. Register for retirement. */
-    walDirtyUpsert(dbid, key, klen, 1);
+    /* key_sds ownership passed to the dict. Register for retirement with
+     * seg 0: the record's only durable copy is the .replay evidence file. */
+    walDirtyUpsert(dbid, key, klen, 0);
     wal_replayed_records++;
 }
 
@@ -383,14 +400,36 @@ int extStorageWalInit(const char *flash_path) {
 
     /* Step 8: replay acked-but-possibly-unflushed records from the previous
      * run BEFORE opening the fresh WAL. Chronological: .replay (older crash
-     * evidence) first, then the leftover active WAL, which is then merged
-    * into .replay -- the files are only deleted once a checkpoint's flush
-     * barrier has re-persisted their content into the main log. */
+     * evidence) first, then sealed segments in generation order, then the
+     * leftover active WAL. Everything is then merged into .replay -- the
+     * evidence is only deleted once a checkpoint's flush barrier has
+     * re-persisted its content into the main log. */
     long r1 = 0, r2 = 0;
     if (access(wal_replay_path, F_OK) == 0)
         r1 = walReplayFile(wal_replay_path, wal_boot_apply, NULL);
+    /* Sealed segments: <wal>.seg.<gen>. Scan a contiguous range from 1 --
+     * the retire cron releases from the low end, so live gens are always a
+     * suffix; probe upward past leading holes until a run of misses. */
+    {
+        char seg[4200];
+        int misses = 0;
+        for (uint64_t g = 1; misses < 64; g++) {
+            snprintf(seg, sizeof(seg), "%s.seg.%llu", wal_path,
+                     (unsigned long long)g);
+            if (access(seg, F_OK) != 0) {
+                misses++;
+                continue;
+            }
+            misses = 0;
+            long rs = walReplayFile(seg, wal_boot_apply, NULL);
+            if (rs > 0) r2 += rs;
+            wal_merge_into_replay(seg, wal_replay_path); /* unlinks seg */
+        }
+    }
     if (access(wal_path, F_OK) == 0) {
-        r2 = walReplayFile(wal_path, wal_boot_apply, NULL);
+        long ra = walReplayFile(wal_path, wal_boot_apply, NULL);
+        serverLog(LL_NOTICE, "wal-debug: REPLAY active file applied=%ld", ra);
+        if (ra > 0) r2 += ra;
         wal_merge_into_replay(wal_path, wal_replay_path);
     }
     if (r1 > 0 || r2 > 0) {
@@ -445,9 +484,26 @@ void extStorageWalApplyFsyncPolicy(void) {
  * whose spill was submitted before the barrier is durable in the log: sweep
  * them; if the table empties, the WAL content is fully covered -> truncate
  * the active file and delete the replay evidence. */
-static uint64_t wal_ckpt_gen_target = 0;
+/* Retirement cron (step 8, reworked for sustained load): when the active
+ * WAL exceeds the threshold (or sealed segments / replay evidence await
+ * release), seal the active file as a segment and request an FC checkpoint
+ * (io thread: flush barrier + head journal + index serialize). Once it
+ * completes, every table entry whose spill was submitted before the barrier
+ * is durable in the log: sweep them, then release every sealed segment older
+ * than the oldest surviving entry's segment. No write quiesce is required --
+ * under sustained writes new acks land in the NEW active file and never pin
+ * the sealed ones. The old design gated release on a fully-empty dirty
+ * table, which is unreachable under load; with fork checkpoints (no io
+ * stalls to quiesce writers) it degenerated into a continuous checkpoint
+ * storm (734 back-to-back forks observed on the r7gd) with unbounded WAL
+ * growth. */
+static uint64_t wal_ckpt_need_seq = 0;
 static uint64_t wal_ckpt_request_epoch = 0;
 static int wal_retire_state = 0; /* 0=idle 1=awaiting checkpoint */
+static uint64_t wal_seg_lo = 1;  /* lowest sealed segment not yet released */
+static uint64_t wal_rotate_wait_gen = 0; /* rotate_gen to wait for; 0=none */
+static mstime_t wal_last_ckpt_request_ms = 0;
+#define WAL_CKPT_MIN_INTERVAL_MS 2000
 
 void extStorageWalCron(void) {
     if (!wal_active) return;
@@ -467,26 +523,39 @@ void extStorageWalCron(void) {
         dictIterator *pit = dictGetSafeIterator(wal_dirty_table);
         dictEntry *pde;
         while (budget > 0 && (pde = dictNext(pit)) != NULL) {
-            if (dictGetUnsignedIntegerVal(pde) != WAL_KEY_DIRTY) continue;
+            if (WAL_IS_COVERED(dictGetUnsignedIntegerVal(pde))) continue;
             sds tk = dictGetKey(pde);
             int dbid;
             memcpy(&dbid, tk, sizeof(dbid));
             sds key = sdsnewlen(tk + sizeof(dbid), sdslen(tk) - sizeof(dbid));
             serverDb *db = (dbid >= 0 && dbid < server.dbnum) ? server.db[dbid] : NULL;
             if (db == NULL || dbFind(db, key) == NULL) {
-                dictSetUnsignedIntegerVal(pde, WAL_COVERED_VAL());
-            } else if (extStorageGetState(db, key) == TIERING_STATE_ONLY_MEMORY) {
-                /* Only pump state-quiescent keys. Submitting a spill while a
-                 * fetch is in flight (COPYING_TO_MEMORY) clobbers the state
-                 * machine: the READ completion asserts and the parked client
-                 * never wakes (seen on r7gd postboot + local crash matrix).
-                 * COPYING_TO_FLASH already covers us (stamped at emit);
-                 * other states resolve and get picked up next tick.
-                 * Failure here = ring backpressure or embedded floor: a
-                 * value below the spill floor is DRAM-retained by design and
-                 * pins the WAL until deleted or grown -- covering
-                 * DRAM-retained state is checkpoint work beyond this POC. */
-                extStorageSpillKeyAsync(dbid, key);
+                dictSetUnsignedIntegerVal(pde,
+                    WAL_COVERED_VAL(dictGetUnsignedIntegerVal(pde)));
+            } else {
+                int tstate = extStorageGetState(db, key);
+                if (tstate == TIERING_STATE_WARM) {
+                    /* Warm retention: the spill COMPLETED and the resident
+                     * value is the clean flash copy -- the ack's bytes are
+                     * already in the log (staging or flushed); the next
+                     * checkpoint's flush barrier makes them provably
+                     * durable. Equivalent to a spill submission: cover. */
+                    dictSetUnsignedIntegerVal(pde,
+                        WAL_COVERED_VAL(dictGetUnsignedIntegerVal(pde)));
+                } else if (tstate == TIERING_STATE_ONLY_MEMORY) {
+                    /* Only pump state-quiescent keys. Submitting a spill
+                     * while a fetch is in flight (COPYING_TO_MEMORY) clobbers
+                     * the state machine: the READ completion asserts and the
+                     * parked client never wakes (seen on r7gd postboot +
+                     * local crash matrix). COPYING_TO_FLASH already covers
+                     * us (stamped at emit); other states resolve and get
+                     * picked up next tick. Failure here = ring backpressure
+                     * or embedded floor: a value below the spill floor is
+                     * DRAM-retained by design and pins the WAL until deleted
+                     * or grown -- covering DRAM-retained state is checkpoint
+                     * work beyond this POC. */
+                    extStorageSpillKeyAsync(dbid, key);
+                }
             }
             /* on success spillItemAsync stamped COVERED via NoteSpillSubmit */
             sdsfree(key);
@@ -496,8 +565,29 @@ void extStorageWalCron(void) {
     }
     if (wal_retire_state == 0) {
         uint64_t threshold = (uint64_t)ext_storage_wal_max_mb * 1024 * 1024;
-        if ((walActiveBytes() > threshold || replay_pending)) {
-            wal_ckpt_gen_target = storageCheckpointGeneration() + 1;
+        int sealed_pending = (wal_seg_lo < walActiveSegGen());
+        if (walActiveBytes() > threshold || replay_pending || sealed_pending) {
+            /* Rate limit: a retirement round costs a checkpoint (fork +
+             * child serialize). Back-to-back rounds add nothing -- coverage
+             * accrues between rounds, not during them. */
+            mstime_t now_ms = mstime();
+            if (now_ms - wal_last_ckpt_request_ms < WAL_CKPT_MIN_INTERVAL_MS)
+                return;
+            wal_last_ckpt_request_ms = now_ms;
+            /* Seal the active file if it is over threshold, so this round's
+             * sweep can release it; sub-threshold active bytes just wait. */
+            wal_rotate_wait_gen = 0;
+            if (walActiveBytes() > threshold) {
+                if (walRequestRotate() != 0)
+                    wal_rotate_wait_gen = walRotateGen() + 1;
+            }
+            /* The sweep must credit only a checkpoint whose FORK started
+             * after this request: an interval checkpoint already in flight
+             * right now has a barrier that predates this round's covered
+             * spills -- crediting its completion retires acked writes whose
+             * bytes are neither in the flushed log nor (after truncate) the
+             * WAL. */
+            wal_ckpt_need_seq = storageCheckpointForkSeq() + 1;
             /* Coverage boundary: only entries covered before this instant
              * are provably flushed by the checkpoint's fork-time barrier. */
             wal_ckpt_request_epoch = wal_cover_epoch;
@@ -507,21 +597,59 @@ void extStorageWalCron(void) {
         }
         return;
     }
-    if (storageCheckpointGeneration() < wal_ckpt_gen_target) return;
-    /* Sweep: submitted-before-barrier entries are durable now. */
+    if (storageCheckpointDoneSeq() < wal_ckpt_need_seq) return;
+    if (wal_rotate_wait_gen != 0 && walRotateGen() < wal_rotate_wait_gen)
+        return; /* writer hasn't sealed the segment yet */
+    /* Sweep: submitted-before-barrier entries are durable now. Survivors pin
+     * their segment (and every later one). */
+    uint64_t dbg_swept = 0, dbg_kept = 0;
+    uint64_t min_seg = UINT64_MAX;
     dictIterator *it = dictGetSafeIterator(wal_dirty_table);
     dictEntry *de;
     while ((de = dictNext(it)) != NULL) {
         uint64_t v = dictGetUnsignedIntegerVal(de);
-        if (WAL_IS_COVERED(v) && WAL_COVER_EPOCH_OF(v) <= wal_ckpt_request_epoch)
+        if (WAL_IS_COVERED(v) && WAL_COVER_EPOCH_OF(v) <= wal_ckpt_request_epoch) {
             dictDelete(wal_dirty_table, dictGetKey(de));
+            dbg_swept++;
+        } else if (WAL_SEG_OF(v) < min_seg) {
+            min_seg = WAL_SEG_OF(v);
+            dbg_kept++;
+        } else {
+            dbg_kept++;
+        }
     }
     dictReleaseIterator(it);
+    serverLog(LL_NOTICE,
+              "wal-debug: SWEEP req_epoch=%llu swept=%llu kept=%llu min_seg=%llu "
+              "replay_pending=%d durable=%llu assigned=%llu",
+              (unsigned long long)wal_ckpt_request_epoch,
+              (unsigned long long)dbg_swept, (unsigned long long)dbg_kept,
+              (unsigned long long)min_seg, replay_pending,
+              (unsigned long long)walDurableLsn(),
+              (unsigned long long)walLastAssignedLsn());
+    /* Release sealed segments no surviving entry points into. */
+    uint64_t release_upto = walActiveSegGen(); /* exclusive */
+    if (min_seg < release_upto) release_upto = min_seg;
+    while (wal_seg_lo < release_upto) {
+        char seg[4200];
+        snprintf(seg, sizeof(seg), "%s.seg.%llu", wal_path_buf,
+                 (unsigned long long)wal_seg_lo);
+        unlink(seg);
+        wal_seg_lo++;
+        wal_truncations++;
+    }
+    /* Replay evidence (seg 0) releases as soon as no entry references it. */
+    if (replay_pending && min_seg > 0) unlink(wal_replay_path);
+    /* Idle bonus: fully-drained table + all LSNs durable -> reclaim the
+     * active file bytes too (cheap; the writer ftruncates at a quiesce). */
     if (dictSize(wal_dirty_table) == 0 &&
         walDurableLsn() == walLastAssignedLsn()) {
         if (walTruncateActive() == 0) {
-            unlink(wal_replay_path);
             wal_truncations++;
+            serverLog(LL_NOTICE,
+                      "wal-debug: TRUNCATE active file (durable=%llu assigned=%llu)",
+                      (unsigned long long)walDurableLsn(),
+                      (unsigned long long)walLastAssignedLsn());
         }
     }
     wal_retire_state = 0;

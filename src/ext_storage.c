@@ -1251,7 +1251,15 @@ static void processOneCompletion(ValkeyModuleExternalStorageMsg *msg) {
                 } else {
                     /* Spill OK — free RAM value, mark as ONLY_FLASH */
                     completion_write_ok++;
-                    extStorageWalNoteSpillDurable(db->id, key_name, sdslen(key_name));
+                    /* Retirement: completion proves the item entered the
+                     * STAGING buffer, not the flushed log — mark covered
+                     * only. The retire sweep deletes it after a checkpoint
+                     * whose flush barrier postdates this instant. Deleting
+                     * here let the WAL truncate while the bytes were still
+                     * staging-resident: kill -9 then lost acked writes from
+                     * both places (crash-matrix singleton2, ~12-key
+                     * staging-tail block). */
+                    extStorageWalNoteSpillSubmit(db->id, key_name, sdslen(key_name));
                     consecutive_spill_failures = 0; /* Backend is healthy */
                     dbEntry *entry = dbFind(db, key_name);
                     if (entry != NULL && !objectIsTiered(entry) &&

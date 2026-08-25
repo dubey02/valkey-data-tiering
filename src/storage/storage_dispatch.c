@@ -108,6 +108,18 @@ uint64_t storageCheckpointGeneration(void) {
     return 0;
 }
 
+uint64_t storageCheckpointForkSeq(void) {
+    if (server_storage && server_storage->checkpoint_fork_seq)
+        return server_storage->checkpoint_fork_seq(server_storage_ctx);
+    return 0;
+}
+
+uint64_t storageCheckpointDoneSeq(void) {
+    if (server_storage && server_storage->checkpoint_done_seq)
+        return server_storage->checkpoint_done_seq(server_storage_ctx);
+    return 0;
+}
+
 int storageRecoveryPerformed(void) {
     return server_storage && server_storage->recovery_performed &&
            server_storage->recovery_performed(server_storage_ctx);

@@ -221,6 +221,13 @@ typedef struct walState {
     _Atomic int truncate_req;
     _Atomic uint64_t truncate_gen;
     _Atomic uint64_t st_ring_full_stalls;
+    /* Segment rotation: the retire cron asks the writer to rotate the active
+     * file aside (rename to <path>.seg.<gen>) so retirement can proceed per
+     * segment under sustained load, without requiring a write quiesce. */
+    _Atomic int rotate_req;
+    _Atomic uint64_t rotate_gen; /* acked rotations (writer increments) */
+    _Atomic uint64_t seg_gen;    /* gen of the CURRENT active file */
+    char path[4096];             /* active WAL path (writer renames from it) */
 } walState;
 
 static walState W; /* zero-initialized; single WAL per process */
@@ -360,6 +367,55 @@ static void *wal_writer_thread(void *arg) {
             struct timespec ts = {0, 50000}; /* 50us */
             nanosleep(&ts, NULL);
         }
+
+        /* Segment rotation: safe at any batch boundary (ring drained above,
+         * everything written so far fsynced when policy=always; for everysec
+         * we fsync explicitly before the swap so the sealed segment is
+         * complete). The sealed file keeps every record it ever had; the new
+         * active file starts empty. Gated LSNs are unaffected: durable_lsn
+         * only ever grows and fsync ordering is preserved across the swap. */
+        if (atomic_load_explicit(&W.rotate_req, memory_order_acquire) &&
+            atomic_load_explicit(&W.tail, memory_order_relaxed) ==
+                atomic_load_explicit(&W.head, memory_order_acquire)) {
+            if (atomic_load_explicit(&W.written_lsn, memory_order_relaxed) >
+                atomic_load_explicit(&W.durable_lsn, memory_order_relaxed)) {
+                if (fdatasync(W.fd) != 0) abort();
+                uint64_t publish =
+                    atomic_load_explicit(&W.written_lsn, memory_order_relaxed);
+                atomic_store_explicit(&W.durable_lsn, publish,
+                                      memory_order_release);
+                char byte = 1;
+                ssize_t wr = write(W.wakeup_pipe[1], &byte, 1);
+                (void)wr;
+            }
+            uint64_t gen =
+                atomic_load_explicit(&W.seg_gen, memory_order_relaxed);
+            char seg[4200];
+            snprintf(seg, sizeof(seg), "%s.seg.%llu", W.path,
+                     (unsigned long long)gen);
+            int ok = 0;
+            if (rename(W.path, seg) == 0) {
+                int nfd = open(W.path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (nfd >= 0 &&
+                    write(nfd, WAL_FILE_MAGIC, WAL_FILE_MAGIC_LEN) ==
+                        WAL_FILE_MAGIC_LEN) {
+                    close(W.fd);
+                    W.fd = nfd;
+                    atomic_store(&W.st_bytes, 0);
+                    atomic_store_explicit(&W.seg_gen, gen + 1,
+                                          memory_order_relaxed);
+                    ok = 1;
+                } else {
+                    /* Could not open a fresh active file: roll back the
+                     * rename and keep appending to the old fd. */
+                    if (nfd >= 0) close(nfd);
+                    rename(seg, W.path);
+                }
+            }
+            (void)ok;
+            atomic_store_explicit(&W.rotate_req, 0, memory_order_release);
+            atomic_fetch_add_explicit(&W.rotate_gen, 1, memory_order_release);
+        }
     }
     return NULL;
 }
@@ -379,6 +435,8 @@ int walOpen(const char *path, int fsync_policy, int *wakeup_fd_out) {
         free(prev);
     }
     W.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    snprintf(W.path, sizeof(W.path), "%s", path);
+    atomic_store_explicit(&W.seg_gen, 1, memory_order_relaxed);
     if (W.fd < 0) return -1;
     if (write(W.fd, WAL_FILE_MAGIC, WAL_FILE_MAGIC_LEN) !=
         WAL_FILE_MAGIC_LEN) {
@@ -452,6 +510,27 @@ int walTruncateActive(void) {
     }
     atomic_store_explicit(&W.truncate_req, 0, memory_order_release);
     return -1;
+}
+
+/* Ask the writer to seal the active file as <path>.seg.<gen> and start a
+ * fresh one. Non-blocking: returns the generation that WILL be sealed, or 0
+ * if a rotation is already pending. Poll walRotateGen() for completion. */
+uint64_t walRequestRotate(void) {
+    if (!W.open) return 0;
+    if (atomic_load_explicit(&W.rotate_req, memory_order_acquire)) return 0;
+    uint64_t gen = atomic_load_explicit(&W.seg_gen, memory_order_relaxed);
+    atomic_store_explicit(&W.rotate_req, 1, memory_order_release);
+    return gen;
+}
+
+uint64_t walRotateGen(void) {
+    return atomic_load_explicit(&W.rotate_gen, memory_order_acquire);
+}
+
+/* Generation of the CURRENT active file. Records stamped with this value
+ * land in this file or a later one (rotation only moves forward). */
+uint64_t walActiveSegGen(void) {
+    return atomic_load_explicit(&W.seg_gen, memory_order_relaxed);
 }
 
 /* ---------------------------------------------------------------------------

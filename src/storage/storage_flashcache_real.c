@@ -95,7 +95,26 @@ typedef struct fcRealCtx {
     size_t checkpoint_interval_bytes;
     _Atomic int checkpoint_req;
     _Atomic uint64_t checkpoint_gen;
+    _Atomic uint64_t ckpt_fork_seq; /* incremented when a fork STARTS */
+    _Atomic uint64_t ckpt_done_seq; /* fork_seq of the last SUCCESSFUL child.
+                                     * The WAL retire sweep must gate on a
+                                     * checkpoint whose FORK postdates its
+                                     * request: gen alone can be satisfied by
+                                     * an interval checkpoint already in
+                                     * flight at request time, whose barrier
+                                     * predates the covered spills (observed:
+                                     * mid-file contiguous acked-write loss
+                                     * in crash-matrix singleton2). */
+    uint64_t checkpoint_child_seq; /* io-thread only: seq of running child */
     pid_t checkpoint_child; /* io-thread only */
+    int checkpoint_armed;   /* io-thread only: request observed; fork after
+                             * the NEXT full ring-drain pass so every spill
+                             * pushed before the request is in staging and
+                             * therefore covered by the fork barrier. Without
+                             * this, ring-resident spills at fork time are
+                             * retired by the WAL sweep but not flushed --
+                             * kill -9 then loses acked writes (crash-matrix
+                             * singleton2, ids contiguous = one ring batch). */
     char superblock_path[4096];
     char index_path[4096];
     storageRecoveryItemFn recovery_item_fn;
@@ -329,18 +348,48 @@ static void *fc_io_worker(void *arg) {
                 int ok = (r == ctx->checkpoint_child) &&
                          WIFEXITED(status) && WEXITSTATUS(status) == 0;
                 flashcacheCheckpointForkResult(ok);
-                if (ok)
+                if (ok) {
                     atomic_fetch_add_explicit(&ctx->checkpoint_gen, 1,
                                               memory_order_release);
+                    atomic_store_explicit(&ctx->ckpt_done_seq,
+                                          ctx->checkpoint_child_seq,
+                                          memory_order_release);
+                }
                 ctx->checkpoint_child = 0;
             }
-        } else if (ctx->fast_boot &&
+        } else if (ctx->fast_boot && !ctx->checkpoint_armed &&
             (atomic_load_explicit(&ctx->checkpoint_req, memory_order_acquire) ||
              (ctx->checkpoint_interval_bytes > 0 &&
               flashcacheCheckpointDue(ctx->checkpoint_interval_bytes)))) {
-            ctx->checkpoint_child = flashcacheCheckpointFork(ctx->index_path);
-            if (ctx->checkpoint_child < 0) ctx->checkpoint_child = 0;
+            /* Two-phase: arm now, fork on the NEXT loop iteration. The drain
+             * pass between arm and fork moves every spill that was pushed
+             * to the request ring before this instant into the staging
+             * buffer, so the fork barrier (staging flush) provably covers
+             * them. Forking directly here would leave ring-resident spills
+             * both unflushed and (per the WAL sweep) retired. */
+            ctx->checkpoint_armed = 1;
             atomic_store_explicit(&ctx->checkpoint_req, 0, memory_order_release);
+        } else if (ctx->fast_boot && ctx->checkpoint_armed &&
+                   ctx->checkpoint_child == 0) {
+            /* Last-moment guard: fork only with an empty request ring, so
+             * the barrier's coverage claim ("everything submitted before
+             * this fork is in staging") holds exactly. New pushes just defer
+             * the fork one iteration. */
+            if (atomic_load_explicit(&ctx->req_tail, memory_order_relaxed) ==
+                atomic_load_explicit(&ctx->req_head, memory_order_acquire)) {
+                ctx->checkpoint_child = flashcacheCheckpointFork(ctx->index_path);
+                if (ctx->checkpoint_child < 0) {
+                    /* Barrier not ready (staging flush still in flight):
+                     * keep the arm and retry next iteration rather than
+                     * silently dropping the request -- the WAL retire cron
+                     * is waiting on the done seq to advance. */
+                    ctx->checkpoint_child = 0;
+                } else {
+                    ctx->checkpoint_child_seq = atomic_fetch_add_explicit(
+                        &ctx->ckpt_fork_seq, 1, memory_order_release) + 1;
+                    ctx->checkpoint_armed = 0;
+                }
+            }
         }
 
         /* If no work was done, brief sleep to avoid busy-spin */
@@ -546,6 +595,16 @@ static uint64_t fc_real_checkpoint_generation(void *opaque) {
     return atomic_load_explicit(&ctx->checkpoint_gen, memory_order_acquire);
 }
 
+static uint64_t fc_real_checkpoint_fork_seq(void *opaque) {
+    fcRealCtx *ctx = opaque;
+    return atomic_load_explicit(&ctx->ckpt_fork_seq, memory_order_acquire);
+}
+
+static uint64_t fc_real_checkpoint_done_seq(void *opaque) {
+    fcRealCtx *ctx = opaque;
+    return atomic_load_explicit(&ctx->ckpt_done_seq, memory_order_acquire);
+}
+
 static void fc_real_close(void *opaque) {
     fcRealCtx *ctx = opaque;
     /* Drain the request ring first so queued spills land before we persist
@@ -712,6 +771,8 @@ static storageType flashcache_real_type = {
     .recovery_performed = fc_real_recovery_performed,
     .request_checkpoint = fc_real_request_checkpoint,
     .checkpoint_generation = fc_real_checkpoint_generation,
+    .checkpoint_fork_seq = fc_real_checkpoint_fork_seq,
+    .checkpoint_done_seq = fc_real_checkpoint_done_seq,
 };
 
 /* Drain all in-flight IO + execute flush on the IO thread.

@@ -186,6 +186,8 @@ typedef struct storageType {
     int (*recovery_performed)(void *ctx);
     void (*request_checkpoint)(void *ctx);        /* async; io thread executes */
     uint64_t (*checkpoint_generation)(void *ctx); /* completed checkpoint count */
+    uint64_t (*checkpoint_fork_seq)(void *ctx);   /* forks STARTED */
+    uint64_t (*checkpoint_done_seq)(void *ctx);   /* fork seq of last success */
 } storageType;
 
 /* ---------------------------------------------------------------------------
@@ -217,6 +219,8 @@ void storageCron(void);
 int storageRecoveryPerformed(void);
 void storageRequestCheckpoint(void);
 uint64_t storageCheckpointGeneration(void);
+uint64_t storageCheckpointForkSeq(void);
+uint64_t storageCheckpointDoneSeq(void);
 
 /* Backend getters */
 storageType *storageGetFlashCacheType(void);          /* in-memory mock (testing) */

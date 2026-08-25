@@ -112,6 +112,9 @@ long walReplayFile(const char *path, walReplayRecordFn cb, void *ctx);
  * (ring empty, durable == last). Caller must guarantee all current content
  * is durable elsewhere. Returns 0 on success, -1 on timeout. */
 int walTruncateActive(void);
+uint64_t walRequestRotate(void);
+uint64_t walRotateGen(void);
+uint64_t walActiveSegGen(void);
 /* Bytes appended to the active WAL since open (reset by truncate). */
 uint64_t walActiveBytes(void);
 
