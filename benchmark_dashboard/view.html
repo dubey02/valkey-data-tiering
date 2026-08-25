@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Valkey Data Tiering — Benchmarks (policies)</title>
+  <title>Valkey Data Tiering — Benchmarks (feat/warm-implied)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5"></script>
   <style>
@@ -146,7 +146,7 @@ function rawUrl(branch, path) {
 // ============================================================
 // STATE
 // ============================================================
-const currentBranch = 'policies';
+const currentBranch = 'feat/warm-implied';
 let currentScenario = 'policymatrix';
 
 // ============================================================
@@ -408,9 +408,11 @@ function renderKPIs(){
 const PM_DATASETS = [
   { file:'admission-dram-promotion-always.csv',    label:'dram+always',    color:'#0ea5e9' },
   { file:'admission-dram-promotion-never.csv',     label:'dram+never',     color:'#f97316' },
+  { file:'admission-dram-promotion-never-warm.csv', label:'dram+never+WARM', color:'#c2410c' },
   { file:'admission-dram-promotion-2hit-50k.csv',  label:'dram+2hit-50k',  color:'#8b5cf6' },
   { file:'admission-flash-promotion-always.csv',   label:'flash+always',   color:'#10b981' },
   { file:'admission-flash-promotion-never.csv',    label:'flash+never',    color:'#ef4444' },
+  { file:'admission-flash-promotion-never-warm.csv', label:'flash+never+WARM', color:'#991b1b' },
   { file:'admission-flash-promotion-2hit-50k.csv', label:'flash+2hit-50k', color:'#eab308' },
 ];
 
