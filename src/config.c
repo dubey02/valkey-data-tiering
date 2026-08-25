@@ -3440,6 +3440,7 @@ standardConfig static_configs[] = {
     createEnumConfig("rdb-version-check", NULL, MODIFIABLE_CONFIG, rdb_version_check_enum, server.rdb_version_check, RDB_VERSION_CHECK_STRICT, NULL, NULL),
     createEnumConfig("ext-storage-admission-policy", NULL, MODIFIABLE_CONFIG, ext_storage_admission_policy_enum, ext_storage_admission_policy, EXT_STORAGE_ADMISSION_DRAM, NULL, NULL),
     createEnumConfig("ext-storage-promotion-policy", NULL, MODIFIABLE_CONFIG, ext_storage_promotion_policy_enum, ext_storage_promotion_policy, EXT_STORAGE_PROMOTION_ALWAYS, NULL, NULL),
+    createBoolConfig("ext-storage-warm-retention", NULL, MODIFIABLE_CONFIG, ext_storage_warm_retention, 0, NULL, NULL),
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases, 16, INTEGER_CONFIG, NULL, NULL),

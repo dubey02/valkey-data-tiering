@@ -120,6 +120,10 @@ int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEn
         if (ext_storage_spill_pool_active && o->tiering_state != TIERING_STATE_ONLY_MEMORY) {
             continue;
         }
+        /* Warm reclaim pass: accept only WARM keys (clean, droppable free). */
+        if (ext_storage_warm_pool_active && o->tiering_state != TIERING_STATE_WARM) {
+            continue;
+        }
 
         /* Calculate the idle time according to the policy. This is called
          * idle just because the code initially handled LRU, but is in fact
@@ -420,7 +424,8 @@ sds findBestEvictionCandidate(struct evictionPoolEntry *pool, int *bestdbid, int
             /* If the spill pool filter is active and the pool is still empty after
              * sampling, all keys are in a non-spillable state (e.g. COPYING_TO_FLASH).
              * Break to avoid spinning forever. */
-            if (ext_storage_spill_pool_active && pool[EVPOOL_SIZE - 1].key == NULL && pool[0].key == NULL) {
+            if ((ext_storage_spill_pool_active || ext_storage_warm_pool_active) &&
+                pool[EVPOOL_SIZE - 1].key == NULL && pool[0].key == NULL) {
                 break;
             }
 

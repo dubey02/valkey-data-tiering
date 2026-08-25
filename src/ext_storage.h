@@ -32,6 +32,11 @@ typedef enum {
                                           * entry retained so the re-executed
                                           * DEL removes it with full command-
                                           * layer side effects */
+    TIERING_STATE_WARM = 6,              /* promotion=never warm retention: value
+                                          * resident in RAM AND a valid (clean)
+                                          * copy on flash. Reads hit RAM; drop is
+                                          * free (tombstone, no IO); a write
+                                          * flips it to ONLY_MEMORY (dirty) */
 } TieringState;
 
 /* tieringStateEntry removed — state stored in robj->tiering_state (3 bits) */
@@ -141,6 +146,14 @@ sds genExternalStorageInfoString(sds info);
 /* Transient promotion: free values after processUnblockedClients completes */
 void extStorageFreeTransientValues(void);
 void extStorageMarkTransientDirty(serverDb *db, robj *key);
+
+/* Warm retention (promotion=never + ext-storage-warm-retention):
+ * dirty flip on write, flash-copy delete on key delete. */
+void extStorageWarmMarkDirty(serverDb *db, robj *key);
+void extStorageWarmOnDelete(serverDb *db, sds key);
+extern int ext_storage_warm_retention;
+extern int ext_storage_warm_pool_active;
+extern long long warm_keys_resident;
 
 /* State machine API */
 TieringState extStorageGetState(serverDb *db, sds key);
