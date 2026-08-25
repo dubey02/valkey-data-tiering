@@ -517,7 +517,7 @@ static flashcacheReturnCode logReadFromIndexEntry(flashcacheLog *log, indexEntry
     // `completion_callback` will be NULL in case when request is generated internally
     // in FlashCache. For e.g. Delete command in FDB file.
     if (completion_callback != NULL) {
-        flashcacheLogger(FC_LL_WARNING, "logReadFromIndexEntry: Calling back a NULL value. "
+        flashcacheLogger(FC_LL_DEBUG, "logReadFromIndexEntry: Calling back a NULL value. "
                                 "This likely indicates a FlashCache read miss.\n"
                                 "dbid: %lu, key: %p, key_len: %zu, read_type: %d , "
                                 "request_context: %p",

@@ -518,8 +518,21 @@ void extStorageWalCron(void) {
         /* Cap well below the backend request ring (4096): a pump burst that
          * saturates the ring starves client fetches (measured: 60k futile
          * push attempts + a dropped GET per crash boot at budget 20000).
-         * Un-pumped keys simply wait for the next tick. */
+         * Un-pumped keys simply wait for the next tick.
+         *
+         * The budget scales with the backlog: under warm retention, overwrite
+         * SETs never spill inline (flash admission fires on CREATE only) and
+         * warm-first demotion satisfies all memory pressure, so the pump is
+         * the ONLY coverage path for them. A fixed 1024 @ 10Hz (10.2k/s)
+         * loses to a 16k/s write rate and the uncovered backlog pins every
+         * WAL segment (measured: 1.13M-record backlog -> 21.7s crash boot).
+         * 3072 @ 10Hz = 30.7k/s stays below the ring while outrunning it. */
         int budget = 1024;
+        size_t backlog = dictSize(wal_dirty_table);
+        if (backlog > (size_t)budget * 16) {
+            budget = (int)(backlog / 16);
+            if (budget > 3072) budget = 3072;
+        }
         dictIterator *pit = dictGetSafeIterator(wal_dirty_table);
         dictEntry *pde;
         while (budget > 0 && (pde = dictNext(pit)) != NULL) {
