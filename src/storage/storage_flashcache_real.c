@@ -86,7 +86,31 @@ typedef struct fcRealCtx {
     int eviction_enabled;      /* 0 = noeviction policy: GC runs but doesn't delete keys from engine */
     storageCompletionFn completion_fn;
     void *completion_privdata;
+
+    /* Completion overflow list. The completion ring is fixed size, and a
+     * dropped completion strands its key in a COPYING_* state forever, which
+     * permanently inflates the in-flight tallies the snapshot barrier reads.
+     * Parking overflow here instead makes the push lossless. Guarded by
+     * comp_ovf_lock (worker appends, main thread drains); comp_ovf_len is
+     * atomic so the producer can take the fast ring path without locking. */
+    /* Requests refused because the request ring was full. Previously these
+     * were dropped silently: the caller had already counted the operation as
+     * in flight, so the tally never came back down. */
+    size_t req_ring_rejects;
+
+    struct fcRealOverflowNode *comp_ovf_head, *comp_ovf_tail;
+    pthread_mutex_t comp_ovf_lock;
+    _Atomic long comp_ovf_len;
 } fcRealCtx;
+
+typedef struct fcRealOverflowNode {
+    storageCompletion c;
+    struct fcRealOverflowNode *next;
+} fcRealOverflowNode;
+
+/* Times a completion had to be parked because the ring was full. Exposed so a
+ * sustained non-zero value is visible rather than silently absorbed. */
+long long storage_completion_overflows = 0;
 
 static fcRealCtx *g_fc_ctx = NULL;
 
@@ -441,7 +465,10 @@ static storageStatus fc_real_put_async(void *opaque, uint32_t db_id,
     fcRealCtx *ctx = opaque;
     fcRequest req = {.op = STORAGE_OP_PUT, .db_id = db_id, .key_robj = (void*)key,
                      .value_robj = (void*)value, .expire_ms = expire_ms, .request_ctx = request_ctx};
-    fc_req_push(ctx, &req);
+    if (fc_req_push(ctx, &req) != 0) {
+        ctx->req_ring_rejects++;
+        return STORAGE_ERR_REJECTED;
+    }
     return STORAGE_WOULDBLOCK;
 }
 
@@ -452,7 +479,10 @@ static storageStatus fc_real_get_async(void *opaque, uint32_t db_id,
     fcRealCtx *ctx = opaque;
     fcRequest req = {.op = STORAGE_OP_GET, .db_id = db_id, .key_robj = (void*)key,
                      .value_robj = NULL, .expire_ms = 0, .request_ctx = request_ctx};
-    fc_req_push(ctx, &req);
+    if (fc_req_push(ctx, &req) != 0) {
+        ctx->req_ring_rejects++;
+        return STORAGE_ERR_REJECTED;
+    }
     return STORAGE_WOULDBLOCK;
 }
 
@@ -463,7 +493,10 @@ static storageStatus fc_real_del_async(void *opaque, uint32_t db_id,
     fcRealCtx *ctx = opaque;
     fcRequest req = {.op = STORAGE_OP_DEL, .db_id = db_id, .key_robj = (void*)key,
                      .value_robj = NULL, .expire_ms = 0, .request_ctx = request_ctx};
-    fc_req_push(ctx, &req);
+    if (fc_req_push(ctx, &req) != 0) {
+        ctx->req_ring_rejects++;
+        return STORAGE_ERR_REJECTED;
+    }
     return STORAGE_WOULDBLOCK;
 }
 
