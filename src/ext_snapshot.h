@@ -28,6 +28,14 @@
  * when this returns 0. */
 int extSnapshotStreamSupported(void);
 
+/* Capability AND policy: what a save should actually check. Separate from the
+ * probe above so the test-only override (DEBUG EXT-STORAGE-SNAPSHOT-STREAM) can
+ * force the fork read path without also disabling the self tests. */
+int extSnapshotStreamEnabled(void);
+
+/* Test-only override backing extSnapshotStreamEnabled(). */
+extern int ext_snapshot_debug_stream_disabled;
+
 /* ---------------------------------------------------------------------------
  * Self test (tests only)
  *
@@ -94,8 +102,26 @@ void extSnapshotTransportAbort(void);
 /* Tear down. Safe to call whether or not Arm succeeded. */
 void extSnapshotTransportRelease(void);
 
-/* One record, as decoded by the consumer. */
-typedef void (*extSnapshotRecordFn)(void *privdata, uint32_t db_id,
+/* True between a successful Arm and Release. The parent uses it to decide
+ * whether a reaped child leaves a stream to cancel. */
+int extSnapshotTransportArmed(void);
+
+/* True when the caller is the consumer of an armed stream, i.e. the fork child
+ * of a streaming snapshot. rdb.c uses this to skip tiered keys in the memory
+ * section (their values arrive on the transport) and to emit the flash
+ * section. False in the parent, so a foreground save there still takes the
+ * fork read path. */
+int extSnapshotStreamConsumerActive(void);
+
+/* One record, as decoded by the consumer.
+ *
+ * `logical_db` and `entry` come from the orphan filter, which has to look the
+ * key up anyway: passing its result through spares the callback a second
+ * hashtable lookup per record. `entry` is the live robj for this key, which is
+ * where the RDB writer reads expire/LRU/LFU from. Declared as struct serverObject
+ * so this header stays independent of server.h. */
+typedef void (*extSnapshotRecordFn)(void *privdata, int logical_db,
+                                    struct serverObject *entry,
                                     const char *key, size_t klen,
                                     const char *value, size_t vlen);
 
@@ -160,10 +186,18 @@ int extSnapshotTransportSelfTest(int timeout_ms, extSnapshotTransportTestResult 
  * key pending deletion is logically gone, and a key that is no longer flash
  * resident has been superseded in memory.
  *
+ * On a live record the resolved logical DB id and the keyspace entry are
+ * published through the out params, so the caller does not repeat the lookup.
+ * Either out param may be NULL.
+ *
  * Consumer side. In a real save this runs in the fork child, where the
  * hashtable is the copy on write snapshot taken at the cut, which is the state
  * the records were frozen against.
  * ---------------------------------------------------------------------------*/
+int extSnapshotRecordResolve(uint32_t physical_db_id, const char *key, size_t klen,
+                             int *logical_db, struct serverObject **entry);
+
+/* Thin wrapper for callers that only need the verdict. */
 int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t klen);
 
 /* Records rejected by the orphan filter. Exposed so tests can assert the

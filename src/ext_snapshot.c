@@ -18,8 +18,17 @@
 
 extern int ext_data_enabled;
 
+/* Test-only policy override, set by DEBUG EXT-STORAGE-SNAPSHOT-STREAM. Kept
+ * separate from the capability probe so a test can still drive the self tests
+ * (which need the capability) while forcing saves down the fork read path. */
+int ext_snapshot_debug_stream_disabled = 0;
+
 int extSnapshotStreamSupported(void) {
     return ext_data_enabled && storageSnapshotStreamSupported();
+}
+
+int extSnapshotStreamEnabled(void) {
+    return !ext_snapshot_debug_stream_disabled && extSnapshotStreamSupported();
 }
 
 /* ---------------------------------------------------------------------------
@@ -330,6 +339,12 @@ long long extSnapshotTransportRecordsSent(void) {
     return atomic_load_explicit(&g_tx.sent, memory_order_relaxed);
 }
 
+int extSnapshotTransportArmed(void) { return g_tx.armed; }
+
+int extSnapshotStreamConsumerActive(void) {
+    return g_tx.armed && server.in_fork_child;
+}
+
 /* --- consumer --------------------------------------------------------------*/
 
 static int txFill(snapTransport *t, int blocking) {
@@ -430,8 +445,10 @@ int extSnapshotTransportDrain(extSnapshotRecordFn fn, void *privdata,
          * decides whether the record reaches the consumer. */
         t->received++;
         t->rx_digest ^= (uint_least64_t)selfTestRecordHash(dbid, key, klen, vlen);
-        if (fn && extSnapshotRecordIsLive(dbid, key, klen))
-            fn(privdata, dbid, key, klen, val, vlen);
+        int logical_db = 0;
+        robj *entry = NULL;
+        if (fn && extSnapshotRecordResolve(dbid, key, klen, &logical_db, &entry))
+            fn(privdata, logical_db, entry, key, klen, val, vlen);
 
         memmove(t->inbuf, t->inbuf + need, t->in_len - need);
         t->in_len -= need;
@@ -465,7 +482,8 @@ static long long ext_snapshot_orphans_dropped = 0;
 
 long long extSnapshotOrphansDropped(void) { return ext_snapshot_orphans_dropped; }
 
-int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t klen) {
+int extSnapshotRecordResolve(uint32_t physical_db_id, const char *key, size_t klen,
+                             int *logical_db, robj **out_entry) {
     int logical = extStorageLogicalDbId((int)physical_db_id);
     if (logical < 0 || logical >= server.dbnum) {
         ext_snapshot_orphans_dropped++;
@@ -493,16 +511,25 @@ int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t kle
     }
 
     sdsfree(kn);
-    if (!live) ext_snapshot_orphans_dropped++;
-    return live;
+    if (!live) {
+        ext_snapshot_orphans_dropped++;
+        return 0;
+    }
+    if (logical_db) *logical_db = logical;
+    if (out_entry) *out_entry = entry;
+    return 1;
+}
+
+int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t klen) {
+    return extSnapshotRecordResolve(physical_db_id, key, klen, NULL, NULL);
 }
 
 /* --- transport self test ---------------------------------------------------*/
 
-static void txTestCountRecord(void *privdata, uint32_t db_id,
+static void txTestCountRecord(void *privdata, int logical_db, robj *entry,
                               const char *key, size_t klen,
                               const char *value, size_t vlen) {
-    (void)db_id; (void)key; (void)klen; (void)value; (void)vlen;
+    (void)logical_db; (void)entry; (void)key; (void)klen; (void)value; (void)vlen;
     (*(long long *)privdata)++;
 }
 

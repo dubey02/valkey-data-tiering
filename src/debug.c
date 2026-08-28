@@ -1095,6 +1095,18 @@ void debugCommand(client *c) {
         }
         ext_storage_debug_pause_completions = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "ext-storage-snapshot-stream") && c->argc == 3) {
+        /* DEBUG EXT-STORAGE-SNAPSHOT-STREAM <0|1> -- force the snapshot path.
+         * 0 makes saves take the fork read path even when the storage engine
+         * can stream, which is the only way to keep that fallback under test
+         * once streaming becomes the default. Tests only; Phase 4 promotes this
+         * to a real config. */
+        if (!ext_data_enabled) {
+            addReplyError(c, "ext-storage-enabled is not set");
+            return;
+        }
+        ext_snapshot_debug_stream_disabled = !atoi(objectGetVal(c->argv[2]));
+        addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "ext-storage-stream-selftest") &&
                (c->argc == 2 || c->argc == 3)) {
         /* DEBUG EXT-STORAGE-STREAM-SELFTEST [timeout_ms] — drive the storage

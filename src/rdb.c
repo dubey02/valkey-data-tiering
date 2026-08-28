@@ -35,6 +35,7 @@
 #include "hashtable.h"
 #include "server.h"
 #include "ext_storage.h"
+#include "ext_snapshot.h"
 #include "lzf.h" /* LZF compression library */
 #include "zipmap.h"
 #include "endianconv.h"
@@ -1207,6 +1208,10 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     char *tiered_payload = NULL;
     size_t tiered_plen = 0;
     if (objectIsTiered(val)) {
+        /* Streaming snapshot: this key's value arrives on the transport, and
+         * the flash section written after the last DB emits it. Skipping here
+         * is what makes the memory section memory-only. */
+        if (extSnapshotStreamConsumerActive()) return 0;
         if (!extStorageMaterializeTiered(dbid, key, val, &tiered_payload, &tiered_plen))
             return 0; /* logically deleted (pending DEL) or GC-evicted: skip */
     }
@@ -1505,6 +1510,130 @@ werr:
     return -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Flash section (streaming snapshot)
+ *
+ * The memory section above walks the keyspace and skips tiered keys. Their
+ * values were frozen by the storage engine before the fork and stream in over
+ * the transport, so this section walks the STREAM instead of the keyspace and
+ * emits one RDB entry per surviving record.
+ *
+ * Two consequences of arriving from the storage engine's side:
+ *
+ *  - Records are not grouped by DB and not ordered. RDB allows SELECTDB to
+ *    reappear, so a SELECTDB is emitted whenever the DB changes. RESIZEDB is
+ *    not re-emitted: the memory section already sized each DB from the full
+ *    kvstore, which counts tiered keys too.
+ *  - The engine enumerates its own store, so a record may belong to a key the
+ *    keyspace has already forgotten. The orphan filter inside the drain rejects
+ *    those before they reach this writer; see ext_snapshot.h.
+ *
+ * Metadata (expire, LRU, LFU) comes from the keyspace entry the filter
+ * resolved, not from the record, so it matches what the memory section would
+ * have written for the same key. The value bytes are the DUMP payload written
+ * at spill time, identical in shape to what extStorageMaterializeTiered
+ * returns, so the resulting entry is a fully standard RDB entry.
+ * ---------------------------------------------------------------------------*/
+typedef struct flashSectionCtx {
+    rio *rdb;
+    long *key_counter;
+    int last_db;            /* DB of the last SELECTDB emitted, -1 = none yet */
+    int err;                /* sticky: first write error wins */
+    long long written;
+    long long malformed;    /* records too short to carry a DUMP footer */
+} flashSectionCtx;
+
+static void rdbSaveFlashRecord(void *privdata, int logical_db, robj *entry,
+                               const char *key, size_t klen,
+                               const char *value, size_t vlen) {
+    flashSectionCtx *ctx = privdata;
+    if (ctx->err) return;
+
+    /* DUMP payload = [type][object bytes][2B rdbver][8B crc64]. The footer is
+     * not part of an RDB entry, and there must be a type byte beneath it. */
+    if (vlen <= 10) {
+        ctx->malformed++;
+        return;
+    }
+    size_t objlen = vlen - 10;
+
+    rio *rdb = ctx->rdb;
+#define rdb_flash_fail() do { ctx->err = 1; return; } while (0)
+
+    if (logical_db != ctx->last_db) {
+        if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) rdb_flash_fail();
+        if (rdbSaveLen(rdb, logical_db) == -1) rdb_flash_fail();
+        ctx->last_db = logical_db;
+    }
+
+    long long expiretime = objectGetExpire(entry);
+    if (expiretime != -1) {
+        if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) rdb_flash_fail();
+        if (rdbSaveMillisecondTime(rdb, expiretime) == -1) rdb_flash_fail();
+    }
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
+        uint64_t idletime = objectGetLRUIdleSecs(entry);
+        if (rdbSaveType(rdb, RDB_OPCODE_IDLE) == -1) rdb_flash_fail();
+        if (rdbSaveLen(rdb, idletime) == -1) rdb_flash_fail();
+    }
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        uint8_t freq = objectGetLFUFrequency(entry);
+        if (rdbSaveType(rdb, RDB_OPCODE_FREQ) == -1) rdb_flash_fail();
+        if (rdbWriteRaw(rdb, &freq, 1) == -1) rdb_flash_fail();
+    }
+
+    /* Type byte, key, object bytes -- spliced straight out of the payload. */
+    if (rdbWriteRaw(rdb, (void *)value, 1) == -1) rdb_flash_fail();
+    if (rdbSaveRawString(rdb, (unsigned char *)key, klen) == -1) rdb_flash_fail();
+    if (rdbWriteRaw(rdb, (void *)(value + 1), objlen - 1) == -1) rdb_flash_fail();
+#undef rdb_flash_fail
+
+    ctx->written++;
+    (*ctx->key_counter)++;
+    if (server.rdb_key_save_delay) debugDelay(server.rdb_key_save_delay);
+}
+
+/* Drain the transport to completion, writing an entry per live record. Returns
+ * C_OK only when the producer's terminator arrived AND the counts matched, so a
+ * truncated stream can never be mistaken for an empty flash set. */
+static int rdbSaveFlashSection(rio *rdb, long *key_counter) {
+    flashSectionCtx ctx = { .rdb = rdb, .key_counter = key_counter, .last_db = -1 };
+
+    for (;;) {
+        int r = extSnapshotTransportDrain(rdbSaveFlashRecord, &ctx, 256, 1);
+        if (ctx.err) {
+            serverLog(LL_WARNING, "Snapshot flash section: write error after %lld entries",
+                      ctx.written);
+            return C_ERR;
+        }
+        if (r == EXT_SNAP_DRAIN_DONE) break;
+        if (r == EXT_SNAP_DRAIN_ERR) {
+            serverLog(LL_WARNING, "Snapshot flash section: stream failed after %lld entries",
+                      ctx.written);
+            return C_ERR;
+        }
+        if (r == EXT_SNAP_DRAIN_WOULDBLOCK) {
+            /* A blocking drain only reports this after the pipe reached EOF with
+             * nothing buffered, which means the producer went away without
+             * writing a terminator -- the parent died, or the transport was
+             * released under us. Retrying would spin forever, so fail. */
+            serverLog(LL_WARNING,
+                "Snapshot flash section: stream ended without a terminator after %lld entries",
+                ctx.written);
+            return C_ERR;
+        }
+    }
+
+    if (ctx.malformed) {
+        serverLog(LL_WARNING, "Snapshot flash section: %lld records were too short to decode",
+                  ctx.malformed);
+        return C_ERR;
+    }
+    serverLog(LL_NOTICE, "Snapshot flash section: %lld entries written, %lld records dropped as orphans",
+              ctx.written, extSnapshotOrphansDropped());
+    return C_OK;
+}
+
 /* Produces a dump of the database in RDB format sending it to the specified
  * I/O channel. On success C_OK is returned, otherwise C_ERR
  * is returned and part of the output, or all the output, can be
@@ -1538,6 +1667,11 @@ int rdbSaveRio(int req, int rdbver, rio *rdb, int *error, int rdbflags, rdbSaveI
         for (j = 0; j < server.dbnum; j++) {
             if (rdbSaveDb(rdb, j, rdbflags, rdbver, &key_counter) == -1) goto werr;
         }
+
+        /* Data tiering: the memory section above skipped tiered keys. Emit them
+         * now from the pre-fork stream. */
+        if (extSnapshotStreamConsumerActive() && rdbSaveFlashSection(rdb, &key_counter) == C_ERR)
+            goto werr;
     }
 
     if (!(req & REPLICA_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, VALKEYMODULE_AUX_AFTER_RDB) == -1) goto werr;
@@ -1742,28 +1876,52 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
-    /* Data tiering: quiesce tiering IO, park the storage IO thread and pause
-     * on-flash GC BEFORE fork(), so the child inherits a consistent backend
-     * state and stable flash offsets. The parent resumes the IO thread right
-     * after fork; GC stays paused until the child is reaped
+    /* Data tiering: two ways to get flash-resident values into the child.
+     *
+     * Streaming (preferred): drain in-flight storage IO so nothing inside the
+     * frozen range belongs to an already-deleted key, then take the engine's
+     * point-in-time cut. Both must happen in this event-loop tick, immediately
+     * before fork, so no mutation lands between the cut and the child's copy on
+     * write view of the keyspace. The child never touches flash, so GC is not
+     * paused for its lifetime.
+     *
+     * Fork read (fallback): quiesce tiering IO, park the storage IO thread and
+     * pause on-flash GC BEFORE fork(), so the child inherits a consistent
+     * backend state and stable flash offsets. The parent resumes the IO thread
+     * right after fork; GC stays paused until the child is reaped
      * (backgroundSaveDoneHandler -> extStorageSnapshotDone). */
     int tiering_snapshot_prepared = 0;
+    int tiering_stream_armed = 0;
     if (ext_data_enabled && num_items_on_flash > 0) {
-        if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
-            extStorageSnapshotPrepare() != C_OK) {
-            serverLog(LL_WARNING,
-                "Refusing background save: %lld values reside on external storage "
-                "and the active backend cannot snapshot them", num_items_on_flash);
-            server.lastbgsave_status = C_ERR;
-            return C_ERR;
+        if (extSnapshotStreamEnabled() && !extStorageSnapshotActive()) {
+            if (extSnapshotDrainBarrier() == C_OK && extSnapshotTransportArm() == C_OK) {
+                tiering_stream_armed = 1;
+            } else {
+                extSnapshotTransportRelease();
+                serverLog(LL_NOTICE,
+                    "Snapshot stream unavailable, falling back to the fork read path");
+            }
         }
-        tiering_snapshot_prepared = 1;
+        if (!tiering_stream_armed) {
+            if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
+                extStorageSnapshotPrepare() != C_OK) {
+                serverLog(LL_WARNING,
+                    "Refusing background save: %lld values reside on external storage "
+                    "and the active backend cannot snapshot them", num_items_on_flash);
+                server.lastbgsave_status = C_ERR;
+                return C_ERR;
+            }
+            tiering_snapshot_prepared = 1;
+        }
     }
 
     if ((childpid = serverFork(CHILD_TYPE_RDB)) == 0) {
         int retval;
 
-        /* Child */
+        /* Child. Drop the producer end: leaving it open would keep the pipe
+         * from ever reporting EOF to our own reader. */
+        if (tiering_stream_armed) extSnapshotTransportCloseWriteEnd();
+
         if (strstr(server.exec_argv[0], "redis-server") != NULL) {
             serverSetProcTitle("redis-rdb-bgsave");
         } else {
@@ -1779,10 +1937,17 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         /* Parent */
         if (childpid == -1) {
             if (tiering_snapshot_prepared) extStorageSnapshotDone();
+            if (tiering_stream_armed) {
+                extSnapshotTransportAbort();
+                extSnapshotTransportRelease();
+            }
             server.lastbgsave_status = C_ERR;
             serverLog(LL_WARNING, "Can't save in background: fork: %s", strerror(errno));
             return C_ERR;
         }
+        /* Drop the consumer end: the child owns it. The write end stays open
+         * for the storage IO thread, which is still producing. */
+        if (tiering_stream_armed) extSnapshotTransportCloseReadEnd();
         /* Unpark the storage IO thread: normal tiering traffic resumes while
          * the child snapshots (GC stays paused for the child's lifetime). */
         if (tiering_snapshot_prepared) extStorageSnapshotResume();
@@ -3805,6 +3970,15 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     /* Data tiering: the snapshot child is gone (success, error or kill) --
      * on-flash GC may resume. No-op when no snapshot was prepared. */
     extStorageSnapshotDone();
+
+    /* Streaming snapshot: with the child gone nothing will consume the rest of
+     * the stream, so cancel it rather than let the storage engine keep
+     * producing into a pipe with no reader. Idempotent when the stream already
+     * completed, which is the normal success case. */
+    if (extSnapshotTransportArmed()) {
+        extSnapshotTransportAbort();
+        extSnapshotTransportRelease();
+    }
 
     int type = server.rdb_child_type;
     time_t save_end = time(NULL);
