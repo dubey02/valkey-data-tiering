@@ -1125,6 +1125,34 @@ void debugCommand(client *c) {
         addReplyBulkCString(c, "digest");
         addReplyBulkSds(c, sdscatprintf(sdsempty(), "%llu", (unsigned long long)res.digest));
         addReplyBulkCString(c, "elapsed_ms");  addReplyLongLong(c, res.elapsed_ms);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "ext-storage-snapshot-transport-selftest") &&
+               (c->argc == 2 || c->argc == 3)) {
+        /* DEBUG EXT-STORAGE-SNAPSHOT-TRANSPORT-SELFTEST [timeout_ms] -- run the
+         * Phase 2 producer/consumer transport in one process and verify the
+         * frame count and digest match end to end. Tests only. */
+        if (!ext_data_enabled) {
+            addReplyError(c, "ext-storage-enabled is not set");
+            return;
+        }
+        if (!extSnapshotStreamSupported()) {
+            addReplyError(c, "active storage engine does not support snapshot streaming");
+            return;
+        }
+        long long timeout_ms = 20000;
+        if (c->argc == 3 && getLongLongFromObjectOrReply(c, c->argv[2], &timeout_ms, NULL) != C_OK)
+            return;
+        extSnapshotTransportTestResult tr;
+        if (extSnapshotTransportSelfTest((int)timeout_ms, &tr) != C_OK) {
+            addReplyError(c, "failed to run snapshot transport self test");
+            return;
+        }
+        addReplyMapLen(c, 6);
+        addReplyBulkCString(c, "ok");           addReplyLongLong(c, tr.ok);
+        addReplyBulkCString(c, "sent");         addReplyLongLong(c, tr.sent);
+        addReplyBulkCString(c, "received");     addReplyLongLong(c, tr.received);
+        addReplyBulkCString(c, "drain_calls");  addReplyLongLong(c, tr.drain_calls);
+        addReplyBulkCString(c, "wouldblocks");  addReplyLongLong(c, tr.wouldblocks);
+        addReplyBulkCString(c, "elapsed_ms");   addReplyLongLong(c, tr.elapsed_ms);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc == 3) {
         /* DEBUG SPILL <key> — manually spill a key to external storage */
         if (!ext_data_enabled) {

@@ -50,4 +50,98 @@ typedef struct extSnapshotSelfTestResult {
 
 int extSnapshotStreamSelfTest(int timeout_ms, extSnapshotSelfTestResult *out);
 
+/* ---------------------------------------------------------------------------
+ * Phase 2: record transport
+ *
+ * The storage engine delivers records on ITS IO thread, but the RDB writer is
+ * the fork child. A pipe carries records across that boundary: the parent's IO
+ * thread encodes each record as a frame and writes it, the child decodes and
+ * hands records to the RDB layer.
+ *
+ * Frame layout (host byte order: producer and consumer are the same build on
+ * the same machine, so there is nothing to normalise):
+ *
+ *   record      : u32 payload_len | u32 dbid | u32 klen | u32 vlen | key | value
+ *   terminator  : u32 0           | u64 record_count | u64 digest
+ *   poison      : u32 0xFFFFFFFF
+ *
+ * The terminator carries a count and digest so the consumer can prove it saw
+ * every record rather than assuming a clean EOF. Poison marks producer side
+ * failure, so a truncated stream is never mistaken for a complete one.
+ *
+ * Backpressure: the write end is non-blocking with a bounded overflow buffer.
+ * Blocking the engine IO thread would also stall spills and fetches, so
+ * instead writable() reports "not now" while overflow is pending and the
+ * engine simply stops handing over records. Overflow past the cap poisons the
+ * stream, matching the storage engine's own abort-rather-than-stall policy.
+ * ---------------------------------------------------------------------------*/
+
+/* Arm the transport and the engine stream. Main thread, and it must run in the
+ * same event-loop tick as the fork so no mutation lands between cut and fork. */
+int extSnapshotTransportArm(void);
+
+/* Consumer end. Valid after Arm until Release. */
+int extSnapshotTransportReadFd(void);
+
+/* Post fork fd hygiene: each side drops the end it does not use. */
+void extSnapshotTransportCloseReadEnd(void);
+void extSnapshotTransportCloseWriteEnd(void);
+
+/* Cancel the engine stream and poison the pipe so the consumer fails loudly
+ * instead of treating a partial stream as complete. */
+void extSnapshotTransportAbort(void);
+
+/* Tear down. Safe to call whether or not Arm succeeded. */
+void extSnapshotTransportRelease(void);
+
+/* One record, as decoded by the consumer. */
+typedef void (*extSnapshotRecordFn)(void *privdata, uint32_t db_id,
+                                    const char *key, size_t klen,
+                                    const char *value, size_t vlen);
+
+/* Drain outcomes. Anything negative is terminal. */
+#define EXT_SNAP_DRAIN_WOULDBLOCK   0   /* nothing available right now */
+#define EXT_SNAP_DRAIN_DONE        -1   /* terminator seen, counts verified */
+#define EXT_SNAP_DRAIN_ERR         -2   /* poison, short read, or count mismatch */
+
+/* Consume up to `budget` records. Returns the number consumed (>0), or one of
+ * the EXT_SNAP_DRAIN_* codes. With blocking=0 this returns WOULDBLOCK rather
+ * than waiting, so the caller can interleave it with other work. */
+int extSnapshotTransportDrain(extSnapshotRecordFn fn, void *privdata,
+                              int budget, int blocking);
+
+/* Records handed to the pipe so far. Producer side counter, for INFO. */
+long long extSnapshotTransportRecordsSent(void);
+
+/* ---------------------------------------------------------------------------
+ * Resurrection barrier
+ *
+ * A key deleted before the cut whose flash record has not been reclaimed yet
+ * would still be inside the frozen range, and writing it to an RDB would bring
+ * the key back. Draining in-flight storage IO before arming the cut removes
+ * that window. Returns C_OK when the queues settled, C_ERR otherwise (caller
+ * must then refuse the snapshot).
+ * ---------------------------------------------------------------------------*/
+int extSnapshotDrainBarrier(void);
+
+/* ---------------------------------------------------------------------------
+ * Transport self test (tests only)
+ *
+ * Runs the whole producer/consumer path in one process: barrier, arm, then
+ * drain from the calling thread while the engine IO thread produces. This is
+ * the same interleave the fork child performs, minus the fork, so the framing
+ * and backpressure can be verified before rdb.c is involved.
+ * ---------------------------------------------------------------------------*/
+typedef struct extSnapshotTransportTestResult {
+    int armed;
+    int ok;                /* terminator seen and counts verified */
+    long long sent;
+    long long received;
+    long long drain_calls;
+    long long wouldblocks; /* times the consumer found nothing ready */
+    long long elapsed_ms;
+} extSnapshotTransportTestResult;
+
+int extSnapshotTransportSelfTest(int timeout_ms, extSnapshotTransportTestResult *out);
+
 #endif /* EXT_SNAPSHOT_H */
