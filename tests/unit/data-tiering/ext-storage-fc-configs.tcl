@@ -111,11 +111,42 @@ start_server [list tags {"ext-storage-fc-configs"} overrides [list \
         assert_match "*fc_num_retryable_disk_errors:*" $info
     }
 
-    test "INFO fc_total_disk_write_bytes is non-zero after FC init" {
-        set info [r info all]
-        regexp {fc_total_disk_write_bytes:(\d+)} $info _ write_bytes
-        # FC writes during init (zero-fill), so this is always > 0
-        assert {$write_bytes > 0}
+    test "INFO fc_total_disk_write_bytes tracks actual disk writes" {
+        # This previously asserted write_bytes > 0 immediately after init, with
+        # the rationale "FC writes during init (zero-fill)". That only passed
+        # because the INFO field read FC_TOTAL_DB_SIZE_BYTES through a
+        # mismatched metric id, reporting the DB file size rather than bytes
+        # written. With the correct metric, write bytes start at 0.
+        #
+        # Two things gate a real disk write. FlashCache buffers spills and only
+        # flushes once ext-storage-buffered-write-flush-threshold (1 MiB) is
+        # crossed, and values are LZF compressed on the way down, so a repeated
+        # character string collapses to almost nothing and never reaches the
+        # threshold. Use incompressible payloads.
+        regexp {fc_total_disk_write_bytes:(\d+)} [r info all] _ before
+
+        set n 400
+        for {set i 0} {$i < $n} {incr i} {
+            set v ""
+            set x [expr {$i + 7}]
+            while {[string length $v] < 8192} {
+                set x [expr {($x * 1103515245 + 12345) & 0x7fffffff}]
+                append v [format %08x $x]
+            }
+            r set fcw:$i $v
+        }
+        regexp {total_num_items_spilled_to_ext_storage:(\d+)} [r info all] _ spilled_before
+        for {set i 0} {$i < $n} {incr i} { catch {r debug spill fcw:$i} }
+
+        set deadline [expr {[clock milliseconds] + 15000}]
+        while {[clock milliseconds] < $deadline} {
+            regexp {total_num_items_spilled_to_ext_storage:(\d+)} [r info all] _ spilled_now
+            if {$spilled_now - $spilled_before >= [expr {$n / 2}]} break
+            after 100
+        }
+
+        regexp {fc_total_disk_write_bytes:(\d+)} [r info all] _ after
+        assert {$after > $before}
     }
 }
 

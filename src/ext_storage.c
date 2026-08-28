@@ -1649,9 +1649,30 @@ sds genExternalStorageInfoString(sds info) {
         ext_storage_throttling_strategy == THROTTLING_STRATEGY_V1 ? "v1" : "v2",
         ext_storage_spilling_strategy == SPILLING_STRATEGY_V1 ? "v1" : "v2");
 
-    /* FlashCache internal metrics (via flashcacheGetCountBasedMetric) */
+    /* FlashCache internal metrics (via flashcacheGetCountBasedMetric).
+     *
+     * These are passed as enum symbols rather than integer literals. The
+     * literals that used to be here had ALL drifted from the enum: id 10 was
+     * labelled FC_NUM_ITEMS_EVICTED but actually reads
+     * FC_GARBAGE_COLLECTION_WRITE_BYTES, and id 11 labelled
+     * FC_TOTAL_EVICTED_ITEMS_SIZE_BYTES actually reads
+     * FC_GARBAGE_COLLECTION_NUM_ITEMS_MOVED. That is why the two fields looked
+     * mutually contradictory: a byte count reported as an item count next to an
+     * item count reported as bytes. Comments naming the intended metric cannot
+     * be checked by the compiler, so the block silently rotted as FlashCache's
+     * enum grew. Symbols make a future insertion a compile-time concern. */
     if (extStorageBridge_isReady()) {
-        extern size_t fc_get_metric(int metric_id);
+        extern size_t fc_metric_items_evicted(void);
+        extern size_t fc_metric_evicted_bytes(void);
+        extern size_t fc_metric_disk_write_bytes(void);
+        extern size_t fc_metric_disk_read_bytes(void);
+        extern size_t fc_metric_num_disk_writes(void);
+        extern size_t fc_metric_num_disk_reads(void);
+        extern size_t fc_metric_reads_in_flight(void);
+        extern size_t fc_metric_active_memory_bytes(void);
+        extern size_t fc_metric_retryable_disk_errs(void);
+        extern size_t fc_metric_evicting_under_max(void);
+        extern size_t fc_metric_evicted_under_max(void);
         info = sdscatprintf(info,
             "fc_num_items_evicted:%zu\r\n"
             "fc_total_evicted_bytes:%zu\r\n"
@@ -1664,17 +1685,17 @@ sds genExternalStorageInfoString(sds info) {
             "fc_num_retryable_disk_errors:%zu\r\n"
             "fc_is_evicting_under_max_logsize:%zu\r\n"
             "fc_num_evicted_under_max_logsize:%zu\r\n",
-            fc_get_metric(10),  /* FC_NUM_ITEMS_EVICTED */
-            fc_get_metric(11),  /* FC_TOTAL_EVICTED_ITEMS_SIZE_BYTES */
-            fc_get_metric(4),   /* FC_TOTAL_DISK_WRITE_BYTES */
-            fc_get_metric(5),   /* FC_TOTAL_DISK_READ_BYTES */
-            fc_get_metric(6),   /* FC_NUM_DISK_WRITE */
-            fc_get_metric(7),   /* FC_NUM_DISK_READ */
-            fc_get_metric(1),   /* FC_NUM_READ_IN_FLIGHT */
-            fc_get_metric(12),  /* FC_ACTIVE_MEMORY_SIZE */
-            fc_get_metric(15),  /* FC_NUM_RETRYABLE_DISK_ERROR */
-            fc_get_metric(30),  /* FC_IS_EVICTING_UNDER_MAX_LOGSIZE */
-            fc_get_metric(31)); /* FC_NUM_ITEMS_EVICTED_UNDER_MAX_LOGSIZE */
+            fc_metric_items_evicted(),
+            fc_metric_evicted_bytes(),
+            fc_metric_disk_write_bytes(),
+            fc_metric_disk_read_bytes(),
+            fc_metric_num_disk_writes(),
+            fc_metric_num_disk_reads(),
+            fc_metric_reads_in_flight(),
+            fc_metric_active_memory_bytes(),
+            fc_metric_retryable_disk_errs(),
+            fc_metric_evicting_under_max(),
+            fc_metric_evicted_under_max());
     }
 
     /* Append module-side metrics */

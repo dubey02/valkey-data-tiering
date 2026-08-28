@@ -941,6 +941,32 @@ size_t fc_get_metric(int metric_id) {
     return flashcacheGetCountBasedMetric((flashcacheCountBasedMetrics)metric_id);
 }
 
+/* Named metric accessors.
+ *
+ * fc_get_metric takes a raw int, so callers outside this file had to pass
+ * integer literals with a comment claiming which metric they meant. Every one
+ * of those literals had drifted from the enum as FlashCache grew it, with no
+ * compiler check to catch it. These accessors keep the enum symbol on the side
+ * of the boundary that can see it, so a future insertion into the enum is a
+ * recompile rather than a silently mislabelled INFO field. */
+#define FC_DEFINE_METRIC_ACCESSOR(fn, sym)                       \
+    size_t fn(void) {                                            \
+        if (!g_fc_ctx) return 0;                                 \
+        return flashcacheGetCountBasedMetric(sym);               \
+    }
+
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_items_evicted,        FC_NUM_ITEMS_EVICTED)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_evicted_bytes,        FC_TOTAL_EVICTED_ITEMS_SIZE_BYTES)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_disk_write_bytes,     FC_TOTAL_DISK_WRITE_BYTES)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_disk_read_bytes,      FC_TOTAL_DISK_READ_BYTES)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_num_disk_writes,      FC_NUM_DISK_WRITE)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_num_disk_reads,       FC_NUM_DISK_READ)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_reads_in_flight,      FC_NUM_READ_IN_FLIGHT)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_active_memory_bytes,  FC_ACTIVE_MEMORY_SIZE)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_retryable_disk_errs,  FC_NUM_RETRYABLE_DISK_ERROR)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_evicting_under_max,   FC_IS_EVICTING_UNDER_MAX_LOGSIZE)
+FC_DEFINE_METRIC_ACCESSOR(fc_metric_evicted_under_max,    FC_NUM_ITEMS_EVICTED_UNDER_MAX_LOGSIZE)
+
 /* Called from ext_storage_bridge when CONFIG SET changes FC tuning params.
  * Propagates current global config values to the live FlashCache instance. */
 void fc_apply_runtime_configs(void) {
