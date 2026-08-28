@@ -4095,6 +4095,49 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
             skip_rdb_checksum = 0;
     }
 
+    /* Data tiering: this path had no tiering handling at all, so a diskless
+     * full sync with flash-resident values ran the child's preads with the
+     * storage IO thread unparked and on-flash GC unpaused -- the offsets it read
+     * were not guaranteed to still describe the values it wanted. Quiesce the
+     * same way rdbSaveBackground does, and refuse rather than ship a lossy RDB
+     * when the backend cannot snapshot at all.
+     *
+     * This sits at the last point before fork deliberately: the replica
+     * bookkeeping above touches no keys, so nothing mutates between the quiesce
+     * and the child's copy on write view. */
+    int tiering_snapshot_prepared = 0;
+    if (ext_data_enabled && num_items_on_flash > 0) {
+        if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
+            extStorageSnapshotPrepare() != C_OK) {
+            serverLog(LL_WARNING,
+                "Refusing RDB transfer to replicas: %lld values reside on external "
+                "storage and the active backend cannot snapshot them", num_items_on_flash);
+            /* Same unwind as the fork failure below: the replicas were already
+             * moved to WAIT_BGSAVE_END, and the pipes and conns array are ours
+             * to release. No child info pipe exists yet. */
+            listRewind(server.replicas, &li);
+            while ((ln = listNext(&li))) {
+                client *replica = ln->value;
+                if (replica->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END)
+                    replica->repl_data->repl_state = REPLICA_STATE_WAIT_BGSAVE_START;
+            }
+            if (!dual_channel) {
+                close(rdb_pipe_write);
+                close(server.rdb_pipe_read);
+                server.rdb_pipe_read = -1;
+                close(server.rdb_child_exit_pipe);
+                server.rdb_child_exit_pipe = -1;
+                close(safe_to_exit_pipe);
+                server.rdb_pipe_conns = NULL;
+                server.rdb_pipe_numconns = 0;
+                server.rdb_pipe_numconns_writing = 0;
+            }
+            zfree(conns);
+            return C_ERR;
+        }
+        tiering_snapshot_prepared = 1;
+    }
+
     /* Create the child process. */
     if ((childpid = serverFork(CHILD_TYPE_RDB)) == 0) {
         /* Child */
@@ -4145,6 +4188,7 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
         /* Parent */
         if (childpid == -1) {
             serverLog(LL_WARNING, "Can't save in background: fork: %s", strerror(errno));
+            if (tiering_snapshot_prepared) extStorageSnapshotDone();
 
             /* Undo the state change. The caller will perform cleanup on
              * all the replicas in BGSAVE_START state, but an early call to
@@ -4176,6 +4220,11 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
 
             server.rdb_save_time_start = time(NULL);
             server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
+            /* Unpark the storage IO thread: normal tiering traffic resumes while
+             * the child transfers. GC stays paused until the child is reaped
+             * (backgroundSaveDoneHandler -> extStorageSnapshotDone, which covers
+             * SOCKET children too). */
+            if (tiering_snapshot_prepared) extStorageSnapshotResume();
             if (dual_channel) {
                 /* For dual channel sync, the main process no longer requires these RDB connections. */
                 zfree(conns);
