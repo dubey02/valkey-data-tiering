@@ -139,14 +139,38 @@ static int fc_req_pop(fcRealCtx *ctx, fcRequest *out) {
 /* ---------------------------------------------------------------------------
  * Lock-free completion ring (SPSC)
  * ---------------------------------------------------------------------------*/
-static int fc_comp_push(fcRealCtx *ctx, storageCompletion *comp) {
-    int head = atomic_load_explicit(&ctx->comp_head, memory_order_relaxed);
-    int next = (head + 1) % FC_COMP_RING;
-    if (next == atomic_load_explicit(&ctx->comp_tail, memory_order_acquire))
-        return -1; /* full */
-    ctx->comp_ring[head] = *comp;
-    atomic_store_explicit(&ctx->comp_head, next, memory_order_release);
-    return 0;
+/* Lossless push: ring fast path, overflow list when the ring is full or a
+ * backlog already exists (order must be preserved, so once anything is parked
+ * everything goes to the list until it drains). Never drops.
+ *
+ * The previous version returned -1 on a full ring and every call site either
+ * ignored it or handled it with an empty block, so completions were silently
+ * discarded. A discarded PUT completion leaves its key in
+ * TIERING_STATE_COPYING_TO_FLASH forever and never decrements
+ * total_items_spilling_to_ext_storage, so one burst of spills permanently
+ * inflates that tally. The snapshot barrier waits for it to reach zero, which
+ * means a single burst disabled snapshotting for the life of the process.
+ * Worker-side only. */
+static void fc_comp_push(fcRealCtx *ctx, storageCompletion *comp) {
+    if (atomic_load_explicit(&ctx->comp_ovf_len, memory_order_acquire) == 0) {
+        int head = atomic_load_explicit(&ctx->comp_head, memory_order_relaxed);
+        int next = (head + 1) % FC_COMP_RING;
+        if (next != atomic_load_explicit(&ctx->comp_tail, memory_order_acquire)) {
+            ctx->comp_ring[head] = *comp;
+            atomic_store_explicit(&ctx->comp_head, next, memory_order_release);
+            return;
+        }
+    }
+    fcRealOverflowNode *n = storage_malloc(sizeof(*n));
+    n->c = *comp;
+    n->next = NULL;
+    pthread_mutex_lock(&ctx->comp_ovf_lock);
+    if (ctx->comp_ovf_tail) ctx->comp_ovf_tail->next = n;
+    else ctx->comp_ovf_head = n;
+    ctx->comp_ovf_tail = n;
+    atomic_fetch_add_explicit(&ctx->comp_ovf_len, 1, memory_order_release);
+    pthread_mutex_unlock(&ctx->comp_ovf_lock);
+    storage_completion_overflows++;
 }
 
 static int fc_comp_pop(fcRealCtx *ctx, storageCompletion *out) {
@@ -175,9 +199,7 @@ static void fc_get_callback(void *request_context, char *value,
     } else {
         comp.status = STORAGE_NOT_FOUND;
     }
-    if (fc_comp_push(g_fc_ctx, &comp) != 0) {
-        /* Ring full — should not happen with 8192 slots */
-    }
+    fc_comp_push(g_fc_ctx, &comp);
 }
 
 /* ---------------------------------------------------------------------------
@@ -383,6 +405,9 @@ static void *fc_real_open(storageConfig *cfg) {
     atomic_init(&ctx->comp_tail, 0);
     atomic_init(&ctx->barrier_done, 0);
     atomic_init(&ctx->shutdown, 0);
+    atomic_init(&ctx->comp_ovf_len, 0);
+    ctx->comp_ovf_head = ctx->comp_ovf_tail = NULL;
+    pthread_mutex_init(&ctx->comp_ovf_lock, NULL);
     ctx->completion_fn = cfg->completion_fn;
     ctx->completion_privdata = cfg->completion_privdata;
     ctx->eviction_enabled = cfg->eviction_enabled;
@@ -506,6 +531,23 @@ static int fc_real_poll_completions(void *opaque, int max) {
     storageCompletion comp;
     while (count < max && fc_comp_pop(ctx, &comp) == 0) {
         if (ctx->completion_fn) ctx->completion_fn(&comp, ctx->completion_privdata);
+        count++;
+    }
+    /* Drain parked completions. These are strictly newer than the ring's
+     * contents, because the push path keeps appending here until the list is
+     * empty again, so ring-then-list preserves order. */
+    while (count < max && atomic_load_explicit(&ctx->comp_ovf_len, memory_order_acquire) > 0) {
+        pthread_mutex_lock(&ctx->comp_ovf_lock);
+        fcRealOverflowNode *n = ctx->comp_ovf_head;
+        if (n) {
+            ctx->comp_ovf_head = n->next;
+            if (!ctx->comp_ovf_head) ctx->comp_ovf_tail = NULL;
+            atomic_fetch_sub_explicit(&ctx->comp_ovf_len, 1, memory_order_release);
+        }
+        pthread_mutex_unlock(&ctx->comp_ovf_lock);
+        if (!n) break;
+        if (ctx->completion_fn) ctx->completion_fn(&n->c, ctx->completion_privdata);
+        storage_free(n);
         count++;
     }
     return count;
