@@ -47,14 +47,9 @@ proc rdb_incompressible {len seed} {
 # when the streaming path did not run at all. Reading it from the log rather
 # than inferring it from key counts is what distinguishes "streamed correctly"
 # from "fell back and happened to be correct".
-proc bgsave_flash_entries {} {
-    set logfile [srv 0 stdout]
-    set from [count_log_lines 0]
-    r bgsave
-    waitForBgsave r
-    assert_equal "ok" [s rdb_last_bgsave_status]
-
-    set fd [open $logfile r]
+# Entries the flash section reported after line $from, or -1 when it did not run.
+proc flash_entries_since {from} {
+    set fd [open [srv 0 stdout] r]
     set lines [split [read $fd] "\n"]
     close $fd
     set entries -1
@@ -66,6 +61,14 @@ proc bgsave_flash_entries {} {
         if {[string match {*falling back to the fork read path*} $line]} { set entries -1 }
     }
     return $entries
+}
+
+proc bgsave_flash_entries {} {
+    set from [count_log_lines 0]
+    r bgsave
+    waitForBgsave r
+    assert_equal "ok" [s rdb_last_bgsave_status]
+    return [flash_entries_since $from]
 }
 
 # Occurrences of $pattern in the server log after line $from. Needed because
@@ -306,6 +309,88 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
             rdb_spill_wait back:$i
         }
         assert_equal 40 [bgsave_flash_entries]
+    }
+
+    # --- foreground SAVE ----------------------------------------------------
+    #
+    # No fork here: the main thread arms the cut and drains it while the storage
+    # IO thread produces. Blocking on the pipe would hang the server forever
+    # because the write end is open in this same process, so the flash section
+    # runs non-blocking against a stall deadline.
+
+    test {rdb SAVE: foreground save streams the flash section} {
+        r flushall
+        set n 120
+        array set expected {}
+        for {set i 0} {$i < $n} {incr i} {
+            set v [rdb_incompressible [expr {220 + $i}] [expr {$i * 13 + 9}]]
+            set expected($i) $v
+            r set fg:$i $v
+            rdb_spill_wait fg:$i
+        }
+        for {set i 0} {$i < 25} {incr i} { r set fgmem:$i "m$i" }
+
+        set from [count_log_lines 0]
+        r save
+        assert_equal $n [flash_entries_since $from]
+
+        restart_server 0 true false
+        assert_equal [expr {$n + 25}] [r dbsize]
+        for {set i 0} {$i < $n} {incr i} { assert_equal $expected($i) [r get fg:$i] }
+        assert_equal "m3" [r get fgmem:3]
+    }
+
+    test {rdb SAVE: DEBUG RELOAD round trips tiered values} {
+        r flushall
+        set n 80
+        array set expected {}
+        for {set i 0} {$i < $n} {incr i} {
+            set v [rdb_incompressible [expr {180 + $i}] [expr {$i * 23 + 4}]]
+            set expected($i) $v
+            r set dr:$i $v
+            r expire dr:$i 3000
+            rdb_spill_wait dr:$i
+        }
+
+        set from [count_log_lines 0]
+        r debug reload
+        assert_equal $n [flash_entries_since $from]
+
+        assert_equal $n [r dbsize]
+        for {set i 0} {$i < $n} {incr i} {
+            assert_equal $expected($i) [r get dr:$i]
+            set t [r ttl dr:$i]
+            assert {$t > 2000 && $t <= 3000}
+        }
+    }
+
+    test {rdb SAVE: repeated foreground saves do not latch the transport} {
+        r flushall
+        for {set i 0} {$i < 30} {incr i} {
+            r set rep:$i [rdb_incompressible 200 [expr {$i + 55}]]
+            rdb_spill_wait rep:$i
+        }
+        for {set j 0} {$j < 3} {incr j} {
+            set from [count_log_lines 0]
+            r save
+            assert_equal 30 [flash_entries_since $from]
+        }
+    }
+
+    test {rdb SAVE: fork path parity for the foreground save} {
+        r flushall
+        r debug ext-storage-snapshot-stream 0
+        for {set i 0} {$i < 60} {incr i} {
+            r set fgf:$i [rdb_incompressible 240 [expr {$i + 37}]]
+            rdb_spill_wait fgf:$i
+        }
+        set from [count_log_lines 0]
+        r save
+        assert_equal 0 [log_hits_since $from "flash section"]
+        r debug reload
+        assert_equal 60 [r dbsize]
+        assert_equal [rdb_incompressible 240 [expr {11 + 37}]] [r get fgf:11]
+        r debug ext-storage-snapshot-stream 1
     }
 }
 

@@ -164,6 +164,8 @@ typedef struct snapTransport {
     long long received;
     uint_least64_t rx_digest;
     int saw_terminator;
+    int writer_closed;      /* reader saw EOF: producer is gone, not just slow */
+    int is_consumer;        /* this process/thread drains the stream */
 } snapTransport;
 
 static snapTransport g_tx;
@@ -333,6 +335,8 @@ void extSnapshotTransportRelease(void) {
     zfree(t->ovf); t->ovf = NULL; t->ovf_len = t->ovf_cap = 0;
     zfree(t->inbuf); t->inbuf = NULL; t->in_len = t->in_cap = 0;
     t->armed = 0;
+    t->is_consumer = 0;
+    t->writer_closed = 0;
 }
 
 long long extSnapshotTransportRecordsSent(void) {
@@ -341,8 +345,12 @@ long long extSnapshotTransportRecordsSent(void) {
 
 int extSnapshotTransportArmed(void) { return g_tx.armed; }
 
+void extSnapshotTransportBecomeConsumer(void) { g_tx.is_consumer = 1; }
+
+int extSnapshotTransportWriterClosed(void) { return g_tx.writer_closed; }
+
 int extSnapshotStreamConsumerActive(void) {
-    return g_tx.armed && server.in_fork_child;
+    return g_tx.armed && g_tx.is_consumer;
 }
 
 /* --- consumer --------------------------------------------------------------*/
@@ -358,7 +366,7 @@ static int txFill(snapTransport *t, int blocking) {
     for (;;) {
         ssize_t n = read(t->fds[0], t->inbuf + t->in_len, t->in_cap - t->in_len);
         if (n > 0) { t->in_len += (size_t)n; return 1; }
-        if (n == 0) return 0;                       /* writer closed */
+        if (n == 0) { t->writer_closed = 1; return 0; }  /* writer closed */
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             if (!blocking) return 0;

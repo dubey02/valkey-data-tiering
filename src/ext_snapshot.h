@@ -91,6 +91,19 @@ int extSnapshotTransportArm(void);
 /* Consumer end. Valid after Arm until Release. */
 int extSnapshotTransportReadFd(void);
 
+/* Declare this process/thread the consumer of the armed stream. The fork child
+ * calls it after fork; a foreground save calls it on the main thread. Until it
+ * is called extSnapshotStreamConsumerActive() stays false, which is what keeps
+ * the parent of a BGSAVE from mistaking itself for the consumer. */
+void extSnapshotTransportBecomeConsumer(void);
+
+/* True once the consumer's reader has seen EOF on the pipe. Only meaningful
+ * across a fork: in a foreground save the write end is open in this same
+ * process, so it never becomes true and a stall deadline is the only backstop.
+ * Lets a consumer tell "producer is gone" from "producer is slow" while using
+ * non-blocking drains. */
+int extSnapshotTransportWriterClosed(void);
+
 /* Post fork fd hygiene: each side drops the end it does not use. */
 void extSnapshotTransportCloseReadEnd(void);
 void extSnapshotTransportCloseWriteEnd(void);
@@ -106,11 +119,11 @@ void extSnapshotTransportRelease(void);
  * whether a reaped child leaves a stream to cancel. */
 int extSnapshotTransportArmed(void);
 
-/* True when the caller is the consumer of an armed stream, i.e. the fork child
- * of a streaming snapshot. rdb.c uses this to skip tiered keys in the memory
- * section (their values arrive on the transport) and to emit the flash
- * section. False in the parent, so a foreground save there still takes the
- * fork read path. */
+/* True when the caller is the consumer of an armed stream: the fork child of a
+ * BGSAVE, or the main thread during a foreground save. rdb.c uses this to skip
+ * tiered keys in the memory section (their values arrive on the transport) and
+ * to emit the flash section. False in the parent of a BGSAVE, whose main thread
+ * must keep taking the fork read path. */
 int extSnapshotStreamConsumerActive(void);
 
 /* One record, as decoded by the consumer.

@@ -1739,6 +1739,18 @@ static long long snapshot_saves = 0;      /* snapshots started (INFO) */
 static long long snapshot_tiered_saved = 0;   /* tiered values materialized (INFO, parent-visible only for foreground SAVE) */
 static long long snapshot_tiered_skipped = 0; /* pending-deletion / GC-evicted keys skipped */
 
+/* snapshot_saves counts every snapshot that had to account for flash-resident
+ * values, whichever path carried them, so it does not silently stop counting
+ * when the streaming path becomes the default. The stream counter below splits
+ * out how many of those took the stream, which is the part an operator needs to
+ * tell the two apart. */
+static long long snapshot_stream_saves = 0;
+
+void extStorageSnapshotCountStreamSave(void) {
+    snapshot_saves++;
+    snapshot_stream_saves++;
+}
+
 int extStorageSnapshotSupported(void) {
     return ext_data_enabled && extStorageBridge_snapshotSupported();
 }
@@ -1839,11 +1851,13 @@ sds genExternalStorageSnapshotInfoString(sds info) {
         "snapshot_supported:%d\r\n"
         "snapshot_active:%d\r\n"
         "snapshot_saves:%lld\r\n"
+        "snapshot_stream_saves:%lld\r\n"
         "snapshot_tiered_values_saved:%lld\r\n"
         "snapshot_tiered_values_skipped:%lld\r\n",
         extStorageSnapshotSupported() ? 1 : 0,
         snapshot_active,
         snapshot_saves,
+        snapshot_stream_saves,
         snapshot_tiered_saved,
         snapshot_tiered_skipped);
     return info;

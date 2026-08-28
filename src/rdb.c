@@ -1595,12 +1595,28 @@ static void rdbSaveFlashRecord(void *privdata, int logical_db, robj *entry,
 
 /* Drain the transport to completion, writing an entry per live record. Returns
  * C_OK only when the producer's terminator arrived AND the counts matched, so a
- * truncated stream can never be mistaken for an empty flash set. */
+ * truncated stream can never be mistaken for an empty flash set.
+ *
+ * Drains non-blocking and decides what a "nothing right now" means from two
+ * signals, because the same loop serves two very different consumers:
+ *
+ *  - BGSAVE child: the write end lives in another process, so EOF is
+ *    observable. Seeing it without a terminator means the parent died.
+ *  - Foreground save: the write end is open in this same process, so EOF never
+ *    arrives however wedged the producer gets. A blocking drain here would hang
+ *    the server forever, so the stall deadline is the only backstop.
+ *
+ * The deadline is on time WITHOUT PROGRESS rather than total elapsed: a flash
+ * set large enough to take an hour to stream is not a stall, and any total
+ * budget would either be wrong for large sets or useless for small ones. */
+#define RDB_FLASH_STALL_MS 30000
+
 static int rdbSaveFlashSection(rio *rdb, long *key_counter) {
     flashSectionCtx ctx = { .rdb = rdb, .key_counter = key_counter, .last_db = -1 };
+    mstime_t last_progress = mstime();
 
     for (;;) {
-        int r = extSnapshotTransportDrain(rdbSaveFlashRecord, &ctx, 256, 1);
+        int r = extSnapshotTransportDrain(rdbSaveFlashRecord, &ctx, 256, 0);
         if (ctx.err) {
             serverLog(LL_WARNING, "Snapshot flash section: write error after %lld entries",
                       ctx.written);
@@ -1612,16 +1628,25 @@ static int rdbSaveFlashSection(rio *rdb, long *key_counter) {
                       ctx.written);
             return C_ERR;
         }
-        if (r == EXT_SNAP_DRAIN_WOULDBLOCK) {
-            /* A blocking drain only reports this after the pipe reached EOF with
-             * nothing buffered, which means the producer went away without
-             * writing a terminator -- the parent died, or the transport was
-             * released under us. Retrying would spin forever, so fail. */
+        if (r > 0) {
+            last_progress = mstime();
+            continue;
+        }
+        /* WOULDBLOCK. */
+        if (extSnapshotTransportWriterClosed()) {
             serverLog(LL_WARNING,
                 "Snapshot flash section: stream ended without a terminator after %lld entries",
                 ctx.written);
             return C_ERR;
         }
+        if (mstime() - last_progress > RDB_FLASH_STALL_MS) {
+            serverLog(LL_WARNING,
+                "Snapshot flash section: no records for %d ms after %lld entries, aborting",
+                RDB_FLASH_STALL_MS, ctx.written);
+            extSnapshotTransportAbort();
+            return C_ERR;
+        }
+        usleep(200);
     }
 
     if (ctx.malformed) {
@@ -1801,30 +1826,60 @@ int rdbSaveToFile(const char *filename) {
 
 /* Save the DB on disk. Return C_ERR on error, C_OK on success. */
 int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
-    /* Data tiering: flash-resident values are included in the snapshot via
-     * the materialization path in rdbSaveKeyValuePair. A foreground save
-     * (SAVE, DEBUG RELOAD, SHUTDOWN save, serverCron auto-save) must first
-     * quiesce the tiering IO so the main thread can read from flash
-     * directly; a BGSAVE child inherits that quiesced state from the
-     * prepare done in rdbSaveBackground() and must not re-prepare.
-     * Backends without snapshot support (module-registered) still refuse,
-     * loudly, rather than writing a lossy snapshot. */
+    /* Data tiering: flash-resident values reach this snapshot one of two ways,
+     * the same two rdbSaveBackground chooses between.
+     *
+     * Streaming: take the engine's cut and drain it right here on the main
+     * thread. There is no fork, so this thread is both the arming thread and
+     * the consumer; the storage IO thread produces alongside it. No IO parking
+     * and no GC pause is needed because nothing reads flash by offset.
+     *
+     * Fork read: quiesce the tiering IO so the main thread can pread flash
+     * directly.
+     *
+     * A BGSAVE child arrives here having already inherited whichever of the two
+     * its parent set up, so it must do neither -- hence the in_fork_child
+     * guard. Backends that can do neither still refuse, loudly, rather than
+     * write a lossy snapshot. */
     int tiering_snapshot_prepared = 0;
+    int tiering_stream_armed = 0;
     if (!server.in_fork_child && ext_data_enabled && num_items_on_flash > 0) {
-        if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
-            extStorageSnapshotPrepare() != C_OK) {
-            static mstime_t last_log = 0;
-            if (mstime() - last_log > 60000) {
-                serverLog(LL_WARNING,
-                    "Refusing RDB save: %lld values reside on external storage and "
-                    "the active backend cannot snapshot them", num_items_on_flash);
-                last_log = mstime();
+        if (extSnapshotStreamEnabled() && !extStorageSnapshotActive()) {
+            if (extSnapshotDrainBarrier() == C_OK && extSnapshotTransportArm() == C_OK) {
+                extStorageSnapshotCountStreamSave();
+                extSnapshotTransportBecomeConsumer();
+                tiering_stream_armed = 1;
+            } else {
+                extSnapshotTransportRelease();
+                serverLog(LL_NOTICE,
+                    "Snapshot stream unavailable, falling back to the fork read path");
             }
-            errno = EPERM;
-            return C_ERR;
         }
-        tiering_snapshot_prepared = 1;
+        if (!tiering_stream_armed) {
+            if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
+                extStorageSnapshotPrepare() != C_OK) {
+                static mstime_t last_log = 0;
+                if (mstime() - last_log > 60000) {
+                    serverLog(LL_WARNING,
+                        "Refusing RDB save: %lld values reside on external storage and "
+                        "the active backend cannot snapshot them", num_items_on_flash);
+                    last_log = mstime();
+                }
+                errno = EPERM;
+                return C_ERR;
+            }
+            tiering_snapshot_prepared = 1;
+        }
     }
+    /* Every exit below has to undo whichever of the two was set up. */
+#define rdb_tiering_done() do {                                     \
+        if (tiering_snapshot_prepared) extStorageSnapshotDone();     \
+        if (tiering_stream_armed) {                                  \
+            extSnapshotTransportAbort();                             \
+            extSnapshotTransportRelease();                           \
+        }                                                            \
+    } while (0)
+
     char tmpfile[256];
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
 
@@ -1832,7 +1887,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     snprintf(tmpfile, 256, "temp-%d.rdb", (int)getpid());
 
     if (rdbSaveInternal(req, tmpfile, rsi, rdbflags) != C_OK) {
-        if (tiering_snapshot_prepared) extStorageSnapshotDone();
+        rdb_tiering_done();
         stopSaving(0);
         return C_ERR;
     }
@@ -1847,13 +1902,13 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
                   "destination %s (in server root dir %s): %s",
                   tmpfile, filename, cwdp ? cwdp : "unknown", str_err);
         unlink(tmpfile);
-        if (tiering_snapshot_prepared) extStorageSnapshotDone();
+        rdb_tiering_done();
         stopSaving(0);
         return C_ERR;
     }
     if (fsyncFileDir(filename) != 0) {
         serverLog(LL_WARNING, "Failed to fsync directory while saving DB: %s", strerror(errno));
-        if (tiering_snapshot_prepared) extStorageSnapshotDone();
+        rdb_tiering_done();
         stopSaving(0);
         return C_ERR;
     }
@@ -1862,7 +1917,8 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     server.dirty = 0;
     server.lastsave = time(NULL);
     server.lastbgsave_status = C_OK;
-    if (tiering_snapshot_prepared) extStorageSnapshotDone();
+    rdb_tiering_done();
+#undef rdb_tiering_done
     stopSaving(1);
     return C_OK;
 }
@@ -1895,6 +1951,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (ext_data_enabled && num_items_on_flash > 0) {
         if (extSnapshotStreamEnabled() && !extStorageSnapshotActive()) {
             if (extSnapshotDrainBarrier() == C_OK && extSnapshotTransportArm() == C_OK) {
+                extStorageSnapshotCountStreamSave();
                 tiering_stream_armed = 1;
             } else {
                 extSnapshotTransportRelease();
@@ -1919,8 +1976,13 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         int retval;
 
         /* Child. Drop the producer end: leaving it open would keep the pipe
-         * from ever reporting EOF to our own reader. */
-        if (tiering_stream_armed) extSnapshotTransportCloseWriteEnd();
+         * from ever reporting EOF to our own reader, which is how the flash
+         * section detects a dead parent. Then claim the consumer role, which is
+         * what makes rdbSave() below emit a flash section instead of preading. */
+        if (tiering_stream_armed) {
+            extSnapshotTransportCloseWriteEnd();
+            extSnapshotTransportBecomeConsumer();
+        }
 
         if (strstr(server.exec_argv[0], "redis-server") != NULL) {
             serverSetProcTitle("redis-rdb-bgsave");
@@ -4096,46 +4158,58 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
     }
 
     /* Data tiering: this path had no tiering handling at all, so a diskless
-     * full sync with flash-resident values ran the child's preads with the
-     * storage IO thread unparked and on-flash GC unpaused -- the offsets it read
-     * were not guaranteed to still describe the values it wanted. Quiesce the
-     * same way rdbSaveBackground does, and refuse rather than ship a lossy RDB
-     * when the backend cannot snapshot at all.
+     * full sync with flash residents ran the child's preads with the storage IO
+     * thread unparked and GC unpaused -- the offsets it read were not
+     * guaranteed stable. Set up the same cut-then-fork as rdbSaveBackground,
+     * with the fork read quiesce as the fallback.
      *
-     * This sits at the last point before fork deliberately: the replica
-     * bookkeeping above touches no keys, so nothing mutates between the quiesce
-     * and the child's copy on write view. */
+     * This is the last point before fork, deliberately: the replica bookkeeping
+     * above touches no keys, so nothing can mutate between the cut and the
+     * child's copy on write view. */
     int tiering_snapshot_prepared = 0;
+    int tiering_stream_armed = 0;
     if (ext_data_enabled && num_items_on_flash > 0) {
-        if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
-            extStorageSnapshotPrepare() != C_OK) {
-            serverLog(LL_WARNING,
-                "Refusing RDB transfer to replicas: %lld values reside on external "
-                "storage and the active backend cannot snapshot them", num_items_on_flash);
-            /* Same unwind as the fork failure below: the replicas were already
-             * moved to WAIT_BGSAVE_END, and the pipes and conns array are ours
-             * to release. No child info pipe exists yet. */
-            listRewind(server.replicas, &li);
-            while ((ln = listNext(&li))) {
-                client *replica = ln->value;
-                if (replica->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END)
-                    replica->repl_data->repl_state = REPLICA_STATE_WAIT_BGSAVE_START;
+        if (extSnapshotStreamEnabled() && !extStorageSnapshotActive()) {
+            if (extSnapshotDrainBarrier() == C_OK && extSnapshotTransportArm() == C_OK) {
+                extStorageSnapshotCountStreamSave();
+                tiering_stream_armed = 1;
+            } else {
+                extSnapshotTransportRelease();
+                serverLog(LL_NOTICE,
+                    "Snapshot stream unavailable for replication, falling back to the fork read path");
             }
-            if (!dual_channel) {
-                close(rdb_pipe_write);
-                close(server.rdb_pipe_read);
-                server.rdb_pipe_read = -1;
-                close(server.rdb_child_exit_pipe);
-                server.rdb_child_exit_pipe = -1;
-                close(safe_to_exit_pipe);
-                server.rdb_pipe_conns = NULL;
-                server.rdb_pipe_numconns = 0;
-                server.rdb_pipe_numconns_writing = 0;
-            }
-            zfree(conns);
-            return C_ERR;
         }
-        tiering_snapshot_prepared = 1;
+        if (!tiering_stream_armed) {
+            if (!extStorageSnapshotSupported() || extStorageSnapshotActive() ||
+                extStorageSnapshotPrepare() != C_OK) {
+                serverLog(LL_WARNING,
+                    "Refusing RDB transfer to replicas: %lld values reside on external "
+                    "storage and the active backend cannot snapshot them", num_items_on_flash);
+                /* Same unwind as the fork failure below: the replicas were
+                 * already moved to WAIT_BGSAVE_END, and the pipes and conns
+                 * array are ours to release. No child info pipe exists yet. */
+                listRewind(server.replicas, &li);
+                while ((ln = listNext(&li))) {
+                    client *replica = ln->value;
+                    if (replica->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END)
+                        replica->repl_data->repl_state = REPLICA_STATE_WAIT_BGSAVE_START;
+                }
+                if (!dual_channel) {
+                    close(rdb_pipe_write);
+                    close(server.rdb_pipe_read);
+                    server.rdb_pipe_read = -1;
+                    close(server.rdb_child_exit_pipe);
+                    server.rdb_child_exit_pipe = -1;
+                    close(safe_to_exit_pipe);
+                    server.rdb_pipe_conns = NULL;
+                    server.rdb_pipe_numconns = 0;
+                    server.rdb_pipe_numconns_writing = 0;
+                }
+                zfree(conns);
+                return C_ERR;
+            }
+            tiering_snapshot_prepared = 1;
+        }
     }
 
     /* Create the child process. */
@@ -4143,6 +4217,13 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
         /* Child */
         int retval, dummy;
         rio rdb;
+
+        /* Same fd hygiene and consumer handover as the disk BGSAVE child. */
+        if (tiering_stream_armed) {
+            extSnapshotTransportCloseWriteEnd();
+            extSnapshotTransportBecomeConsumer();
+        }
+
         if (dual_channel) {
             rioInitWithConnset(&rdb, conns, connsnum);
         } else {
@@ -4189,7 +4270,10 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
         if (childpid == -1) {
             serverLog(LL_WARNING, "Can't save in background: fork: %s", strerror(errno));
             if (tiering_snapshot_prepared) extStorageSnapshotDone();
-
+            if (tiering_stream_armed) {
+                extSnapshotTransportAbort();
+                extSnapshotTransportRelease();
+            }
             /* Undo the state change. The caller will perform cleanup on
              * all the replicas in BGSAVE_START state, but an early call to
              * replicationSetupReplicaForFullResync() turned it into BGSAVE_END */
@@ -4220,10 +4304,12 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
 
             server.rdb_save_time_start = time(NULL);
             server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
-            /* Unpark the storage IO thread: normal tiering traffic resumes while
-             * the child transfers. GC stays paused until the child is reaped
-             * (backgroundSaveDoneHandler -> extStorageSnapshotDone, which covers
-             * SOCKET children too). */
+            /* Drop the consumer end: the child owns it. The write end stays open
+             * for the storage IO thread, which is still producing. The transport
+             * is released when the child is reaped
+             * (backgroundSaveDoneHandler, which covers SOCKET children too). */
+            if (tiering_stream_armed) extSnapshotTransportCloseReadEnd();
+            /* Unpark the storage IO thread; GC stays paused until the reap. */
             if (tiering_snapshot_prepared) extStorageSnapshotResume();
             if (dual_channel) {
                 /* For dual channel sync, the main process no longer requires these RDB connections. */
@@ -4251,7 +4337,8 @@ void saveCommand(client *c) {
     /* Data tiering: flash-resident values are snapshotted via the
      * materialization path (see rdbSave). Only refuse when the active
      * backend cannot support it (module-registered backends). */
-    if (ext_data_enabled && num_items_on_flash > 0 && !extStorageSnapshotSupported()) {
+    if (ext_data_enabled && num_items_on_flash > 0 &&
+        !extStorageSnapshotSupported() && !extSnapshotStreamEnabled()) {
         addReplyError(c, "SAVE is not supported while values reside on external "
                          "storage: the active storage backend cannot snapshot "
                          "flash-resident values");
@@ -4300,7 +4387,8 @@ void bgsaveCommand(client *c) {
     }
 
     /* Data tiering: see saveCommand. */
-    if (ext_data_enabled && num_items_on_flash > 0 && !extStorageSnapshotSupported()) {
+    if (ext_data_enabled && num_items_on_flash > 0 &&
+        !extStorageSnapshotSupported() && !extSnapshotStreamEnabled()) {
         addReplyError(c, "BGSAVE is not supported while values reside on external "
                          "storage: the active storage backend cannot snapshot "
                          "flash-resident values");

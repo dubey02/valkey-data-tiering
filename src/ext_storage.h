@@ -59,6 +59,11 @@ int extStorageSnapshotActive(void);
 int extStorageSnapshotPrepare(void);   /* main thread, before fork/save */
 void extStorageSnapshotResume(void);   /* parent, right after fork */
 void extStorageSnapshotDone(void);     /* child reaped / foreground save done */
+
+/* Count a snapshot that carried flash-resident values via the streaming path
+ * rather than a prepare/pread. Keeps snapshot_saves meaningful now that
+ * streaming, which never calls Prepare(), is the default. */
+void extStorageSnapshotCountStreamSave(void);
 /* Fork-child (or held-worker main-thread) materialization of a tiered value.
  * 1 = *payload/(plen) set ([type][object bytes], zfree() after use);
  * 0 = skip this key. */
