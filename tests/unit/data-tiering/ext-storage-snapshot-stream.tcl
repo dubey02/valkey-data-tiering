@@ -209,6 +209,45 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream"} overrides 
         assert {$gauge >= 0}
     }
 
+    test {transport: live records pass the orphan filter} {
+        # Positive control. A filter that rejects everything is indistinguishable
+        # from a working one if you only assert on the reject count, so the
+        # load-bearing assertion is that all N live records ARRIVE.
+        #
+        # sent is NOT asserted equal to N: the engine enumerates its own store,
+        # and on the mock FLUSHALL leaves records behind, so earlier tests'
+        # orphans are still streamed. That is what makes the mock a useful
+        # positive test for the reject path, while real FlashCache clears its
+        # store and has nothing to orphan.
+        r flushall
+        set deadline [expr {[clock milliseconds] + 8000}]
+        while {[clock milliseconds] < $deadline} {
+            if {[get_tiering_counter num_items_on_flash] == 0} break
+            after 100
+        }
+        set n 200
+        for {set i 0} {$i < $n} {incr i} { r set orph:$i [incompressible 600 [expr {$i + 31}]] }
+        for {set i 0} {$i < $n} {incr i} { debug_spill_wait orph:$i }
+
+        set res [r debug ext-storage-snapshot-transport-selftest 30000]
+        assert_equal 1 [dict get $res ok]
+        assert_equal $n [dict get $res received]
+        # Everything streamed is either delivered or rejected, never lost.
+        assert_equal [dict get $res sent] \
+            [expr {[dict get $res received] + [dict get $res orphans]}]
+        puts "  orphan filter on $::stream_backend: sent=[dict get $res sent] live=[dict get $res received] dropped=[dict get $res orphans]"
+    }
+
+    test {transport: framing count and digest verify end to end} {
+        # The terminator carries the producer's count and digest, and the
+        # consumer returns an error rather than DONE on mismatch, so ok=1 is
+        # itself the assertion that framing survived the pipe intact.
+        set res [r debug ext-storage-snapshot-transport-selftest 30000]
+        assert_equal 1 [dict get $res ok]
+        assert_equal [dict get $res sent] \
+            [expr {[dict get $res received] + [dict get $res orphans]}]
+    }
+
     test {stream: server healthy after streaming} {
         assert_equal "PONG" [r ping]
         r set sn:post:ok 1

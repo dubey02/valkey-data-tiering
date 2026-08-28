@@ -139,9 +139,35 @@ typedef struct extSnapshotTransportTestResult {
     long long received;
     long long drain_calls;
     long long wouldblocks; /* times the consumer found nothing ready */
+    long long orphans;     /* records rejected by the orphan filter */
     long long elapsed_ms;
 } extSnapshotTransportTestResult;
 
 int extSnapshotTransportSelfTest(int timeout_ms, extSnapshotTransportTestResult *out);
+
+/* ---------------------------------------------------------------------------
+ * Orphan filter (Phase 3 correctness gate)
+ *
+ * The storage engine enumerates ITS OWN store, not the engine keyspace. A
+ * record whose key the engine has already forgotten stays in the store until
+ * its space is reclaimed, so streaming it into an RDB would resurrect a
+ * deleted key on load. The fork based path cannot hit this, because it looks
+ * each key up in the hashtable and only then reads flash. The streaming path
+ * arrives from the opposite direction and has to reject explicitly.
+ *
+ * Returns 1 when the record should be written, 0 when it must be dropped.
+ * Mirrors the two conditions extStorageMaterializeTiered already honours: a
+ * key pending deletion is logically gone, and a key that is no longer flash
+ * resident has been superseded in memory.
+ *
+ * Consumer side. In a real save this runs in the fork child, where the
+ * hashtable is the copy on write snapshot taken at the cut, which is the state
+ * the records were frozen against.
+ * ---------------------------------------------------------------------------*/
+int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t klen);
+
+/* Records rejected by the orphan filter. Exposed so tests can assert the
+ * filter actually engaged rather than passing vacuously. */
+long long extSnapshotOrphansDropped(void);
 
 #endif /* EXT_SNAPSHOT_H */

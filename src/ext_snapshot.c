@@ -424,9 +424,14 @@ int extSnapshotTransportDrain(extSnapshotRecordFn fn, void *privdata,
 
         const char *key = t->inbuf + 16;
         const char *val = key + klen;
-        if (fn) fn(privdata, dbid, key, klen, val, vlen);
+        /* Count and digest EVERY record, including dropped ones: those figures
+         * verify the transport against the producer's terminator, so filtering
+         * them here would make a correct stream look truncated. The filter only
+         * decides whether the record reaches the consumer. */
         t->received++;
         t->rx_digest ^= (uint_least64_t)selfTestRecordHash(dbid, key, klen, vlen);
+        if (fn && extSnapshotRecordIsLive(dbid, key, klen))
+            fn(privdata, dbid, key, klen, val, vlen);
 
         memmove(t->inbuf, t->inbuf + need, t->in_len - need);
         t->in_len -= need;
@@ -454,6 +459,44 @@ int extSnapshotDrainBarrier(void) {
     return C_ERR;
 }
 
+/* --- orphan filter -------------------------------------------------------- */
+
+static long long ext_snapshot_orphans_dropped = 0;
+
+long long extSnapshotOrphansDropped(void) { return ext_snapshot_orphans_dropped; }
+
+int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t klen) {
+    int logical = extStorageLogicalDbId((int)physical_db_id);
+    if (logical < 0 || logical >= server.dbnum) {
+        ext_snapshot_orphans_dropped++;
+        return 0;
+    }
+    serverDb *db = server.db[logical];
+
+    /* dbFind takes an sds, not an robj. */
+    sds kn = sdsnewlen(key, klen);
+    dbEntry *entry = dbFind(db, kn);
+
+    int live = 1;
+    if (entry == NULL) {
+        /* The engine has forgotten this key. The record is a leftover whose
+         * space has not been reclaimed. Writing it would resurrect the key. */
+        live = 0;
+    } else if (!objectIsTiered(entry)) {
+        /* Superseded: the value is back in memory, so the memory section of the
+         * snapshot already carries it and this record is stale. */
+        live = 0;
+    } else if (entry->tiering_state == TIERING_STATE_PENDING_DELETION) {
+        /* A client DEL already removed it logically; the flash copy is being
+         * deleted. Same condition extStorageMaterializeTiered rejects. */
+        live = 0;
+    }
+
+    sdsfree(kn);
+    if (!live) ext_snapshot_orphans_dropped++;
+    return live;
+}
+
 /* --- transport self test ---------------------------------------------------*/
 
 static void txTestCountRecord(void *privdata, uint32_t db_id,
@@ -469,6 +512,7 @@ int extSnapshotTransportSelfTest(int timeout_ms, extSnapshotTransportTestResult 
     if (!extSnapshotStreamSupported()) return C_ERR;
 
     mstime_t start = mstime();
+    long long orphans_before = extSnapshotOrphansDropped();
     if (extSnapshotDrainBarrier() != C_OK) return C_ERR;
     if (extSnapshotTransportArm() != C_OK) return C_ERR;
     out->armed = 1;
@@ -501,6 +545,7 @@ int extSnapshotTransportSelfTest(int timeout_ms, extSnapshotTransportTestResult 
 
     out->sent = extSnapshotTransportRecordsSent();
     out->received = seen;
+    out->orphans = extSnapshotOrphansDropped() - orphans_before;
     out->elapsed_ms = (long long)(mstime() - start);
     extSnapshotTransportRelease();
     return C_OK;

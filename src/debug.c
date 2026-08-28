@@ -1146,12 +1146,13 @@ void debugCommand(client *c) {
             addReplyError(c, "failed to run snapshot transport self test");
             return;
         }
-        addReplyMapLen(c, 6);
+        addReplyMapLen(c, 7);
         addReplyBulkCString(c, "ok");           addReplyLongLong(c, tr.ok);
         addReplyBulkCString(c, "sent");         addReplyLongLong(c, tr.sent);
         addReplyBulkCString(c, "received");     addReplyLongLong(c, tr.received);
         addReplyBulkCString(c, "drain_calls");  addReplyLongLong(c, tr.drain_calls);
         addReplyBulkCString(c, "wouldblocks");  addReplyLongLong(c, tr.wouldblocks);
+        addReplyBulkCString(c, "orphans");      addReplyLongLong(c, tr.orphans);
         addReplyBulkCString(c, "elapsed_ms");   addReplyLongLong(c, tr.elapsed_ms);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc == 3) {
         /* DEBUG SPILL <key> — manually spill a key to external storage */
