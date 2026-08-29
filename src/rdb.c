@@ -1609,8 +1609,6 @@ static void rdbSaveFlashRecord(void *privdata, int logical_db, robj *entry,
  * The deadline is on time WITHOUT PROGRESS rather than total elapsed: a flash
  * set large enough to take an hour to stream is not a stall, and any total
  * budget would either be wrong for large sets or useless for small ones. */
-#define RDB_FLASH_STALL_MS 30000
-
 static int rdbSaveFlashSection(rio *rdb, long *key_counter) {
     flashSectionCtx ctx = { .rdb = rdb, .key_counter = key_counter, .last_db = -1 };
     mstime_t last_progress = mstime();
@@ -1642,10 +1640,10 @@ static int rdbSaveFlashSection(rio *rdb, long *key_counter) {
         /* Foreground save: the event loop is not running, so nothing else will
          * push out a terminator the producer left in overflow. Do it here. */
         extSnapshotTransportFlushPending();
-        if (mstime() - last_progress > RDB_FLASH_STALL_MS) {
+        if (mstime() - last_progress > ext_snapshot_stream_stall_timeout_ms) {
             serverLog(LL_WARNING,
                 "Snapshot flash section: no records for %d ms after %lld entries, aborting",
-                RDB_FLASH_STALL_MS, ctx.written);
+                ext_snapshot_stream_stall_timeout_ms, ctx.written);
             extSnapshotTransportAbort();
             return C_ERR;
         }

@@ -273,7 +273,7 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
         # untested. Force it off and assert the fallback still round trips, so a
         # regression there is caught here rather than in production.
         r flushall
-        r debug ext-storage-snapshot-stream 0
+        r config set ext-storage-snapshot-stream no
         set n 120
         array set expected {}
         for {set i 0} {$i < $n} {incr i} {
@@ -302,7 +302,7 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
     }
 
     test {rdb: streaming resumes after the override is cleared} {
-        r debug ext-storage-snapshot-stream 1
+        r config set ext-storage-snapshot-stream yes
         r flushall
         for {set i 0} {$i < 40} {incr i} {
             r set back:$i [rdb_incompressible 260 [expr {$i + 91}]]
@@ -379,7 +379,7 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
 
     test {rdb SAVE: fork path parity for the foreground save} {
         r flushall
-        r debug ext-storage-snapshot-stream 0
+        r config set ext-storage-snapshot-stream no
         for {set i 0} {$i < 60} {incr i} {
             r set fgf:$i [rdb_incompressible 240 [expr {$i + 37}]]
             rdb_spill_wait fgf:$i
@@ -390,24 +390,24 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
         r debug reload
         assert_equal 60 [r dbsize]
         assert_equal [rdb_incompressible 240 [expr {11 + 37}]] [r get fgf:11]
-        r debug ext-storage-snapshot-stream 1
+        r config set ext-storage-snapshot-stream yes
     }
 
     # --- backpressure ------------------------------------------------------
     #
-    # Every test above keeps the whole stream inside the pipe buffer, so the
-    # producer never has to buffer and the overflow path never runs. This forces
-    # it: enough flash bytes to overflow the pipe, and a memory section slow
-    # enough that the consumer is not draining while the producer works.
+    # Everything above keeps the whole stream inside the pipe buffer, so the
+    # producer never has to buffer and the overflow path never runs. This test
+    # forces it: enough flash bytes to overflow the pipe, and a memory section
+    # slow enough that the consumer is not draining while the producer works.
     #
-    # The failure this guards against is silent. A terminator left in overflow is
-    # never flushed by the engine -- which has stopped calling back, or aborted
-    # outright the first time the sink reported full -- so the consumer waits out
-    # its stall deadline and fails a snapshot that was in fact produced in full.
+    # It asserts overflow actually engaged, because the interesting failure is
+    # silent -- a terminator left in overflow is never flushed by the engine
+    # (which has stopped calling back), so the consumer waits out its stall
+    # deadline and fails a snapshot that was produced in full.
 
     test {rdb stream: a stream that overflows the pipe still terminates} {
         r flushall
-        r debug ext-storage-snapshot-stream 1
+        r config set ext-storage-snapshot-stream yes
         set n 200
         for {set i 0} {$i < $n} {incr i} {
             r set ov:$i [rdb_incompressible 4096 [expr {$i * 41 + 13}]]
@@ -422,6 +422,10 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
         waitForBgsave r
         r config set rdb-key-save-delay 0
         assert_equal "ok" [s rdb_last_bgsave_status]
+
+        # Not vacuous: the producer must really have had to buffer.
+        assert {[rdb_get_counter snapshot_stream_overflow_peak_bytes] > 0}
+        assert_equal 0 [rdb_get_counter snapshot_stream_aborts]
         assert_equal $n [flash_entries_since $from]
 
         restart_server 0 true false
@@ -429,6 +433,45 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
         for {set i 0} {$i < $n} {incr i} {
             assert_equal [rdb_incompressible 4096 [expr {$i * 41 + 13}]] [r get ov:$i]
         }
+    }
+
+    test {rdb stream: INFO reports the stream counters} {
+        r flushall
+        for {set i 0} {$i < 25} {incr i} {
+            r set c:$i [rdb_incompressible 300 [expr {$i + 5}]]
+            rdb_spill_wait c:$i
+        }
+        set before [rdb_get_counter snapshot_stream_records_total]
+        assert_equal 25 [bgsave_flash_entries]
+
+        assert_equal 1 [rdb_get_counter snapshot_stream_enabled]
+        assert_equal 1 [rdb_get_counter snapshot_stream_available]
+        assert_equal 0 [rdb_get_counter snapshot_stream_armed]
+        assert_equal 25 [rdb_get_counter snapshot_stream_last_records]
+        assert_equal [expr {$before + 25}] [rdb_get_counter snapshot_stream_records_total]
+        assert_equal 0 [rdb_get_counter snapshot_stream_aborts]
+        # snapshot_saves must keep counting on the streaming path, otherwise an
+        # operator watching it would think snapshots had stopped.
+        assert {[rdb_get_counter snapshot_saves] > 0}
+        assert {[rdb_get_counter snapshot_stream_saves] > 0}
+    }
+
+    test {rdb stream: the kill switch is honoured and reversible} {
+        r flushall
+        for {set i 0} {$i < 20} {incr i} {
+            r set ks:$i [rdb_incompressible 260 [expr {$i + 61}]]
+            rdb_spill_wait ks:$i
+        }
+        r config set ext-storage-snapshot-stream no
+        assert_equal 0 [rdb_get_counter snapshot_stream_enabled]
+        set from [count_log_lines 0]
+        r bgsave
+        waitForBgsave r
+        assert_equal "ok" [s rdb_last_bgsave_status]
+        assert_equal 0 [log_hits_since $from "flash section"]
+
+        r config set ext-storage-snapshot-stream yes
+        assert_equal 20 [bgsave_flash_entries]
     }
 }
 

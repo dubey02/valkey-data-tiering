@@ -23,18 +23,46 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "sds.h"    /* genExtSnapshotStreamInfoString returns sds */
+
 /* Capability probe. Returns 1 when tiering is on AND the active storage engine
  * implements the streaming ops. Callers must fall back to the fork based path
  * when this returns 0. */
 int extSnapshotStreamSupported(void);
 
+/* ---------------------------------------------------------------------------
+ * Tunables (registered in config.c)
+ * ---------------------------------------------------------------------------*/
+
+/* Master switch. Off makes every save take the fork read path, which is the
+ * operational kill switch if streaming ever misbehaves in the field. */
+extern int ext_snapshot_stream_enabled;
+
+/* How many bytes the producer may buffer beyond what the pipe accepted before
+ * it gives up and poisons the stream. This is a bound on how far the consumer
+ * may fall behind, not on frame size: a single record is always allowed through
+ * even if it is larger, because refusing it would make snapshots impossible for
+ * a keyspace holding values bigger than the limit. */
+extern long long ext_snapshot_stream_overflow_limit;
+
+/* How long the consumer waits WITHOUT PROGRESS before declaring the producer
+ * wedged and failing the save. Deliberately not a total budget: a flash set
+ * large enough to take an hour to stream is not a stall. */
+extern int ext_snapshot_stream_stall_timeout_ms;
+
+/* Capacity to request for the transport pipe (F_SETPIPE_SZ). A bigger pipe lets
+ * the producer run further ahead before it has to buffer, which matters most
+ * while the consumer is still working through the memory section and not
+ * draining at all. 0 leaves the OS default. */
+extern long long ext_snapshot_stream_pipe_size;
+
 /* Capability AND policy: what a save should actually check. Separate from the
- * probe above so the test-only override (DEBUG EXT-STORAGE-SNAPSHOT-STREAM) can
- * force the fork read path without also disabling the self tests. */
+ * probe above so the kill switch cannot also disable the self tests, which need
+ * only the capability. */
 int extSnapshotStreamEnabled(void);
 
-/* Test-only override backing extSnapshotStreamEnabled(). */
-extern int ext_snapshot_debug_stream_disabled;
+/* INFO section for the streaming snapshot. */
+sds genExtSnapshotStreamInfoString(sds info);
 
 /* ---------------------------------------------------------------------------
  * Self test (tests only)
@@ -108,10 +136,11 @@ int extSnapshotTransportWriterClosed(void);
 void extSnapshotTransportCloseReadEnd(void);
 void extSnapshotTransportCloseWriteEnd(void);
 
-/* Main thread. Flush anything the producer left buffered. Must be pumped from
- * the event loop while a stream is armed: overflow only drains from inside a
- * storage engine callback, and the engine may stop calling at any point -- so a
- * terminator that landed in overflow would otherwise never reach the consumer. */
+/* Main thread. Flush anything the producer left buffered after it finished.
+ * Must be pumped from the event loop while a stream is armed: overflow only
+ * drains from inside a storage engine callback, and the engine stops calling
+ * once it has completed, so a terminator that landed in overflow would never
+ * reach the consumer. */
 void extSnapshotTransportFlushPending(void);
 
 /* Cancel the engine stream and poison the pipe so the consumer fails loudly

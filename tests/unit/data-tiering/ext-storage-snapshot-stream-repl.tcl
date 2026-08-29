@@ -197,7 +197,7 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-repl"} overr
 
     test {repl diskless: fork read fallback still syncs a replica} {
         $replica replicaof no one
-        $primary debug ext-storage-snapshot-stream 0
+        $primary config set ext-storage-snapshot-stream no
         set n 80
         seed_primary $primary $n
 
@@ -210,7 +210,7 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-repl"} overr
         # section nor a fallback notice should appear.
         assert_equal -1 [repl_flash_entries $primary_log $from]
         verify_replica $replica $n
-        $primary debug ext-storage-snapshot-stream 1
+        $primary config set ext-storage-snapshot-stream yes
     }
 
     test {repl: writes after the cut reach the replica} {

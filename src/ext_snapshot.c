@@ -19,17 +19,35 @@
 
 extern int ext_data_enabled;
 
-/* Test-only policy override, set by DEBUG EXT-STORAGE-SNAPSHOT-STREAM. Kept
- * separate from the capability probe so a test can still drive the self tests
- * (which need the capability) while forcing saves down the fork read path. */
-int ext_snapshot_debug_stream_disabled = 0;
+/* --- tunables (see ext_snapshot.h) ---------------------------------------- */
+int ext_snapshot_stream_enabled = 1;
+long long ext_snapshot_stream_overflow_limit = 64 * 1024 * 1024;
+int ext_snapshot_stream_stall_timeout_ms = 30000;
+long long ext_snapshot_stream_pipe_size = 0;
+
+/* --- counters -------------------------------------------------------------
+ *
+ * Producer side, so they live in the process that armed the cut and stay
+ * meaningful in the parent of a BGSAVE. The consumer's own figures (entries
+ * written, orphans dropped) are only in-process for a foreground save, so they
+ * are reported in the flash section's log line instead of pretended to here.
+ *
+ * Written from the storage IO thread, read by the main thread for INFO, hence
+ * atomic. ------------------------------------------------------------------*/
+static _Atomic long long stream_records_total = 0;   /* records handed to the pipe, all saves */
+static _Atomic long long stream_last_records = 0;    /* ... in the most recent save */
+static _Atomic long long stream_backpressure = 0;    /* times writable() said "not now" */
+static _Atomic long long stream_overflow_peak = 0;   /* high water mark of buffered bytes */
+static _Atomic long long stream_oversize_frames = 0; /* frames allowed past the overflow limit */
+static _Atomic long long stream_aborts = 0;          /* streams that ended poisoned */
+static _Atomic long long stream_last_ms = 0;         /* arm -> complete of the most recent save */
 
 int extSnapshotStreamSupported(void) {
     return ext_data_enabled && storageSnapshotStreamSupported();
 }
 
 int extSnapshotStreamEnabled(void) {
-    return !ext_snapshot_debug_stream_disabled && extSnapshotStreamSupported();
+    return ext_snapshot_stream_enabled && extSnapshotStreamSupported();
 }
 
 /* ---------------------------------------------------------------------------
@@ -140,7 +158,6 @@ int extSnapshotStreamSelfTest(int timeout_ms, extSnapshotSelfTestResult *out) {
  * ===========================================================================*/
 
 #define EXT_SNAP_POISON_LEN   0xFFFFFFFFu
-#define EXT_SNAP_OVERFLOW_CAP (64u * 1024 * 1024)   /* Phase 4 makes this a config */
 
 extern void extStorageBridge_drainOnly(void);
 extern void processCompletedStorageRequests(void);
@@ -167,6 +184,7 @@ typedef struct snapTransport {
     int saw_terminator;
     int writer_closed;      /* reader saw EOF: producer is gone, not just slow */
     int is_consumer;        /* this process/thread drains the stream */
+    mstime_t armed_ms;      /* for the duration reported in INFO */
 
     /* The overflow buffer is touched by the storage IO thread (from the sink
      * callbacks) and by the main thread (from the event loop, which has to keep
@@ -181,7 +199,7 @@ static snapTransport g_tx;
 /* --- producer --------------------------------------------------------------*/
 
 /* Push bytes toward the pipe. Anything the pipe will not take right now lands
- * in overflow. Returns 0 on hard failure.
+ * in overflow, which writable() then reports on. Returns 0 on hard failure.
  * Caller must hold t->ovf_lock; use txPush(). */
 static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
     if (t->producer_failed) return 0;
@@ -213,19 +231,24 @@ static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
     }
     if (off == len) return 1;
 
-    /* Buffer the remainder. Growing past the cap means the consumer is not
-     * keeping up at all, so fail rather than absorb without bound. */
+    /* Buffer the remainder. Growing past the limit means the consumer is not
+     * keeping up at all, so fail rather than absorb without bound.
+     *
+     * One exception, and it is load bearing: when nothing is buffered yet, this
+     * is a single frame that on its own exceeds the limit. Refusing it would
+     * make snapshots impossible for any keyspace holding a value larger than
+     * the limit -- and ext-storage-max-spill-size allows values well past the
+     * default -- so let it through and count it. The limit is a bound on how
+     * far the consumer may fall BEHIND, not a cap on frame size. */
     size_t need = len - off;
-    if (t->ovf_len + need > EXT_SNAP_OVERFLOW_CAP) {
-        /* One exception, and it is load bearing: with nothing buffered yet this
-         * is a single frame that on its own exceeds the cap. Refusing it would
-         * make snapshots impossible for any keyspace holding a value larger than
-         * the cap, and ext-storage-max-spill-size allows values well past it. The
-         * cap bounds how far the consumer may fall BEHIND, not frame size. */
-        if (t->ovf_len != 0) {
+    size_t limit = (size_t)ext_snapshot_stream_overflow_limit;
+    if (t->ovf_len + need > limit) {
+        if (t->ovf_len == 0) {
+            atomic_fetch_add_explicit(&stream_oversize_frames, 1, memory_order_relaxed);
+        } else {
             serverLog(LL_WARNING,
-                "Snapshot transport buffered %zu bytes past the %u byte cap, aborting stream",
-                t->ovf_len + need, EXT_SNAP_OVERFLOW_CAP);
+                "Snapshot transport buffered %zu bytes past the %lld byte limit, aborting stream",
+                t->ovf_len + need, ext_snapshot_stream_overflow_limit);
             t->producer_failed = 1;
             return 0;
         }
@@ -240,6 +263,8 @@ static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
     }
     memcpy(t->ovf + t->ovf_len, buf + off, need);
     t->ovf_len += need;
+    if ((long long)t->ovf_len > atomic_load_explicit(&stream_overflow_peak, memory_order_relaxed))
+        atomic_store_explicit(&stream_overflow_peak, (long long)t->ovf_len, memory_order_relaxed);
     return 1;
 }
 
@@ -257,18 +282,25 @@ static int txPush(snapTransport *t, const char *buf, size_t len) {
  *
  * This used to report "not now" while overflow was pending, on the assumption
  * that the storage engine would back off and re-poll. Real FlashCache does not:
- * a single refusal makes it ABORT the snapshot and call complete(ok=0), which
- * strands every remaining record. The mock, which does retry, hid this.
+ * a single refusal makes it ABORT the snapshot and call complete(ok=0). The
+ * counters made that unambiguous -- one backpressure event, nine records
+ * delivered out of two hundred, one abort -- while the mock, which does retry,
+ * passed the same test.
  *
  * So refusal is not a usable signal and the transport has to absorb instead.
- * The bound is EXT_SNAP_OVERFLOW_CAP: buffer up to it, and past it poison the
- * stream so the save fails loudly and falls back to the fork read path, rather
- * than growing without limit. */
+ * The bound is ext-storage-snapshot-stream-overflow-limit: buffer up to it, and
+ * past it poison the stream so the save fails loudly and falls back, rather
+ * than growing without limit. The counter below is kept purely as a signal that
+ * the consumer is running behind. */
 static int txWritable(void *privdata) {
     snapTransport *t = privdata;
     if (t->producer_failed) return 0;
     pthread_mutex_lock(&t->ovf_lock);
-    if (t->ovf_len > 0) txPushLocked(t, NULL, 0);
+    if (t->ovf_len > 0) {
+        txPushLocked(t, NULL, 0);
+        if (t->ovf_len > 0)
+            atomic_fetch_add_explicit(&stream_backpressure, 1, memory_order_relaxed);
+    }
     int failed = t->producer_failed;
     pthread_mutex_unlock(&t->ovf_lock);
     return failed ? 0 : 1;
@@ -294,11 +326,18 @@ static void txOnRecord(void *privdata, uint32_t db_id,
 
     t->digest ^= (uint_least64_t)selfTestRecordHash(db_id, key, klen, vlen);
     atomic_fetch_add_explicit(&t->sent, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&stream_records_total, 1, memory_order_relaxed);
 }
 
 static void txComplete(void *privdata, int ok) {
     snapTransport *t = privdata;
+    atomic_store_explicit(&stream_last_records,
+                          atomic_load_explicit(&t->sent, memory_order_relaxed),
+                          memory_order_relaxed);
+    atomic_store_explicit(&stream_last_ms, (long long)(mstime() - t->armed_ms),
+                          memory_order_relaxed);
     if (!ok || t->producer_failed) {
+        atomic_fetch_add_explicit(&stream_aborts, 1, memory_order_relaxed);
         uint32_t poison = EXT_SNAP_POISON_LEN;
         (void)txPush(t, (const char *)&poison, sizeof(poison));
         t->producer_failed = 1;
@@ -314,12 +353,12 @@ static void txComplete(void *privdata, int ok) {
         txPush(t, (const char *)&count, sizeof(count)))
         (void)txPush(t, (const char *)&dg, sizeof(dg));
 
-    /* Publish that the producer is finished. Anything still buffered here --
-     * the tail of the last record, or the terminator itself -- would otherwise
-     * be stranded forever: overflow only drains from inside a sink callback,
-     * and the engine stops calling us the moment it has completed. The consumer
-     * would then wait out its stall deadline and fail a snapshot that had in
-     * fact been produced in full. */
+    /* Hand the overflow buffer to the main thread. Anything still buffered here
+     * -- the tail of the last record, or the terminator itself -- would
+     * otherwise be stranded forever: overflow only drains from inside a sink
+     * callback, and the storage engine stops calling us the moment it has
+     * completed. The consumer would then wait out its stall deadline and fail a
+     * snapshot that had in fact been produced in full. */
     atomic_store_explicit(&t->producer_done, 1, memory_order_release);
 }
 
@@ -344,21 +383,40 @@ int extSnapshotTransportArm(void) {
     memset(t, 0, sizeof(*t));
     pthread_mutex_init(&t->ovf_lock, NULL);
     t->fds[0] = t->fds[1] = -1;
+    t->armed_ms = mstime();
     atomic_store_explicit(&t->sent, 0, memory_order_relaxed);
 
     if (pipe(t->fds) != 0) {
         serverLog(LL_WARNING, "Snapshot transport: pipe() failed: %s", strerror(errno));
         return C_ERR;
     }
+    /* A bigger pipe lets the producer run ahead before it has to buffer, which
+     * matters most while the consumer is still in the memory section and not
+     * draining at all. Advisory: the kernel caps this at
+     * /proc/sys/fs/pipe-max-size for unprivileged processes, so a refusal is
+     * not fatal -- we just keep the default and say so once. */
+    if (ext_snapshot_stream_pipe_size > 0) {
+        if (fcntl(t->fds[1], F_SETPIPE_SZ, (int)ext_snapshot_stream_pipe_size) == -1) {
+            static int warned = 0;
+            if (!warned) {
+                serverLog(LL_NOTICE,
+                    "Snapshot transport: could not set pipe size to %lld (%s), using the default",
+                    ext_snapshot_stream_pipe_size, strerror(errno));
+                warned = 1;
+            }
+        }
+    }
     /* Both ends non-blocking.
      *
-     * Write end: blocking the engine IO thread would stall spills and fetches.
+     * Write end: see the backpressure note in ext_snapshot.h -- blocking the
+     * engine IO thread would stall spills and fetches too.
      *
-     * Read end: a blocking read end silently defeats the consumer's
-     * non-blocking drain. read() sleeps in the kernel instead of returning
-     * EAGAIN, so the drain can never report WOULDBLOCK, its stall deadline is
-     * never evaluated, and a foreground save -- which drains on the main thread
-     * -- hangs the whole server on a wedged producer instead of failing. */
+     * Read end: a blocking read end would silently defeat the consumer's
+     * non-blocking drain. read() would sleep in the kernel instead of
+     * returning EAGAIN, so the drain could never report WOULDBLOCK, its stall
+     * deadline would never be evaluated, and a foreground save -- which drains
+     * on the main thread -- would hang the whole server on a wedged producer
+     * rather than failing after the deadline. */
     if (fcntl(t->fds[0], F_SETFL, fcntl(t->fds[0], F_GETFL, 0) | O_NONBLOCK) != 0 ||
         fcntl(t->fds[1], F_SETFL, fcntl(t->fds[1], F_GETFL, 0) | O_NONBLOCK) != 0) {
         close(t->fds[0]); close(t->fds[1]);
@@ -421,6 +479,30 @@ int extSnapshotTransportArmed(void) { return g_tx.armed; }
 void extSnapshotTransportBecomeConsumer(void) { g_tx.is_consumer = 1; }
 
 int extSnapshotTransportWriterClosed(void) { return g_tx.writer_closed; }
+
+sds genExtSnapshotStreamInfoString(sds info) {
+    return sdscatprintf(info,
+        "snapshot_stream_enabled:%d\r\n"
+        "snapshot_stream_available:%d\r\n"
+        "snapshot_stream_armed:%d\r\n"
+        "snapshot_stream_records_total:%lld\r\n"
+        "snapshot_stream_last_records:%lld\r\n"
+        "snapshot_stream_last_duration_ms:%lld\r\n"
+        "snapshot_stream_backpressure_events:%lld\r\n"
+        "snapshot_stream_overflow_peak_bytes:%lld\r\n"
+        "snapshot_stream_oversize_frames:%lld\r\n"
+        "snapshot_stream_aborts:%lld\r\n",
+        ext_snapshot_stream_enabled ? 1 : 0,
+        extSnapshotStreamSupported() ? 1 : 0,
+        g_tx.armed ? 1 : 0,
+        atomic_load_explicit(&stream_records_total, memory_order_relaxed),
+        atomic_load_explicit(&stream_last_records, memory_order_relaxed),
+        atomic_load_explicit(&stream_last_ms, memory_order_relaxed),
+        atomic_load_explicit(&stream_backpressure, memory_order_relaxed),
+        atomic_load_explicit(&stream_overflow_peak, memory_order_relaxed),
+        atomic_load_explicit(&stream_oversize_frames, memory_order_relaxed),
+        atomic_load_explicit(&stream_aborts, memory_order_relaxed));
+}
 
 int extSnapshotStreamConsumerActive(void) {
     return g_tx.armed && g_tx.is_consumer;

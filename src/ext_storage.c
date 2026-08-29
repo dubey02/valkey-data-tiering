@@ -11,6 +11,7 @@
 
 #include "ext_storage.h"
 #include "ext_storage_bridge.h"
+#include "ext_snapshot.h"
 #include "server.h"
 #include "module.h"
 #include "rdb.h"
@@ -1860,5 +1861,5 @@ sds genExternalStorageSnapshotInfoString(sds info) {
         snapshot_stream_saves,
         snapshot_tiered_saved,
         snapshot_tiered_skipped);
-    return info;
+    return genExtSnapshotStreamInfoString(info);
 }
