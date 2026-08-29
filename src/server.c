@@ -33,6 +33,7 @@
  */
 #include "server.h"
 #include "ext_storage.h"
+#include "ext_snapshot.h"
 #include "ext_storage_bridge.h"
 #include "ext_storage_throttle.h"
 #include "connection.h"
@@ -1872,6 +1873,11 @@ extern int ProcessingEventsWhileBlocked;
  * call some other low-risk functions. */
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
+
+    /* Data tiering: push out anything a snapshot stream left buffered. Cheap
+     * no-op unless a stream is armed with bytes pending; see
+     * extSnapshotTransportFlushPending(). */
+    extSnapshotTransportFlushPending();
 
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();

@@ -108,6 +108,12 @@ int extSnapshotTransportWriterClosed(void);
 void extSnapshotTransportCloseReadEnd(void);
 void extSnapshotTransportCloseWriteEnd(void);
 
+/* Main thread. Flush anything the producer left buffered. Must be pumped from
+ * the event loop while a stream is armed: overflow only drains from inside a
+ * storage engine callback, and the engine may stop calling at any point -- so a
+ * terminator that landed in overflow would otherwise never reach the consumer. */
+void extSnapshotTransportFlushPending(void);
+
 /* Cancel the engine stream and poison the pipe so the consumer fails loudly
  * instead of treating a partial stream as complete. */
 void extSnapshotTransportAbort(void);

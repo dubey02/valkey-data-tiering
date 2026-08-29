@@ -1639,6 +1639,9 @@ static int rdbSaveFlashSection(rio *rdb, long *key_counter) {
                 ctx.written);
             return C_ERR;
         }
+        /* Foreground save: the event loop is not running, so nothing else will
+         * push out a terminator the producer left in overflow. Do it here. */
+        extSnapshotTransportFlushPending();
         if (mstime() - last_progress > RDB_FLASH_STALL_MS) {
             serverLog(LL_WARNING,
                 "Snapshot flash section: no records for %d ms after %lld entries, aborting",

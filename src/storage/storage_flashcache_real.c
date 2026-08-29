@@ -764,11 +764,10 @@ static void fc_snap_parse(fcSnapStream *s) {
             continue;
         }
 
-        if (!s->sink.writable(s->sink.privdata)) {
-            /* Sink is full. Leave the item buffered and return: FlashCache
-             * polls is_writable before each write and will come back. */
-            return;
-        }
+        /* No writable() gate here on purpose. Leaving an assembled item
+         * buffered depends on FlashCache coming back to poll again, and it does
+         * not: it aborts the snapshot the first time the sink reports full.
+         * Backpressure lives entirely in the sink's bounded overflow now. */
         s->sink.on_record(s->sink.privdata, dbid,
                           s->buf + FC_ITEM_HEADER_LEN, key_len,
                           s->buf + FC_ITEM_HEADER_LEN + key_len, value_len);

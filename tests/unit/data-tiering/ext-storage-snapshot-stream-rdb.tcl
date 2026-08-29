@@ -392,6 +392,44 @@ start_server [list tags {"ext-storage" "ext-storage-snapshot-stream-rdb"} overri
         assert_equal [rdb_incompressible 240 [expr {11 + 37}]] [r get fgf:11]
         r debug ext-storage-snapshot-stream 1
     }
+
+    # --- backpressure ------------------------------------------------------
+    #
+    # Every test above keeps the whole stream inside the pipe buffer, so the
+    # producer never has to buffer and the overflow path never runs. This forces
+    # it: enough flash bytes to overflow the pipe, and a memory section slow
+    # enough that the consumer is not draining while the producer works.
+    #
+    # The failure this guards against is silent. A terminator left in overflow is
+    # never flushed by the engine -- which has stopped calling back, or aborted
+    # outright the first time the sink reported full -- so the consumer waits out
+    # its stall deadline and fails a snapshot that was in fact produced in full.
+
+    test {rdb stream: a stream that overflows the pipe still terminates} {
+        r flushall
+        r debug ext-storage-snapshot-stream 1
+        set n 200
+        for {set i 0} {$i < $n} {incr i} {
+            r set ov:$i [rdb_incompressible 4096 [expr {$i * 41 + 13}]]
+            rdb_spill_wait ov:$i
+        }
+        # Slow memory section: the consumer will not touch the pipe for a while.
+        for {set i 0} {$i < 300} {incr i} { r set ovmem:$i "m$i" }
+        r config set rdb-key-save-delay 2000
+
+        set from [count_log_lines 0]
+        r bgsave
+        waitForBgsave r
+        r config set rdb-key-save-delay 0
+        assert_equal "ok" [s rdb_last_bgsave_status]
+        assert_equal $n [flash_entries_since $from]
+
+        restart_server 0 true false
+        assert_equal [expr {$n + 300}] [r dbsize]
+        for {set i 0} {$i < $n} {incr i} {
+            assert_equal [rdb_incompressible 4096 [expr {$i * 41 + 13}]] [r get ov:$i]
+        }
+    }
 }
 
 # Fresh server: nothing has ever been spilled, so no cut is taken and neither

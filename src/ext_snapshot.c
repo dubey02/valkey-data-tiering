@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <string.h>
 
 extern int ext_data_enabled;
@@ -166,6 +167,13 @@ typedef struct snapTransport {
     int saw_terminator;
     int writer_closed;      /* reader saw EOF: producer is gone, not just slow */
     int is_consumer;        /* this process/thread drains the stream */
+
+    /* The overflow buffer is touched by the storage IO thread (from the sink
+     * callbacks) and by the main thread (from the event loop, which has to keep
+     * pushing it out because the engine may stop calling back at any point --
+     * including permanently, once it has completed). Hence the lock. */
+    pthread_mutex_t ovf_lock;
+    _Atomic int producer_done;
 } snapTransport;
 
 static snapTransport g_tx;
@@ -173,8 +181,9 @@ static snapTransport g_tx;
 /* --- producer --------------------------------------------------------------*/
 
 /* Push bytes toward the pipe. Anything the pipe will not take right now lands
- * in overflow, which writable() then reports on. Returns 0 on hard failure. */
-static int txPush(snapTransport *t, const char *buf, size_t len) {
+ * in overflow. Returns 0 on hard failure.
+ * Caller must hold t->ovf_lock; use txPush(). */
+static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
     if (t->producer_failed) return 0;
 
     /* Overflow must drain first or frames would be reordered. */
@@ -208,11 +217,18 @@ static int txPush(snapTransport *t, const char *buf, size_t len) {
      * keeping up at all, so fail rather than absorb without bound. */
     size_t need = len - off;
     if (t->ovf_len + need > EXT_SNAP_OVERFLOW_CAP) {
-        serverLog(LL_WARNING,
-            "Snapshot transport overflow exceeded %u bytes, aborting stream",
-            EXT_SNAP_OVERFLOW_CAP);
-        t->producer_failed = 1;
-        return 0;
+        /* One exception, and it is load bearing: with nothing buffered yet this
+         * is a single frame that on its own exceeds the cap. Refusing it would
+         * make snapshots impossible for any keyspace holding a value larger than
+         * the cap, and ext-storage-max-spill-size allows values well past it. The
+         * cap bounds how far the consumer may fall BEHIND, not frame size. */
+        if (t->ovf_len != 0) {
+            serverLog(LL_WARNING,
+                "Snapshot transport buffered %zu bytes past the %u byte cap, aborting stream",
+                t->ovf_len + need, EXT_SNAP_OVERFLOW_CAP);
+            t->producer_failed = 1;
+            return 0;
+        }
     }
     if (t->ovf_len + need > t->ovf_cap) {
         size_t cap = t->ovf_cap ? t->ovf_cap : 65536;
@@ -227,13 +243,35 @@ static int txPush(snapTransport *t, const char *buf, size_t len) {
     return 1;
 }
 
+/* Lock-taking wrapper. Every path that moves bytes goes through this, because
+ * the main thread pushes the buffer out from the event loop while the storage IO
+ * thread is still producing into it. */
+static int txPush(snapTransport *t, const char *buf, size_t len) {
+    pthread_mutex_lock(&t->ovf_lock);
+    int r = txPushLocked(t, buf, len);
+    pthread_mutex_unlock(&t->ovf_lock);
+    return r;
+}
+
+/* Always accept, unless the stream is already dead.
+ *
+ * This used to report "not now" while overflow was pending, on the assumption
+ * that the storage engine would back off and re-poll. Real FlashCache does not:
+ * a single refusal makes it ABORT the snapshot and call complete(ok=0), which
+ * strands every remaining record. The mock, which does retry, hid this.
+ *
+ * So refusal is not a usable signal and the transport has to absorb instead.
+ * The bound is EXT_SNAP_OVERFLOW_CAP: buffer up to it, and past it poison the
+ * stream so the save fails loudly and falls back to the fork read path, rather
+ * than growing without limit. */
 static int txWritable(void *privdata) {
     snapTransport *t = privdata;
     if (t->producer_failed) return 0;
-    /* Flush what we can, then report readiness. Reporting not-ready while
-     * overflow is pending is what throttles the engine. */
-    if (t->ovf_len > 0) txPush(t, NULL, 0);
-    return t->producer_failed ? 0 : (t->ovf_len == 0);
+    pthread_mutex_lock(&t->ovf_lock);
+    if (t->ovf_len > 0) txPushLocked(t, NULL, 0);
+    int failed = t->producer_failed;
+    pthread_mutex_unlock(&t->ovf_lock);
+    return failed ? 0 : 1;
 }
 
 static void txOnRecord(void *privdata, uint32_t db_id,
@@ -264,6 +302,7 @@ static void txComplete(void *privdata, int ok) {
         uint32_t poison = EXT_SNAP_POISON_LEN;
         (void)txPush(t, (const char *)&poison, sizeof(poison));
         t->producer_failed = 1;
+        atomic_store_explicit(&t->producer_done, 1, memory_order_release);
         return;
     }
     /* Terminator: zero length, then count and digest so the consumer can
@@ -271,9 +310,30 @@ static void txComplete(void *privdata, int ok) {
     uint32_t zero = 0;
     long long count = atomic_load_explicit(&t->sent, memory_order_relaxed);
     uint64_t dg = (uint64_t)t->digest;
-    if (!txPush(t, (const char *)&zero, sizeof(zero))) return;
-    if (!txPush(t, (const char *)&count, sizeof(count))) return;
-    (void)txPush(t, (const char *)&dg, sizeof(dg));
+    if (txPush(t, (const char *)&zero, sizeof(zero)) &&
+        txPush(t, (const char *)&count, sizeof(count)))
+        (void)txPush(t, (const char *)&dg, sizeof(dg));
+
+    /* Publish that the producer is finished. Anything still buffered here --
+     * the tail of the last record, or the terminator itself -- would otherwise
+     * be stranded forever: overflow only drains from inside a sink callback,
+     * and the engine stops calling us the moment it has completed. The consumer
+     * would then wait out its stall deadline and fail a snapshot that had in
+     * fact been produced in full. */
+    atomic_store_explicit(&t->producer_done, 1, memory_order_release);
+}
+
+/* Main thread. Push out whatever the producer left buffered.
+ *
+ * Deliberately NOT gated on producer_done: the engine decides when to call
+ * writable(), and it may stop for a while or forever, while the consumer keeps
+ * draining the pipe and freeing room that only we will use. Cheap no-op when
+ * there is nothing to do, so it is fine to call every event loop iteration. */
+void extSnapshotTransportFlushPending(void) {
+    snapTransport *t = &g_tx;
+    if (!t->armed || t->fds[1] < 0) return;
+    if (t->ovf_len == 0) return;
+    (void)txPush(t, NULL, 0);
 }
 
 int extSnapshotTransportArm(void) {
@@ -282,6 +342,7 @@ int extSnapshotTransportArm(void) {
     if (!extSnapshotStreamSupported()) return C_ERR;
 
     memset(t, 0, sizeof(*t));
+    pthread_mutex_init(&t->ovf_lock, NULL);
     t->fds[0] = t->fds[1] = -1;
     atomic_store_explicit(&t->sent, 0, memory_order_relaxed);
 
@@ -289,8 +350,17 @@ int extSnapshotTransportArm(void) {
         serverLog(LL_WARNING, "Snapshot transport: pipe() failed: %s", strerror(errno));
         return C_ERR;
     }
-    /* Non-blocking write end: see the backpressure note in ext_snapshot.h. */
-    if (fcntl(t->fds[1], F_SETFL, fcntl(t->fds[1], F_GETFL, 0) | O_NONBLOCK) != 0) {
+    /* Both ends non-blocking.
+     *
+     * Write end: blocking the engine IO thread would stall spills and fetches.
+     *
+     * Read end: a blocking read end silently defeats the consumer's
+     * non-blocking drain. read() sleeps in the kernel instead of returning
+     * EAGAIN, so the drain can never report WOULDBLOCK, its stall deadline is
+     * never evaluated, and a foreground save -- which drains on the main thread
+     * -- hangs the whole server on a wedged producer instead of failing. */
+    if (fcntl(t->fds[0], F_SETFL, fcntl(t->fds[0], F_GETFL, 0) | O_NONBLOCK) != 0 ||
+        fcntl(t->fds[1], F_SETFL, fcntl(t->fds[1], F_GETFL, 0) | O_NONBLOCK) != 0) {
         close(t->fds[0]); close(t->fds[1]);
         t->fds[0] = t->fds[1] = -1;
         return C_ERR;
@@ -332,6 +402,9 @@ void extSnapshotTransportRelease(void) {
     snapTransport *t = &g_tx;
     if (t->fds[0] >= 0) { close(t->fds[0]); t->fds[0] = -1; }
     if (t->fds[1] >= 0) { close(t->fds[1]); t->fds[1] = -1; }
+    /* Only if Arm got as far as initialising it. Release is also the cleanup
+     * path for a failed Arm. */
+    if (t->armed) pthread_mutex_destroy(&t->ovf_lock);
     zfree(t->ovf); t->ovf = NULL; t->ovf_len = t->ovf_cap = 0;
     zfree(t->inbuf); t->inbuf = NULL; t->in_len = t->in_cap = 0;
     t->armed = 0;
