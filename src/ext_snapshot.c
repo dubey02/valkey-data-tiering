@@ -192,19 +192,19 @@ typedef struct snapTransport {
      * including permanently, once it has completed). Hence the lock. */
     pthread_mutex_t ovf_lock;
     _Atomic int producer_done;
+    int poisoned;           /* poison marker queued; do not queue it twice */
+    int write_error;        /* pipe is dead, not merely full */
 } snapTransport;
 
 static snapTransport g_tx;
 
 /* --- producer --------------------------------------------------------------*/
 
-/* Push bytes toward the pipe. Anything the pipe will not take right now lands
- * in overflow, which writable() then reports on. Returns 0 on hard failure.
- * Caller must hold t->ovf_lock; use txPush(). */
-static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
-    if (t->producer_failed) return 0;
-
-    /* Overflow must drain first or frames would be reordered. */
+/* Move buffered bytes toward the pipe. Deliberately has NO producer_failed
+ * check: a poisoned stream still has to get its poison marker out, and that
+ * marker lives in this same buffer. Caller must hold t->ovf_lock. */
+static void txDrainOvfLocked(snapTransport *t) {
+    if (t->fds[1] < 0) return;
     while (t->ovf_len > 0) {
         ssize_t n = write(t->fds[1], t->ovf, t->ovf_len);
         if (n > 0) {
@@ -212,9 +212,64 @@ static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
             t->ovf_len -= (size_t)n;
             continue;
         }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
         if (n < 0 && errno == EINTR) continue;
-        t->producer_failed = 1;
+        /* EAGAIN just means later; anything else is a dead pipe. */
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        t->write_error = 1;
+        return;
+    }
+}
+
+/* Kill the stream and queue the poison marker so the consumer fails at once
+ * instead of waiting out its stall deadline.
+ *
+ * Whatever is still buffered is dropped first: the stream is over, those bytes
+ * are a partial frame nobody can use, and leaving them in front of the marker
+ * would delay or prevent its delivery. Caller must hold ovf_lock. */
+static void txPoisonLocked(snapTransport *t) {
+    if (t->poisoned) return;
+    t->poisoned = 1;
+    t->producer_failed = 1;
+    t->ovf_len = 0;
+    if (t->ovf_cap < sizeof(uint32_t)) {
+        char *nb = zrealloc(t->ovf, 64);
+        if (!nb) return;
+        t->ovf = nb;
+        t->ovf_cap = 64;
+    }
+    uint32_t poison = EXT_SNAP_POISON_LEN;
+    memcpy(t->ovf, &poison, sizeof(poison));
+    t->ovf_len = sizeof(poison);
+    txDrainOvfLocked(t);
+
+    /* Then close the write end, and rely on that rather than on the marker.
+     *
+     * The marker alone is not enough. Dropping the buffered bytes above can
+     * leave a truncated frame in the pipe, and the consumer waits for the rest
+     * of that frame before it will look at anything else -- so the four poison
+     * bytes queue up behind a frame that will never complete and are never
+     * interpreted. That is exactly how a poisoned stream still cost the full
+     * stall deadline. EOF cannot be stuck behind a partial frame: the consumer
+     * sees it as writer_closed and fails immediately.
+     *
+     * Safe because the stream is over: nothing more will ever be sent. */
+    if (t->fds[1] >= 0) {
+        close(t->fds[1]);
+        t->fds[1] = -1;
+        t->ovf_len = 0;
+    }
+}
+
+/* Push bytes toward the pipe. Anything the pipe will not take right now lands
+ * in overflow. Returns 0 on hard failure.
+ * Caller must hold t->ovf_lock; use txPush(). */
+static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
+    if (t->producer_failed) return 0;
+
+    /* Overflow must drain first or frames would be reordered. */
+    txDrainOvfLocked(t);
+    if (t->write_error) {
+        txPoisonLocked(t);
         return 0;
     }
 
@@ -249,7 +304,7 @@ static int txPushLocked(snapTransport *t, const char *buf, size_t len) {
             serverLog(LL_WARNING,
                 "Snapshot transport buffered %zu bytes past the %lld byte limit, aborting stream",
                 t->ovf_len + need, ext_snapshot_stream_overflow_limit);
-            t->producer_failed = 1;
+            txPoisonLocked(t);
             return 0;
         }
     }
@@ -294,10 +349,9 @@ static int txPush(snapTransport *t, const char *buf, size_t len) {
  * the consumer is running behind. */
 static int txWritable(void *privdata) {
     snapTransport *t = privdata;
-    if (t->producer_failed) return 0;
     pthread_mutex_lock(&t->ovf_lock);
     if (t->ovf_len > 0) {
-        txPushLocked(t, NULL, 0);
+        txDrainOvfLocked(t);
         if (t->ovf_len > 0)
             atomic_fetch_add_explicit(&stream_backpressure, 1, memory_order_relaxed);
     }
@@ -338,9 +392,9 @@ static void txComplete(void *privdata, int ok) {
                           memory_order_relaxed);
     if (!ok || t->producer_failed) {
         atomic_fetch_add_explicit(&stream_aborts, 1, memory_order_relaxed);
-        uint32_t poison = EXT_SNAP_POISON_LEN;
-        (void)txPush(t, (const char *)&poison, sizeof(poison));
-        t->producer_failed = 1;
+        pthread_mutex_lock(&t->ovf_lock);
+        txPoisonLocked(t);
+        pthread_mutex_unlock(&t->ovf_lock);
         atomic_store_explicit(&t->producer_done, 1, memory_order_release);
         return;
     }
@@ -370,9 +424,20 @@ static void txComplete(void *privdata, int ok) {
  * there is nothing to do, so it is fine to call every event loop iteration. */
 void extSnapshotTransportFlushPending(void) {
     snapTransport *t = &g_tx;
+    /* Checked BEFORE taking the lock, and that ordering is load bearing.
+     *
+     * A fork child inherits a copy of this mutex in whatever state it was in at
+     * fork() -- so if the storage IO thread happened to hold it, the child's
+     * copy is locked forever. The child is consumer-only and must therefore
+     * never touch this lock at all. It always closes the write end immediately
+     * after fork, so fds[1] < 0 is exactly the "I am the child" test, and it has
+     * to be answered without locking. A foreground save is unaffected: there is
+     * no fork, and its write end is open in this same process. */
     if (!t->armed || t->fds[1] < 0) return;
     if (t->ovf_len == 0) return;
-    (void)txPush(t, NULL, 0);
+    pthread_mutex_lock(&t->ovf_lock);
+    if (t->fds[1] >= 0 && t->ovf_len > 0) txDrainOvfLocked(t);
+    pthread_mutex_unlock(&t->ovf_lock);
 }
 
 int extSnapshotTransportArm(void) {
