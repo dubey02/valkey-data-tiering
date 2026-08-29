@@ -1278,6 +1278,9 @@ start_server {tags {"introspection"}} {
             ext-storage-backend
             ext-storage-path
             ext-storage-capacity-mb
+            ext-storage-index-size
+            ext-storage-max-allocated-percent
+            ext-storage-max-in-flight-reads
         }
 
         if {!$::tls} {
