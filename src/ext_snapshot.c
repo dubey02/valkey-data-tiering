@@ -675,12 +675,16 @@ int extSnapshotTransportDrain(extSnapshotRecordFn fn, void *privdata,
         t->rx_digest ^= (uint_least64_t)selfTestRecordHash(dbid, key, klen, vlen);
         int logical_db = 0;
         robj *entry = NULL;
+        int stop = 0;
         if (fn && extSnapshotRecordResolve(dbid, key, klen, &logical_db, &entry))
-            fn(privdata, logical_db, entry, key, klen, val, vlen);
+            stop = fn(privdata, logical_db, entry, key, klen, val, vlen) != 0;
 
         memmove(t->inbuf, t->inbuf + need, t->in_len - need);
         t->in_len -= need;
         consumed++;
+        /* The frame is consumed before bailing out so the stream stays framed if
+         * anyone drains again. */
+        if (stop) return EXT_SNAP_DRAIN_ERR;
     }
     return consumed;
 }
@@ -754,11 +758,12 @@ int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t kle
 
 /* --- transport self test ---------------------------------------------------*/
 
-static void txTestCountRecord(void *privdata, int logical_db, robj *entry,
-                              const char *key, size_t klen,
-                              const char *value, size_t vlen) {
+static int txTestCountRecord(void *privdata, int logical_db, robj *entry,
+                             const char *key, size_t klen,
+                             const char *value, size_t vlen) {
     (void)logical_db; (void)entry; (void)key; (void)klen; (void)value; (void)vlen;
     (*(long long *)privdata)++;
+    return 0;
 }
 
 int extSnapshotTransportSelfTest(int timeout_ms, extSnapshotTransportTestResult *out) {
@@ -804,4 +809,137 @@ int extSnapshotTransportSelfTest(int timeout_ms, extSnapshotTransportTestResult 
     out->elapsed_ms = (long long)(mstime() - start);
     extSnapshotTransportRelease();
     return C_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Drain to completion
+ * ---------------------------------------------------------------------------*/
+
+/* One loop, two very different consumers, which is why the exit conditions look
+ * over-specified:
+ *
+ *  - BGSAVE child: the write end lives in another process, so EOF is
+ *    observable. Seeing it without a terminator means the producer died.
+ *  - Foreground save: the write end is open in this same process, so EOF never
+ *    arrives however wedged the producer gets. A blocking drain would hang the
+ *    server forever, so the stall deadline is the only backstop.
+ *
+ * The deadline measures time WITHOUT PROGRESS rather than total elapsed. A flash
+ * set large enough to take an hour to stream is not a stall, and any total
+ * budget would be either wrong for large sets or useless for small ones. */
+int extSnapshotDrainAll(extSnapshotRecordFn fn, void *privdata) {
+    mstime_t last_progress = mstime();
+
+    for (;;) {
+        int r = extSnapshotTransportDrain(fn, privdata, 256, 0);
+        if (r == EXT_SNAP_DRAIN_DONE) return C_OK;
+        if (r == EXT_SNAP_DRAIN_ERR) return C_ERR;
+        if (r > 0) {
+            last_progress = mstime();
+            continue;
+        }
+        /* WOULDBLOCK. */
+        if (extSnapshotTransportWriterClosed()) {
+            serverLog(LL_WARNING,
+                "Snapshot transport: stream ended without a terminator");
+            return C_ERR;
+        }
+        /* Foreground save: no event loop is running, so nothing else will push
+         * out a terminator the producer left sitting in overflow. Do it here. */
+        extSnapshotTransportFlushPending();
+        if (mstime() - last_progress > ext_snapshot_stream_stall_timeout_ms) {
+            serverLog(LL_WARNING,
+                "Snapshot transport: no records for %d ms, aborting",
+                ext_snapshot_stream_stall_timeout_ms);
+            extSnapshotTransportAbort();
+            return C_ERR;
+        }
+        usleep(200);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Save lifecycle
+ * ---------------------------------------------------------------------------*/
+
+static extSnapshotSaveMode g_save_mode = EXT_SNAP_SAVE_NONE;
+
+extSnapshotSaveMode extSnapshotSaveBegin(int will_fork) {
+    g_save_mode = EXT_SNAP_SAVE_NONE;
+
+    /* A fork child inherits whichever strategy its parent set up, so it must
+     * not set up anything itself. */
+    if (server.in_fork_child) return g_save_mode;
+    if (!ext_data_enabled || num_items_on_flash <= 0) return g_save_mode;
+
+    /* Preferred: ask the storage engine for a point-in-time stream, so no value
+     * has to be read back. The barrier settles in-flight IO first -- a key
+     * deleted before the cut whose record has not been reclaimed would still sit
+     * inside the frozen range, and writing it would resurrect the key. */
+    if (extSnapshotStreamEnabled() && !extStorageSnapshotActive()) {
+        if (extSnapshotDrainBarrier() == C_OK && extSnapshotTransportArm() == C_OK) {
+            extStorageSnapshotCountStreamSave();
+            /* No fork means this thread is the consumer, so claim the role now.
+             * A forking save leaves it to the child. */
+            if (!will_fork) extSnapshotTransportBecomeConsumer();
+            g_save_mode = EXT_SNAP_SAVE_STREAM;
+            return g_save_mode;
+        }
+        extSnapshotTransportRelease();
+        serverLog(LL_NOTICE,
+            "Snapshot stream unavailable, falling back to the fork read path");
+    }
+
+    /* Fallback: quiesce tiering IO, park the storage IO thread and pause on-flash
+     * GC before the fork, so the child inherits consistent backend state and
+     * stable flash offsets. */
+    if (extStorageSnapshotSupported() && !extStorageSnapshotActive() &&
+        extStorageSnapshotPrepare() == C_OK) {
+        g_save_mode = EXT_SNAP_SAVE_FORKREAD;
+        return g_save_mode;
+    }
+
+    /* Neither path is available and values do live on flash. Refuse rather than
+     * write a snapshot that silently omits them. Rate limited because a save can
+     * be attempted every few seconds. */
+    static mstime_t last_log = 0;
+    if (mstime() - last_log > 60000) {
+        serverLog(LL_WARNING,
+            "Refusing RDB save: %lld values reside on external storage and the "
+            "active backend cannot snapshot them", num_items_on_flash);
+        last_log = mstime();
+    }
+    g_save_mode = EXT_SNAP_SAVE_REFUSE;
+    return g_save_mode;
+}
+
+void extSnapshotSaveAfterForkChild(void) {
+    if (g_save_mode != EXT_SNAP_SAVE_STREAM) return;
+    /* Drop the producer end first: leaving it open would stop our own reader
+     * ever seeing EOF, which is how a dead parent is detected. */
+    extSnapshotTransportCloseWriteEnd();
+    extSnapshotTransportBecomeConsumer();
+}
+
+void extSnapshotSaveAfterForkParent(void) {
+    /* Streaming: the child owns the read end. The write end stays open here
+     * because the storage IO thread is still producing into it. */
+    if (g_save_mode == EXT_SNAP_SAVE_STREAM) extSnapshotTransportCloseReadEnd();
+    /* Fork read: unpark the storage IO thread so normal tiering traffic resumes
+     * while the child works. GC stays paused until the child is reaped. */
+    if (g_save_mode == EXT_SNAP_SAVE_FORKREAD) extStorageSnapshotResume();
+}
+
+void extSnapshotSaveEnd(void) {
+    /* On-flash GC may resume. No-op when nothing was prepared. */
+    extStorageSnapshotDone();
+    /* With the consumer gone nothing will drain the rest of the stream, so
+     * cancel it rather than let the engine keep producing into a pipe with no
+     * reader. Abort is idempotent once the stream completed, which is the normal
+     * success case. */
+    if (extSnapshotTransportArmed()) {
+        extSnapshotTransportAbort();
+        extSnapshotTransportRelease();
+    }
+    g_save_mode = EXT_SNAP_SAVE_NONE;
 }

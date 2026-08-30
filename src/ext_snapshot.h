@@ -106,10 +106,18 @@ int extSnapshotStreamSelfTest(int timeout_ms, extSnapshotSelfTestResult *out);
  * failure, so a truncated stream is never mistaken for a complete one.
  *
  * Backpressure: the write end is non-blocking with a bounded overflow buffer.
- * Blocking the engine IO thread would also stall spills and fetches, so
- * instead writable() reports "not now" while overflow is pending and the
- * engine simply stops handing over records. Overflow past the cap poisons the
- * stream, matching the storage engine's own abort-rather-than-stall policy.
+ * Blocking the engine IO thread would also stall spills and fetches, so the
+ * buffer absorbs whatever the pipe would not take.
+ *
+ * Note that writable() always ACCEPTS unless the producer has already failed.
+ * Backpressure-by-refusal is not available: FlashCache treats a sink refusing a
+ * record as a reason to abort the snapshot outright and calls complete() with
+ * partial output -- it does not retry the record -- which would strand every
+ * remaining record and the terminator in the buffer forever. So the transport
+ * takes the record and lets the buffer grow. Overflow past the cap poisons the
+ * stream, matching the storage engine's own abort-rather-than-stall policy. One
+ * record larger than the whole cap is still let through: the cap bounds how far
+ * the consumer may fall BEHIND, not the size of a frame.
  * ---------------------------------------------------------------------------*/
 
 /* Arm the transport and the engine stream. Main thread, and it must run in the
@@ -168,10 +176,12 @@ int extSnapshotStreamConsumerActive(void);
  * hashtable lookup per record. `entry` is the live robj for this key, which is
  * where the RDB writer reads expire/LRU/LFU from. Declared as struct serverObject
  * so this header stays independent of server.h. */
-typedef void (*extSnapshotRecordFn)(void *privdata, int logical_db,
-                                    struct serverObject *entry,
-                                    const char *key, size_t klen,
-                                    const char *value, size_t vlen);
+/* Return 0 to continue, -1 to stop the drain (the consumer hit its own error,
+ * e.g. a failed RDB write -- there is no point reading the rest of the pipe). */
+typedef int (*extSnapshotRecordFn)(void *privdata, int logical_db,
+                                   struct serverObject *entry,
+                                   const char *key, size_t klen,
+                                   const char *value, size_t vlen);
 
 /* Drain outcomes. Anything negative is terminal. */
 #define EXT_SNAP_DRAIN_WOULDBLOCK   0   /* nothing available right now */
@@ -186,6 +196,46 @@ int extSnapshotTransportDrain(extSnapshotRecordFn fn, void *privdata,
 
 /* Records handed to the pipe so far. Producer side counter, for INFO. */
 long long extSnapshotTransportRecordsSent(void);
+
+/* Drive the armed stream to completion, handing every surviving record to `fn`.
+ * Owns the whole liveness policy -- budgeted non-blocking drains, the
+ * no-progress deadline, EOF-without-terminator detection, and pumping the
+ * producer's overflow buffer during a foreground save where no event loop runs.
+ * Returns C_OK once the terminator has been seen and verified, C_ERR on poison,
+ * truncation, stall, or `fn` asking to stop. */
+int extSnapshotDrainAll(extSnapshotRecordFn fn, void *privdata);
+
+/* ---------------------------------------------------------------------------
+ * Save lifecycle
+ *
+ * A tiering-aware save has to pick between two strategies before it forks, undo
+ * whichever it picked on every exit path, and split pipe ends correctly across
+ * the fork. That is tiering policy, not RDB business, so it lives here and the
+ * RDB layer only announces where it is in the save.
+ *
+ * Order for a forking save:
+ *   Begin(1) -> fork -> AfterForkChild() in the child, AfterForkParent() in the
+ *   parent -> End() when the child is reaped.
+ * For a foreground save:
+ *   Begin(0) -> write the RDB on this thread -> End().
+ * ---------------------------------------------------------------------------*/
+typedef enum {
+    EXT_SNAP_SAVE_NONE = 0,   /* tiering off, nothing on flash, or a fork child */
+    EXT_SNAP_SAVE_STREAM,     /* transport armed; the consumer emits a flash section */
+    EXT_SNAP_SAVE_FORKREAD,   /* fallback: values are read back per key */
+    EXT_SNAP_SAVE_REFUSE,     /* values on flash and no way to snapshot them */
+} extSnapshotSaveMode;
+
+/* `will_fork` tells us who consumes the stream: the child (1) or this very
+ * thread (0). Logs its own refusal; the caller only maps REFUSE onto whatever
+ * error convention that save path uses. */
+extSnapshotSaveMode extSnapshotSaveBegin(int will_fork);
+void extSnapshotSaveAfterForkChild(void);
+void extSnapshotSaveAfterForkParent(void);
+
+/* Undo whatever Begin() set up. Idempotent, and safe to call when Begin()
+ * returned NONE or was never called, so the child reaper can call it blindly. */
+void extSnapshotSaveEnd(void);
 
 /* ---------------------------------------------------------------------------
  * Resurrection barrier
