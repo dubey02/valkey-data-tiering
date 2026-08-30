@@ -43,6 +43,11 @@ extern int ext_data_enabled;
 extern int ext_storage_debug_pause_completions; /* DEBUG EXT-STORAGE-PAUSE-COMPLETIONS (tests only) */
 extern long long num_items_on_flash; /* values currently on external storage */
 
+/* Account for a store flush against num_items_on_flash. Call BEFORE the
+ * keyspace is emptied: the single-db case counts that db's tiered entries,
+ * which must still be present. dbnum == -1 means "all databases". */
+void extStorageNoteStoreFlushed(int dbnum);
+
 /* Mid-execution synchronous fetch (.agent/knowledge/sync-fetch-design.md).
  * Drives the IO for `key` to completion on the calling (main) thread, deferring
  * other keys' completions. On return the key is either resident or absent —

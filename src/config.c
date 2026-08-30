@@ -2618,6 +2618,21 @@ static int updateExtStorageFcConfig(const char **err) {
     return 1;
 }
 
+/* Data tiering: swapdb has no temp external store to swap, so an aborted
+ * diskless load orphans every flash record it already ingested (see the
+ * downgrade in extStorage_init for the full reasoning). Startup downgrades
+ * silently because config ordering is not guaranteed; runtime CONFIG SET can
+ * and should be refused outright so the operator learns why. */
+static int updateReplDisklessLoad(const char **err) {
+    if (ext_data_enabled && extStorageIsInitialized() &&
+        server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
+        *err = "repl-diskless-load swapdb is not supported while data tiering "
+               "(ext-storage-enabled) is active; use flush-before-load";
+        return 0;
+    }
+    return 1;
+}
+
 static int updateMaxmemoryPolicy(const char **err) {
     /* Data tiering: spill victim selection supports only allkeys-lru,
      * allkeys-lfu, and noeviction (volatile-* needs flash-aware sampling
@@ -3411,7 +3426,7 @@ standardConfig static_configs[] = {
     /* Enum Configs */
     createEnumConfig("supervised", NULL, IMMUTABLE_CONFIG, supervised_mode_enum, server.supervised_mode, SUPERVISED_NONE, NULL, NULL),
     createEnumConfig("syslog-facility", NULL, IMMUTABLE_CONFIG, syslog_facility_enum, server.syslog_facility, LOG_LOCAL0, NULL, NULL),
-    createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, NULL),
+    createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, updateReplDisklessLoad),
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
     createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, updateMaxmemoryPolicy),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, updateAppendFsync),

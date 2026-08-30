@@ -207,6 +207,40 @@ void extStorageRemoveState(serverDb *db, sds key) {
     }
 }
 
+/* Account for a store flush against num_items_on_flash.
+ *
+ * The gauge is otherwise only moved by storage completion callbacks (spill
+ * completion increments, fetch/delete/evict completion decrements). A flush
+ * removes flash residency for a whole db without producing any completion, so
+ * without this the gauge stays phantom-high forever. That matters beyond INFO:
+ * every save path gates the tiering branch on `num_items_on_flash > 0`, so a
+ * stale value makes a save arm a snapshot cut over an effectively empty store.
+ *
+ * Must be called BEFORE the keyspace is emptied — the single-db case counts
+ * that db's tiered entries and needs them still present. */
+void extStorageNoteStoreFlushed(int dbnum) {
+    if (!ext_data_enabled) return;
+
+    /* Whole server, or a single-db server: everything went away. */
+    if (dbnum == -1 || server.dbnum == 1) {
+        num_items_on_flash = 0;
+        return;
+    }
+
+    /* Multi-db server, one db flushed: subtract just that db's tiered entries.
+     * O(keys in db), but FLUSHDB is already O(n). */
+    if (dbnum < 0 || dbnum >= server.dbnum || !server.db[dbnum]) return;
+    long long tiered = 0;
+    kvstoreIterator *kvs_it = kvstoreIteratorInit(server.db[dbnum]->keys, HASHTABLE_ITER_SAFE);
+    void *next;
+    while (kvstoreIteratorNext(kvs_it, &next)) {
+        if (((robj *)next)->encoding == OBJ_ENCODING_TIERED) tiered++;
+    }
+    kvstoreIteratorRelease(kvs_it);
+    num_items_on_flash -= tiered;
+    if (num_items_on_flash < 0) num_items_on_flash = 0;
+}
+
 /* ---------------------------------------------------------------------------
  * Metrics — keyBlocksClient decision path
  * ---------------------------------------------------------------------------*/
@@ -409,6 +443,36 @@ void extStorage_init(void) {
     }
 
     extStorageThrottle_init();
+
+    /* repl-diskless-load swapdb is unsafe with tiering, so downgrade it.
+     *
+     * Under swapdb the replica loads the primary's RDB into a temp keyspace and
+     * only swaps it in on success. But the flash section is ingested straight
+     * into the one process-global store — there is no temp store to swap. On
+     * abort, disklessLoadDiscardTempDb frees only the in-memory temp DB, so
+     * every flash record the partial load had already ingested is left behind
+     * with nothing referencing it: permanently leaked flash capacity, repeated
+     * on every failed full sync until the store fills.
+     *
+     * flush-before-load has no such window. It discards through emptyData(),
+     * which flushes the store, so an aborted load leaves nothing behind. The
+     * cost is losing swapdb's read availability during the load, which is the
+     * right trade against unbounded capacity loss.
+     *
+     * Deliberately placed after the backend has come up: an init failure above
+     * clears ext_data_enabled and returns, and in that case the operator's
+     * choice of swapdb must be left alone.
+     *
+     * Runtime CONFIG SET is refused separately in updateReplDisklessLoad(); this
+     * is the startup path, where the config file may name swapdb before
+     * ext-storage-enabled has been parsed. */
+    if (server.repl_diskless_load == REPL_DISKLESS_LOAD_SWAPDB) {
+        serverLog(LL_WARNING,
+            "repl-diskless-load swapdb is not supported with data tiering "
+            "(ext-storage-enabled): an aborted load would permanently orphan every "
+            "flash record it had ingested. Downgrading to flush-before-load.");
+        server.repl_diskless_load = REPL_DISKLESS_LOAD_FLUSH_BEFORE_LOAD;
+    }
 
     ext_storage_timer_id = aeCreateTimeEvent(server.el, 1, extStorageTimerCallback, NULL, NULL);
     if (ext_storage_timer_id == AE_ERR) {

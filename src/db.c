@@ -704,6 +704,30 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
         clusterHandleFlushDuringSlotMigration();
     }
 
+    /* Data tiering: settle and wipe the external store BEFORE the in-memory
+     * keys go away. Draining first prevents a spill completion from landing on
+     * a key that no longer exists, and wiping the flash index stops the store
+     * accumulating unreachable records across every flush.
+     *
+     * This is centralised here rather than in flushdbCommand/flushallCommand so
+     * that the non-command flush paths are covered too: DEBUG RELOAD,
+     * DEBUG FLUSHALL, and — the one that matters — the replica's
+     * flush-before-load full sync, which previously dropped every key while
+     * leaving its flash records behind on each resync.
+     *
+     * A fork child must not touch the store or the gauge: its parent owns both,
+     * and the child's copy is discarded. */
+    if (ext_data_enabled && !server.in_fork_child) {
+        /* Gauge first — the single-db case counts this db's tiered entries,
+         * which must still be present in the keyspace. */
+        extStorageNoteStoreFlushed(dbnum);
+        if (dbnum == -1) {
+            extStorageBridge_flushAll();
+        } else {
+            extStorageBridge_flushDB(extStoragePhysicalDbId(dbnum));
+        }
+    }
+
     /* Empty the database structure. */
     removed = emptyDbStructure(server.db, dbnum, async, callback);
 
@@ -857,13 +881,6 @@ void flushdbCommand(client *c) {
 
     if (getFlushCommandFlags(c, &flags) == C_ERR) return;
 
-    /* Flush flash storage synchronously BEFORE deleting in-memory keys.
-     * This drains all in-flight IO and wipes the flash index, preventing
-     * crashes from deleting keys mid-spill. */
-    if (ext_data_enabled) {
-        extStorageBridge_flushDB(extStoragePhysicalDbId(c->db->id));
-    }
-
     /* flushdb should not flush the functions */
     server.dirty += emptyData(c->db->id, flags | EMPTYDB_NOFUNCTIONS, NULL);
 
@@ -887,10 +904,6 @@ void flushdbCommand(client *c) {
 void flushallCommand(client *c) {
     int flags;
     if (getFlushCommandFlags(c, &flags) == C_ERR) return;
-
-    if (ext_data_enabled) {
-        extStorageBridge_flushAll();
-    }
 
     /* flushall should not flush the functions */
     flushAllDataAndResetRDB(flags | EMPTYDB_NOFUNCTIONS);
