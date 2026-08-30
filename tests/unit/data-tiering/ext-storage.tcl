@@ -40,8 +40,18 @@ proc get_info_field {field} {
     return ""
 }
 
+# This suite drives the rocksdb module backend, but ext-storage-enabled still
+# brings up the native store, and with no ext-storage-path every parallel test
+# client lands on the same default /tmp/valkey-flash.db. Under real FlashCache
+# that shared file is a cross-client collision and shows up as an init segfault
+# ("Can't start / No PID detected"). Give each client its own pre-sized file.
+set _fcpath "/tmp/valkey-flash-base-[pid].db"
+catch {exec fallocate -l 256M $_fcpath}
+
 start_server [list tags {"ext-storage"} overrides [list \
     ext-storage-enabled yes \
+    ext-storage-path $_fcpath \
+    ext-storage-capacity-mb 256 \
     maxmemory 2mb \
     maxmemory-policy allkeys-lru \
     loadmodule "$testmodule backend=rocksdb db_path=/tmp/valkey-test-tiering-[pid]" \

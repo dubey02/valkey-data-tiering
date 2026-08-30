@@ -35,10 +35,17 @@ proc debug_spill_wait {key} {
 
 proc bigelem {tag} { return "${tag}[string repeat z 300]" }
 
+# Real FlashCache asserts on backing-file size inside getFileSize() before its
+# logger exists, so a missing or undersized file segfaults during init with no
+# usable message (the harness only reports "Can't start / No PID detected").
+# Pre-allocating removes that entirely. Harmless for the mock backend.
+set _fcpath "/tmp/valkey-flash-blk-[pid].db"
+catch {exec fallocate -l 256M $_fcpath}
+
 start_server [list tags {"ext-storage" "ext-storage-blocking"} overrides [list \
     ext-storage-enabled yes \
     ext-storage-backend flashcache-mock \
-    ext-storage-path "/tmp/valkey-flash-blk-[pid].db" \
+    ext-storage-path $_fcpath \
     ext-storage-capacity-mb 256 \
     maxmemory 50mb \
     maxmemory-policy allkeys-lru \

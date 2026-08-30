@@ -43,11 +43,20 @@ proc get_info_field {field} {
     return ""
 }
 
+# Real FlashCache asserts on backing-file size inside getFileSize() before its
+# logger exists, so a missing or undersized file segfaults during init with no
+# usable message (the harness only reports "Can't start / No PID detected").
+# Pre-allocating removes that entirely. Harmless for the mock backend.
+set _backend  [expr {[info exists ::env(EXT_STORAGE_BACKEND)] ? $::env(EXT_STORAGE_BACKEND) : "flashcache-mock"}]
+set _path     [expr {[info exists ::env(EXT_STORAGE_PATH)] ? $::env(EXT_STORAGE_PATH) : "/tmp/valkey-flash-test-[pid].db"}]
+set _capacity [expr {[info exists ::env(EXT_STORAGE_CAPACITY_MB)] ? $::env(EXT_STORAGE_CAPACITY_MB) : "256"}]
+catch {exec fallocate -l ${_capacity}M $_path}
+
 start_server [list tags {"ext-storage" "ext-storage-data-types"} overrides [list \
     ext-storage-enabled yes \
-    ext-storage-backend [expr {[info exists ::env(EXT_STORAGE_BACKEND)] ? $::env(EXT_STORAGE_BACKEND) : "flashcache-mock"}] \
-    ext-storage-path [expr {[info exists ::env(EXT_STORAGE_PATH)] ? $::env(EXT_STORAGE_PATH) : "/tmp/valkey-flash-test-[pid].db"}] \
-    ext-storage-capacity-mb [expr {[info exists ::env(EXT_STORAGE_CAPACITY_MB)] ? $::env(EXT_STORAGE_CAPACITY_MB) : "256"}] \
+    ext-storage-backend $_backend \
+    ext-storage-path $_path \
+    ext-storage-capacity-mb $_capacity \
     maxmemory 10mb \
     maxmemory-policy allkeys-lru \
 ]] {

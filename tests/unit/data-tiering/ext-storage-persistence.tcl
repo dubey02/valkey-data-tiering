@@ -46,6 +46,12 @@ if {[info exists ::env(EXT_STORAGE_CAPACITY_MB)]} {
     set _capacity "256"
 }
 
+# Real FlashCache asserts on backing-file size inside getFileSize() before its
+# logger exists, so a missing or undersized file segfaults during init with no
+# usable message (the harness only reports "Can't start / No PID detected").
+# Pre-allocating removes that entirely. Harmless for the mock backend.
+catch {exec fallocate -l ${_capacity}M $_path}
+
 start_server [list tags {"ext-storage" "ext-storage-persistence"} overrides [list \
     ext-storage-enabled yes \
     ext-storage-backend $_backend \

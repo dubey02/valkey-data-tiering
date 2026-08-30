@@ -36,6 +36,12 @@ if {[info exists ::env(EXT_STORAGE_PATH)]} {
     set _path "/tmp/valkey-flash-uaf-[pid].db"
 }
 
+# Real FlashCache asserts on backing-file size inside getFileSize() before its
+# logger exists, so a missing or undersized file segfaults during init with no
+# usable message (the harness only reports "Can't start / No PID detected").
+# Pre-allocating removes that entirely. Harmless for the mock backend.
+catch {exec fallocate -l 256M $_path}
+
 start_server [list tags {"ext-storage-embstr"} overrides [list \
     ext-storage-enabled yes \
     ext-storage-backend $_backend \
