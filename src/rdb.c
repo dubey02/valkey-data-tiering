@@ -1186,6 +1186,67 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
     return len;
 }
 
+/* Write one tiered value as a standard RDB entry.
+ *
+ * This is the single place that knows how a value living on external storage
+ * becomes RDB bytes. Both tiering snapshot paths route through it: the fork
+ * read path, which materializes one payload at a time from rdbSaveKeyValuePair,
+ * and the streaming path, which receives payloads off the snapshot transport.
+ *
+ * `obj` is the DUMP payload with its footer ALREADY REMOVED, i.e.
+ * [type byte][rdbSaveObject bytes]. With the footer gone that is byte for byte
+ * what rdbSaveKeyValuePair emits for the same object, which is why the entry
+ * produced here is a plain RDB entry -- loadable by a node with tiering
+ * compiled out entirely (on load the value starts in memory and re-tiers under
+ * memory pressure).
+ *
+ * `entry` is the live keyspace object, read only, for the LRU/LFU metadata.
+ *
+ * `last_db` tracks the DB of the last SELECTDB emitted so a caller streaming
+ * records in arbitrary DB order can re-emit on change. Callers whose enclosing
+ * loop already emits SELECTDB pass NULL. `key_counter` may also be NULL.
+ *
+ * Returns C_OK, or C_ERR on the first write error.
+ *
+ * NOTE: the payload was serialized at spill time with this binary's
+ * RDB_VERSION. A future dual-channel replication downgrade (rdbver <
+ * RDB_VERSION) would need a deserialize/reserialize fallback here. */
+int rdbSaveTieredEntry(rio *rdb, int dbid, robj *entry, long long expiretime,
+                       const char *key, size_t klen,
+                       const char *obj, size_t objlen,
+                       int *last_db, long *key_counter) {
+    if (last_db && dbid != *last_db) {
+        if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) return C_ERR;
+        if (rdbSaveLen(rdb, dbid) == -1) return C_ERR;
+        *last_db = dbid;
+    }
+
+    if (expiretime != -1) {
+        if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) return C_ERR;
+        if (rdbSaveMillisecondTime(rdb, expiretime) == -1) return C_ERR;
+    }
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
+        uint64_t idletime = objectGetLRUIdleSecs(entry);
+        if (rdbSaveType(rdb, RDB_OPCODE_IDLE) == -1) return C_ERR;
+        if (rdbSaveLen(rdb, idletime) == -1) return C_ERR;
+    }
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        uint8_t freq = objectGetLFUFrequency(entry);
+        if (rdbSaveType(rdb, RDB_OPCODE_FREQ) == -1) return C_ERR;
+        if (rdbWriteRaw(rdb, &freq, 1) == -1) return C_ERR;
+    }
+
+    /* Type byte, key, object bytes -- the last spliced straight out of the
+     * payload, which is why no deserialize/reserialize round trip happens. */
+    if (rdbWriteRaw(rdb, (void *)obj, 1) == -1) return C_ERR;
+    if (rdbSaveRawString(rdb, (unsigned char *)key, klen) == -1) return C_ERR;
+    if (rdbWriteRaw(rdb, (void *)(obj + 1), objlen - 1) == -1) return C_ERR;
+
+    if (key_counter) (*key_counter)++;
+    if (server.rdb_key_save_delay) debugDelay(server.rdb_key_save_delay);
+    return C_OK;
+}
+
 /* Save a key-value pair, with expire time, type, key, value.
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
@@ -1214,12 +1275,18 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
         if (extSnapshotStreamConsumerActive()) return 0;
         if (!extStorageMaterializeTiered(dbid, key, val, &tiered_payload, &tiered_plen))
             return 0; /* logically deleted (pending DEL) or GC-evicted: skip */
+        /* SELECTDB is emitted by rdbSaveDb for this path, so pass last_db NULL. */
+        int r = rdbSaveTieredEntry(rdb, dbid, val, expiretime,
+                                   objectGetKey(val), sdslen(objectGetKey(val)),
+                                   tiered_payload, tiered_plen, NULL, NULL);
+        zfree(tiered_payload);
+        return r == C_OK ? 1 : -1;
     }
 
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
-#define rdb_kvp_fail() do { if (tiered_payload) zfree(tiered_payload); return -1; } while (0)
+#define rdb_kvp_fail() do { return -1; } while (0)
     /* Save the expire time */
     if (expiretime != -1) {
         if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) rdb_kvp_fail();
@@ -1242,17 +1309,6 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
          * a single time when loading does not affect the frequency much. */
         if (rdbSaveType(rdb, RDB_OPCODE_FREQ) == -1) rdb_kvp_fail();
         if (rdbWriteRaw(rdb, &freq, 1) == -1) rdb_kvp_fail();
-    }
-
-    /* Save type, key, value. For a tiered entry the type byte and the object
-     * bytes are spliced from the materialized DUMP payload. */
-    if (tiered_payload) {
-        if (rdbWriteRaw(rdb, tiered_payload, 1) == -1) rdb_kvp_fail();       /* type byte */
-        if (rdbSaveStringObject(rdb, key) == -1) rdb_kvp_fail();
-        if (rdbWriteRaw(rdb, tiered_payload + 1, tiered_plen - 1) == -1) rdb_kvp_fail();
-        zfree(tiered_payload);
-        if (server.rdb_key_save_delay) debugDelay(server.rdb_key_save_delay);
-        return 1;
     }
 
     int rdbtype = rdbGetObjectType(val, rdbver);
@@ -1543,54 +1599,29 @@ typedef struct flashSectionCtx {
     long long malformed;    /* records too short to carry a DUMP footer */
 } flashSectionCtx;
 
+/* Transport record -> RDB entry. Thin by design: the serialization lives in
+ * rdbSaveTieredEntry, shared with the fork read path. All this adds is the
+ * footer strip (the transport carries the raw DUMP payload) and the sticky
+ * error/malformed accounting the drain loop reports on. */
 static void rdbSaveFlashRecord(void *privdata, int logical_db, robj *entry,
                                const char *key, size_t klen,
                                const char *value, size_t vlen) {
     flashSectionCtx *ctx = privdata;
     if (ctx->err) return;
 
-    /* DUMP payload = [type][object bytes][2B rdbver][8B crc64]. The footer is
-     * not part of an RDB entry, and there must be a type byte beneath it. */
-    if (vlen <= 10) {
+    /* There must be a type byte beneath the footer. */
+    if (vlen <= RDB_DUMP_FOOTER_LEN) {
         ctx->malformed++;
         return;
     }
-    size_t objlen = vlen - 10;
 
-    rio *rdb = ctx->rdb;
-#define rdb_flash_fail() do { ctx->err = 1; return; } while (0)
-
-    if (logical_db != ctx->last_db) {
-        if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) rdb_flash_fail();
-        if (rdbSaveLen(rdb, logical_db) == -1) rdb_flash_fail();
-        ctx->last_db = logical_db;
+    if (rdbSaveTieredEntry(ctx->rdb, logical_db, entry, objectGetExpire(entry),
+                           key, klen, value, vlen - RDB_DUMP_FOOTER_LEN,
+                           &ctx->last_db, ctx->key_counter) != C_OK) {
+        ctx->err = 1;
+        return;
     }
-
-    long long expiretime = objectGetExpire(entry);
-    if (expiretime != -1) {
-        if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) rdb_flash_fail();
-        if (rdbSaveMillisecondTime(rdb, expiretime) == -1) rdb_flash_fail();
-    }
-    if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
-        uint64_t idletime = objectGetLRUIdleSecs(entry);
-        if (rdbSaveType(rdb, RDB_OPCODE_IDLE) == -1) rdb_flash_fail();
-        if (rdbSaveLen(rdb, idletime) == -1) rdb_flash_fail();
-    }
-    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
-        uint8_t freq = objectGetLFUFrequency(entry);
-        if (rdbSaveType(rdb, RDB_OPCODE_FREQ) == -1) rdb_flash_fail();
-        if (rdbWriteRaw(rdb, &freq, 1) == -1) rdb_flash_fail();
-    }
-
-    /* Type byte, key, object bytes -- spliced straight out of the payload. */
-    if (rdbWriteRaw(rdb, (void *)value, 1) == -1) rdb_flash_fail();
-    if (rdbSaveRawString(rdb, (unsigned char *)key, klen) == -1) rdb_flash_fail();
-    if (rdbWriteRaw(rdb, (void *)(value + 1), objlen - 1) == -1) rdb_flash_fail();
-#undef rdb_flash_fail
-
     ctx->written++;
-    (*ctx->key_counter)++;
-    if (server.rdb_key_save_delay) debugDelay(server.rdb_key_save_delay);
 }
 
 /* Drain the transport to completion, writing an entry per live record. Returns

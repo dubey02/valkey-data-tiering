@@ -153,6 +153,12 @@ enum RdbType {
 #define RDB_OPCODE_RESIZEDB 251        /* Hash table resize hint. */
 #define RDB_OPCODE_EXPIRETIME_MS 252   /* Expire time in milliseconds. */
 #define RDB_OPCODE_EXPIRETIME 253      /* Old expire time in seconds. */
+/* A DUMP payload is [type byte][rdbSaveObject bytes][2 byte RDB version]
+ * [8 byte CRC64]. The trailing 10 bytes are the DUMP footer, which is not part
+ * of an RDB entry -- data tiering stores DUMP payloads and strips this before
+ * splicing the object bytes into an RDB. */
+#define RDB_DUMP_FOOTER_LEN 10
+
 #define RDB_OPCODE_SELECTDB 254        /* DB number of the following keys. */
 #define RDB_OPCODE_EOF 255             /* End of the RDB file. */
 
@@ -208,6 +214,13 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char type
 size_t rdbSavedObjectLen(robj *o, robj *key, int dbid);
 robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rdbflags, mstime_t now);
 void backgroundSaveDoneHandler(int exitcode, int bysignal);
+/* Data tiering: write one externally-stored value as a standard RDB entry.
+ * `obj` is a DUMP payload with the footer already removed. Shared by the fork
+ * read and streaming snapshot paths. See rdb.c for the full contract. */
+int rdbSaveTieredEntry(rio *rdb, int dbid, robj *entry, long long expiretime,
+                       const char *key, size_t klen,
+                       const char *obj, size_t objlen,
+                       int *last_db, long *key_counter);
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid, int rdbver);
 ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt);
 robj *rdbLoadCheckModuleValue(rio *rdb, char *modulename);
