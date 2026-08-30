@@ -146,6 +146,16 @@ start_server [list tags {"ext-storage-fc-configs"} overrides [list \
         }
 
         regexp {fc_total_disk_write_bytes:(\d+)} [r info all] _ after
+        # Reaching the spill count above does not imply a disk write has landed:
+        # FC buffers and only flushes once the 1 MiB threshold is crossed, and
+        # that flush is asynchronous. Poll the counter this test actually asserts
+        # on, otherwise a loaded box reports 0 and fails on timing alone.
+        set wdeadline [expr {[clock milliseconds] + 20000}]
+        while {[clock milliseconds] < $wdeadline} {
+            regexp {fc_total_disk_write_bytes:(\d+)} [r info all] _ after
+            if {$after > $before} break
+            after 100
+        }
         assert {$after > $before}
     }
 }

@@ -93,10 +93,18 @@ start_server [list tags {"ext-storage-expiry"} overrides [list \
         fill_memory
         wait_for_spill 50
         set before [r dbsize]
-        # Wait for TTL + active expiry cycle
-        after 5000
-        set after [r dbsize]
-        set expired [expr {$before - $after}]
+        # The TTL is 4s and the active-expire cron sweeps in sampled batches, so
+        # the drop is not instantaneous. Poll to a deadline rather than sleeping
+        # a fixed 5s: on a loaded box that single sleep can land before the cron
+        # has swept, reporting 0 expired, which reads as a product failure when
+        # it is only a timing shortfall.
+        set deadline [expr {[clock milliseconds] + 30000}]
+        set expired 0
+        while {[clock milliseconds] < $deadline} {
+            set expired [expr {$before - [r dbsize]}]
+            if {$expired >= 45} break
+            after 100
+        }
         assert {$expired >= 45}
     }
 
@@ -130,14 +138,34 @@ start_server [list tags {"ext-storage-expiry"} overrides [list \
     test {Expiry: key expires during fetch (no wasted promotion)} {
         r flushdb
         after 1000
-        # Set key with very short TTL, fill to spill it
-        r set fetchexpire "value-that-will-expire-during-fetch-padding" EX 2
+        # Seed WITHOUT a short TTL. The original set EX 2 here, then ran
+        # fill_memory + wait_for_spill (up to 15s under load) before asserting
+        # the key still existed — so the key routinely expired during its own
+        # setup and the assertion below failed with exists==0. Arm the fuse only
+        # after the key is confirmed resident on flash.
+        r set fetchexpire "value-that-will-expire-during-fetch-padding"
         fill_memory
         wait_for_spill 50
         # Key should exist (not yet expired)
         assert_equal [r exists fetchexpire] 1
-        # Wait for TTL to expire while key is on flash
-        after 2500
+
+        # Arm a short fuse now. Guard that this did not promote the value back
+        # into memory — if it had, the test would silently stop covering the
+        # expire-while-on-flash path it exists to check.
+        #
+        # The guard is one-sided on purpose. num_items_on_flash is a live gauge
+        # and fill_memory's spills are still completing asynchronously here, so
+        # it drifts upward on its own; an exact equality check flakes by
+        # construction (observed 5463 vs 5464). A promotion moves the gauge
+        # DOWN, so "did not decrease" is the assertion that actually carries
+        # weight. It cannot catch a promotion that a concurrent spill masks in
+        # the same instant, which is an accepted limit rather than a hidden one.
+        regexp {num_items_on_flash:(\d+)} [r info all] _ _on_flash_before
+        r pexpire fetchexpire 200
+        regexp {num_items_on_flash:(\d+)} [r info all] _ _on_flash_after
+        assert {$_on_flash_after >= $_on_flash_before}
+
+        after 1000
         # GET triggers fetch from flash, but key is expired — should return nil
         assert_equal [r get fetchexpire] {}
         # Key should be fully gone

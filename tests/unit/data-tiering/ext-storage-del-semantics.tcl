@@ -38,10 +38,17 @@ proc debug_spill_wait {key} {
 # Non-embedded value so DEBUG SPILL accepts it
 proc big_val {} { return [string repeat z 300] }
 
+# Real FlashCache asserts on backing-file size inside getFileSize() before its
+# logger exists, so a missing or undersized file segfaults during init with no
+# usable message (the harness only reports "Can't start / No PID detected").
+# Pre-allocating removes that entirely. Harmless for the mock backend.
+set _fcpath "/tmp/valkey-flash-del-[pid].db"
+catch {exec fallocate -l 256M $_fcpath}
+
 start_server [list tags {"ext-storage" "ext-storage-del-semantics"} overrides [list \
     ext-storage-enabled yes \
     ext-storage-backend flashcache-mock \
-    ext-storage-path "/tmp/valkey-flash-del-[pid].db" \
+    ext-storage-path $_fcpath \
     ext-storage-capacity-mb 256 \
     maxmemory 50mb \
     maxmemory-policy allkeys-lru \
@@ -118,8 +125,17 @@ start_server [list tags {"ext-storage" "ext-storage-del-semantics"} overrides [l
     test {GET queued behind pending DEL sees the key as deleted} {
         # GET arriving while the DEL is draining must block, then observe
         # the post-delete keyspace (nil), never the placeholder.
-        r set racekey [big_val]
-        debug_spill_wait racekey
+        # Establish the key on flash and confirm it is STILL there immediately
+        # before the race. Earlier tests in this suite fill memory, so the key
+        # could be evicted between the spill and the DEL — DEL then returned 0
+        # and the failure looked like a product bug rather than a lost fixture.
+        set _established 0
+        for {set _try 0} {$_try < 5} {incr _try} {
+            r set racekey [big_val]
+            debug_spill_wait racekey
+            if {[r exists racekey]} { set _established 1; break }
+        }
+        assert_equal 1 $_established
         set rd [valkey_deferring_client]
         # Fire DEL and GET back-to-back on separate connections; DEL blocks
         # on the flash key, GET queues behind PENDING_DELETION.
