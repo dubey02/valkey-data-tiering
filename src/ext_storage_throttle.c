@@ -130,13 +130,30 @@ static long long throttleTimerProc(struct aeEventLoop *el, long long id, void *d
         ts.total_released++;
         released++;
 
-        /* Mark client so the next readQueryFromClient call skips throttle. */
-        c->flag.pending_command = 1;
-
-        /* Re-install read handler */
+        /* Re-install the read handler AND queue the client so whatever is
+         * already sitting in its query buffer actually gets processed.
+         *
+         * Re-arming on its own is not enough, and that was a permanent client
+         * wedge. The throttle hook runs at the TOP of readQueryFromClient,
+         * before readToQueryBuf/processInputBuffer, so a complete command that
+         * an earlier read left in querybuf is stranded when we disarm. A normal
+         * request/response client has sent that command and is now waiting for
+         * its reply -- it sends nothing further, so the socket never becomes
+         * readable again, readQueryFromClient is never called, and the buffered
+         * command is never executed. The client waits forever while the server
+         * stays healthy for every other connection. Observed as
+         * qbuf=1069 (one whole SET), blocked_clients=0, idle climbing.
+         *
+         * queueClientForReprocessing puts it on server.unblocked_clients, and
+         * processUnblockedClients re-arms the handler if needed and then calls
+         * processPendingCommandAndInputBuffer, which drains querybuf. That path
+         * does not re-enter the throttle, which is correct: this client's token
+         * was already consumed above, so its buffered command must not be
+         * charged again. */
         if (c->conn) {
             connSetReadHandler(c->conn, readQueryFromClient);
         }
+        queueClientForReprocessing(c);
     }
 
     if (listLength(ts.client_queue) > 0) {
@@ -339,11 +356,20 @@ int extStorageThrottle_shouldThrottle(client *c) {
 
     if (!ts.is_throttling) return 0;
 
-    /* Skip throttle for clients that were just released from the queue. */
-    if (c->flag.pending_command) {
-        c->flag.pending_command = 0;
-        return 0;
-    }
+    /* Deliberately does NOT inspect c->flag.pending_command.
+     *
+     * That flag belongs to the blocking framework: it means "this client has a
+     * PARSED command awaiting execution" (see blockClientInUseOnKeys, which
+     * asserts it is 1, and processPendingCommandAndInputBuffer, which calls
+     * processCommandAndResetClient on the strength of it). The throttle runs
+     * before parsing, so it never has a parsed command to describe, and reading
+     * plus clearing the flag here silently stole it from the blocking path.
+     *
+     * The "skip the throttle once after release" behaviour it was implementing
+     * is now achieved properly: a released client's buffered command is drained
+     * via processInputBuffer, which never enters this function, so it is not
+     * charged a second token. Genuinely new socket data is throttled normally,
+     * which is what should happen. */
 
     /* If there are already queued clients, new clients must queue too (FIFO fairness) */
     if (listLength(ts.client_queue) > 0) {
