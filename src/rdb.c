@@ -4203,8 +4203,7 @@ void saveCommand(client *c) {
     /* Data tiering: flash-resident values are snapshotted via the
      * materialization path (see rdbSave). Only refuse when the active
      * backend cannot support it (module-registered backends). */
-    if (ext_data_enabled && num_items_on_flash > 0 &&
-        !extStorageSnapshotSupported() && !extSnapshotStreamEnabled()) {
+    if (extSnapshotSaveWouldRefuse()) {
         addReplyError(c, "SAVE is not supported while values reside on external "
                          "storage: the active storage backend cannot snapshot "
                          "flash-resident values");
@@ -4253,8 +4252,7 @@ void bgsaveCommand(client *c) {
     }
 
     /* Data tiering: see saveCommand. */
-    if (ext_data_enabled && num_items_on_flash > 0 &&
-        !extStorageSnapshotSupported() && !extSnapshotStreamEnabled()) {
+    if (extSnapshotSaveWouldRefuse()) {
         addReplyError(c, "BGSAVE is not supported while values reside on external "
                          "storage: the active storage backend cannot snapshot "
                          "flash-resident values");

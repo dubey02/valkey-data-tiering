@@ -237,6 +237,14 @@ void extSnapshotSaveAfterForkParent(void);
  * returned NONE or was never called, so the child reaper can call it blindly. */
 void extSnapshotSaveEnd(void);
 
+/* Cheap pre-check for a command that wants to reject a save with a clean error
+ * reply before any save machinery runs: true when values live on flash and
+ * neither snapshot strategy is available. Deliberately an approximation --
+ * extSnapshotSaveBegin() makes the real decision, and can still refuse if the
+ * fork-read path fails to prepare. Exists so callers do not re-derive the
+ * condition from tiering internals. */
+int extSnapshotSaveWouldRefuse(void);
+
 /* ---------------------------------------------------------------------------
  * Resurrection barrier
  *

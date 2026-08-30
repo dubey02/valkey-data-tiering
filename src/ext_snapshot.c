@@ -943,3 +943,9 @@ void extSnapshotSaveEnd(void) {
     }
     g_save_mode = EXT_SNAP_SAVE_NONE;
 }
+
+int extSnapshotSaveWouldRefuse(void) {
+    if (!ext_data_enabled || num_items_on_flash <= 0) return 0;
+    if (extSnapshotStreamEnabled()) return 0;
+    return !extStorageSnapshotSupported();
+}
