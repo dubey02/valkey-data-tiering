@@ -29,6 +29,7 @@
 
 #include "server.h"
 #include "ext_storage.h"
+#include "ext_snapshot.h"
 #include "bio.h"
 #include "rio.h"
 #include "functions.h"

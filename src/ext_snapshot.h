@@ -310,4 +310,17 @@ int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t kle
  * filter actually engaged rather than passing vacuously. */
 long long extSnapshotOrphansDropped(void);
 
+/* ---------------------------------------------------------------------------
+ * Fork read snapshot (fallback strategy). Moved here from ext_storage.h so
+ * that one concern has one home -- see ext_snapshot.c for the reasoning.
+ * ---------------------------------------------------------------------------*/
+int extStorageSnapshotSupported(void);
+int extStorageSnapshotActive(void);
+int extStorageSnapshotPrepare(void);   /* main thread, before fork/save */
+void extStorageSnapshotResume(void);   /* parent, right after fork */
+void extStorageSnapshotDone(void);     /* child reaped / foreground save done */
+void extStorageSnapshotCountStreamSave(void);
+int extStorageMaterializeTiered(int dbid, robj *key, robj *val, char **payload, size_t *plen);
+sds genExternalStorageSnapshotInfoString(sds info);
+
 #endif /* EXT_SNAPSHOT_H */
