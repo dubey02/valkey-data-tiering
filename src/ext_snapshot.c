@@ -708,54 +708,6 @@ int extSnapshotDrainBarrier(void) {
     return C_ERR;
 }
 
-/* --- orphan filter -------------------------------------------------------- */
-
-static long long ext_snapshot_orphans_dropped = 0;
-
-long long extSnapshotOrphansDropped(void) { return ext_snapshot_orphans_dropped; }
-
-int extSnapshotRecordResolve(uint32_t physical_db_id, const char *key, size_t klen,
-                             int *logical_db, robj **out_entry) {
-    int logical = extStorageLogicalDbId((int)physical_db_id);
-    if (logical < 0 || logical >= server.dbnum) {
-        ext_snapshot_orphans_dropped++;
-        return 0;
-    }
-    serverDb *db = server.db[logical];
-
-    /* dbFind takes an sds, not an robj. */
-    sds kn = sdsnewlen(key, klen);
-    dbEntry *entry = dbFind(db, kn);
-
-    int live = 1;
-    if (entry == NULL) {
-        /* The engine has forgotten this key. The record is a leftover whose
-         * space has not been reclaimed. Writing it would resurrect the key. */
-        live = 0;
-    } else if (!objectIsTiered(entry)) {
-        /* Superseded: the value is back in memory, so the memory section of the
-         * snapshot already carries it and this record is stale. */
-        live = 0;
-    } else if (entry->tiering_state == TIERING_STATE_PENDING_DELETION) {
-        /* A client DEL already removed it logically; the flash copy is being
-         * deleted. Same condition extStorageMaterializeTiered rejects. */
-        live = 0;
-    }
-
-    sdsfree(kn);
-    if (!live) {
-        ext_snapshot_orphans_dropped++;
-        return 0;
-    }
-    if (logical_db) *logical_db = logical;
-    if (out_entry) *out_entry = entry;
-    return 1;
-}
-
-int extSnapshotRecordIsLive(uint32_t physical_db_id, const char *key, size_t klen) {
-    return extSnapshotRecordResolve(physical_db_id, key, klen, NULL, NULL);
-}
-
 /* --- transport self test ---------------------------------------------------*/
 
 static int txTestCountRecord(void *privdata, int logical_db, robj *entry,

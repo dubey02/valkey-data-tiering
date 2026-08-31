@@ -510,6 +510,7 @@ ENGINE_SERVER_OBJ = \
     ext_storage_bridge.o \
     ext_storage_throttle.o \
     ext_snapshot.o \
+    ext_snapshot_liveness.o \
     storage/storage_dispatch.o \
     storage/storage_middleware.o \
     storage/storage_mock.o \
