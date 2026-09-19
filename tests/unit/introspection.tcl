@@ -1363,6 +1363,10 @@ start_server {tags {"introspection"}} {
             rdma-bind
             rdma-port
             forkless-infrastructure-enabled
+            ext-storage-enabled
+            ext-storage-engine
+            ext-storage-path
+            ext-storage-capacity
         }
 
         if {!$::tls} {
