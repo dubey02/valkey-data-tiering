@@ -28,6 +28,10 @@ elseif (USE_TCMALLOC OR USE_TCMALLOC_MINIMAL)
     list(APPEND COMPILE_DEFINITIONS "USE_TCMALLOC")
 endif ()
 
+if (USE_ZSTD)
+    list(APPEND COMPILE_DEFINITIONS "HAVE_ZSTD")
+endif ()
+
 # Propagate the external-storage gate so the C++ gtest targets compile the
 # ext_storage tests. add_valkey_server_compiler_options() only reaches
 # CMAKE_C_FLAGS, so without this the C++ target sees test_ext_storage.cpp as
@@ -53,6 +57,9 @@ target_compile_options(valkeylib-gtest PRIVATE -Og -g -fno-lto)
 target_compile_definitions(valkeylib-gtest PRIVATE "${COMPILE_DEFINITIONS}")
 target_include_directories(valkeylib-gtest PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/deps)
 target_link_libraries(valkeylib-gtest PRIVATE ffc)
+if (USE_ZSTD)
+    target_link_libraries(valkeylib-gtest PRIVATE valkey_zstd)
+endif ()
 
 # Generate wrapper files from wrappers.h
 set(GENERATED_WRAPPERS_DIR ${CMAKE_BINARY_DIR}/gtest_generated)
