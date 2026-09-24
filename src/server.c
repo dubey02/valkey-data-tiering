@@ -50,6 +50,7 @@
 #include "fmtargs.h"
 #include "io_threads.h"
 #include "tls.h"
+#include "ext_storage.h"
 #include "sds.h"
 #include "module.h"
 #include "scripting_engine.h"
@@ -3258,6 +3259,18 @@ void initServer(void) {
     initSharedQueryBuf();
     bgIteration_init();
 
+    /* ext-storage on a build without tiering is a fatal config error, not a
+     * silently-ignored setting. */
+#ifndef USE_EXT_STORAGE
+    if (server.ext_storage_enabled) {
+        serverLog(LL_WARNING,
+                  "FATAL: ext-storage-enabled is set, but this valkey server was built without data tiering support. "
+                  "Rebuild with BUILD_EXT_STORAGE=yes (make) or -DBUILD_EXT_STORAGE=ON (cmake), or remove "
+                  "ext-storage-enabled from the configuration.");
+        exit(1);
+    }
+#endif
+
     /* Initialize ACL default password if it exists */
     ACLUpdateDefaultUserPassword(server.requirepass);
 
@@ -5284,6 +5297,12 @@ int finishShutdown(void) {
     /* Free the AOF manifest. */
     if (server.aof_manifest) aofManifestFree(server.aof_manifest);
 
+#ifdef USE_EXT_STORAGE
+    /* Close the storage engine after the final save. An engine that buffers
+     * writes can flush them now. */
+    extStorageDeinit();
+#endif
+
     /* Fire the shutdown modules event. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_SHUTDOWN, 0, NULL);
 
@@ -7157,6 +7176,16 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttleRepl_sdscatInfoMetrics(info);
     }
 
+#ifdef USE_EXT_STORAGE
+    /* Ext_storage section. Not in the default set. A plain INFO stays
+     * byte-identical to a build without tiering. */
+    if (all_sections || (dictFind(section_dict, "ext_storage") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscat(info, "# Ext_storage\r\n");
+        info = extStorageInfoString(info);
+    }
+#endif
+
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.
      * We're not aware of the module section names here, and we rather avoid the search when we can.
@@ -8131,6 +8160,12 @@ __attribute__((weak)) int main(int argc, char **argv) {
         moduleLoadFromQueue();
     }
     ACLLoadUsersAtStartup();
+
+#ifdef USE_EXT_STORAGE
+    /* Open the engine after modules load, so a module engine is available. */
+    if (server.ext_storage_enabled) extStorageInit();
+#endif
+
     initListeners();
     if (server.cluster_enabled) {
         clusterInitLast();
