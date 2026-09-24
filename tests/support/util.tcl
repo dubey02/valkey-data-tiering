@@ -1152,6 +1152,17 @@ proc config_get_set {param value {options {}}} {
     return $config
 }
 
+# Return whether a CONFIG parameter accepts a value without changing its
+# current setting.
+proc config_value_supported {client param value} {
+    set old [lindex [$client config get $param] 1]
+    set supported [expr {[catch {$client config set $param $value}] == 0}]
+    if {$supported} {
+        $client config set $param $old
+    }
+    return $supported
+}
+
 proc delete_lines_with_pattern {filename tmpfilename pattern} {
     set fh_in [open $filename r]
     set fh_out [open $tmpfilename w]
@@ -1468,4 +1479,30 @@ proc cluster_nodes_conf_path {id} {
     set dir [lindex [R $id config get dir] 1]
     set conf [lindex [R $id config get cluster-config-file] 1]
     return [file join $dir $conf]
+}
+
+# Return a finite operand `x` such that `x + x` overflows the server's `long double`.
+#
+# The width of `long double` is platform dependent, so no single constant works
+# everywhere:
+#
+#   x86-64 / aarch64 Linux   80-bit or 128-bit, LDBL_MAX ~1.19e4932
+#   Apple Silicon            long double == double, LDBL_MAX ~1.80e308
+#
+# Rather than branch on the build, ask the server: a value it cannot represent is
+# rejected when parsed as a long double, so the first candidate it accepts is the
+# right magnitude for this build.
+#
+# `level` selects the server instance, matching the convention of `r` (0 is the
+# current server, -1 the previous one, and so on).
+proc ldbl_overflow_operand {{level 0}} {
+    foreach candidate {1e4932 1e308} {
+        r $level set __ldbl_probe $candidate
+        if {![catch {r $level increx __ldbl_probe byfloat 0}]} {
+            r $level del __ldbl_probe
+            return $candidate
+        }
+    }
+    r $level del __ldbl_probe
+    error "no long double operand large enough to overflow on this platform"
 }
