@@ -16,9 +16,6 @@
 #define FC_SNAPSHOT_DEFAULT_KEEP_ALIVE_MSG_INTERVAL_US (5000000)                             // 5 seconds
 #define FC_SNAPSHOT_DEFAULT_MAX_REPLICATION_LINK_SECS (21600)                                // 6 hours
 
-#define FC_SNAPSHOT_EXPORT_PARKING_BUFFER_SIZE (1024 * 1024 * 200)         // The largest an item can be is 128 MiB
-#define FC_SNAPSHOT_EXPORT_DEFAULT_READ_BUFFER (1024 * 1024)               // 1 MiB
-
 extern snapshotMetrics snapshot_metrics;
 // The snapshot file contains 2 sections in the following order:
 // 1. Metadata section: The metadata of the snapshot is written from offset 0. The metadata contains information used
@@ -189,7 +186,7 @@ int isUnprocessedItemInSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size
  * Function to check if an item is within the snapshotting scope and already processed 
  * (added to the snapshot) when the range is not wrapped around or wrapped around.
  * 
- * This function is used by Threadsave to determine if we need to send a DEL command
+ * This function is used by forkless save to determine if we need to send a DEL command
  * on this item to Flashcache.
  */
 int isProcessedItemInSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size_t offset) {
@@ -216,7 +213,7 @@ int isProcessedItemInSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size_t
 /*
  * Functions to check if and item is within the snapshot offset range (from S to E).
  *
- * This function is used by Threadsave to determine if we need to propagate
+ * This function is used by forkless save to determine if we need to propagate
  * a flag add_item_to_rdb on this item back to ASIO.
  */
 int isItemInSnapshotRange(snapshotVersionTwoInfo *snapshot_info,
@@ -226,11 +223,11 @@ int isItemInSnapshotRange(snapshotVersionTwoInfo *snapshot_info,
 }
 
 // Not static since we use this function in unit test.
-int isThreadsaveReplication(snapshotVersionTwoInfo *snapshot_info) {
+int isForklessSaveReplication(snapshotVersionTwoInfo *snapshot_info) {
     return snapshot_info != NULL
            && snapshot_info->snapshot_common.is_running
            && (snapshot_info->snapshot_common.snapshot_writer != NULL
-               && snapshot_info->snapshot_save_type == FC_SAVE_TYPE_THREADSAVE);
+               && snapshot_info->snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE);
 }
 
 /*
@@ -439,9 +436,9 @@ static void resetSnapshotInfo(snapshotVersionTwoInfo *snapshot_info) {
     snapshot_info->checksum = 0;
     snapshot_info->checksum_filename = NULL;
     snapshot_info->eof_added = 0;
-    snapshot_info->snapshot_common.has_snapshotting_completed_in_redis_layer = 0;
+    snapshot_info->snapshot_common.has_snapshotting_completed_in_engine_layer = 0;
     snapshot_info->snapshot_save_type = FC_SAVE_TYPE_BGSAVE;
-    snapshot_info->is_waiting_for_redis_snapshotting_completion = 0;
+    snapshot_info->is_waiting_for_engine_snapshotting_completion = 0;
     snapshot_info->curr_num_delete_repl_cmd = 0;
     snapshot_info->curr_delete_repl_cmd_bytes = 0;
     snapshot_info->curr_num_items_deleted_from_pending_snapshot_range = 0;
@@ -478,9 +475,9 @@ static void snapshotV2Stop(snapshotVersionTwoInfo *snapshot_info, int completed)
         snapshot_info->snapshot_common.log_metrics->num_save_cancelled++;
     }
 
-    // Unpause the GC log compaction after Threadsave Replication is done.
+    // Unpause the GC log compaction after forkless save replication is done.
     if (snapshot_info->can_do_log_compaction && *(snapshot_info->can_do_log_compaction) == 0) {
-        flashcacheAssert(isThreadsaveReplication(snapshot_info));
+        flashcacheAssert(isForklessSaveReplication(snapshot_info));
         *(snapshot_info->can_do_log_compaction) = 1;
     }
 
@@ -613,7 +610,7 @@ void snapshotV2StartSave(snapshotVersionTwoInfo *snapshot_info,
                       snapshot_filename == NULL) || (snapshot_writer == NULL &&
                                                      file_based_snapshot_callback_details != NULL &&
                                                      snapshot_filename != NULL));
-    flashcacheAssert(snapshot_save_type == FC_SAVE_TYPE_BGSAVE || snapshot_save_type == FC_SAVE_TYPE_THREADSAVE);
+    flashcacheAssert(snapshot_save_type == FC_SAVE_TYPE_BGSAVE || snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE);
 
     // Reset snapshot info
     resetSnapshotInfo(snapshot_info);
@@ -678,10 +675,10 @@ void snapshotV2StartSave(snapshotVersionTwoInfo *snapshot_info,
     flashcacheAssert(snapshot_info->snapshot_file_write_offset == 0);
     writeSnapshotV2Metadata(snapshot_info);
 
-    // Pause GC log compaction in case of Threadsave stream based snapshot. It will be
+    // Pause GC log compaction in case of forkless save stream based snapshot. It will be
     // resumed after snapshotting completes. We need this to avoid any scenario of
     // item getting moved from snapshotting range which brings lot of complexity.
-    if (snapshot_save_type == FC_SAVE_TYPE_THREADSAVE && snapshot_writer != NULL
+    if (snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE && snapshot_writer != NULL
            && can_do_log_compaction) {
         *can_do_log_compaction = 0;
     }
@@ -757,19 +754,19 @@ void snapshotV2CronTask(snapshotVersionTwoInfo *snapshot_info) {
 
     if (!snapshot_info->eof_added && !snapshotV2IsLogReadingInProgress(snapshot_info) &&
         (snapshot_info->snapshot_data_generated_size_bytes == snapshot_file_size_at_completion)) {
-        // For stream based snapshot using threadsave when redis layer has not completed, skip EOF and continue.
-        // In this case we will wait and add EOF once Redis Layer completes the snapshotting generation.
-        if (snapshot_writer != NULL && snapshot_info->snapshot_save_type == FC_SAVE_TYPE_THREADSAVE &&
-            !snapshot_info->snapshot_common.has_snapshotting_completed_in_redis_layer) {
+        // For stream based snapshot using forkless save when the engine layer has not completed, skip EOF and continue.
+        // In this case we will wait and add EOF once the engine layer completes the snapshotting generation.
+        if (snapshot_writer != NULL && snapshot_info->snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE &&
+            !snapshot_info->snapshot_common.has_snapshotting_completed_in_engine_layer) {
             // Invoke log iteration completion callback
-            if (!snapshot_info->is_waiting_for_redis_snapshotting_completion) {
+            if (!snapshot_info->is_waiting_for_engine_snapshotting_completion) {
                 flashcacheLogIterationCallbackDetails log_iteration_completion_callback_details =
                         snapshot_info->log_iteration_completion_callback_details;
                 memset(&(snapshot_info->log_iteration_completion_callback_details), 0,
                        sizeof(flashcacheLogIterationCallbackDetails));
                 log_iteration_completion_callback_details.callback(
                         log_iteration_completion_callback_details.context);
-                snapshot_info->is_waiting_for_redis_snapshotting_completion = 1;
+                snapshot_info->is_waiting_for_engine_snapshotting_completion = 1;
             }
             return;
         }
@@ -819,29 +816,6 @@ static snapshotV2Metadata *readSnapshotV2Metadata(fioContext *snapshot_file_io_c
     flashcacheAssert(metadata != NULL);
     memcpy(metadata, snapshot_buffer, metadata_size);
     fcFree(snapshot_buffer);
-    return metadata;
-}
-
-// Overloaded function of the one above in order to work for snapshot exporter. This is needed because snapshot
-// exporter does not use fio, inherits the running checksum from processRDB, and cannot read the same bytes more than
-// once (in order to be pipe streaming safe).
-static snapshotV2Metadata *readSnapshotV2MetadataForSnapshotExporter(FILE *source_fdb, char *first_page) {
-    snapshotV2Metadata initial_metadata = { 0 };
-    memcpy(&initial_metadata, first_page, sizeof(snapshotV2Metadata));
-
-    size_t metadata_page_bytes_left = getSerializedSnapshotV2MetadataSize(initial_metadata.num_databases) - FC_PAGESIZE;
-    snapshotV2Metadata *metadata = (snapshotV2Metadata *)
-                                    fcMalloc(getSerializedSnapshotV2MetadataSize(initial_metadata.num_databases));
-
-    if (metadata_page_bytes_left > 0) {
-        // need more data for full metadata
-        memcpy(metadata, first_page, FC_PAGESIZE);
-        if (fread(metadata + FC_PAGESIZE, 1, metadata_page_bytes_left, source_fdb) != metadata_page_bytes_left) {
-            flashcacheAssertWithLogging(0, "Unable to read FDB Metadata", 0);
-        }
-    } else {
-        memcpy(metadata, first_page, getSnapshotV2MetadataSize(initial_metadata.num_databases));
-    }
     return metadata;
 }
 
@@ -1034,7 +1008,7 @@ int isUnprocessedItemInActiveSnapshotRange(snapshotVersionTwoInfo *snapshot_info
 }
 
 int snapshotV2ShouldExpediteItem(snapshotVersionTwoInfo *snapshot_info, size_t offset) {
-    return isUnprocessedItemInActiveSnapshotRange(snapshot_info, offset) && !isThreadsaveReplication(snapshot_info);
+    return isUnprocessedItemInActiveSnapshotRange(snapshot_info, offset) && !isForklessSaveReplication(snapshot_info);
 }
 
 // A function to expedite adding an item to the snapshot. If a snapshot is in progress and an item that
@@ -1042,9 +1016,9 @@ int snapshotV2ShouldExpediteItem(snapshotVersionTwoInfo *snapshot_info, size_t o
 // include the item in the snapshot before being deleted from FC.
 void snapshotV2AddExpeditedItem(snapshotVersionTwoInfo *snapshot_info, size_t offset, char *item, size_t item_size) {
     if (isUnprocessedItemInActiveSnapshotRange(snapshot_info, offset)) {
-        // When we are doing THREADSAVE replication, we will let read request to unprocessed item in
+        // When we are doing forkless save replication, we will let read request to unprocessed item in
         // snapshot range actually delete the item without expediting them and adding them to the snapshot.
-        if (isThreadsaveReplication(snapshot_info)) {
+        if (isForklessSaveReplication(snapshot_info)) {
             snapshot_info->curr_num_items_deleted_from_pending_snapshot_range++;
             snapshot_info->curr_items_deleted_from_pending_snapshot_range_bytes += item_size;
         } else {
@@ -1058,7 +1032,7 @@ void snapshotV2AddReplicationCommandIfRequired(snapshotVersionTwoInfo *snapshot_
                                                uint32_t dbid, char const *key, size_t key_len, char const *value,
                                                size_t value_len, flashcache_crc_function crc_function) {
     if (!snapshot_info->snapshot_common.is_running || snapshot_info->snapshot_common.has_failed
-        || !isThreadsaveReplication(snapshot_info))
+        || !isForklessSaveReplication(snapshot_info))
         return;
 
     // If item is already iterated by the log iterator, we will
@@ -1072,7 +1046,7 @@ void snapshotV2AddReplicationCommandIfRequired(snapshotVersionTwoInfo *snapshot_
                                                               serialized_item, serialized_item_len);
 
         // We need to update `curr_delete_repl_cmd_bytes` metric before calling `addDataToSnapshot` as its updated
-        // value is used in `addDataToSnapshot` function to determine the end of ThreadSave replication.
+        // value is used in `addDataToSnapshot` function to determine the end of forkless save replication.
         snapshot_info->curr_num_delete_repl_cmd++;
         snapshot_info->curr_delete_repl_cmd_bytes += serialized_item_len;
         addDataToSnapshot(snapshot_info, serialized_item, serialized_item_len);
@@ -1084,22 +1058,22 @@ void snapshotV2IncrementNumItemsAddedToRDB(snapshotVersionTwoInfo *snapshot_info
         snapshot_info->curr_num_items_with_add_to_rdb_flag++;
 }
 
-int snapshotV2IsItemInThreadsaveSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size_t offset) {
-    int is_threadsave_replication = isThreadsaveReplication(snapshot_info);
+int snapshotV2IsItemInForklessSaveSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size_t offset) {
+    int is_forkless_save_replication = isForklessSaveReplication(snapshot_info);
     int is_item_in_snapshot_range = isItemInSnapshotRange(snapshot_info, offset);
-    flashcacheLogger(FC_LL_DEBUG, "Threadsave related info : "
-                                  "HasSnapshotFailed = %d, IsThreadsaveReplication = %d, IsItemInSnapshotRange = %d, "
+    flashcacheLogger(FC_LL_DEBUG, "Forkless save related info : "
+                                  "HasSnapshotFailed = %d, IsForklessSaveReplication = %d, IsItemInSnapshotRange = %d, "
                                   "Offset = %lu", snapshot_info->snapshot_common.has_failed,
-                                  is_threadsave_replication, is_item_in_snapshot_range, offset);
-    if (snapshot_info->snapshot_common.has_failed || !is_threadsave_replication || !is_item_in_snapshot_range) return 0;
+                                  is_forkless_save_replication, is_item_in_snapshot_range, offset);
+    if (snapshot_info->snapshot_common.has_failed || !is_forkless_save_replication || !is_item_in_snapshot_range) return 0;
     return 1;
 }
 
 size_t snapshotV2GetCountBasedMetric(snapshotVersionTwoInfo *snapshot_info, flashcacheCountBasedMetrics metric) {
     size_t ret = 0;
     switch (metric) {
-        case FC_IS_WAITING_FOR_REDIS_SNAPSHOTTING_COMPLETION:
-            ret = snapshot_info->is_waiting_for_redis_snapshotting_completion;
+        case FC_IS_WAITING_FOR_ENGINE_SNAPSHOTTING_COMPLETION:
+            ret = snapshot_info->is_waiting_for_engine_snapshotting_completion;
             break;
         case FC_CURR_NUM_DELETE_REPL_CMD:
             ret = snapshot_info->curr_num_delete_repl_cmd;
@@ -1140,133 +1114,10 @@ size_t snapshotV2GetCountBasedMetric(snapshotVersionTwoInfo *snapshot_info, flas
     return ret;
 }
 
-void snapshotV2UpdateSnapshottingRangeDuringThreadsave(snapshotVersionTwoInfo *snapshot_info,
+void snapshotV2UpdateSnapshottingRangeDuringForklessSave(snapshotVersionTwoInfo *snapshot_info,
                                                        size_t updated_log_tail_offset_after_eviction) {
-    if (!isThreadsaveReplication(snapshot_info) || snapshot_info->snapshot_common.has_failed) return;
+    if (!isForklessSaveReplication(snapshot_info) || snapshot_info->snapshot_common.has_failed) return;
     snapshot_info->snapshot_common.log_file_tail_offset = updated_log_tail_offset_after_eviction;
-}
-
-static size_t calculate_buffer_size(size_t *partial_item_bytes_left) {
-    // By default, reads are performed by 1MB chunks
-    size_t buf = FC_MAX(FC_SNAPSHOT_EXPORT_DEFAULT_READ_BUFFER, *partial_item_bytes_left);
-    *partial_item_bytes_left = 0;
-    return buf;
-}
-
-static bool is_eof(char *item) {
-    uint32_t item_flag = getFlagInSerializedItem(item);
-    return item_flag == FC_EOF_INDICATOR;
-}
-
-static void adjust_parking_buffer(int head, int tail, char *parking_buffer) {
-    // starting point of data we want to keep
-    char *item = parking_buffer + head;
-    // reset everything else
-    memset(parking_buffer, 0, head);
-    // move the needed data to the beginning
-    memmove(parking_buffer, item, tail - head);
-}
-
-// Snapshot V2 specific algorithm for processing snapshot data for the snapshot exporter
-
-// The approach is to maintain a parking buffer which will store data read from the snapshot
-// file. This buffer will keep appending reads from the snapshot file to the end. There will
-// be a head and a tail. The tail will keep track of how much of the parking buffer has been
-// populated. The head will track how much of the populated buffer has been processed. Once
-// there is no room for the next read, the data at the head will be moved to the beginning of
-// the buffer- clearing the data that has already been processed. This will carry on until
-// the EOF is detected.
-// Returns -1 on failure, and 0 on success.
-int snapshotV2ProcessSourceFdbForSnapshotExporter(FILE *source_fdb,
-                                               FILE *target_rdb,
-                                               uint64_t *crc64_checksum,
-                                               flashcacheSnapshotSecret *rdb_secret,
-                                               char *first_page_in_source_fdb,
-                                               crc64_checksum_callback crc64_callback,
-                                               get_customer_dbid_and_ttl_callback dbid_and_ttl_callback) {
-    // Get the metadata and jump to where data bytes start
-    snapshotV2Metadata *snapshot_metadata = readSnapshotV2MetadataForSnapshotExporter(source_fdb,
-                                                                     first_page_in_source_fdb);
-    flashcacheAssertWithLogging(snapshot_metadata != NULL,
-                                "snapshot_metadata is NULL while processing Snapshot exporter", 0);
-    // Ensure the secrets match up
-    if (snapshot_metadata->snapshot_secret.size > 0 &&
-        (rdb_secret->size != snapshot_metadata->snapshot_secret.size ||
-        memcmp(rdb_secret->secret, snapshot_metadata->snapshot_secret.secret, rdb_secret->size) != 0)) {
-        flashcacheLogger(FC_LL_WARNING,
-                         "Snapshot Exporter- snapshotV2ProcessSourceFdbForSnapshotExporter:"
-                         "rdb & fdb secret do not match.", 0);
-        return -1;
-    }
-
-    // A buffer to park the data read from the snapshot prior to processing
-    char *parking_buffer = fcCalloc(FC_SNAPSHOT_EXPORT_PARKING_BUFFER_SIZE, sizeof(char));
-    int head = 0;
-    int tail = 0;
-    size_t partial_item_bytes_left = 0;
-    int eof_reached = 0;
-
-    while (!eof_reached) {
-        size_t buffer_size = calculate_buffer_size(&partial_item_bytes_left);
-        // If there is not sufficient space for the upcoming read, perform memmove on
-        // existing data
-        if (buffer_size >= (size_t)(FC_SNAPSHOT_EXPORT_PARKING_BUFFER_SIZE - tail)) {
-            adjust_parking_buffer(head, tail, parking_buffer);
-            // update the new heads and tails
-            tail = tail - head;
-            head = 0;
-        }
-        // Perform the read and ensure that it doesnt return an error.
-        // If there has been an error return -1.
-        int res = fread(parking_buffer + tail, 1, buffer_size, source_fdb);
-        if (res < (int)(buffer_size)) {
-            if (ferror(source_fdb)) {
-                // TODO: Do some specific error handling
-                flashcacheLogger(FC_LL_WARNING,
-                                "Snapshot Exporter- unable to read from source fdb file.", 0);
-                return -1;
-            }
-        }
-        tail += res;
-
-        // Check if there is enough data to process the header
-        if ((tail - head) < (int)(FC_ITEM_HEADER_LEN)) {
-            // there is not
-            continue;
-        }
-
-        // Process header
-        char *item = parking_buffer + head;
-        flashcacheAssert(validateHeaderInSerializedItem(item, flashcacheCrc32c));
-        size_t total_item_len = extractTotalLenFromSerializedItem(item);
-
-        // Check if there is enough data to process the full item
-        if ((tail - head) < (int)(total_item_len)) {
-            // There is not, so note down how many more bytes are needed
-            partial_item_bytes_left = total_item_len - (tail - head);
-            continue;
-        }
-
-        // Check if reached EOF
-        if (is_eof(item)){
-            eof_reached = 1;
-            break;
-        }
-
-        // Process item
-        if (snapshotExporterUpdateChecksumAndWriteItemToTargetFile(target_rdb,
-                                                               item,
-                                                               crc64_checksum,
-                                                               crc64_callback,
-                                                               dbid_and_ttl_callback) == -1) {
-            return -1;
-        }
-        // Item has been processed, so move the head
-        head += total_item_len;
-    }
-    fcFree(parking_buffer);
-    fcFree(snapshot_metadata);
-    return FC_OK;
 }
 
 // Only used for unit testing purposes
