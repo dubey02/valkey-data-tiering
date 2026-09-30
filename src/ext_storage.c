@@ -13,6 +13,7 @@
 
 #include "ext_storage.h"
 #include "rdb.h"
+#include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
 
 /* Holds a storage engine registered by a module. Built-in storage engines are
@@ -133,6 +134,9 @@ void extStorageInit(void) {
     const storageEngine *engine = storageLookupEngine(server.ext_storage_engine);
     if (engine == NULL && strcmp(server.ext_storage_engine, "mock") == 0) {
         engine = storageMockEngine();
+    }
+    if (engine == NULL && strcmp(server.ext_storage_engine, "flashcache") == 0) {
+        engine = storageFlashCacheEngine();
     }
     if (engine == NULL) {
         serverLog(LL_WARNING,
