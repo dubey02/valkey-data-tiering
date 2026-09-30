@@ -1367,6 +1367,7 @@ start_server {tags {"introspection"}} {
             ext-storage-engine
             ext-storage-path
             ext-storage-capacity
+            ext-storage-cpulist
         }
 
         if {!$::tls} {

@@ -13,6 +13,7 @@
 
 #include "ext_storage.h"
 #include "rdb.h"
+#include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
 
 /* Holds a storage engine registered by a module. Built-in storage engines are
@@ -120,6 +121,45 @@ const storageSerializer *extStorageSerializer(void) {
     return &ext_storage_serializer;
 }
 
+/* Runs first on every storage engine thread. */
+static void extStorageOnThreadStart(const char *name) {
+    valkey_set_thread_title(name);
+    serverSetCpuAffinity(server.ext_storage_cpulist);
+    makeThreadKillable();
+
+    /* Only the main thread may receive the watchdog signal. */
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGALRM);
+    int err = pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+    if (err) serverLog(LL_WARNING, "Warning: can't mask SIGALRM in the %s thread: %s", name, strerror(err));
+}
+
+static const storageThreadConfig ext_storage_thread_config = {
+    .stack_size = VALKEY_THREAD_STACK_SIZE,
+    .on_thread_start = extStorageOnThreadStart,
+};
+
+/* Forwards a storage engine log line to the valkey server log. */
+static void extStorageLog(storageLogLevel level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void extStorageLog(storageLogLevel level, const char *fmt, ...) {
+    int server_level;
+    switch (level) {
+    case STORAGE_LOG_DEBUG: server_level = LL_DEBUG; break;
+    case STORAGE_LOG_VERBOSE: server_level = LL_VERBOSE; break;
+    case STORAGE_LOG_NOTICE: server_level = LL_NOTICE; break;
+    default: server_level = LL_WARNING; break;
+    }
+    if (server_level < server.verbosity) return;
+
+    char msg[LOG_MAX_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    serverLogRaw(server_level, msg);
+}
+
 /* Storage Engine Initialization. */
 void extStorageInit(void) {
     serverAssert(server.ext_storage_enabled);
@@ -133,6 +173,9 @@ void extStorageInit(void) {
     const storageEngine *engine = storageLookupEngine(server.ext_storage_engine);
     if (engine == NULL && strcmp(server.ext_storage_engine, "mock") == 0) {
         engine = storageMockEngine();
+    }
+    if (engine == NULL && strcmp(server.ext_storage_engine, "flashcache") == 0) {
+        engine = storageFlashCacheEngine();
     }
     if (engine == NULL) {
         serverLog(LL_WARNING,
@@ -155,6 +198,8 @@ void extStorageInit(void) {
         .capacity_bytes = server.ext_storage_capacity,
         .num_databases = (uint32_t)server.dbnum,
         .serializer = ext_storage_serializer,
+        .thread_config = ext_storage_thread_config,
+        .logger = extStorageLog,
         /* No storage-engine-specific options are forwarded yet. The
          * configuration directive that collects them is future work. */
         .options = NULL,
@@ -181,6 +226,14 @@ void extStorageDeinit(void) {
     ext_storage.engine->close();
     ext_storage.open = 0;
     ext_storage.engine = NULL;
+}
+
+/* Crash handler only. Stops the storage engine threads with no cleanup. */
+void extStorageKillThreads(void) {
+    if (!ext_storage.open) return;
+    if (ext_storage.engine->kill_threads == NULL) return;
+    ext_storage.engine->kill_threads();
+    serverLog(LL_WARNING, "Storage engine \"%s\" threads terminated", ext_storage.engine->name);
 }
 
 /* Returns 1 when the storage engine is active, otherwise 0. */

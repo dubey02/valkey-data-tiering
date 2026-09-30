@@ -8,7 +8,9 @@
  *
  * A storage engine holds items spilled out of memory, addressed by (db_id, key)
  * where the key is raw bytes. It stores the serialized value bytes a callback
- * hands it, so a storage engine need not know the object layout. */
+ * hands it, so a storage engine need not know the object layout.
+ *
+ * Every call into a storage engine comes from the main thread. */
 
 #ifndef VALKEY_STORAGE_H
 #define VALKEY_STORAGE_H
@@ -47,7 +49,8 @@ typedef enum {
 
 /* Callbacks that convert between a keyspace entry and its serialized bytes. */
 typedef struct storageSerializer {
-    /* A keyspace entry to bytes. Returns the byte length, or -1 on failure. */
+    /* A keyspace entry to bytes. Returns the byte length, or -1 on failure. A
+     * storage engine reports a failure here as STORAGE_ERR_REJECTED. */
     int (*serialize)(const char *key, size_t key_len, const valkeyObject *entry, char **out);
 
     /* Bytes to a keyless value object. Returns NULL on a malformed buffer. */
@@ -71,7 +74,8 @@ typedef struct storageCompletion {
     storageStatus status;
     /* The database the record belongs to. */
     uint32_t db_id;
-    /* The keyless value object, for a successful GET. NULL otherwise. */
+    /* The keyless value object, for a successful GET. NULL otherwise. Owned by
+     * the caller once polled. */
     valkeyObject *value;
     /* The serialized size of the value, for a PUT. Zero otherwise. */
     size_t stored_bytes;
@@ -87,6 +91,25 @@ typedef struct storageOption {
     const char *value;
 } storageOption;
 
+/* Setup for the storage engine's threads. */
+typedef struct storageThreadConfig {
+    /* Minimum stack size in bytes. Zero means the platform default. */
+    size_t stack_size;
+    /* Called first on every storage engine thread, with the thread name. May be NULL. */
+    void (*on_thread_start)(const char *name);
+} storageThreadConfig;
+
+/* Log levels, lowest first. */
+typedef enum storageLogLevel {
+    STORAGE_LOG_DEBUG = 0,
+    STORAGE_LOG_VERBOSE,
+    STORAGE_LOG_NOTICE,
+    STORAGE_LOG_WARNING
+} storageLogLevel;
+
+/* Writes one line to the valkey server log. */
+typedef void (*storageLogFn)(storageLogLevel level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
 /* Settings a storage engine is opened with. */
 typedef struct storageConfig {
     /* Directory for the storage engine's data. */
@@ -97,6 +120,10 @@ typedef struct storageConfig {
     uint32_t num_databases;
     /* Serialization callbacks. */
     storageSerializer serializer;
+    /* Thread setup. */
+    storageThreadConfig thread_config;
+    /* Logging. Never NULL. */
+    storageLogFn logger;
     /* Storage-engine-specific options, forwarded uninterpreted by the valkey
      * server. Only the storage engine understands them. */
     const storageOption *options;
@@ -114,6 +141,8 @@ typedef struct storageStats {
     uint64_t total_num_items;
     /* Serialized bytes currently held. */
     uint64_t total_num_bytes;
+    /* Finished requests whose completion waits for poll_completions. */
+    uint64_t num_completions_pending;
 } storageStats;
 
 /* ---------------------------------------------------------------------------
@@ -129,15 +158,22 @@ typedef struct storageEngine {
 
     /* Opens the storage engine. */
     storageStatus (*open)(const storageConfig *cfg);
-    /* Closes the storage engine. */
+    /* Closes the storage engine. Anything still queued or unpolled is freed,
+     * not finished. A request in flight completes and its result is dropped.
+     * Caller should poll everything before calling this. */
     void (*close)(void);
+    /* Crash handler only. Stops the storage engine threads with no cleanup.
+     * May be NULL. */
+    void (*kill_threads)(void);
 
-    /* Asynchronous put, get, and delete. */
+    /* Asynchronous put, get, and delete. The key is freed by the caller
+     * after the call returns. The entry lives until its completion is polled. */
     storageStatus (*put_async)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx);
     storageStatus (*get_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
     storageStatus (*del_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
 
-    /* Collects finished asynchronous requests. */
+    /* Collects finished asynchronous requests, oldest first, at most max.
+     * Must not block the valkey server's main thread. */
     int (*poll_completions)(storageCompletion *out, int max);
 
     /* Reports the storage engine's counters. */
