@@ -1,0 +1,186 @@
+name: Data Tiering PR Benchmark
+
+# Add the run-tiering-benchmark label to a PR to benchmark it against its base
+# branch with the valkey-perf-benchmark Zipfian 80/20 tiering test.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+concurrency:
+  group: tiering-pr-benchmark
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: "bash -Eeuo pipefail -x {0}"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  PERF_BENCHMARK_REPO: ${{ vars.PERF_BENCHMARK_REPO || 'valkey-io/valkey-perf-benchmark' }}
+  PERF_BENCHMARK_REF: ${{ vars.PERF_BENCHMARK_REF || 'main' }}
+  NUM_RUNS: ${{ vars.TIERING_BENCHMARK_RUNS || '3' }}
+  FLASHCACHE_DIR: /mnt/nvme
+  FLASHCACHE_FILE: /mnt/nvme/flashcache.db
+  FLASHCACHE_CAPACITY: 8gb
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  PR_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+
+jobs:
+  benchmark:
+    if: github.event.label.name == 'run-tiering-benchmark'
+    runs-on: ["self-hosted", "data-tiering-benchmark-arm-pr"]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout valkey-data-tiering
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: valkey
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
+
+      - name: Checkout unstable for valkey-benchmark
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: valkey_bench
+          fetch-depth: 1
+          ref: unstable
+          persist-credentials: false
+
+      - name: Checkout valkey-perf-benchmark
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.PERF_BENCHMARK_REPO }}
+          ref: ${{ env.PERF_BENCHMARK_REF }}
+          path: valkey-perf-benchmark
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: kishaningithub/setup-python-amazon-linux@a326cdc792983fe0fbd04c81d3d62b59b6123a6c # v1.1.0
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        working-directory: valkey-perf-benchmark
+        run: |
+          sudo dnf install -y gcc gcc-c++ make cmake libaio-devel openssl-devel \
+              python3-devel bzip2-devel libffi-devel jq
+          pip install --require-hashes -r requirements.txt
+
+      # valkey-benchmark is built once from unstable, which has --zipfian and
+      # --keysize, so both legs use the same load generator.
+      - name: Build valkey-benchmark from unstable
+        working-directory: valkey_bench
+        run: |
+          make distclean || true
+          make -j"$(nproc)"
+          if ! ./src/valkey-benchmark --help 2>&1 | grep -q -- "--keysize"; then
+            echo "::error::valkey-benchmark on unstable has no --keysize, which the tiering config needs"
+            exit 1
+          fi
+          echo "VALKEY_BENCHMARK_PATH=$(pwd)/src/valkey-benchmark" >> "$GITHUB_ENV"
+
+      - name: Resolve the server address
+        run: |
+          TARGET_IP="${{ secrets.DT_BENCHMARK_IP }}"
+          if [[ -z "$TARGET_IP" ]]; then
+            TARGET_IP="$(hostname -I | awk '{print $1}')"
+          fi
+          echo "TARGET_IP=$TARGET_IP" >> "$GITHUB_ENV"
+
+      - name: Run base benchmark
+        working-directory: valkey-perf-benchmark
+        run: |
+          mountpoint -q "$FLASHCACHE_DIR"
+          sudo rm -f "$FLASHCACHE_FILE"
+          sudo fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
+          git -C ../valkey checkout --detach "$BASE_SHA"
+          python ./benchmark.py \
+            --config configs/tiering-zipfian-80-20.json \
+            --commits "$BASE_SHA" \
+            --valkey-path ../valkey \
+            --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
+            --target-ip "$TARGET_IP" \
+            --results-dir results \
+            --runs "$NUM_RUNS"
+          test "$(git -C ../valkey rev-parse HEAD)" = "$BASE_SHA"
+
+      - name: Run PR benchmark
+        working-directory: valkey-perf-benchmark
+        run: |
+          sudo rm -f "$FLASHCACHE_FILE"
+          sudo fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
+          git -C ../valkey checkout --detach "$PR_SHA"
+          python ./benchmark.py \
+            --config configs/tiering-zipfian-80-20.json \
+            --commits "$PR_SHA" \
+            --valkey-path ../valkey \
+            --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
+            --target-ip "$TARGET_IP" \
+            --results-dir results \
+            --runs "$NUM_RUNS"
+          test "$(git -C ../valkey rev-parse HEAD)" = "$PR_SHA"
+
+      - name: Compare results
+        working-directory: valkey-perf-benchmark
+        run: |
+          python ./utils/compare_benchmark_results.py \
+            --baseline "./results/$BASE_SHA/metrics.json" \
+            --new "./results/$PR_SHA/metrics.json" \
+            --output ../comparison.md
+          cat ../comparison.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tiering-benchmark-results
+          path: |
+            ./valkey-perf-benchmark/results/
+            comparison.md
+
+      - name: Comment PR with results
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('comparison.md', 'utf8');
+            const {owner, repo} = context.repo;
+            const sha = '${{ github.event.pull_request.head.sha }}';
+            const link = `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner,
+              repo,
+              body: `**Data tiering benchmark ran on this commit:** ${link}\n\n${body}`
+            });
+
+      - name: Cleanup
+        if: always()
+        continue-on-error: true
+        run: |
+          pkill -f valkey-server || true
+          sudo rm -f "$FLASHCACHE_FILE"
+          rm -rf comparison.md valkey valkey_bench
+
+      - name: Remove run-tiering-benchmark label
+        if: always()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.removeLabel({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'run-tiering-benchmark'
+            }).catch(err => console.log('label not present', err.message));
