@@ -403,6 +403,9 @@ BUILD_MODULE:=2
 
 # Data tiering
 ifeq ($(BUILD_EXT_STORAGE),yes)
+ifneq ($(uname_S),Linux)
+    $(error BUILD_EXT_STORAGE requires Linux (libaio))
+endif
 	FINAL_CFLAGS+=-DUSE_EXT_STORAGE=$(BUILD_YES)
 	DEPENDENCY_TARGETS+= flashcache
 	FINAL_CFLAGS+= -I../deps/flashcache/src
