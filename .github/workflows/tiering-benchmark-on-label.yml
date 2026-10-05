@@ -9,16 +9,31 @@ on:
     types: [labeled]
   workflow_dispatch:
     inputs:
+      pr_number:
+        description: "PR number to benchmark against its base. Overrides base_ref and pr_ref"
+        required: false
       base_ref:
-        description: "Base commit or branch"
-        required: true
+        description: "Base commit or branch, used when pr_number is empty"
+        required: false
         default: unstable
       pr_ref:
-        description: "Commit or branch to compare against the base"
-        required: true
+        description: "Commit or branch to compare against the base, used when pr_number is empty"
+        required: false
+      instance_type:
+        description: "EC2 instance type. Empty uses DT_INSTANCE_TYPE or r8gd.2xlarge"
+        required: false
+      aws_region:
+        description: "AWS region. Empty uses DT_AWS_REGION or us-west-2. DT_SUBNET_ID must be in this region"
+        required: false
+      perf_benchmark_repo:
+        description: "valkey-perf-benchmark repo. Empty uses PERF_BENCHMARK_REPO or valkey-io/valkey-perf-benchmark"
+        required: false
+      perf_benchmark_ref:
+        description: "valkey-perf-benchmark branch or commit. Empty uses PERF_BENCHMARK_REF or main"
+        required: false
 
 concurrency:
-  group: tiering-pr-benchmark-${{ github.event.pull_request.number || github.run_id }}
+  group: tiering-pr-benchmark-${{ github.event.pull_request.number || inputs.pr_number || github.run_id }}
   cancel-in-progress: false
 
 defaults:
@@ -29,9 +44,11 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ${{ vars.DT_AWS_REGION || 'us-west-2' }}
-  INSTANCE_TYPE: ${{ vars.DT_INSTANCE_TYPE || 'r8gd.2xlarge' }}
+  AWS_REGION: ${{ inputs.aws_region || vars.DT_AWS_REGION || 'us-west-2' }}
+  INSTANCE_TYPE: ${{ inputs.instance_type || vars.DT_INSTANCE_TYPE || 'r8gd.2xlarge' }}
   VALKEY_REPO: ${{ vars.DT_VALKEY_REPO || github.repository }}
+  PERF_BENCHMARK_REPO: ${{ inputs.perf_benchmark_repo || vars.PERF_BENCHMARK_REPO || 'valkey-io/valkey-perf-benchmark' }}
+  PERF_BENCHMARK_REF: ${{ inputs.perf_benchmark_ref || vars.PERF_BENCHMARK_REF || 'main' }}
 
 jobs:
   start-runner:
@@ -48,27 +65,39 @@ jobs:
       security-group-id: ${{ steps.sg.outputs.security-group-id }}
       base-sha: ${{ steps.refs.outputs.base-sha }}
       pr-sha: ${{ steps.refs.outputs.pr-sha }}
+      head-sha: ${{ steps.refs.outputs.head-sha }}
+      pr-number: ${{ steps.refs.outputs.pr-number }}
     steps:
       - name: Resolve commits
         id: refs
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_MERGE: ${{ github.event.pull_request.merge_commit_sha }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          IN_PR_NUMBER: ${{ inputs.pr_number }}
           IN_BASE: ${{ inputs.base_ref }}
           IN_PR: ${{ inputs.pr_ref }}
         run: |
-          if [[ "$EVENT" == pull_request_target ]]; then
-            BASE=$PR_BASE
-            PR=$PR_MERGE
+          NUMBER=${EVENT_PR:-$IN_PR_NUMBER}
+          if [[ -n "$NUMBER" ]]; then
+            PULL=$(gh api "repos/$VALKEY_REPO/pulls/$NUMBER")
+            BASE=$(jq -r .base.sha <<< "$PULL")
+            PR=$(jq -r .merge_commit_sha <<< "$PULL")
+            HEAD=$(jq -r .head.sha <<< "$PULL")
+            [[ "$PR" != null && -n "$PR" ]] || { echo "::error::PR #$NUMBER has no merge commit (conflicts?)"; exit 1; }
           else
-            BASE=$(gh api "repos/$VALKEY_REPO/commits/$IN_BASE" --jq .sha)
+            [[ -n "$IN_PR" ]] || { echo "::error::set pr_number, or pr_ref"; exit 1; }
+            BASE=$(gh api "repos/$VALKEY_REPO/commits/${IN_BASE:-unstable}" --jq .sha)
             PR=$(gh api "repos/$VALKEY_REPO/commits/$IN_PR" --jq .sha)
+            HEAD=$PR
           fi
-          echo "base-sha=$BASE" >> "$GITHUB_OUTPUT"
-          echo "pr-sha=$PR" >> "$GITHUB_OUTPUT"
-          echo "base $BASE, pr $PR"
+          {
+            echo "base-sha=$BASE"
+            echo "pr-sha=$PR"
+            echo "head-sha=$HEAD"
+            echo "pr-number=$NUMBER"
+          } >> "$GITHUB_OUTPUT"
+          echo "pr #${NUMBER:-none}, base $BASE, pr $PR, $INSTANCE_TYPE in $AWS_REGION, $PERF_BENCHMARK_REPO@$PERF_BENCHMARK_REF"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -191,8 +220,8 @@ jobs:
       - name: Checkout valkey-perf-benchmark
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          repository: ${{ vars.PERF_BENCHMARK_REPO || 'valkey-io/valkey-perf-benchmark' }}
-          ref: ${{ vars.PERF_BENCHMARK_REF || 'main' }}
+          repository: ${{ env.PERF_BENCHMARK_REPO }}
+          ref: ${{ env.PERF_BENCHMARK_REF }}
           path: valkey-perf-benchmark
           fetch-depth: 1
           persist-credentials: false
@@ -298,7 +327,9 @@ jobs:
 
   report:
     needs: [start-runner, benchmark]
-    if: always() && github.event_name == 'pull_request_target' && needs.start-runner.result != 'skipped'
+    if: >-
+      always() && needs.start-runner.result != 'skipped' &&
+      needs.start-runner.outputs.pr-number != '' && (vars.DT_VALKEY_REPO || github.repository) == github.repository
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -318,16 +349,17 @@ jobs:
             const fs = require('fs');
             const body = fs.readFileSync('comparison.md', 'utf8');
             const {owner, repo} = context.repo;
-            const sha = context.payload.pull_request.head.sha;
+            const sha = '${{ needs.start-runner.outputs.head-sha }}';
             const link = `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
             await github.rest.issues.createComment({
-              issue_number: context.issue.number,
+              issue_number: Number('${{ needs.start-runner.outputs.pr-number }}'),
               owner,
               repo,
               body: `**Data tiering benchmark ran on this commit:** ${link}\n\n${body}`
             });
 
       - name: Remove run-tiering-benchmark label
+        if: github.event_name == 'pull_request_target'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
