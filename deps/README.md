@@ -9,6 +9,7 @@ should be provided by the operating system.
 * **hdr_histogram** Used for per-command latency tracking histograms.
 * **ffc.h** is a C99 port of the fast_float library, used as a replacement for strtod to convert strings to floats efficiently.
 * **gtest-parallel** is a script for running googletest tests in parallel.
+* **flashcache** is the storage engine for data tiering. It is built only with `BUILD_EXT_STORAGE=yes` and needs libaio.
 
 How to upgrade the above dependencies
 ===

@@ -404,6 +404,9 @@ BUILD_MODULE:=2
 # Data tiering
 ifeq ($(BUILD_EXT_STORAGE),yes)
 	FINAL_CFLAGS+=-DUSE_EXT_STORAGE=$(BUILD_YES)
+	DEPENDENCY_TARGETS+= flashcache
+	FINAL_CFLAGS+= -I../deps/flashcache/src
+	FINAL_LIBS := ../deps/flashcache/build/libflashcache.a $(FINAL_LIBS) -laio
 endif
 
 ifeq ($(BUILD_TLS),yes)
@@ -873,6 +876,13 @@ test: $(ALL_BUILD_PREREQUISITES)
 
 test-unit:
 	@(cd unit && $(MAKE) test-unit)
+
+# Storage engine (FlashCache) unit tests
+test-storage:
+	@(cd ../deps && $(MAKE) flashcache FLASHCACHE_TESTS=yes gtest-parallel)
+	@(cd ../deps/flashcache/build/tst/unit && python3 ../../../../gtest-parallel/gtest_parallel.py ./unitTests --timeout_per_test 600 --gtest_filter=$(UNIT_TEST_PATTERN)*)
+
+.PHONY: test-storage
 
 # valkey-unit-gtests
 $(ENGINE_UNIT_GTESTS): $(ENGINE_LIB_NAME)
