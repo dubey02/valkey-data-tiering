@@ -2169,7 +2169,7 @@ TEST_P(SingleDbLogTest, testLogShouldRunCronTasksImmediatelyDuringIndexGrowth) {
     ASSERT_FALSE(logShouldRunCronTasksImmediately(log));
 }
 
-/**
+/*
  * This tests validates the following scenario:
  * 1. Let say we have 3 items (A, B, C) in a bucket that have the same collision hash.
  * 2. The order of the items in the bucket is the following: A -> B -> C
@@ -2260,7 +2260,7 @@ TEST_P(SingleDbLogTest, testReadRequestWithItemsHavingSameCollisionHashAndGrowth
     ASSERT_EQ(logGetCountBasedMetric(log, FC_NUM_UNUSED_DISK_READ_HASH_COLLISION), 2);
 }
 
-/**
+/*
  * This validates that pending read request which was marked Invalid because of same collision hash
  * should succeed with index growth in place. Lets take an example and understand
  * K1 -> (KEY1, IH, CH) ,  K2 -> (KEY2, IH, CH1) ,  K3 -> (KEY3, IH, CH)

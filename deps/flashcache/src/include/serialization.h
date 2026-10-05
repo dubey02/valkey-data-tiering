@@ -76,7 +76,7 @@ void serializeKeyValuePair(uint32_t dbid, char const *key, size_t key_len, char 
 void updateFlagInSerializedItem(char *serialized_item, int32_t flag,
         flashcache_crc_function crc_function);
 
-/**
+/*
  * Serializes the key/value pair with flag into serialized item. This function is generic enough to support all kinds of
  * replication command like READ/WRITE/DELETE or EOF marker for Snapshot file based on different flags.
  * For read/delete command, value will be NULL and value_len will be 0. This function allocates the memory of the

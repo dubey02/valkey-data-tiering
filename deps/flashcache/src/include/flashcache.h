@@ -5,23 +5,23 @@
 
 #include "include/flashcache_common.h"
 
-/*!\brief Initializes flashcache store
+/* Initializes flashcache store
  *
- * @param db_filename the name of the file used to store data on flash
- * @param db_size_bytes the size of file used to store data on flash
- * @param initial_index_size_per_db the initial size of in-memory dictionary used to store the index of a database
- * @param num_databases number of databases
- * @param max_allocated_db_size_percent maximum allowed allocated log size as a percentage of db_size_bytes.
+ * db_filename: the name of the file used to store data on flash
+ * db_size_bytes: the size of file used to store data on flash
+ * initial_index_size_per_db: the initial size of in-memory dictionary used to store the index of a database
+ * num_databases: number of databases
+ * max_allocated_db_size_percent: maximum allowed allocated log size as a percentage of db_size_bytes.
  *        When the allocated db size becomes greater than this threshold, keys are evicted from the db.
- * @param max_num_in_flight_read_requests The maximum allowed number of in-flight READ item requests in the queue
+ * max_num_in_flight_read_requests: The maximum allowed number of in-flight READ item requests in the queue
  *        before the read requests start to get throttled
  * param evict_under_max_logsize_time_limit longest amount of time that eviction under max logsize can
  *       run without a signal from the engine
- * @param hash_function function pointer used for hashing keys
- * @param crc_function function pointer used for computing checksum of data stored on flash
- * @param eviction_details the details of callback called when a key is evicted
- * @param logger log function to be used by this library
- * @param storage_io_thread_control_msg_callback_details details of the storage IO thread callback to handle control messages
+ * hash_function: function pointer used for hashing keys
+ * crc_function: function pointer used for computing checksum of data stored on flash
+ * eviction_details: the details of callback called when a key is evicted
+ * logger: log function to be used by this library
+ * storage_io_thread_control_msg_callback_details: details of the storage IO thread callback to handle control messages
  *        in a timely fashion.
  */
 flashcacheReturnCode flashcacheInit(char const *db_filename,
@@ -38,7 +38,7 @@ flashcacheReturnCode flashcacheInit(char const *db_filename,
         flashcache_logger logger,
         flashcacheStorageIoThreadControlMsgCallbackDetails *storage_io_thread_control_msg_callback_details);
 
-/*!\brief Stores the provided value against the provided key and db id
+/* Stores the provided value against the provided key and db id
  *
  * The key and value is copied internally. The caller can free them
  * immediately after calling this API.
@@ -46,7 +46,7 @@ flashcacheReturnCode flashcacheInit(char const *db_filename,
 flashcacheReturnCode flashcachePutItem(uint32_t dbid, char const *key, size_t key_len,
         char const *value, size_t value_len);
 
-/*!\brief Retrieve the value against the provided key and db id
+/* Retrieve the value against the provided key and db id
  *
  * The key is copied internally. The caller can free them immediately
  * after calling this API. This is an asynchronous API. Once the value is
@@ -57,17 +57,17 @@ flashcacheReturnCode flashcachePutItem(uint32_t dbid, char const *key, size_t ke
 flashcacheReturnCode flashcacheGetItem(uint32_t dbid, char const *key, size_t key_len,
         flashcacheReadTypes read_type, void *request_context, flashcache_get_item_callback completion_callback);
 
-/*!\brief Starts taking a point in time snapshot in a snapshot file
+/* Starts taking a point in time snapshot in a snapshot file
  *
  * This function starts taking a point in time snapshot of the store. All changes performed by the read (which
  * deletes item) and write request before this call is present in the snapshot. The snapshot is stored in the
  * specified snapshot file. Once the snapshot file is created, the completion callback is invoked.
- * @Returns : Void
- * @param snapshot_filename : Name of a file in which snapshot will be captured
- * @param snapshot_secret : Snapshot Secret which will be used for preparing rdb/fdb correlation secret.
- * @param completion_callback_details : Callback function which will be called after completion of file based snapshot.
- * @param checksum_verification_enabled : A flag for whether checksum verification for the whole snapshot is needed.
- * @param snapshot_version : The version of the snapshot to use in the current save attempt.
+ * Returns Void
+ * snapshot_filename: Name of a file in which snapshot will be captured
+ * snapshot_secret: Snapshot Secret which will be used for preparing rdb/fdb correlation secret.
+ * completion_callback_details: Callback function which will be called after completion of file based snapshot.
+ * checksum_verification_enabled: A flag for whether checksum verification for the whole snapshot is needed.
+ * snapshot_version: The version of the snapshot to use in the current save attempt.
  */
 void flashcacheStartFileBasedSave(char const *snapshot_filename,
         flashcacheSnapshotSecret *snapshot_secret,
@@ -76,20 +76,20 @@ void flashcacheStartFileBasedSave(char const *snapshot_filename,
         flashcacheSnapshotVersion snapshot_version,
         flashcacheSnapshotSaveType snapshot_save_type);
 
-/*!\brief Cancels any ongoing snapshot */
+/* Cancels any ongoing snapshot */
 void flashcacheCancelSave();
 
-/*!\brief Load the snapshot from the specified file. The current data in the store is removed during loading the
+/* Load the snapshot from the specified file. The current data in the store is removed during loading the
  * snapshot
- * @param snapshot_filename: name of the file to load snapshot from.
- * @param secret_response: an output parameter to return the secret in the snapshot to the caller.
- * @param checksum_comparison_result: an output parameter to return the result of checksum verification to the caller.
+ * snapshot_filename: name of the file to load snapshot from.
+ * secret_response: an output parameter to return the secret in the snapshot to the caller.
+ * checksum_comparison_result: an output parameter to return the result of checksum verification to the caller.
  * */
 void flashcacheLoadSnapshot(char const *snapshot_filename,
                             flashcacheSnapshotSecret *secret_response,
                             int *checksum_comparison_result);
 
-/*!\brief Runs cron tasks like garbage collection.
+/* Runs cron tasks like garbage collection.
  *
  * This API also processes the pending get data requests that are waiting
  * on the data being fetched from flash. The expectation from the caller
@@ -110,35 +110,35 @@ flashcacheReturnCode flashcacheForkChildReadItem(uint32_t dbid, char const *key,
 
 flashcacheReturnCode flashcacheRunCronTasks();
 
-/*!\brief Returns the value associated with the specified metric */
+/* Returns the value associated with the specified metric */
 size_t flashcacheGetCountBasedMetric(flashcacheCountBasedMetrics metric);
 
-/*!\brief Fetches histogram for the specified histogram metric */
+/* Fetches histogram for the specified histogram metric */
 void flashcacheGetHistogramMetrics(flashcacheHistogramMetrics metric,
         unsigned long long histogram[], const size_t histogram_size);
 
-/*!\brief Fetches histogram interval for the specified histogram metric */
+/* Fetches histogram interval for the specified histogram metric */
 void flashcacheGetHistogramIntervals(flashcacheHistogramMetrics metric,
         flashcacheHistogramInterval histogram_interval[], const size_t interval_size);
 
-/*!\brief Tear down the current instance of flashcache. */
+/* Tear down the current instance of flashcache. */
 flashcacheReturnCode flashcacheTearDown();
 
-/*!\brief Delete all keys for a given db id on flashcache layer
+/* Delete all keys for a given db id on flashcache layer
  *
  * This API works synchronously so the caller will be blocked while
  * all pending reads complete, pending snapshots get cancelled.
  */
 flashcacheReturnCode flashcacheFlushDB(uint32_t dbid);
 
-/*!\brief Delete all keys for all DBs
+/* Delete all keys for all DBs
  *
  * This API works synchronously so the caller will be blocked while
  * all pending reads complete, pending snapshots get cancelled.
  */
 flashcacheReturnCode flashcacheFlushAllDBs();
 
-/*!\brief Returns 1 if there are pending cron tasks that needs to be processed immediately else returns 0
+/* Returns 1 if there are pending cron tasks that needs to be processed immediately else returns 0
  *
  * This API helps the caller know that there are no more pending cron task left at the moment. when this API return
  * 0, the caller can choose to sleep for a small amount of time. This helps the caller to avoid spinning continuously
@@ -147,15 +147,15 @@ flashcacheReturnCode flashcacheFlushAllDBs();
  */
 int flashcacheShouldRunCronTasksImmediately();
 
-/**!\brief Starts taking a point in time snapshot using snapshot writer
+/* Starts taking a point in time snapshot using snapshot writer
  *
  * This API starts taking a point in time stream based snapshot of the store. It uses snapshot writer to write
  * snapshot chunks. This is primarily used for replication.
- * @Returns : Void
- * @param snapshot_secret : Snapshot Secret which will be used for preparing rdb/fdb correlation secret.
- * @param snapshot_writer : Pointer of a flashcacheSnapshotWriter which contains bunch of APIs for stream based snapshot.
- * @param snapshot_version : The version of the snapshot to use in the current save attempt.
- * @param log_iteration_completion_callback_details : Callback which needs to be called after completion of log
+ * Returns Void
+ * snapshot_secret: Snapshot Secret which will be used for preparing rdb/fdb correlation secret.
+ * snapshot_writer: Pointer of a flashcacheSnapshotWriter which contains bunch of APIs for stream based snapshot.
+ * snapshot_version: The version of the snapshot to use in the current save attempt.
+ * log_iteration_completion_callback_details: Callback which needs to be called after completion of log
  *                          iteration in forkless save replication. Note: we do shallow copy of this callback currently
  *                          but deep copy might be required if we change it in future by adding any allocated memory.
  */
@@ -165,36 +165,34 @@ void flashcacheStartStreamBasedSave(flashcacheSnapshotSecret *snapshot_secret,
                                     flashcacheSnapshotSaveType snapshot_save_type,
                                     flashcacheLogIterationCallbackDetails *log_iteration_completion_callback_details);
 
-/**!\brief Set the specified config
+/* Set the specified config
  *
- * @Returns : Void
- * @param :
+ * Returns Void
  * config: The details of the config to set.
  */
 void flashcacheSetConfig(flashcacheConfig *config);
 
-/**!\brief Get the value for the specified key in the configuration. The retrieved value is set in the provided config
+/* Get the value for the specified key in the configuration. The retrieved value is set in the provided config
  * itself.
  *
- * @Returns : Void
- * @param :
+ * Returns Void
  * config: The details of the config to get.
  */
 void flashcacheGetConfig(flashcacheConfig *config);
 
-/**!\brief Flush buffered writes to disk
+/* Flush buffered writes to disk
  *
- * @Returns : Void
+ * Returns Void
  */
 void flashcacheFsyncBufferedWrites();
 
-/**!\brief Notifies engine layer snapshot completion
+/* Notifies engine layer snapshot completion
  *
- * @Returns : Void
+ * Returns Void
  */
 void flashcacheNotifyEngineLayerSnapshotCompletion();
 
-/*!\brief Check if a key exists in the FlashCache index (no disk I/O). */
+/* Check if a key exists in the FlashCache index (no disk I/O). */
 int flashcacheKeyExists(uint32_t dbid, char const *key, size_t key_len);
 
 #endif  // __FLASHCACHE_H

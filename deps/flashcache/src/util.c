@@ -26,7 +26,7 @@ int isPowerOf2(size_t v) {
     return ((v & (v - 1)) == 0);
 }
 
-/**
+/*
  * Returns the number of bits required to hold the given number of elements
  */
 int getNumBitsRequired(size_t num) {
@@ -34,7 +34,7 @@ int getNumBitsRequired(size_t num) {
     return ceil(log(num) / log(2));
 }
 
-/**
+/*
  * Computes Index Hash. Lets understand it with an example, for eg:
  *
  * hash = 1011010001101101 0001101101000110 1101000110110100 0110110100011010  (64 bits)

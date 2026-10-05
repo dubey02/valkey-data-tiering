@@ -18,7 +18,7 @@
         FC_LOG_ENTRY_COLLISION_HASHBITS)
 
 typedef struct logEntry {
-    /**
+    /*
      * The on flash flag is used to determine if the item is on flash or in
      * memory. We use a union of staging buffer ptr and a log entry to store the
      * reference of the item in index entry. The most significant bit is used as
@@ -29,7 +29,7 @@ typedef struct logEntry {
      */
     uint8_t on_flash               : FC_LOG_ENTRY_ON_FLASH_BITS;
 
-    /**
+    /*
      * Hash used to avoid collision when multiple entries are mapped to the same
      * hash bucket. This hash is also used to grow the hash table without the need
      * of fetch the key from flash and rehashing the key. The maximum size of the

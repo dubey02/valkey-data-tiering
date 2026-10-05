@@ -143,7 +143,7 @@ loadThrottleState snapshot_load_write_throttle_state = {0};
 /* Data structure to track metrics related to snapshots */
 snapshotMetrics snapshot_metrics = {0};
 
-/**
+/*
  * Test-only function (kept non-static to use in unit-tests)
  * Sets the system to throttle writes during `throttle_duration` cycles of the snapshot load read/write
  * main loop.
@@ -154,7 +154,7 @@ void snapshotThrottleLoadWrite(unsigned int throttle_duration) {
     snapshot_load_write_throttle_state.load_throttle_counter = throttle_duration;
 }
 
-/**
+/*
  * Test-only function (kept non-static to use in unit-tests)
  * Disables snapshot load write throttling.
  */
@@ -164,7 +164,7 @@ void snapshotUnthrottleLoadWrite() {
     snapshot_load_write_throttle_state.load_throttle_counter = 0;
 }
 
-/**
+/*
  * Enabled-during-tests-only-function (should not return true in production)
  * Used from the main snapshot load loop to throttle writes and test staging buffer limits.
  */
@@ -180,7 +180,7 @@ static int isSnapshotLoadWriteThrottled() {
     }
 }
 
-/**
+/*
  * Used to track the maximum load staging buffer size seeing during the last load operation.
  * For the time being this is used for test only but could be exported as a Flahscache metric
  * at a later time.

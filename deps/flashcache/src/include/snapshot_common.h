@@ -109,48 +109,48 @@ typedef struct snapshotInfoCreateParameters {
     flashcache_crc_function crc_function;
 } snapshotInfoCreateParameters;
 
-/**
+/*
  * Create FIO requests.
- * @param A list of available FIO
- * @return an FIO to use
+ * A: list of available FIO
+ * Returns an FIO to use
  */
 fioRequest *getFreeFioData(fioRequest *fio_requests);
 
 
-/**
+/*
  * Flush an item from the staging buffer.
- * @param io_context IO context
- * @param fio_request FIO request
- * @param staging_buffer Staging buffer
- * @param entry entry to flush
- * @param offset offset of the entry to flush.
- * @return The number of bytes flushed.
+ * io_context: IO context
+ * fio_request: FIO request
+ * staging_buffer: Staging buffer
+ * entry: entry to flush
+ * offset: offset of the entry to flush.
+ * Returns The number of bytes flushed.
  */
 size_t flushItemFromStagingBuffer(fioContext *io_context, fioRequest *fio_request, stagingBuffer* staging_buffer,
                                   stagingBufferEntry *entry, size_t offset);
 
-/**
+/*
  * Read and item from an FIO context in a blocking fashion.
- * @param io_context IO context.
- * @param offset offset of the item to read.
- * @param size of the item to read
- * @return item read.
+ * io_context: IO context.
+ * offset: offset of the item to read.
+ * size: of the item to read
+ * Returns item read.
  */
 char *readItemBlocking(fioContext *io_context, size_t offset, size_t size);
 
-/**
+/*
  * Call the snapshot completion callback.
- * @param snapshot_common instance of the common fields between all snapshot version.
- * @param completed status of completion 1 success 0 failure
+ * snapshot_common: instance of the common fields between all snapshot version.
+ * completed: status of completion 1 success 0 failure
  */
 void invokeCompletionCallback(snapshotCommon *snapshot_common, int completed);
 
-/**
+/*
  * In file based save create the snapshot file context and in Stream based initiate the stream.
- * @param snapshot_common instance of the common fields between all snapshot version.
- * @param snapshot_filename used to name the file in file based snapshot
- * @param monotonic_clock_us instance of the monotonic clock
- * @param snapshot_file_total_size_bytes number of bytes to allocate to the file or expect the stream to receive.
+ * snapshot_common: instance of the common fields between all snapshot version.
+ * snapshot_filename: used to name the file in file based snapshot
+ * monotonic_clock_us: instance of the monotonic clock
+ * snapshot_file_total_size_bytes: number of bytes to allocate to the file or expect the stream to receive.
  */
 ssize_t snapshotAllocateStorage(snapshotCommon *snapshot_common, char const *snapshot_filename,
                                 flashcache_monotonic_clock_us monotonic_clock_us,

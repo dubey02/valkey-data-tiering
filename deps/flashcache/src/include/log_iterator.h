@@ -5,24 +5,24 @@
 #include "include/index.h"
 #include "include/fio.h"
 
-/**
+/*
  * A callback function for executing the logic needed on the fetched item.
- * @param context: A generic parameter defined by the owner while creating the iterator.
- * @param *item: The location of item read by the iterator.
- * @param *index_entry: the current entry as read from the index.
+ * context: A generic parameter defined by the owner while creating the iterator.
+ * *item: The location of item read by the iterator.
+ * *index_entry: the current entry as read from the index.
  */
 typedef void (*flashcache_iterator_core_logic_processing_callback)(void *context, void *item, void *index_entry);
 
-/**
+/*
  * A callback function to be executed before fetching an item. It should return the block size of the item to fetch.
- * @param context: A generic parameter defined by the owner while creating the iterator.
+ * context: A generic parameter defined by the owner while creating the iterator.
 */
 typedef size_t (*flashcache_iterator_pre_processing_callback)(void *context);
 
-/**
+/*
  * A callback function to be executed after fetching an item.
- * @param context: A generic parameter defined by the owner while creating the iterator.
- * @param is_running: the state of the iterator.
+ * context: A generic parameter defined by the owner while creating the iterator.
+ * is_running: the state of the iterator.
 */
 typedef void (*flashcache_iterator_post_processing_callback)(void *context, size_t is_running);
 

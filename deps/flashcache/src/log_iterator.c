@@ -3,7 +3,7 @@
 #include "include/log_iterator.h"
 #include "include/serialization.h"
 
-/**
+/*
  * The log iterator provides a generic way to iterate through all items currently stored in the log.
  * It offers a cron job (logIteratorCron) that fetches items from the log as needed. The cron job performs
  * two actions: (a) place a read request from the log (readItem) and (b) when the item is read apply the

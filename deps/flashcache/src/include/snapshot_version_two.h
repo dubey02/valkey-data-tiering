@@ -94,7 +94,7 @@ typedef struct snapshotVersionTwoInfo {
     // for the engine layer to complete snapshotting.
     size_t is_waiting_for_engine_snapshotting_completion;
 
-    /**
+    /*
      * When we are doing forkless save replication:
      *
      * 1. If a read request comes to the processed part of the snapshot, we delete the item from FDB

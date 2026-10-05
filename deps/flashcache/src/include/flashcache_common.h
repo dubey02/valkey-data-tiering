@@ -305,7 +305,7 @@ typedef struct {
     flashcache_eviction_callback callback;
 } flashcacheEvictionDetails;
 
-/**
+/*
  * Flashcache has several code paths that may take significant time including saving or
  * loading a snapshot. This callback is to be invoked periodically during these long running
  * operations so that the storage IO thread can respond in a timely manner to control messages from the Valkey main
@@ -369,22 +369,20 @@ typedef struct {
     // The callback context that is passed when the callbacks are invoked.
     void *callback_context;
 
-    /**
+    /*
      * This API is called at the beginning of the snapshotting operation. This helps
      * the writer know about the size of the snapshot to be generated.
-     * @Returns : Void
-     * @param :
+     * Returns Void
      * callback_context : The context that was passed from the caller when
      * flashcacheStartStreamBasedSave was called.
      * size : Size of a snapshot which is about to generate.
      */
     void (*set_snapshot_size)(void *callback_context, size_t size);
 
-    /**
+    /*
      * This API is used to write chunks to the writer. The sum of buf_len
      * from all the write calls will sum up to the snapshot size.
-     * @Returns : Void
-     * @param :
+     * Returns Void
      * callback_context : The context that was passed from the caller when
      * flashcacheStartStreamBasedSave was called.
      * offset : Offset where we want to write the snapshot chuck.
@@ -393,31 +391,30 @@ typedef struct {
      */
     void (*write)(void *callback_context, size_t offset, char *buf, size_t buf_len);
 
-    /**
+    /*
      * This API is used to check if the writer is writable before calling
      * the write API.
-     * @Returns : 1 if writer is writable else 0.
+     * Returns 1 if writer is writable else 0.
      * @Params :
      * callback_context : The context that was passed from the caller when
      * flashcacheStartStreamBasedSave was called.
      */
     int (*is_writable)(void *callback_context);
 
-    /**
+    /*
      * This API is used to write a keep alive message to the writer. 
      * This is to keep the replication link alive during forkless save.
      *
-     * @Returns : Void
-     * @param :
+     * Returns Void
      * callback_context : The context that was passed from the caller when
      * flashcacheStartStreamBasedSave was called.
      */
     void (*keep_alive)(void *callback_context);
 
-    /**
+    /*
      * This API is used to indicate that the snapshotting has completed. if the
      * snapshotting was terminated before completion, completed is set to 0 else its 1.
-     * @Returns : void
+     * Returns void
      * @Params :
      * callback_context : The context that was passed from the caller when
      * flashcacheStartStreamBasedSave was called.

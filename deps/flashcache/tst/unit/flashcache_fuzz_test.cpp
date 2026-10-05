@@ -27,7 +27,7 @@ extern "C" {
 #define SNAPSHOT_INTERVAL (256ul * 1024 * ITERATION_SCALE_MULTIPLIER)
 #define LOG_STATS_INTERVAL (16ul * 1024 * ITERATION_SCALE_MULTIPLIER)
 
-/**
+/*
  * A corpus of characters (value_corpus) is used to generate the value of an item. The key of the item is a randomly
  * generated integer. The value is a sub-string of the value_corpus. The start index and size of the sub-string is
  * generated randomly. The database id of the item is also randomly generated. When an item is written to flashcache,

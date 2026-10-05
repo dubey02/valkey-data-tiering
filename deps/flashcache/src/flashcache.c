@@ -76,7 +76,7 @@ flashcacheReturnCode flashcacheGetItem(uint32_t dbid, char const *key, size_t ke
         completion_callback);
 }
 
-/*!\brief Check if a key exists in the FlashCache index.
+/* Check if a key exists in the FlashCache index.
  *
  * This is a synchronous, O(1) check against the in-memory index.
  * No disk I/O is performed. Returns 1 if the key may exist, 0 if

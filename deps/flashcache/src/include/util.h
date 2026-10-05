@@ -86,68 +86,68 @@ size_t getCurrentMemoryUsage();
 // Get the actual block or file size in bytes
 size_t getFileSize(char const *filename);
 
-/**
+/*
  * Wrapper function for malloc.
- * @param size : Size of memory to allocate
- * @return Pointer to newly allocated memory.
+ * size: Size of memory to allocate
+ * Returns Pointer to newly allocated memory.
  */
 void *fcMalloc(size_t size);
 
-/**
+/*
  * Wrapper function for calloc.
- * @param block_count : No. of Contiguous block to allocated.
- * @param size : Size of memory to allocate.
- * @return Pointer to newly allocated memory.
+ * block_count: No. of Contiguous block to allocated.
+ * size: Size of memory to allocate.
+ * Returns Pointer to newly allocated memory.
  */
 void *fcCalloc(size_t block_count, size_t size);
 
-/**
+/*
  * Wrapper function for realloc.
- * @param ptr : pointer to the allocated memory which needs to be reallocated.
- * @param size : Size of memory to allocate.
- * @return Pointer to newly allocated memory.
+ * ptr: pointer to the allocated memory which needs to be reallocated.
+ * size: Size of memory to allocate.
+ * Returns Pointer to newly allocated memory.
  */
 void *fcRealloc(void *ptr, size_t size);
 
-/**
+/*
  * Wrapper function for free.
- * @param ptr : pointer to the allocated memory which needs to be deleted.
+ * ptr: pointer to the allocated memory which needs to be deleted.
  */
 void fcFree(void *ptr);
 
-/**
+/*
  * Updates current_memory_usage without actually freeing the memory
- * @param ptr : pointer to the allocated memory.
+ * ptr: pointer to the allocated memory.
  */
 void fcPseudoFree(void *ptr);
 
-/**
+/*
  * Wrapper function for posix_memalign.
  * Returns a Pointer to newly allocated memory.
  */
 void *fcPosixMemalign(size_t alignment, size_t size);
 
-/**
+/*
  * Update the histogram interval with given value.
- * @param current_value : Value to be updated in histogram
- * @param histogram : Array which stores the latency frequency for all interval.
- * @param intervals : Defined interval for given histogram
+ * current_value: Value to be updated in histogram
+ * histogram: Array which stores the latency frequency for all interval.
+ * intervals: Defined interval for given histogram
  */
 void updateHistogram(long long current_value, unsigned long long *histogram,
                      flashcacheHistogramInterval *intervals);
 
-/***
+/*
  * Align the offset of the item to read with the page size
- * @param item_len: the length of the item to read.
- * @param offset: the offset to read from.
- * @return the amount of bytes to read.
+ * item_len: the length of the item to read.
+ * offset: the offset to read from.
+ * Returns the amount of bytes to read.
  */
 size_t getPartialItemReadSizeBytes(size_t item_len, size_t offset);
 
-/**
+/*
  * Create a buffer after aligning the requested size to page sizes.
- * @param buf_size the size to align to a page.
- * @return The buffer created.
+ * buf_size: the size to align to a page.
+ * Returns The buffer created.
  */
 char *createPageAlignedBuffer(size_t buf_size);
 
