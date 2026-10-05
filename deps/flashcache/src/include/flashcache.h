@@ -101,10 +101,9 @@ void flashcacheLoadSnapshot(char const *snapshot_filename,
 void flashcacheSetGcPaused(int paused);
 int flashcacheGetGcPaused(void);
 
-/* Snapshot support: synchronous, fork-child-safe single-item read. Walks the
- * (CoW) index and reads with pread(2) -- never touches the async IO ring.
- * Returns FC_OK with a malloc'd *out_item (header+key+value; caller frees),
- * or FC_ERR_CATCH_ALL. */
+/* Reads one item synchronously, for use in a forked snapshot child.
+    * Returns FC_OK and a malloc'd copy of the item in *out_item, which the
+    * caller frees, or FC_ERR_CATCH_ALL. */
 flashcacheReturnCode flashcacheForkChildReadItem(uint32_t dbid, char const *key,
         size_t key_len, char **out_item, size_t *out_len);
 
