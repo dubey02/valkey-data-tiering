@@ -307,12 +307,12 @@ typedef struct {
 /*
  * Flashcache has several code paths that may take significant time including saving or
  * loading a snapshot. This callback is to be invoked periodically during these long running
- * operations so that the storage IO thread can respond in a timely manner to control messages from the Valkey main
+ * operations so that the storage IO thread can respond in a timely manner to control messages from the Valkey server main
  * thread in a timely fashion.
  *
- * (Valkey main thread) --> (control message: i.e. pull_metrics) --> storage IO thread
+ * (Valkey server main thread) --> (control message: i.e. pull_metrics) --> storage IO thread
  *                                                                   (executing long-running flashcache function)
- * (Valkey main thread) <-- (timely control message reply) <-------- Flashcache(storage IO thread control msg callback)
+ * (Valkey server main thread) <-- (timely control message reply) <-------- Flashcache(storage IO thread control msg callback)
  */
 
 typedef void (*flashcache_storage_io_thread_control_msg_callback)(void *context);

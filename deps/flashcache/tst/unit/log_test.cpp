@@ -2665,7 +2665,7 @@ TEST_P(LogTestWithReplication, testEndToEndThreadsaveInFlashcache) {
     if (isTestingThreadsaveReplication()) {
         ASSERT_EQ(1, logGetCountBasedMetric(log, FC_LAST_NUM_DELETE_REPL_CMD));
         ASSERT_EQ(1, logGetCountBasedMetric(log, FC_LAST_NUM_ITEMS_WITH_ADD_TO_RDB_FLAG));
-        // As `has_snapshotting_completed_in_redis_layer` was true in the test,
+        // As `has_snapshotting_completed_in_engine_layer` was true in the test,
         // log iteration callback will not be invoked
         ASSERT_EQ(0, snapshot_context->num_log_iteration_completion_callback_invocation);
     } else {
@@ -3125,7 +3125,7 @@ TEST_P(LogTestWithSnapshotting, testSnapshotKeepaliveAllSaveTypes) {
     }
 }
 
-TEST_P(LogTestWithReplication, testSnapshotCompletionOnlyAfterRedisCompletesSnapshotting) {
+TEST_P(LogTestWithReplication, testSnapshotCompletionOnlyAfterValkeyServerCompletesSnapshotting) {
     ASSERT_EQ(0, logGetCountBasedMetric(log, FC_NUM_ITEMS));
     size_t num_items = 5;
     writeItemsToLog(log, num_databases, num_items);
@@ -3174,7 +3174,7 @@ TEST_P(LogTestWithReplication, testSnapshotCompletionOnlyAfterRedisCompletesSnap
         while (counter--) {
             logRunCronTasks(log);
         }
-        // Even after multiple iteration of cron job snapshot will not be completed as Redis layer has not completed
+        // Even after multiple iteration of cron job snapshot will not be completed as the Valkey server has not completed
         ASSERT_EQ(snapshot_context->num_snapshot_completion_callback_invocation, 0);
         ASSERT_EQ(snapshot_context->num_log_iteration_completion_callback_invocation, 1);
 
@@ -3251,7 +3251,7 @@ TEST_P(LogTestWithReplication, testReplicationLinkKeepAliveWithinMaxTimeout) {
             count--;
         }
 
-        // The current time now should be 2 seconds after we started to wait for Redis snapshotting
+        // The current time now should be 2 seconds after we started to wait for Valkey server snapshotting
         ASSERT_TRUE(mockClockGetTimeUs() >= current_time_us + (2 * FC_SECOND_TO_MICROSECOND)
                     && mockClockGetTimeUs() < current_time_us + (3 * FC_SECOND_TO_MICROSECOND));
 
@@ -3327,7 +3327,7 @@ TEST_P(LogTestWithReplication, testReplicationLinkKeepAlivePastMaxTimeout) {
             count--;
         }
 
-        // The current time now should be 10 seconds after we started to wait for Redis snapshotting
+        // The current time now should be 10 seconds after we started to wait for Valkey server snapshotting
         ASSERT_TRUE(mockClockGetTimeUs() >= current_time_us + (10 * FC_SECOND_TO_MICROSECOND)
                     && mockClockGetTimeUs() < current_time_us + (11 * FC_SECOND_TO_MICROSECOND));
 
@@ -3819,7 +3819,7 @@ TEST_P(LogTestWithReplication, testSnapshotWithDeleteion) {
     if (isTestingThreadsaveReplication()) {
         ASSERT_EQ(1, logGetCountBasedMetric(log, FC_LAST_NUM_DELETE_REPL_CMD));
         ASSERT_EQ(0, logGetCountBasedMetric(log, FC_LAST_NUM_ITEMS_WITH_ADD_TO_RDB_FLAG));
-        // As `has_snapshotting_completed_in_redis_layer` was true in the test,
+        // As `has_snapshotting_completed_in_engine_layer` was true in the test,
         // log iteration callback will not be invoked
         ASSERT_EQ(0, snapshot_context->num_log_iteration_completion_callback_invocation);
     } else {
