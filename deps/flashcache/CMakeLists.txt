@@ -49,9 +49,12 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     target_compile_options(flashcache PRIVATE -march=armv8-a+crc)
 endif()
 
+# Stress test app
+enable_language(CXX)
+add_subdirectory(app)
+
 # Unit tests (opt-in)
 option(FC_BUILD_TESTS "Build the FlashCache unit tests" OFF)
 if(FC_BUILD_TESTS)
-    enable_language(CXX)
     add_subdirectory(tst/unit)
 endif()

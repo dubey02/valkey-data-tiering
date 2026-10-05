@@ -126,3 +126,17 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2013, Google Inc."
 SPDX-License-Identifier = "Apache-2.0"
 SPDX-FileComment = "Development/testing dependency only. Not present in compiled binaries."
+
+[[annotations]]
+path = "deps/flashcache/app/crc32/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2011-2016, Stephan Brumme"
+SPDX-License-Identifier = "Zlib"
+SPDX-FileComment = "Stress test app dependency only. Not present in compiled binaries."
+
+[[annotations]]
+path = "deps/flashcache/app/monotonic_clock/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = ["2020, Redis Ltd.", "2024-present, Valkey contributors"]
+SPDX-License-Identifier = "BSD-3-Clause"
+SPDX-FileComment = "Stress test app dependency only. Not present in compiled binaries."
