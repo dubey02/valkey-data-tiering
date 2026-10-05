@@ -1,52 +1,188 @@
 name: Data Tiering PR Benchmark
 
 # Add the run-tiering-benchmark label to a PR to benchmark it against its base
-# branch with the valkey-perf-benchmark Zipfian 80/20 tiering test.
+# branch with the valkey-perf-benchmark Zipfian 80/20 tiering test. Each run
+# launches its own EC2 instance and terminates it when done.
 
 on:
   pull_request_target:
     types: [labeled]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base commit or branch"
+        required: true
+        default: unstable
+      pr_ref:
+        description: "Commit or branch to compare against the base"
+        required: true
 
 concurrency:
-  group: tiering-pr-benchmark
+  group: tiering-pr-benchmark-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: false
 
 defaults:
   run:
-    shell: "bash -Eeuo pipefail -x {0}"
+    shell: "bash -Eeuo pipefail {0}"
 
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
 
 env:
-  PERF_BENCHMARK_REPO: ${{ vars.PERF_BENCHMARK_REPO || 'valkey-io/valkey-perf-benchmark' }}
-  PERF_BENCHMARK_REF: ${{ vars.PERF_BENCHMARK_REF || 'main' }}
-  NUM_RUNS: ${{ vars.TIERING_BENCHMARK_RUNS || '3' }}
-  FLASHCACHE_DIR: /mnt/nvme
-  FLASHCACHE_FILE: /mnt/nvme/flashcache.db
-  FLASHCACHE_CAPACITY: 8gb
-  BASE_SHA: ${{ github.event.pull_request.base.sha }}
-  PR_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+  AWS_REGION: ${{ vars.DT_AWS_REGION || 'us-west-2' }}
+  INSTANCE_TYPE: ${{ vars.DT_INSTANCE_TYPE || 'r8gd.2xlarge' }}
+  VALKEY_REPO: ${{ vars.DT_VALKEY_REPO || github.repository }}
 
 jobs:
+  start-runner:
+    if: github.event_name != 'pull_request_target' || github.event.label.name == 'run-tiering-benchmark'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+      instance-id: ${{ steps.runner.outputs.ec2-instance-id }}
+      public-ip: ${{ steps.ingress.outputs.public-ip }}
+      security-group-id: ${{ steps.sg.outputs.security-group-id }}
+      base-sha: ${{ steps.refs.outputs.base-sha }}
+      pr-sha: ${{ steps.refs.outputs.pr-sha }}
+    steps:
+      - name: Resolve commits
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_MERGE: ${{ github.event.pull_request.merge_commit_sha }}
+          IN_BASE: ${{ inputs.base_ref }}
+          IN_PR: ${{ inputs.pr_ref }}
+        run: |
+          if [[ "$EVENT" == pull_request_target ]]; then
+            BASE=$PR_BASE
+            PR=$PR_MERGE
+          else
+            BASE=$(gh api "repos/$VALKEY_REPO/commits/$IN_BASE" --jq .sha)
+            PR=$(gh api "repos/$VALKEY_REPO/commits/$IN_PR" --jq .sha)
+          fi
+          echo "base-sha=$BASE" >> "$GITHUB_OUTPUT"
+          echo "pr-sha=$PR" >> "$GITHUB_OUTPUT"
+          echo "base $BASE, pr $PR"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.DT_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create a security group for this run
+        id: sg
+        run: |
+          VPC=$(aws ec2 describe-subnets --subnet-ids "${{ vars.DT_SUBNET_ID }}" \
+            --query 'Subnets[0].VpcId' --output text)
+          NAME="dt-pr-benchmark-${{ github.run_id }}-${{ github.run_attempt }}"
+          SG=$(aws ec2 create-security-group --group-name "$NAME" --vpc-id "$VPC" \
+            --description "Data tiering PR benchmark run ${{ github.run_id }}, self access only" \
+            --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$NAME},{Key=purpose,Value=dt-pr-benchmark}]" \
+            --query GroupId --output text)
+          echo "security-group-id=$SG" >> "$GITHUB_OUTPUT"
+          echo "created $SG in $VPC"
+
+      - name: Resolve the AMI
+        id: ami
+        run: |
+          AMI=$(aws ssm get-parameter \
+            --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+            --query Parameter.Value --output text)
+          echo "ami=$AMI" >> "$GITHUB_OUTPUT"
+
+      - name: Create a GitHub App token for runner registration
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DT_RUNNER_APP_ID }}
+          private-key: ${{ secrets.DT_RUNNER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: write
+
+      - name: Start the EC2 runner
+        id: runner
+        uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
+        with:
+          mode: start
+          github-token: ${{ steps.app.outputs.token }}
+          use-jit: true
+          ec2-image-id: ${{ steps.ami.outputs.ami }}
+          ec2-instance-type: ${{ env.INSTANCE_TYPE }}
+          subnet-id: ${{ vars.DT_SUBNET_ID }}
+          security-group-id: ${{ steps.sg.outputs.security-group-id }}
+          iam-role-name: ${{ vars.DT_INSTANCE_PROFILE }}
+          run-runner-as-user: ec2-user
+          startup-timeout-minutes: 15
+          metadata-options: '{"HttpTokens": "required"}'
+          block-device-mappings: '[{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 64, "VolumeType": "gp3", "DeleteOnTermination": true}}]'
+          aws-resource-tags: '[{"Key": "Name", "Value": "dt-pr-benchmark-${{ github.run_id }}"}, {"Key": "purpose", "Value": "dt-pr-benchmark"}]'
+          pre-runner-script: |
+            shutdown -h +240
+            dnf install -y -q git gcc gcc-c++ make cmake tcl libaio-devel openssl-devel \
+              python3.11 python3.11-pip libicu jq sysstat numactl perf
+            NODES=$(ls -d /sys/devices/system/node/node[0-9]* | wc -l)
+            for d in /sys/block/nvme*n1; do
+              grep -q "Instance Storage" "$d/device/model" || continue
+              node=$(cat "$d/device/numa_node")
+              if [ "$node" = 0 ] || { [ "$NODES" = 1 ] && [ "$node" = -1 ]; }; then
+                DEV=/dev/$(basename "$d")
+                break
+              fi
+            done
+            mkfs.ext4 -q -F "$DEV"
+            mkdir -p /mnt/nvme
+            mount -o noatime "$DEV" /mnt/nvme
+            chown ec2-user:ec2-user /mnt/nvme
+
+      - name: Allow the instance to reach itself on its public IP
+        id: ingress
+        env:
+          IID: ${{ steps.runner.outputs.ec2-instance-id }}
+          SG: ${{ steps.sg.outputs.security-group-id }}
+        run: |
+          IP=$(aws ec2 describe-instances --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          [[ "$IP" != None && -n "$IP" ]] || { echo "::error::instance $IID has no public IP"; exit 1; }
+          aws ec2 authorize-security-group-ingress --group-id "$SG" --ip-permissions \
+            "[{\"IpProtocol\":\"tcp\",\"FromPort\":6379,\"ToPort\":6379,\"IpRanges\":[{\"CidrIp\":\"$IP/32\"}]}]" > /dev/null
+          echo "public-ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "$SG allows tcp 6379 from $IP/32"
+
   benchmark:
-    if: github.event.label.name == 'run-tiering-benchmark'
-    runs-on: ["self-hosted", "data-tiering-benchmark-arm-pr"]
+    needs: start-runner
+    runs-on: ${{ needs.start-runner.outputs.label }}
     timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      FLASHCACHE_FILE: /mnt/nvme/flashcache.db
+      FLASHCACHE_CAPACITY: 8gb
+      NUM_RUNS: ${{ vars.TIERING_BENCHMARK_RUNS || '3' }}
+      BASE_SHA: ${{ needs.start-runner.outputs.base-sha }}
+      PR_SHA: ${{ needs.start-runner.outputs.pr-sha }}
+      EXPECTED_IP: ${{ needs.start-runner.outputs.public-ip }}
     steps:
       - name: Checkout valkey-data-tiering
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: ${{ env.VALKEY_REPO }}
           path: valkey
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ env.PR_SHA }}
           persist-credentials: false
 
       - name: Checkout unstable for valkey-benchmark
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: ${{ env.VALKEY_REPO }}
           path: valkey_bench
           fetch-depth: 1
           ref: unstable
@@ -55,31 +191,22 @@ jobs:
       - name: Checkout valkey-perf-benchmark
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          repository: ${{ env.PERF_BENCHMARK_REPO }}
-          ref: ${{ env.PERF_BENCHMARK_REF }}
+          repository: ${{ vars.PERF_BENCHMARK_REPO || 'valkey-io/valkey-perf-benchmark' }}
+          ref: ${{ vars.PERF_BENCHMARK_REF || 'main' }}
           path: valkey-perf-benchmark
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Python
-        uses: kishaningithub/setup-python-amazon-linux@a326cdc792983fe0fbd04c81d3d62b59b6123a6c # v1.1.0
-        with:
-          python-version: "3.10"
-          cache: "pip"
-
-      - name: Install dependencies
+      - name: Install Python dependencies
         working-directory: valkey-perf-benchmark
         run: |
-          sudo dnf install -y gcc gcc-c++ make cmake libaio-devel openssl-devel \
-              python3-devel bzip2-devel libffi-devel jq
-          pip install --require-hashes -r requirements.txt
+          python3.11 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q --require-hashes -r requirements.txt
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
-      # valkey-benchmark is built once from unstable, which has --zipfian and
-      # --keysize, so both legs use the same load generator.
       - name: Build valkey-benchmark from unstable
         working-directory: valkey_bench
         run: |
-          make distclean || true
           make -j"$(nproc)"
           if ! ./src/valkey-benchmark --help 2>&1 | grep -q -- "--keysize"; then
             echo "::error::valkey-benchmark on unstable has no --keysize, which the tiering config needs"
@@ -87,23 +214,46 @@ jobs:
           fi
           echo "VALKEY_BENCHMARK_PATH=$(pwd)/src/valkey-benchmark" >> "$GITHUB_ENV"
 
-      - name: Resolve the server address
+      - name: Resolve the public IP and fit the CPU layout to this machine
+        working-directory: valkey-perf-benchmark
         run: |
-          TARGET_IP="${{ secrets.DT_BENCHMARK_IP }}"
-          if [[ -z "$TARGET_IP" ]]; then
-            TARGET_IP="$(hostname -I | awk '{print $1}')"
-          fi
+          for _ in $(seq 1 24); do
+            TOK=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            TARGET_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/public-ipv4)
+            [[ "$TARGET_IP" == "$EXPECTED_IP" ]] && break
+            sleep 5
+          done
+          [[ "$TARGET_IP" == "$EXPECTED_IP" ]] || { echo "::error::public IP is $TARGET_IP, expected $EXPECTED_IP"; exit 1; }
           echo "TARGET_IP=$TARGET_IP" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import json, os
+          cfg = json.load(open("configs/tiering-zipfian-80-20.json"))
+          n = os.cpu_count()
+          for c in cfg:
+              alloc = c.get("cpu_allocation", {})
+              need = alloc.get("cores_per_server", 0) + 2 * alloc.get("cores_per_client", 0)
+              if alloc and need > n:
+                  server = max(2, n // 4)
+                  per_client = (n - server) // 2
+                  c["cpu_allocation"] = {
+                      "cores_per_server": server,
+                      "cores_per_client": per_client,
+                      "servers": [f"0-{server - 1}"],
+                      "clients": [f"{server}-{server + 2 * per_client - 1}"],
+                  }
+              print("cpu_allocation", c.get("cpu_allocation"))
+          json.dump(cfg, open("../tiering.json", "w"), indent=2)
+          PY
+          echo "target $TARGET_IP, $(nproc) cores"
 
       - name: Run base benchmark
         working-directory: valkey-perf-benchmark
         run: |
-          mountpoint -q "$FLASHCACHE_DIR"
-          sudo rm -f "$FLASHCACHE_FILE"
-          sudo fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
+          rm -f "$FLASHCACHE_FILE"
+          fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
           git -C ../valkey checkout --detach "$BASE_SHA"
           python ./benchmark.py \
-            --config configs/tiering-zipfian-80-20.json \
+            --config ../tiering.json \
             --commits "$BASE_SHA" \
             --valkey-path ../valkey \
             --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
@@ -115,11 +265,11 @@ jobs:
       - name: Run PR benchmark
         working-directory: valkey-perf-benchmark
         run: |
-          sudo rm -f "$FLASHCACHE_FILE"
-          sudo fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
+          rm -f "$FLASHCACHE_FILE"
+          fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
           git -C ../valkey checkout --detach "$PR_SHA"
           python ./benchmark.py \
-            --config configs/tiering-zipfian-80-20.json \
+            --config ../tiering.json \
             --commits "$PR_SHA" \
             --valkey-path ../valkey \
             --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
@@ -139,7 +289,6 @@ jobs:
 
       - name: Upload results
         if: always()
-        continue-on-error: true
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: tiering-benchmark-results
@@ -147,15 +296,29 @@ jobs:
             ./valkey-perf-benchmark/results/
             comparison.md
 
+  report:
+    needs: [start-runner, benchmark]
+    if: always() && github.event_name == 'pull_request_target' && needs.start-runner.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Download results
+        if: needs.benchmark.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tiering-benchmark-results
+
       - name: Comment PR with results
+        if: needs.benchmark.result == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const body = fs.readFileSync('comparison.md', 'utf8');
             const {owner, repo} = context.repo;
-            const sha = '${{ github.event.pull_request.head.sha }}';
+            const sha = context.payload.pull_request.head.sha;
             const link = `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -164,19 +327,9 @@ jobs:
               body: `**Data tiering benchmark ran on this commit:** ${link}\n\n${body}`
             });
 
-      - name: Cleanup
-        if: always()
-        continue-on-error: true
-        run: |
-          pkill -f valkey-server || true
-          sudo rm -f "$FLASHCACHE_FILE"
-          rm -rf comparison.md valkey valkey_bench
-
       - name: Remove run-tiering-benchmark label
-        if: always()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             await github.rest.issues.removeLabel({
               issue_number: context.issue.number,
@@ -184,3 +337,55 @@ jobs:
               repo: context.repo.repo,
               name: 'run-tiering-benchmark'
             }).catch(err => console.log('label not present', err.message));
+
+  stop-runner:
+    needs: [start-runner, benchmark]
+    if: always() && needs.start-runner.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.DT_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create a GitHub App token for runner registration
+        id: app
+        if: needs.start-runner.outputs.instance-id != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DT_RUNNER_APP_ID }}
+          private-key: ${{ secrets.DT_RUNNER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: write
+
+      - name: Stop the EC2 runner
+        if: needs.start-runner.outputs.instance-id != ''
+        uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
+        with:
+          mode: stop
+          github-token: ${{ steps.app.outputs.token }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.instance-id }}
+
+      - name: Delete the run's security group
+        if: needs.start-runner.outputs.security-group-id != ''
+        env:
+          IID: ${{ needs.start-runner.outputs.instance-id }}
+          SG: ${{ needs.start-runner.outputs.security-group-id }}
+        run: |
+          if [[ -n "$IID" ]]; then
+            aws ec2 wait instance-terminated --instance-ids "$IID"
+          fi
+          for _ in $(seq 1 12); do
+            if aws ec2 delete-security-group --group-id "$SG"; then
+              echo "deleted $SG"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::warning::could not delete $SG"
