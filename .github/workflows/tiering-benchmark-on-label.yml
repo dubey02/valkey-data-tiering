@@ -102,13 +102,15 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ vars.DT_AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.DT_AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Create a security group for this run
         id: sg
+        env:
+          SUBNET_ID: ${{ secrets.DT_SUBNET_ID }}
         run: |
-          VPC=$(aws ec2 describe-subnets --subnet-ids "${{ vars.DT_SUBNET_ID }}" \
+          VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET_ID" \
             --query 'Subnets[0].VpcId' --output text)
           NAME="dt-pr-benchmark-${{ github.run_id }}-${{ github.run_attempt }}"
           SG=$(aws ec2 create-security-group --group-name "$NAME" --vpc-id "$VPC" \
@@ -145,9 +147,9 @@ jobs:
           use-jit: true
           ec2-image-id: ${{ steps.ami.outputs.ami }}
           ec2-instance-type: ${{ env.INSTANCE_TYPE }}
-          subnet-id: ${{ vars.DT_SUBNET_ID }}
+          subnet-id: ${{ secrets.DT_SUBNET_ID }}
           security-group-id: ${{ steps.sg.outputs.security-group-id }}
-          iam-role-name: ${{ vars.DT_INSTANCE_PROFILE }}
+          iam-role-name: ${{ secrets.DT_INSTANCE_PROFILE }}
           run-runner-as-user: ec2-user
           startup-timeout-minutes: 15
           metadata-options: '{"HttpTokens": "required"}'
@@ -381,7 +383,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ vars.DT_AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.DT_AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Create a GitHub App token for runner registration
