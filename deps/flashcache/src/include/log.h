@@ -22,8 +22,6 @@
 #define FC_GARBAGE_COLLECTION_LOG_READ_REQUEST_IDENTIFIER (SIZE_MAX-1)
 #define FC_INTERNAL_REQUEST_QUEUE_LENGTH (2)
 
-#define FC_NUM_BLOCKS_WRITTEN_IN_BATCH (256)
-
 // The default threshold used for flushing item to flash from the staging buffer. This is
 // currently set to 1 MiB to ensure sequential write performance on the flash.
 #define FC_DEFAULT_STAGING_BUFFER_FLUSH_SIZE_THRESHOLD (1LL<<20)

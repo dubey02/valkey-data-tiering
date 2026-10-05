@@ -32,7 +32,6 @@ typedef enum {
 
 typedef enum {
     FC_OK,
-    FC_ERR_SETUP_DB_FILE,
     FC_ERR_THROTTLED,
     FC_ERR_CATCH_ALL
 } flashcacheReturnCode;
