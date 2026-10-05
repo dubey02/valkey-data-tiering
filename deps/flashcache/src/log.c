@@ -1291,7 +1291,7 @@ finish_processing_request:
             fcFree(data_buffer);
         }
     }
-    invokeAsioControlMsgCallback();
+    invokeStorageIoThreadControlMsgCallback();
     logFlushStagingBufferIfRequired(log, log->staging_buffer_flush_size_threshold_bytes);
 
     // If we have only dead/garbage items in log, we will reset the head/tail offset so that we can avoid the compute
@@ -1801,9 +1801,9 @@ void logFsyncBufferedWrites(flashcacheLog *log) {
     log->garbage_collector_info.can_start_garbage_collection = 1;
 }
 
-void invokeAsioControlMsgCallback() {
-    if (asio_control_msg_callback.callback != NULL) {
-        asio_control_msg_callback.callback(asio_control_msg_callback.context);
+void invokeStorageIoThreadControlMsgCallback() {
+    if (storage_io_thread_control_msg_callback.callback != NULL) {
+        storage_io_thread_control_msg_callback.callback(storage_io_thread_control_msg_callback.context);
     }
 }
 

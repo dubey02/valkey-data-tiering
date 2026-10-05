@@ -308,25 +308,25 @@ typedef struct {
 /**
  * Flashcache has several code paths that may take significant time including saving or
  * loading a snapshot. This callback is to be invoked periodically during these long running
- * operations so that ASIO can respond in a timely manner to control messages from the Valkey main
+ * operations so that the storage IO thread can respond in a timely manner to control messages from the Valkey main
  * thread in a timely fashion.
  *
- * (Valkey main thread) --> (control message: i.e. pull_metrics) --> ASIO thread
+ * (Valkey main thread) --> (control message: i.e. pull_metrics) --> storage IO thread
  *                                                                   (executing long-running flashcache function)
- * (Valkey main thread) <-- (timely control message reply) <-------- Flashcache(ASIO control msg callback)
+ * (Valkey main thread) <-- (timely control message reply) <-------- Flashcache(storage IO thread control msg callback)
  */
 
-typedef void (*flashcache_asio_control_msg_callback)(void *context);
+typedef void (*flashcache_storage_io_thread_control_msg_callback)(void *context);
 
 typedef struct {
-    /* The context that is passed to the asio control msg callback */
+    /* The context that is passed to the storage IO thread control msg callback */
     void *context;
 
     /* The callback that is invoked periodically during long running operations
      * in FlashCache
      */
-    flashcache_asio_control_msg_callback callback;
-} flashcacheAsioControlMsgCallbackDetails;
+    flashcache_storage_io_thread_control_msg_callback callback;
+} flashcacheStorageIoThreadControlMsgCallbackDetails;
 
 /* This callback is triggered when snapshotting is complete or is cancelled
  */
@@ -345,7 +345,7 @@ typedef struct {
 typedef void (*flashcache_log_iteration_completion_callback)(void *context);
 
 typedef struct {
-    /* The context that is passed to the asio control msg callback */
+    /* The context that is passed to the storage IO thread control msg callback */
     void *context;
 
     /* The callback that is invoked when lot iteration is completed

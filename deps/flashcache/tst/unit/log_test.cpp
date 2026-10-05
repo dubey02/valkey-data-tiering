@@ -3178,7 +3178,7 @@ TEST_P(LogTestWithReplication, testSnapshotCompletionOnlyAfterRedisCompletesSnap
         ASSERT_EQ(snapshot_context->num_snapshot_completion_callback_invocation, 0);
         ASSERT_EQ(snapshot_context->num_log_iteration_completion_callback_invocation, 1);
 
-        // Make sure that we sent keep alive to the replica ASIO while we are waiting for Redis snapshot to complete
+        // Make sure that we sent keep alive to the replica's storage IO thread while waiting for the engine snapshot to complete
         ASSERT_GT(snapshot_manager_info->snapshot_version_two_info->num_replication_link_keep_alive_msg, 0);
 
         logCompleteForklessSaveReplication(log);

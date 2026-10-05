@@ -11,7 +11,7 @@ typedef struct flashcacheContext {
 
 flashcacheContext flashcache_context = { NULL };
 extern flashcache_logger logger;
-flashcacheAsioControlMsgCallbackDetails asio_control_msg_callback = { NULL, NULL };
+flashcacheStorageIoThreadControlMsgCallbackDetails storage_io_thread_control_msg_callback = { NULL, NULL };
 
 flashcacheReturnCode flashcacheInit(char const *db_filename,
         size_t db_size_bytes,
@@ -25,7 +25,7 @@ flashcacheReturnCode flashcacheInit(char const *db_filename,
         flashcache_monotonic_clock_us monotonic_clock_us,
         flashcacheEvictionDetails *eviction_details,
         flashcache_logger logger_,
-        flashcacheAsioControlMsgCallbackDetails *asio_control_msg_callback_details) {
+        flashcacheStorageIoThreadControlMsgCallbackDetails *storage_io_thread_control_msg_callback_details) {
     flashcacheAssert(!(flashcache_context.log));
     flashcacheAssert(db_filename != NULL);
     flashcacheAssert(monotonic_clock_us != NULL);
@@ -34,10 +34,10 @@ flashcacheReturnCode flashcacheInit(char const *db_filename,
     flashcacheAssert(eviction_details->callback != NULL);
     flashcacheAssert(max_allocated_db_size_percent > 0 && max_allocated_db_size_percent <= 100);
     flashcacheAssert(max_num_in_flight_read_requests > 0);
-    flashcacheAssert(asio_control_msg_callback_details != NULL);
-    flashcacheAssert(asio_control_msg_callback_details->callback != NULL);
-    flashcacheAssert(asio_control_msg_callback_details->context != NULL);
-    asio_control_msg_callback = *asio_control_msg_callback_details;
+    flashcacheAssert(storage_io_thread_control_msg_callback_details != NULL);
+    flashcacheAssert(storage_io_thread_control_msg_callback_details->callback != NULL);
+    flashcacheAssert(storage_io_thread_control_msg_callback_details->context != NULL);
+    storage_io_thread_control_msg_callback = *storage_io_thread_control_msg_callback_details;
 
     logger = logger_;
     flashcacheLogger(FC_LL_NOTICE, "Starting flashcache, DB file: [%s], Num database: [%u], DB size: [%lu], "

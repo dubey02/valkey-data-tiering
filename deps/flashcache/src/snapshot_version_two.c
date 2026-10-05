@@ -54,16 +54,16 @@ static size_t getSerializedSnapshotV2MetadataSize(uint32_t num_databases) {
     return getCeilPageAlignedOffset(getSnapshotV2MetadataSize(num_databases));
 }
 
-/* Send keepalive message to ASIO if it has been at least `snapshot_keep_alive_msg_interval_us`
+/* Send keepalive message to the storage IO thread if it has been at least `snapshot_keep_alive_msg_interval_us`
  * microseconds since the last keepalive message was sent
  * and we have not exceeded the replication link timeout.
  */
-static void sendKeepAliveMessageToASIOIfRequired(snapshotVersionTwoInfo *snapshot_info,
+static void sendKeepAliveMessageToStorageIoThreadIfRequired(snapshotVersionTwoInfo *snapshot_info,
                                            flashcacheSnapshotWriter *snapshot_writer) {
     if (snapshot_writer == NULL) {
         return;
     }
-    // We will periodically send keep alive message to the replica ASIO layer to keep the replication link alive.
+    // We will periodically send keep alive message to the replica's storage IO thread to keep the replication link alive.
     uint64_t current_time_us = snapshot_info->monotonic_clock_us();
     uint64_t expected_keep_alive_time_us = snapshot_info->latest_keep_alive_msg_time_us +
                                             snapshot_info->snapshot_keep_alive_msg_interval_us;
@@ -214,7 +214,7 @@ int isProcessedItemInSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size_t
  * Functions to check if and item is within the snapshot offset range (from S to E).
  *
  * This function is used by forkless save to determine if we need to propagate
- * a flag add_item_to_rdb on this item back to ASIO.
+ * a flag add_item_to_rdb on this item back to the storage IO thread.
  */
 int isItemInSnapshotRange(snapshotVersionTwoInfo *snapshot_info,
                                  size_t offset) {
@@ -736,7 +736,7 @@ void snapshotV2CronTask(snapshotVersionTwoInfo *snapshot_info) {
 
     // Send keepalive message
     flashcacheSnapshotWriter *snapshot_writer = snapshot_info->snapshot_common.snapshot_writer;
-    sendKeepAliveMessageToASIOIfRequired(snapshot_info, snapshot_writer);
+    sendKeepAliveMessageToStorageIoThreadIfRequired(snapshot_info, snapshot_writer);
 
     // Use iterator
     logIteratorCron(snapshot_info->snapshot_log_iterator);
@@ -905,7 +905,7 @@ void snapshotV2Load(flashcacheLog *log, char const *snapshot_filename,
     int eof_reached = 0;
     while (!eof_reached) {
         if (fioRequestIsEmpty(&fio_request)) {
-            invokeAsioControlMsgCallback();
+            invokeStorageIoThreadControlMsgCallback();
             // We will take a page size buffer for reading items from snapshot file.
             size_t buf_size = FC_MAX(FC_PAGESIZE, getCeilPageAlignedOffset(partial_item_size_bytes));
             partial_item_size_bytes = 0;

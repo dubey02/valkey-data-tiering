@@ -418,9 +418,9 @@ void logGetConfig(flashcacheLog *log, flashcacheConfig *config);
 // Flush buffered writes to disk
 void logFsyncBufferedWrites(flashcacheLog *log);
 
-// Invokes the ASIO control message callback so that these messages are processed timely
+// Invokes the storage IO thread control message callback so that these messages are processed timely
 // even during long-running operations in flashcache
-void invokeAsioControlMsgCallback();
+void invokeStorageIoThreadControlMsgCallback();
 
 // Flush staging buffer.
 void logFlushStagingBufferIfRequired(flashcacheLog *log, size_t threshold);

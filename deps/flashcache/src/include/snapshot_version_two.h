@@ -87,7 +87,7 @@ typedef struct snapshotVersionTwoInfo {
     // The snapshot save type from the engine.
     flashcacheSnapshotSaveType snapshot_save_type;
 
-    // Callback for notifying the completion of log iteration to ASIO
+    // Callback for notifying the completion of log iteration to the storage IO thread
     flashcacheLogIterationCallbackDetails log_iteration_completion_callback_details;
 
     // Flag to indicate if FC snapshotting is completed and is waiting

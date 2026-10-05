@@ -924,7 +924,7 @@ void snapshotLoad(flashcacheLog *log, fioContext *snapshot_file_io_context, flas
     // Clear metric before we start current load
     snapshot_metrics.max_load_staging_buffer_size = 0;
     while (num_bytes_processed < total_num_bytes_to_process) {
-        invokeAsioControlMsgCallback();
+        invokeStorageIoThreadControlMsgCallback();
         // Once an block is read from snapshot file, the block is added to the index data buffer list or log data
         // buffer list for further processing
         fioRequest **completed_fio_requests = NULL;

@@ -552,13 +552,13 @@ void parseArgs(int argc, char *argv[]) {
     printf("Using snapshot save type: `%s`\n", arg);
 }
 
-int mockAsioContext = 0;
-void mockAsioCallback(void *context) {
-    if (context != static_cast<void *>(&mockAsioContext)) {
+int mockStorageIoThreadContext = 0;
+void mockStorageIoThreadCallback(void *context) {
+    if (context != static_cast<void *>(&mockStorageIoThreadContext)) {
         printf("Context used in callback function is incorrect!\n");
         exit(1);
     }
-    mockAsioContext++;
+    mockStorageIoThreadContext++;
 }
 
 int main(int argc, char *argv[]) {
@@ -582,14 +582,14 @@ int main(int argc, char *argv[]) {
     uint32_t min_garbage_collection_rate = 4096;
     uint32_t evict_under_max_logsize_time_limit = 100 * 1000;
     uint8_t optimized_delete_enabled = 1;
-    flashcacheAsioControlMsgCallbackDetails asio_control_msg_callback =
-        { static_cast<void *>(&mockAsioContext), mockAsioCallback};
+    flashcacheStorageIoThreadControlMsgCallbackDetails storage_io_thread_control_msg_callback =
+        { static_cast<void *>(&mockStorageIoThreadContext), mockStorageIoThreadCallback};
     if (flashcacheInit(db_filename, dbsize, index_size_per_db, num_databases,
                 max_allocated_db_size_percent, max_num_in_flight_read_requests,
                 min_garbage_collection_rate, evict_under_max_logsize_time_limit,
                 optimized_delete_enabled,
                 timeInMicrosecond,&eviction_details, logging_function,
-                &asio_control_msg_callback) != FC_OK) {
+                &storage_io_thread_control_msg_callback) != FC_OK) {
         printf("Unable to initialize flashcache");
         exit(1);
     }

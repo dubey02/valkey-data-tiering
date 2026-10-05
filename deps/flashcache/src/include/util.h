@@ -11,7 +11,7 @@
 #define FC_MIN(x, y) ((x < y) ? x : y)
 #define FC_MAX(x, y) ((x > y) ? x : y)
 
-extern flashcacheAsioControlMsgCallbackDetails asio_control_msg_callback;
+extern flashcacheStorageIoThreadControlMsgCallbackDetails storage_io_thread_control_msg_callback;
 extern flashcache_logger logger;
 
 #define flashcacheLogger(level, fmt, ...) do {\

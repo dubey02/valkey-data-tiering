@@ -198,15 +198,15 @@ class FlashcacheFuzzTest : public flashcache::FlashcacheTestBase, public testing
          size_t evict_under_max_logsize_time_limit = 100 * 1000;
          uint8_t optimized_delete_enabled = 1;
          flashcacheEvictionDetails eviction_details = { 0 };
-         eviction_details.context = static_cast<void *>(&mockAsioContext);
+         eviction_details.context = static_cast<void *>(&mockStorageIoThreadContext);
          eviction_details.callback = evictionCallback;
-         flashcacheAsioControlMsgCallbackDetails asio_control_msg_callback =
-             {static_cast<void *>(&mockAsioContext), mockAsioCallback};
+         flashcacheStorageIoThreadControlMsgCallbackDetails storage_io_thread_control_msg_callback =
+             {static_cast<void *>(&mockStorageIoThreadContext), mockStorageIoThreadCallback};
 
          ASSERT_EQ(flashcacheInit(db_filename.c_str(), DB_SIZE_BYTES, INITIAL_INDEX_SIZE_PER_DB, NUM_DATABASES,
                      max_allocated_db_size_percent, max_num_in_flight_read_requests, min_garbage_collection_rate,
                      evict_under_max_logsize_time_limit, optimized_delete_enabled, clockGetTimeUs, &eviction_details,
-                     fuzzTestLogger, &asio_control_msg_callback), FC_OK);
+                     fuzzTestLogger, &storage_io_thread_control_msg_callback), FC_OK);
      }
 
      void TearDown() {
@@ -362,5 +362,5 @@ TEST_F(FlashcacheFuzzTest, fuzzTest) {
         saveOrLoadSnapshotIfRequired(i);
         logStatsIfRequired(FC_LL_VERBOSE, i);
     }
-    ASSERT_GT(mockAsioContext, 0);  // Callback must have been called at least once here
+    ASSERT_GT(mockStorageIoThreadContext, 0);  // Callback must have been called at least once here
 }

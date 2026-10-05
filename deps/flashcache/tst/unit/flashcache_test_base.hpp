@@ -37,8 +37,8 @@ typedef struct {
     flashcacheSnapshotVersion snapshot_version;
 } snapshotContext;
 
-extern int mockAsioContext;
-extern void mockAsioCallback(void *context);
+extern int mockStorageIoThreadContext;
+extern void mockStorageIoThreadCallback(void *context);
 
 static inline void validateValue(char const *actual_value, size_t actual_value_len,
         char const *received_value, size_t received_value_len) {

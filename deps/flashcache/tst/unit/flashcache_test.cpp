@@ -26,10 +26,10 @@ void mockLogger(int level, const char *fmt, ...) {
     num_logger_invoked++;
 }
 
-int mockAsioContext = 0;
-void mockAsioCallback(void *context) {
-    ASSERT_EQ(context, static_cast<void *>(&mockAsioContext));
-    mockAsioContext++;
+int mockStorageIoThreadContext = 0;
+void mockStorageIoThreadCallback(void *context) {
+    ASSERT_EQ(context, static_cast<void *>(&mockStorageIoThreadContext));
+    mockStorageIoThreadContext++;
 }
 
 class FlashcacheTest : public flashcache::FlashcacheTestBase, public testing::TestWithParam
@@ -55,15 +55,15 @@ class FlashcacheTest : public flashcache::FlashcacheTestBase, public testing::Te
          flashcacheEvictionDetails eviction_details = { 0 };
          eviction_details.context = static_cast<void *>(&eviction_context);
          eviction_details.callback = eviction_callback;
-         flashcacheAsioControlMsgCallbackDetails asio_control_msg_callback =
-             {static_cast<void *>(&mockAsioContext), mockAsioCallback};
+         flashcacheStorageIoThreadControlMsgCallbackDetails storage_io_thread_control_msg_callback =
+             {static_cast<void *>(&mockStorageIoThreadContext), mockStorageIoThreadCallback};
          flashcache_snapshot_version = std::get<0>(GetParam());
          flashcache_snapshot_save_type = std::get<1>(GetParam());
          checksum_verification_enabled = std::get<2>(GetParam());
          ASSERT_EQ(flashcacheInit(db_filename.c_str(), db_size, INITIAL_INDEX_SIZE_PER_DB, NUM_DATABASES,
                      max_allocated_db_size_percent, max_num_in_flight_read_requests, min_garbage_collection_rate,
                      evict_under_max_logsize_time_limit, optimized_delete_enabled, mockClockGetTimeUs,
-                     &eviction_details, mockLogger, &asio_control_msg_callback), FC_OK);
+                     &eviction_details, mockLogger, &storage_io_thread_control_msg_callback), FC_OK);
      }
 
      void TearDown() {
@@ -96,8 +96,8 @@ TEST_P(FlashcacheTest, flashcacheRunCronTasksWithoutPutOrGet) {
     for (int i = 0; i < 1000; ++i) {
         flashcacheRunCronTasks();
     }
-    // Must have received ASIO callbacks
-    ASSERT_GT(mockAsioContext, 0);
+    // Must have received storage IO thread callbacks
+    ASSERT_GT(mockStorageIoThreadContext, 0);
 }
 
 TEST_P(FlashcacheTest, testLogState) {

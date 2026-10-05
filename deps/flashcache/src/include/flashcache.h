@@ -21,7 +21,7 @@
  * @param crc_function function pointer used for computing checksum of data stored on flash
  * @param eviction_details the details of callback called when a key is evicted
  * @param logger log function to be used by this library
- * @param asio_control_msg_callback_details details of the ASIO callback to handle control messages
+ * @param storage_io_thread_control_msg_callback_details details of the storage IO thread callback to handle control messages
  *        in a timely fashion.
  */
 flashcacheReturnCode flashcacheInit(char const *db_filename,
@@ -36,7 +36,7 @@ flashcacheReturnCode flashcacheInit(char const *db_filename,
         flashcache_monotonic_clock_us monotonic_clock_us,
         flashcacheEvictionDetails *eviction_details,
         flashcache_logger logger,
-        flashcacheAsioControlMsgCallbackDetails *asio_control_msg_callback_details);
+        flashcacheStorageIoThreadControlMsgCallbackDetails *storage_io_thread_control_msg_callback_details);
 
 /*!\brief Stores the provided value against the provided key and db id
  *
