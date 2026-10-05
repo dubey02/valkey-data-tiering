@@ -19,6 +19,9 @@ on:
       pr_ref:
         description: "Commit or branch to compare against the base, used when pr_number is empty"
         required: false
+      comment_on:
+        description: "PR or issue number to post the results on. Empty uses pr_number"
+        required: false
       instance_type:
         description: "EC2 instance type. Empty uses DT_INSTANCE_TYPE or r8gd.2xlarge"
         required: false
@@ -66,7 +69,7 @@ jobs:
       base-sha: ${{ steps.refs.outputs.base-sha }}
       pr-sha: ${{ steps.refs.outputs.pr-sha }}
       head-sha: ${{ steps.refs.outputs.head-sha }}
-      pr-number: ${{ steps.refs.outputs.pr-number }}
+      comment-number: ${{ steps.refs.outputs.comment-number }}
     steps:
       - name: Resolve commits
         id: refs
@@ -75,10 +78,16 @@ jobs:
           EVENT: ${{ github.event_name }}
           EVENT_PR: ${{ github.event.pull_request.number }}
           IN_PR_NUMBER: ${{ inputs.pr_number }}
+          IN_COMMENT_ON: ${{ inputs.comment_on }}
           IN_BASE: ${{ inputs.base_ref }}
           IN_PR: ${{ inputs.pr_ref }}
         run: |
           NUMBER=${EVENT_PR:-$IN_PR_NUMBER}
+          COMMENT_ON=${IN_COMMENT_ON:-$NUMBER}
+          if [[ -n "$COMMENT_ON" && ! "$COMMENT_ON" =~ ^[0-9]+$ ]]; then
+            echo "::error::comment_on must be a PR or issue number"
+            exit 1
+          fi
           if [[ -n "$NUMBER" ]]; then
             PULL=$(gh api "repos/$VALKEY_REPO/pulls/$NUMBER")
             BASE=$(jq -r .base.sha <<< "$PULL")
@@ -95,9 +104,9 @@ jobs:
             echo "base-sha=$BASE"
             echo "pr-sha=$PR"
             echo "head-sha=$HEAD"
-            echo "pr-number=$NUMBER"
+            echo "comment-number=$COMMENT_ON"
           } >> "$GITHUB_OUTPUT"
-          echo "pr #${NUMBER:-none}, base $BASE, pr $PR, $INSTANCE_TYPE in $AWS_REGION, $PERF_BENCHMARK_REPO@$PERF_BENCHMARK_REF"
+          echo "pr #${NUMBER:-none}, comment on #${COMMENT_ON:-none}, base $BASE, pr $PR, $INSTANCE_TYPE in $AWS_REGION, $PERF_BENCHMARK_REPO@$PERF_BENCHMARK_REF"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -331,7 +340,7 @@ jobs:
     needs: [start-runner, benchmark]
     if: >-
       always() && needs.start-runner.result != 'skipped' &&
-      needs.start-runner.outputs.pr-number != '' && (vars.DT_VALKEY_REPO || github.repository) == github.repository
+      needs.start-runner.outputs.comment-number != '' && (vars.DT_VALKEY_REPO || github.repository) == github.repository
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -343,7 +352,7 @@ jobs:
         with:
           name: tiering-benchmark-results
 
-      - name: Comment PR with results
+      - name: Comment results
         if: needs.benchmark.result == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
@@ -351,13 +360,14 @@ jobs:
             const fs = require('fs');
             const body = fs.readFileSync('comparison.md', 'utf8');
             const {owner, repo} = context.repo;
-            const sha = '${{ needs.start-runner.outputs.head-sha }}';
-            const link = `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
+            const link = (sha) => `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
+            const base = '${{ needs.start-runner.outputs.base-sha }}';
+            const head = '${{ needs.start-runner.outputs.head-sha }}';
             await github.rest.issues.createComment({
-              issue_number: Number('${{ needs.start-runner.outputs.pr-number }}'),
+              issue_number: Number('${{ needs.start-runner.outputs.comment-number }}'),
               owner,
               repo,
-              body: `**Data tiering benchmark ran on this commit:** ${link}\n\n${body}`
+              body: `**Data tiering benchmark:** ${link(head)} compared with base ${link(base)}\n\n${body}`
             });
 
       - name: Remove run-tiering-benchmark label
