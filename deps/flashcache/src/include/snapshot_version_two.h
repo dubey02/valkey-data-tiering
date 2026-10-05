@@ -95,7 +95,7 @@ typedef struct snapshotVersionTwoInfo {
     size_t is_waiting_for_engine_snapshotting_completion;
 
     /*
-     * When we are doing forkless save replication:
+     * When we are doing forkless replication:
      *
      * 1. If a read request comes to the processed part of the snapshot, we delete the item from FDB
      * by adding a DELETE flag to the item in the snapshot because the item will be in RDB.
@@ -107,19 +107,19 @@ typedef struct snapshotVersionTwoInfo {
      * will be move to the engine.
      **/
 
-    // Number of DELETE replication command written to snapshot during forkless save replication.
+    // Number of DELETE replication command written to snapshot during forkless replication.
     size_t curr_num_delete_repl_cmd;
 
     // Total size of replication data by DELETE replication command added into snapshot.
     size_t curr_delete_repl_cmd_bytes;
 
-    // Number of items reads in unprocessed part of the snapshot during forkless save.
+    // Number of items reads in unprocessed part of the snapshot during forkless replication.
     size_t curr_num_items_deleted_from_pending_snapshot_range;
 
-    // Bytes read in unprocessed part of the snapshot during forkless save.
+    // Bytes read in unprocessed part of the snapshot during forkless replication.
     size_t curr_items_deleted_from_pending_snapshot_range_bytes;
 
-    // Number of items that is added to RDB during forkless save
+    // Number of items that is added to RDB during forkless replication
     size_t curr_num_items_with_add_to_rdb_flag;
 
     // persisted_info collects metrics that is preserved after snapshot finishes.
@@ -198,13 +198,13 @@ void snapshotV2AddReplicationCommandIfRequired(snapshotVersionTwoInfo *snapshot_
 // Increments the snapshot manager's tracker for number of items added to the RDB
 void snapshotV2IncrementNumItemsAddedToRDB(snapshotVersionTwoInfo *snapshot_info);
 
-// Returns 1 if the item is in an active forkless save's snapshot range
-int snapshotV2IsItemInForklessSaveSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size_t offset);
+// Returns 1 if the item is in an active forkless replication's snapshot range
+int snapshotV2IsItemInForklessSnapshotRange(snapshotVersionTwoInfo *snapshot_info, size_t offset);
 
 size_t snapshotV2GetCountBasedMetric(snapshotVersionTwoInfo *snapshot_info, flashcacheCountBasedMetrics metric);
 
-// Updates the Snapshotting range after eviction in flash during forkless save replication.
-void snapshotV2UpdateSnapshottingRangeDuringForklessSave(snapshotVersionTwoInfo *snapshot_info,
+// Updates the Snapshotting range after eviction in flash during forkless replication.
+void snapshotV2UpdateSnapshottingRangeDuringForklessReplication(snapshotVersionTwoInfo *snapshot_info,
                                                        size_t updated_log_tail_offset_after_eviction);
 
 #endif  // __FLASHCACHE_SNAPSHOTV2_H

@@ -800,11 +800,11 @@ void logIteratorCoreLogicProcessingGarbageCollectionCallback(void *context, void
     if (needToPerformEviction(log) || !log->garbage_collector_info.can_do_log_compaction) {
         // We perform item eviction in 3 scenarios:
         // 1. The current allocated log size bytes is greater than the max allowed allocated log size
-        // 2. We are not allowed to move items for log compaction during stream-based forkless save
+        // 2. We are not allowed to move items for log compaction during forkless replication
         // 3. There are too few spillable values in memory
         char *value = NULL;
         size_t value_len = 0;
-        // For forkless save replication, we need to propagate a DELETE command for the item
+        // For forkless replication, we need to propagate a DELETE command for the item
         size_t log_offset = expandTrimmedLogOffset(index_entry->item_entry.log_entry.trimmed_log_offset);
         extractValueFromSerializedItem(item, &value, &value_len);
         snapshotManagerAddReplicationCommandIfRequired(log_offset, dbid, key, key_len,
@@ -1241,16 +1241,16 @@ flashcacheReturnCode logRunCronTasks(flashcacheLog *log) {
                 if (completion_callback != NULL) {
                     int should_add_item_to_rdb = 0;
                     int is_item_in_ts_snapshot_range =
-                            snapshotManagerIsItemInForklessSaveSnapshotRange(log_offset);
+                            snapshotManagerIsItemInForklessSnapshotRange(log_offset);
                     if (read_type == FC_READ) {
                         if (is_item_in_ts_snapshot_range) {
                             snapshotManagerIncrementNumItemsAddedToRDB();
                             should_add_item_to_rdb = 1;
-                            log->metrics.item_bytes_moved_from_disk_during_forkless_save += key_len + value_len;
+                            log->metrics.item_bytes_moved_from_disk_during_forkless_replication += key_len + value_len;
                         }
                     } else {
                         if (is_item_in_ts_snapshot_range) {
-                            log->metrics.item_bytes_deleted_from_disk_during_forkless_save +=
+                            log->metrics.item_bytes_deleted_from_disk_during_forkless_replication +=
                                 (total_len - FC_ITEM_HEADER_LEN);
                         }
                     }
@@ -1321,9 +1321,9 @@ finish_processing_request:
     // affected -- only the iterator that drives GC is skipped.
     if (!fc_gc_paused) logIteratorCron(log->log_iterator);
 
-    // Update the snapshotting range start offset if tail offset has been moved due to evictions during forkless save
+    // Update the snapshotting range start offset if tail offset has been moved due to evictions during forkless replication
     // replication. This is required because whenever eviction happens in flash, we move the log tail offset. As tail
-    // offset moves, head offset can overwrite the original snapshotting range of forkless save. Hence we need to update
+    // offset moves, head offset can overwrite the original snapshotting range of forkless replication. Hence we need to update
     // the snapshotting range accordingly.
     snapshotManagerUpdateSnapshottingRangeTailOffset(log->tail_offset);
     return FC_OK;
@@ -1335,8 +1335,8 @@ void waitTillNoPendingIoAndGarbageCollection(flashcacheLog *log, int is_empty_st
     // 1. There are pending read request that came before logStartSnaphotting invocation.
     // 2. There is a GC run in progress.
     // 3. There are items in the staging buffer that has not been written to the log depending on
-    //    `is_empty_staging_buffer_required` flag. In case of end of forkless save replication, when log is full and items
-    //    are still present in staging buffer we wont be able to flush it in log as GC are disabled during forkless save.
+    //    `is_empty_staging_buffer_required` flag. In case of end of forkless replication, when log is full and items
+    //    are still present in staging buffer we wont be able to flush it in log as GC are disabled during forkless replication.
     //    In that case we dont wait for staging buffer to become empty.
     // 4. There is a log flush in progress
     while ((!fioRequestIsEmpty(&(log->log_flush_fio_request))) ||
@@ -1357,7 +1357,7 @@ static void logStartSave(flashcacheLog *log, flashcacheSnapshotSecret *snapshot_
                          flashcacheSnapshotSaveType snapshot_save_type,
                          flashcacheLogIterationCallbackDetails *log_iteration_completion_callback_details) {
     log->metrics.num_start_save_request++;
-    log->metrics.item_bytes_moved_from_disk_during_forkless_save = 0;
+    log->metrics.item_bytes_moved_from_disk_during_forkless_replication = 0;
 
     // Pause garbage collection and eviction so no new garbage collection starts
     log->garbage_collector_info.can_start_garbage_collection = 0;
@@ -1366,7 +1366,7 @@ static void logStartSave(flashcacheLog *log, flashcacheSnapshotSecret *snapshot_
     waitTillNoPendingIoAndGarbageCollection(log, 1);
 
     resetHeadTailOffsetOfLogIfRequired(log);  // Reset the head and tail offset of the log if required.
-    flashcacheLogger(FC_LL_NOTICE, "Starting save operation for Bgsave or forkless save with Head offset : %lu, "
+    flashcacheLogger(FC_LL_NOTICE, "Starting save operation for Bgsave or forkless with Head offset : %lu, "
                                    "Tail offset : %lu, Active size = %lu",
                      log->head_offset,  log->tail_offset, getActiveLogSizeBytes(log));
     snapshotManagerStartSave(snapshot_secret,
@@ -1551,9 +1551,9 @@ size_t logGetCountBasedMetric(flashcacheLog *log, flashcacheCountBasedMetrics me
         case FC_LATEST_KEEP_ALIVE_MSG_TIME_US:
             return snapshotManagerGetCountBasedMetric(FC_LATEST_KEEP_ALIVE_MSG_TIME_US);
         case FC_ITEM_BYTES_MOVED_FROM_DISK:
-            return log->metrics.item_bytes_moved_from_disk_during_forkless_save;
+            return log->metrics.item_bytes_moved_from_disk_during_forkless_replication;
         case FC_ITEM_BYTES_DELETED_FROM_DISK:
-            return log->metrics.item_bytes_deleted_from_disk_during_forkless_save;
+            return log->metrics.item_bytes_deleted_from_disk_during_forkless_replication;
         default:
             flashcacheAssertWithLogging(0, "Unknown metric: [%d]", metric);
     }
@@ -1693,7 +1693,7 @@ int logShouldRunCronTasksImmediately(struct flashcacheLog *log) {
     return 0;
 }
 
-void logCompleteForklessSaveReplication(flashcacheLog *log) {
+void logCompleteForklessReplication(flashcacheLog *log) {
     // Pause garbage collection and eviction so no new garbage collection starts
     log->garbage_collector_info.can_start_garbage_collection = 0;
     // Wait till all all the pending IO request has been served

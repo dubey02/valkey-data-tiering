@@ -38,5 +38,5 @@ deps/flashcache/build/app/FlashCacheApp /tmp/fc.db 1 20000 500:1,2000:1 normal_d
 <num_ops_per_stat_emission>: Number of ops before emitting stats
 <read_to_write_ratio>: Number of read operations per write operation
 <snapshot_version>: The version of snapshot algorithm to use, 1 or 2
-<snapshot_save_type>: bgsave or forkless_save
+<snapshot_save_type>: bgsave or forkless
 ```

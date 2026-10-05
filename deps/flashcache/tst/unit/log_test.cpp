@@ -199,7 +199,7 @@ class LogTest : public flashcache::FlashcacheTestBase, public testing::TestWithP
                                     flashcache_snapshot_save_type, &log_iteration_completion_callback_details);
 
             // Set FC_CONFIG_KEY_ENGINE_LAYER_SNAPSHOT_COMPLETION_STATUS config to 1 in case of Threadsave
-            if (flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE) {
+            if (flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS) {
                 flashcacheConfig config = {};
                 config.key = FC_CONFIG_KEY_ENGINE_LAYER_SNAPSHOT_COMPLETION_STATUS;
                 config.numeric_value = 1;
@@ -370,7 +370,7 @@ class LogTest : public flashcache::FlashcacheTestBase, public testing::TestWithP
     }
 
     bool isTestingThreadsaveReplication() {
-        return snapshot_writer != NULL && flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE;
+        return snapshot_writer != NULL && flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS;
     }
 
     bool isTestingReplicationWithThreadsaveAndVersionOne() {
@@ -3121,7 +3121,7 @@ TEST_P(LogTestWithSnapshotting, testSnapshotKeepaliveAllSaveTypes) {
 
         // Check to see that keepalive message has been sent
         ASSERT_GT(snapshot_manager_info->snapshot_version_two_info->num_replication_link_keep_alive_msg, 0);
-        logCompleteForklessSaveReplication(log);
+        logCompleteForklessReplication(log);
     }
 }
 
@@ -3131,7 +3131,7 @@ TEST_P(LogTestWithReplication, testSnapshotCompletionOnlyAfterRedisCompletesSnap
     writeItemsToLog(log, num_databases, num_items);
     ASSERT_EQ(num_items, logGetCountBasedMetric(log, FC_NUM_ITEMS));
 
-    setFlashCacheSnapshotSaveType(FC_SAVE_TYPE_FORKLESS_SAVE);
+    setFlashCacheSnapshotSaveType(FC_SAVE_TYPE_FORKLESS);
     snapshotContext context = { 0 };
     snapshotContext *snapshot_context = &context;
     snapshot_context->expected_completion_status = 1;
@@ -3181,7 +3181,7 @@ TEST_P(LogTestWithReplication, testSnapshotCompletionOnlyAfterRedisCompletesSnap
         // Make sure that we sent keep alive to the replica's storage IO thread while waiting for the engine snapshot to complete
         ASSERT_GT(snapshot_manager_info->snapshot_version_two_info->num_replication_link_keep_alive_msg, 0);
 
-        logCompleteForklessSaveReplication(log);
+        logCompleteForklessReplication(log);
 
         ASSERT_EQ(snapshot_context->num_snapshot_completion_callback_invocation, 1);
         ASSERT_EQ(snapshot_context->num_log_iteration_completion_callback_invocation, 1);
@@ -3200,7 +3200,7 @@ TEST_P(LogTestWithReplication, testReplicationLinkKeepAliveWithinMaxTimeout) {
     writeItemsToLog(log, num_databases, num_items);
     ASSERT_EQ(num_items, logGetCountBasedMetric(log, FC_NUM_ITEMS));
 
-    setFlashCacheSnapshotSaveType(FC_SAVE_TYPE_FORKLESS_SAVE);
+    setFlashCacheSnapshotSaveType(FC_SAVE_TYPE_FORKLESS);
     snapshotContext context = { 0 };
     snapshotContext *snapshot_context = &context;
     snapshot_context->expected_completion_status = 1;
@@ -3258,7 +3258,7 @@ TEST_P(LogTestWithReplication, testReplicationLinkKeepAliveWithinMaxTimeout) {
         // Total message sent = num secs
         ASSERT_EQ(snapshot_manager_info->snapshot_version_two_info->num_replication_link_keep_alive_msg, 2);
 
-        logCompleteForklessSaveReplication(log);
+        logCompleteForklessReplication(log);
         ASSERT_EQ(snapshot_context->num_snapshot_completion_callback_invocation, 1);
         ASSERT_EQ(snapshot_context->num_log_iteration_completion_callback_invocation, 1);
     }
@@ -3276,7 +3276,7 @@ TEST_P(LogTestWithReplication, testReplicationLinkKeepAlivePastMaxTimeout) {
     writeItemsToLog(log, num_databases, num_items);
     ASSERT_EQ(num_items, logGetCountBasedMetric(log, FC_NUM_ITEMS));
 
-    setFlashCacheSnapshotSaveType(FC_SAVE_TYPE_FORKLESS_SAVE);
+    setFlashCacheSnapshotSaveType(FC_SAVE_TYPE_FORKLESS);
     snapshotContext context = { 0 };
     snapshotContext *snapshot_context = &context;
     snapshot_context->expected_completion_status = 1;
@@ -3334,7 +3334,7 @@ TEST_P(LogTestWithReplication, testReplicationLinkKeepAlivePastMaxTimeout) {
         // Total message sent is only 2 because we stopped sending those at the 2nd second.
         ASSERT_EQ(snapshot_manager_info->snapshot_version_two_info->num_replication_link_keep_alive_msg, 2);
 
-        logCompleteForklessSaveReplication(log);
+        logCompleteForklessReplication(log);
         ASSERT_EQ(snapshot_context->num_snapshot_completion_callback_invocation, 1);
         ASSERT_EQ(snapshot_context->num_log_iteration_completion_callback_invocation, 1);
     }
@@ -4023,7 +4023,7 @@ TEST_P(LogTest, testDeletionWithHashCollisionUsingNonUniformKeysZeroOffset) {
 TEST_P(LogTest, testResubmitInflightDeletionWhenPITSnapshottingStarts) {
     // Skip this test if not SV2 with point-in-time snapshotting
     if (flashcache_snapshot_version != FC_SNAPSHOT_VERSION_TWO ||
-            flashcache_snapshot_save_type != FC_SAVE_TYPE_FORKLESS_SAVE) {
+            flashcache_snapshot_save_type != FC_SAVE_TYPE_FORKLESS) {
         return;
     }
 
@@ -4249,7 +4249,7 @@ std::vector<flashcacheSnapshotVersion> flashcache_snapshot_versions_list {
         FC_SNAPSHOT_VERSION_ONE, FC_SNAPSHOT_VERSION_TWO };
 
 std::vector<flashcacheSnapshotSaveType> flashcache_snapshot_save_types_list {
-        FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS_SAVE };
+        FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS };
 
 std::vector<flashcacheReadTypes> flashcache_read_type { FC_READ, FC_DELETE };
 

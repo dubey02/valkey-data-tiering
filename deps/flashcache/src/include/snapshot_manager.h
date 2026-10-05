@@ -95,8 +95,8 @@ void snapshotManagerSetHasSnapshottingCompletedInEngineLayer(uint8_t value);
 // Increments the snapshot manager's tracker for number of items added to the RDB
 void snapshotManagerIncrementNumItemsAddedToRDB();
 
-// Returns 1 if the item is in an active forkless save's snapshot range
-int snapshotManagerIsItemInForklessSaveSnapshotRange(size_t offset);
+// Returns 1 if the item is in an active forkless replication's snapshot range
+int snapshotManagerIsItemInForklessSnapshotRange(size_t offset);
 
 // Get metric from the current snapshot
 size_t snapshotManagerGetCountBasedMetric(flashcacheCountBasedMetrics metric);
@@ -109,7 +109,7 @@ void snapshotManagerSetSnapshotKeepAliveMsgIntervalUs(uint64_t value);
 // snapshotting to complete
 void snapshotManagerSetReplicationLinkTimeoutSecs(size_t value);
 
-// Updates the Snapshotting range after eviction in flash during forkless save replication.
+// Updates the Snapshotting range after eviction in flash during forkless replication.
 void snapshotManagerUpdateSnapshottingRangeTailOffset(size_t updated_log_tail_offset);
 
 #endif  // __FLASHCACHE_SNAPSHOT_MANAGER_H

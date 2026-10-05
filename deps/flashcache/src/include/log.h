@@ -199,11 +199,11 @@ typedef struct logMetrics {
     // Total size of items evicted from log
     size_t total_item_evicted_size_bytes;
 
-    // Size bytes which is moved out of disk during forkless save
-    size_t item_bytes_moved_from_disk_during_forkless_save;
+    // Size bytes which is moved out of disk during forkless replication
+    size_t item_bytes_moved_from_disk_during_forkless_replication;
 
-    // Size bytes which is deleted from disk during forkless save
-    size_t item_bytes_deleted_from_disk_during_forkless_save;
+    // Size bytes which is deleted from disk during forkless replication
+    size_t item_bytes_deleted_from_disk_during_forkless_replication;
 
     // Is log iterator currently evicting while log has not reached maximum size
     size_t is_evicting_under_max_logsize;
@@ -423,8 +423,8 @@ void invokeStorageIoThreadControlMsgCallback();
 // Flush staging buffer.
 void logFlushStagingBufferIfRequired(flashcacheLog *log, size_t threshold);
 
-// Completes forkless save replication
-void logCompleteForklessSaveReplication(flashcacheLog *log);
+// Completes forkless replication
+void logCompleteForklessReplication(flashcacheLog *log);
 
 // Snapshot support: pause/resume the GC iterator (see logRunCronTasks)
 void logSetGcPaused(int paused);

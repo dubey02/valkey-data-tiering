@@ -443,7 +443,7 @@ void parseArgs(int argc, char *argv[]) {
         printf("<num_ops_per_stat_emission>: Number of ops before emitting stats\n");
         printf("<read_to_write_ratio>: Number of read operations per write operation\n");
         printf("<snapshot_version>: The version of snapshot algorithm to use values 1 or 2.\n");
-        printf("<snapshot_save_type>: bgsave or forkless_save\n");
+        printf("<snapshot_save_type>: bgsave or forkless\n");
         exit(1);
     }
 
@@ -542,8 +542,8 @@ void parseArgs(int argc, char *argv[]) {
 
     // Parse the snapshot save type. Default to BGSAVE.
     arg = argv[arg_idx++];
-    if (!strcmp(arg, "forkless_save")) {
-        flashcache_snapshot_save_type = FC_SAVE_TYPE_FORKLESS_SAVE;
+    if (!strcmp(arg, "forkless")) {
+        flashcache_snapshot_save_type = FC_SAVE_TYPE_FORKLESS;
     } else if (!strcmp(arg, "bgsave")) {
         flashcache_snapshot_save_type = FC_SAVE_TYPE_BGSAVE;
     } else {

@@ -103,8 +103,8 @@ void snapshotManagerStartSave(flashcacheSnapshotSecret *snapshot_secret,
                                      snapshot_manager_info.snapshot_version);
     switch (snapshot_manager_info.snapshot_version) {
         case FC_SNAPSHOT_VERSION_ONE:
-            if (snapshot_writer != NULL && snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE) {
-                flashcacheAssertWithLogging(0, "Snapshot V1 does not support forkless save replication.", 0);
+            if (snapshot_writer != NULL && snapshot_save_type == FC_SAVE_TYPE_FORKLESS) {
+                flashcacheAssertWithLogging(0, "Snapshot V1 does not support forkless replication.", 0);
             }
             indexPauseGrowth(index);  // If index growth is Running, Pause it.
 
@@ -379,20 +379,20 @@ void snapshotManagerIncrementNumItemsAddedToRDB() {
     }
 }
 
-int snapshotManagerIsItemInForklessSaveSnapshotRange(size_t offset) {
+int snapshotManagerIsItemInForklessSnapshotRange(size_t offset) {
     int ret = 0;
     switch (snapshot_manager_info.snapshot_version) {
         case FC_SNAPSHOT_VERSION_ONE:
             // nothing to do for this snapshotting version.
             break;
         case FC_SNAPSHOT_VERSION_TWO:
-            ret = snapshotV2IsItemInForklessSaveSnapshotRange(snapshot_manager_info.snapshot_version_two_info,
+            ret = snapshotV2IsItemInForklessSnapshotRange(snapshot_manager_info.snapshot_version_two_info,
                     offset);
             break;
         default:
             // Being here means we have an unsupported version of snapshotting.
             flashcacheAssertWithLogging(0, "Unknown snapshot version %d in "
-                                           "snapshotManagerIsItemInForklessSaveSnapshotRange",
+                                           "snapshotManagerIsItemInForklessSnapshotRange",
                                         snapshot_manager_info.snapshot_version, 0);
             break;
     }
@@ -456,7 +456,7 @@ void snapshotManagerUpdateSnapshottingRangeTailOffset(size_t updated_log_tail_of
             // nothing to do for this snapshotting version.
             break;
         case FC_SNAPSHOT_VERSION_TWO:
-            snapshotV2UpdateSnapshottingRangeDuringForklessSave(snapshot_manager_info.snapshot_version_two_info,
+            snapshotV2UpdateSnapshottingRangeDuringForklessReplication(snapshot_manager_info.snapshot_version_two_info,
                                                               updated_log_tail_offset);
             break;
         default:

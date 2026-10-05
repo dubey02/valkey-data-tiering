@@ -156,7 +156,7 @@ int flashcacheShouldRunCronTasksImmediately();
  * snapshot_writer: Pointer of a flashcacheSnapshotWriter which contains bunch of APIs for stream based snapshot.
  * snapshot_version: The version of the snapshot to use in the current save attempt.
  * log_iteration_completion_callback_details: Callback which needs to be called after completion of log
- *                          iteration in forkless save replication. Note: we do shallow copy of this callback currently
+ *                          iteration in forkless replication. Note: we do shallow copy of this callback currently
  *                          but deep copy might be required if we change it in future by adding any allocated memory.
  */
 void flashcacheStartStreamBasedSave(flashcacheSnapshotSecret *snapshot_secret,

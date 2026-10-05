@@ -239,7 +239,7 @@ TEST_P(SnapshotV2Test, testAddReplicationCommandIfRequired) {
     snapshot_info->snapshot_common.has_failed = 0;
 
     // Enables Threadsave so the function would be called.
-    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS_SAVE;
+    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS;
     ASSERT_EQ(0, snapshot_info->snapshot_data_generated_size_bytes);
     snapshotV2AddReplicationCommandIfRequired(snapshot_info, offset, dbid, key, key_len,
                                               value, value_len, log->crc_function);
@@ -279,7 +279,7 @@ TEST_P(SnapshotV2Test, testAddReplicationCommandIfRequiredNegativeCases) {
     // Snapshot is not running.
     snapshot_info->snapshot_common.is_running = 0;
     snapshot_info->snapshot_common.has_failed = 0;
-    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS_SAVE;
+    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS;
     ASSERT_EQ(0, snapshot_info->snapshot_data_generated_size_bytes);
     snapshotV2AddReplicationCommandIfRequired(snapshot_info, offset, dbid, key, key_len,
                                               value, value_len, log->crc_function);
@@ -289,7 +289,7 @@ TEST_P(SnapshotV2Test, testAddReplicationCommandIfRequiredNegativeCases) {
     // Snapshot has failed.
     snapshot_info->snapshot_common.is_running = 1;
     snapshot_info->snapshot_common.has_failed = 1;
-    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS_SAVE;
+    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS;
     ASSERT_EQ(0, snapshot_info->snapshot_data_generated_size_bytes);
     snapshotV2AddReplicationCommandIfRequired(snapshot_info, offset, dbid, key, key_len,
                                               value, value_len, log->crc_function);
@@ -299,7 +299,7 @@ TEST_P(SnapshotV2Test, testAddReplicationCommandIfRequiredNegativeCases) {
     // Snapshot is not running and has failed.
     snapshot_info->snapshot_common.is_running = 0;
     snapshot_info->snapshot_common.has_failed = 1;
-    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS_SAVE;
+    snapshot_info->snapshot_save_type = FC_SAVE_TYPE_FORKLESS;
     ASSERT_EQ(0, snapshot_info->snapshot_data_generated_size_bytes);
     snapshotV2AddReplicationCommandIfRequired(snapshot_info, offset, dbid, key, key_len,
                                               value, value_len, log->crc_function);

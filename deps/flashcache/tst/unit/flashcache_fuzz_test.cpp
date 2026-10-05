@@ -57,9 +57,9 @@ static size_t num_save_snapshot_completed = 0;
 static size_t num_load_snapshot = 0;
 static std::vector<std::tuple<flashcacheSnapshotVersion, flashcacheSnapshotSaveType>> snapshot_configs = {
     {FC_SNAPSHOT_VERSION_ONE, FC_SAVE_TYPE_BGSAVE},
-    {FC_SNAPSHOT_VERSION_ONE, FC_SAVE_TYPE_FORKLESS_SAVE},
+    {FC_SNAPSHOT_VERSION_ONE, FC_SAVE_TYPE_FORKLESS},
     {FC_SNAPSHOT_VERSION_TWO, FC_SAVE_TYPE_BGSAVE},
-    {FC_SNAPSHOT_VERSION_TWO, FC_SAVE_TYPE_FORKLESS_SAVE}
+    {FC_SNAPSHOT_VERSION_TWO, FC_SAVE_TYPE_FORKLESS}
 };
 
 typedef struct {

@@ -20,7 +20,7 @@ typedef struct {
 
 typedef enum {
     FC_SAVE_TYPE_BGSAVE,
-    FC_SAVE_TYPE_FORKLESS_SAVE
+    FC_SAVE_TYPE_FORKLESS
 } flashcacheSnapshotSaveType;
 
 typedef enum {
@@ -161,14 +161,14 @@ typedef enum {
     FC_CURR_DELETE_REPL_CMD_BYTES,
 
     // Number of items read in pending snapshotting range and moved back to the engine
-    // during forkless save replication
+    // during forkless replication
     FC_CURR_NUM_ITEMS_DELETED_FROM_PENDING_SNAPSHOT_RANGE,
 
     // Number of bytes read in pending snapshotting range and moved back to the engine
-    // during forkless save replication
+    // during forkless replication
     FC_CURR_ITEMS_DELETED_FROM_PENDING_SNAPSHOT_RANGE_BYTES,
 
-    // Number of items that needs to be added to RDB while doing forkless save replication
+    // Number of items that needs to be added to RDB while doing forkless replication
     FC_CURR_NUM_ITEMS_WITH_ADD_TO_RDB_FLAG,
 
     // Number of DELETE replication commands sent to FDB in the previous snapshot
@@ -178,24 +178,24 @@ typedef enum {
     FC_LAST_DELETE_REPL_CMD_BYTES,
 
     // Number of items read in pending snapshotting range and moved back to the engine
-    // during forkless save replication in the previous snapshot
+    // during forkless replication in the previous snapshot
     FC_LAST_NUM_ITEMS_DELETED_FROM_PENDING_SNAPSHOT_RANGE,
 
     // Number of bytes read in pending snapshotting range and moved back to the engine
-    // during forkless save replication in the previous snapshot
+    // during forkless replication in the previous snapshot
     FC_LAST_ITEMS_DELETED_FROM_PENDING_SNAPSHOT_RANGE_BYTES,
 
-    // Number of items that needs to be added to RDB while doing forkless save replication
+    // Number of items that needs to be added to RDB while doing forkless replication
     // in the previous snapshot
     FC_LAST_NUM_ITEMS_WITH_ADD_TO_RDB_FLAG,
 
     // Latest keep alive message time in us
     FC_LATEST_KEEP_ALIVE_MSG_TIME_US,
 
-    // Size bytes of item which has been moved out of disk during forkless save replication
+    // Size bytes of item which has been moved out of disk during forkless replication
     FC_ITEM_BYTES_MOVED_FROM_DISK,
 
-    // Size bytes of item which has been deleted from disk during forkless save replication
+    // Size bytes of item which has been deleted from disk during forkless replication
     FC_ITEM_BYTES_DELETED_FROM_DISK,
 
     // Is log iterator evicting before flashcache log has reached max size or not
@@ -340,7 +340,7 @@ typedef struct {
     flashcache_snapshot_completion_callback callback;
 } flashcacheSnapshotCallbackDetails;
 
-/* This callback is triggered when log iteration is completed during forkless save replication */
+/* This callback is triggered when log iteration is completed during forkless replication */
 typedef void (*flashcache_log_iteration_completion_callback)(void *context);
 
 typedef struct {
@@ -348,7 +348,7 @@ typedef struct {
     void *context;
 
     /* The callback that is invoked when lot iteration is completed
-     * during forkless save replication
+     * during forkless replication
      */
     flashcache_log_iteration_completion_callback callback;
 } flashcacheLogIterationCallbackDetails;
@@ -402,7 +402,7 @@ typedef struct {
 
     /*
      * This API is used to write a keep alive message to the writer. 
-     * This is to keep the replication link alive during forkless save.
+     * This is to keep the replication link alive during forkless replication.
      *
      * Returns Void
      * callback_context : The context that was passed from the caller when

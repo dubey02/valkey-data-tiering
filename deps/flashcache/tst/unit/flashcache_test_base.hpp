@@ -122,7 +122,7 @@ static void snapshotCompletionCallback(void *context, int completed) {
 
 static void logIterationCompletionCallback(void *context) {
     snapshotContext *snapshot_context = reinterpret_cast<snapshotContext *>(context);
-    ASSERT_EQ(snapshot_context->snapshot_save_type, FC_SAVE_TYPE_FORKLESS_SAVE);
+    ASSERT_EQ(snapshot_context->snapshot_save_type, FC_SAVE_TYPE_FORKLESS);
     ASSERT_EQ(snapshot_context->snapshot_version, FC_SNAPSHOT_VERSION_TWO);
     snapshot_context->num_log_iteration_completion_callback_invocation++;
 }

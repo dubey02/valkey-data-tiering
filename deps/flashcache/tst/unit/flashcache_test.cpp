@@ -196,7 +196,7 @@ TEST_P(FlashcacheTestWithSnapshottingVersionsAndChecksum, testSnapshotCompletion
                                  flashcache_snapshot_version, flashcache_snapshot_save_type);
 
     // Set FC_CONFIG_KEY_ENGINE_LAYER_SNAPSHOT_COMPLETION_STATUS config to 1 in case of Threadsave
-    if (flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE) {
+    if (flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS) {
         flashcacheConfig config = {};
         config.key = FC_CONFIG_KEY_ENGINE_LAYER_SNAPSHOT_COMPLETION_STATUS;
         config.numeric_value = 1;
@@ -241,7 +241,7 @@ TEST_P(FlashcacheTestWithSnapshottingVersionsAndChecksum, testStreamBasedSnapsho
     // Snapshot V1 does not support THREADSAVE replication, FlashCache
     // will crash if we start snapshotting with these configurations.
     if (flashcache_snapshot_version == FC_SNAPSHOT_VERSION_ONE
-        && flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE) {
+        && flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS) {
         return;
     }
     uint32_t dbid = 0;
@@ -276,7 +276,7 @@ TEST_P(FlashcacheTestWithSnapshottingVersionsAndChecksum, testStreamBasedSnapsho
                                    flashcache_snapshot_save_type, &log_iteration_callback_details);
 
     // Set FC_CONFIG_KEY_ENGINE_LAYER_SNAPSHOT_COMPLETION_STATUS config to 1 in case of Threadsave
-    if (flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE) {
+    if (flashcache_snapshot_save_type == FC_SAVE_TYPE_FORKLESS) {
         flashcacheConfig config = {};
         config.key = FC_CONFIG_KEY_ENGINE_LAYER_SNAPSHOT_COMPLETION_STATUS;
         config.numeric_value = 1;
@@ -512,17 +512,17 @@ TEST_P(FlashcacheTest, testFsyncBufferedWrites) {
 INSTANTIATE_TEST_SUITE_P(ParameterizedFlashcacheTest, FlashcacheTest,
         testing::Combine(
                 testing::Values(FC_SNAPSHOT_VERSION_TWO),
-                testing::Values(FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS_SAVE),
+                testing::Values(FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS),
                 testing::Values(0)));
 INSTANTIATE_TEST_SUITE_P(ParameterizedFlashcacheTestWithSnapshottingVersions,
                          FlashcacheTestWithSnapshottingVersions,
         testing::Combine(
                 testing::Values(FC_SNAPSHOT_VERSION_ONE, FC_SNAPSHOT_VERSION_TWO),
-                testing::Values(FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS_SAVE),
+                testing::Values(FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS),
                 testing::Values(1)));
 INSTANTIATE_TEST_SUITE_P(ParameterizedFlashcacheTestWithSnapshottingVersionsAndChecksum,
                          FlashcacheTestWithSnapshottingVersionsAndChecksum,
         testing::Combine(
                 testing::Values(FC_SNAPSHOT_VERSION_ONE, FC_SNAPSHOT_VERSION_TWO),
-                testing::Values(FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS_SAVE),
+                testing::Values(FC_SAVE_TYPE_BGSAVE, FC_SAVE_TYPE_FORKLESS),
                 testing::Values(0, 1)));

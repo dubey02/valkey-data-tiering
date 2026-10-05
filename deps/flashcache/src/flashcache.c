@@ -224,5 +224,5 @@ void flashcacheFsyncBufferedWrites() {
 }
 
 void flashcacheNotifyEngineLayerSnapshotCompletion() {
-    logCompleteForklessSaveReplication(flashcache_context.log);
+    logCompleteForklessReplication(flashcache_context.log);
 }

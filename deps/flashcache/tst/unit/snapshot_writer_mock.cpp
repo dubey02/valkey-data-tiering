@@ -72,7 +72,7 @@ static void completeMock(void *context, int completed) {
         // and some delete requests in unprocessed snapshotting range. Because of
         // this, snapshot_written_bytes can not be predicted as it can be more/less
         // or equal to snapshot_size_bytes.
-        if (snapshot_context->snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE) {
+        if (snapshot_context->snapshot_save_type == FC_SAVE_TYPE_FORKLESS) {
             ASSERT_GE(snapshot_written_bytes, 0);
         } else {
             // In the case of snapshot v2 BGSAVE, we can have a situation where
