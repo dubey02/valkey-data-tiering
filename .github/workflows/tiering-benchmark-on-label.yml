@@ -72,6 +72,7 @@ jobs:
       pr-sha: ${{ steps.refs.outputs.pr-sha }}
       head-sha: ${{ steps.refs.outputs.head-sha }}
       comment-number: ${{ steps.refs.outputs.comment-number }}
+      pr-number: ${{ steps.refs.outputs.pr-number }}
     steps:
       - name: Resolve commits
         id: refs
@@ -107,6 +108,7 @@ jobs:
             echo "pr-sha=$PR"
             echo "head-sha=$HEAD"
             echo "comment-number=$COMMENT_ON"
+            echo "pr-number=$NUMBER"
           } >> "$GITHUB_OUTPUT"
           echo "pr #${NUMBER:-none}, comment on #${COMMENT_ON:-none}, base $BASE, pr $PR, $INSTANCE_TYPE in $AWS_REGION, $PERF_BENCHMARK_REPO@$PERF_BENCHMARK_REF"
 
@@ -115,6 +117,7 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           COMMENT_ON: ${{ steps.refs.outputs.comment-number }}
+          PR_NUMBER: ${{ steps.refs.outputs.pr-number }}
           BASE: ${{ steps.refs.outputs.base-sha }}
           HEAD: ${{ steps.refs.outputs.head-sha }}
         with:
@@ -122,11 +125,15 @@ jobs:
             const {owner, repo} = context.repo;
             const link = (sha) => `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
             const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const {PR_NUMBER, BASE, HEAD} = process.env;
+            const what = PR_NUMBER
+              ? `PR #${PR_NUMBER} merged onto base ${link(BASE)} (PR head ${link(HEAD)})`
+              : `${link(HEAD)} compared with base ${link(BASE)}`;
             await github.rest.issues.createComment({
               issue_number: Number(process.env.COMMENT_ON),
               owner,
               repo,
-              body: `**Data tiering benchmark started:** ${link(process.env.HEAD)} compared with base ${link(process.env.BASE)} on \`${process.env.INSTANCE_TYPE}\`. [Follow the run](${run})`
+              body: `**Data tiering benchmark started:** ${what} on \`${process.env.INSTANCE_TYPE}\`. [Follow the run](${run})`
             });
 
       - name: Configure AWS credentials
@@ -378,11 +385,15 @@ jobs:
             const link = (sha) => `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
             const base = '${{ needs.start-runner.outputs.base-sha }}';
             const head = '${{ needs.start-runner.outputs.head-sha }}';
+            const pr = '${{ needs.start-runner.outputs.pr-number }}';
+            const what = pr
+              ? `PR #${pr} merged onto base ${link(base)} (PR head ${link(head)})`
+              : `${link(head)} compared with base ${link(base)}`;
             await github.rest.issues.createComment({
               issue_number: Number('${{ needs.start-runner.outputs.comment-number }}'),
               owner,
               repo,
-              body: `**Data tiering benchmark:** ${link(head)} compared with base ${link(base)}\n\n${body}`
+              body: `**Data tiering benchmark:** ${what}\n\n${body}`
             });
 
       - name: Comment that the benchmark failed
