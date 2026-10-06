@@ -61,6 +61,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      issues: write
+      pull-requests: write
     outputs:
       label: ${{ steps.runner.outputs.label }}
       instance-id: ${{ steps.runner.outputs.ec2-instance-id }}
@@ -90,10 +92,10 @@ jobs:
           fi
           if [[ -n "$NUMBER" ]]; then
             PULL=$(gh api "repos/$VALKEY_REPO/pulls/$NUMBER")
-            BASE=$(jq -r .base.sha <<< "$PULL")
             PR=$(jq -r .merge_commit_sha <<< "$PULL")
             HEAD=$(jq -r .head.sha <<< "$PULL")
             [[ "$PR" != null && -n "$PR" ]] || { echo "::error::PR #$NUMBER has no merge commit (conflicts?)"; exit 1; }
+            BASE=$(gh api "repos/$VALKEY_REPO/commits/$PR" --jq '.parents[0].sha')
           else
             [[ -n "$IN_PR" ]] || { echo "::error::set pr_number, or pr_ref"; exit 1; }
             BASE=$(gh api "repos/$VALKEY_REPO/commits/${IN_BASE:-unstable}" --jq .sha)
@@ -107,6 +109,25 @@ jobs:
             echo "comment-number=$COMMENT_ON"
           } >> "$GITHUB_OUTPUT"
           echo "pr #${NUMBER:-none}, comment on #${COMMENT_ON:-none}, base $BASE, pr $PR, $INSTANCE_TYPE in $AWS_REGION, $PERF_BENCHMARK_REPO@$PERF_BENCHMARK_REF"
+
+      - name: Comment that the benchmark started
+        if: steps.refs.outputs.comment-number != '' && env.VALKEY_REPO == github.repository
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          COMMENT_ON: ${{ steps.refs.outputs.comment-number }}
+          BASE: ${{ steps.refs.outputs.base-sha }}
+          HEAD: ${{ steps.refs.outputs.head-sha }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const link = (sha) => `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
+            const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              issue_number: Number(process.env.COMMENT_ON),
+              owner,
+              repo,
+              body: `**Data tiering benchmark started:** ${link(process.env.HEAD)} compared with base ${link(process.env.BASE)} on \`${process.env.INSTANCE_TYPE}\`. [Follow the run](${run})`
+            });
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
@@ -203,8 +224,6 @@ jobs:
     permissions:
       contents: read
     env:
-      FLASHCACHE_FILE: /mnt/nvme/flashcache.db
-      FLASHCACHE_CAPACITY: 8gb
       NUM_RUNS: ${{ vars.TIERING_BENCHMARK_RUNS || '3' }}
       BASE_SHA: ${{ needs.start-runner.outputs.base-sha }}
       PR_SHA: ${{ needs.start-runner.outputs.pr-sha }}
@@ -289,8 +308,6 @@ jobs:
       - name: Run base benchmark
         working-directory: valkey-perf-benchmark
         run: |
-          rm -f "$FLASHCACHE_FILE"
-          fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
           git -C ../valkey checkout --detach "$BASE_SHA"
           python ./benchmark.py \
             --config ../tiering.json \
@@ -305,8 +322,6 @@ jobs:
       - name: Run PR benchmark
         working-directory: valkey-perf-benchmark
         run: |
-          rm -f "$FLASHCACHE_FILE"
-          fallocate -l "$FLASHCACHE_CAPACITY" "$FLASHCACHE_FILE"
           git -C ../valkey checkout --detach "$PR_SHA"
           python ./benchmark.py \
             --config ../tiering.json \
@@ -368,6 +383,22 @@ jobs:
               owner,
               repo,
               body: `**Data tiering benchmark:** ${link(head)} compared with base ${link(base)}\n\n${body}`
+            });
+
+      - name: Comment that the benchmark failed
+        if: needs.benchmark.result != 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          RESULT: ${{ needs.benchmark.result == 'skipped' && needs.start-runner.result || needs.benchmark.result }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              issue_number: Number('${{ needs.start-runner.outputs.comment-number }}'),
+              owner,
+              repo,
+              body: `**Data tiering benchmark ${process.env.RESULT}.** No results were posted. [See the run](${run})`
             });
 
       - name: Remove run-tiering-benchmark label
