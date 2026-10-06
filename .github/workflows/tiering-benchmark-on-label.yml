@@ -15,7 +15,7 @@ on:
       base_ref:
         description: "Base commit or branch, used when pr_number is empty"
         required: false
-        default: unstable
+        default: data-tiering-unstable
       pr_ref:
         description: "Commit or branch to compare against the base, used when pr_number is empty"
         required: false
@@ -99,7 +99,7 @@ jobs:
             BASE=$(gh api "repos/$VALKEY_REPO/commits/$PR" --jq '.parents[0].sha')
           else
             [[ -n "$IN_PR" ]] || { echo "::error::set pr_number, or pr_ref"; exit 1; }
-            BASE=$(gh api "repos/$VALKEY_REPO/commits/${IN_BASE:-unstable}" --jq .sha)
+            BASE=$(gh api "repos/$VALKEY_REPO/commits/${IN_BASE:-data-tiering-unstable}" --jq .sha)
             PR=$(gh api "repos/$VALKEY_REPO/commits/$IN_PR" --jq .sha)
             HEAD=$PR
           fi
@@ -245,13 +245,13 @@ jobs:
           ref: ${{ env.PR_SHA }}
           persist-credentials: false
 
-      - name: Checkout unstable for valkey-benchmark
+      - name: Checkout data-tiering-unstable for valkey-benchmark
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ env.VALKEY_REPO }}
           path: valkey_bench
           fetch-depth: 1
-          ref: unstable
+          ref: data-tiering-unstable
           persist-credentials: false
 
       - name: Checkout valkey-perf-benchmark
@@ -270,12 +270,12 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install -q --require-hashes -r requirements.txt
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
-      - name: Build valkey-benchmark from unstable
+      - name: Build valkey-benchmark from data-tiering-unstable
         working-directory: valkey_bench
         run: |
           make -j"$(nproc)"
           if ! ./src/valkey-benchmark --help 2>&1 | grep -q -- "--keysize"; then
-            echo "::error::valkey-benchmark on unstable has no --keysize, which the tiering config needs"
+            echo "::error::valkey-benchmark on data-tiering-unstable has no --keysize, which the tiering config needs"
             exit 1
           fi
           echo "VALKEY_BENCHMARK_PATH=$(pwd)/src/valkey-benchmark" >> "$GITHUB_ENV"
