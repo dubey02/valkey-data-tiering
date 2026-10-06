@@ -22,6 +22,9 @@ on:
       comment_on:
         description: "PR or issue number to post the results on. Empty uses pr_number"
         required: false
+      groups:
+        description: "Test groups from configs/tiering.json to run, e.g. 1,4. Empty uses TIERING_BENCHMARK_GROUPS or 1 (Zipfian 80/20)"
+        required: false
       instance_type:
         description: "EC2 instance type. Empty uses DT_INSTANCE_TYPE or r8gd.2xlarge"
         required: false
@@ -232,6 +235,7 @@ jobs:
       contents: read
     env:
       NUM_RUNS: ${{ vars.TIERING_BENCHMARK_RUNS || '3' }}
+      TIERING_GROUPS: ${{ inputs.groups || vars.TIERING_BENCHMARK_GROUPS || '1' }}
       BASE_SHA: ${{ needs.start-runner.outputs.base-sha }}
       PR_SHA: ${{ needs.start-runner.outputs.pr-sha }}
       EXPECTED_IP: ${{ needs.start-runner.outputs.public-ip }}
@@ -293,7 +297,7 @@ jobs:
           echo "TARGET_IP=$TARGET_IP" >> "$GITHUB_ENV"
           python - <<'PY'
           import json, os
-          cfg = json.load(open("configs/tiering-zipfian-80-20.json"))
+          cfg = json.load(open("configs/tiering.json"))
           n = os.cpu_count()
           for c in cfg:
               alloc = c.get("cpu_allocation", {})
@@ -323,6 +327,7 @@ jobs:
             --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
             --target-ip "$TARGET_IP" \
             --results-dir results \
+            --groups "$TIERING_GROUPS" \
             --runs "$NUM_RUNS"
           test "$(git -C ../valkey rev-parse HEAD)" = "$BASE_SHA"
 
@@ -337,6 +342,7 @@ jobs:
             --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
             --target-ip "$TARGET_IP" \
             --results-dir results \
+            --groups "$TIERING_GROUPS" \
             --runs "$NUM_RUNS"
           test "$(git -C ../valkey rev-parse HEAD)" = "$PR_SHA"
 
