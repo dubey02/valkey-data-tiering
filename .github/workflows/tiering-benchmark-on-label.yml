@@ -32,9 +32,6 @@ on:
       instance_type:
         description: "EC2 instance type. Empty uses DT_INSTANCE_TYPE or r8gd.2xlarge"
         required: false
-      aws_region:
-        description: "AWS region. Empty uses DT_AWS_REGION or us-west-2. DT_SUBNET_ID must be in this region"
-        required: false
       perf_benchmark_repo:
         description: "valkey-perf-benchmark repo. Empty uses PERF_BENCHMARK_REPO or valkey-io/valkey-perf-benchmark"
         required: false
@@ -54,7 +51,7 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ${{ inputs.aws_region || vars.DT_AWS_REGION || 'us-west-2' }}
+  AWS_REGION: ${{ vars.DT_AWS_REGION || 'us-west-2' }}
   INSTANCE_TYPE: ${{ inputs.instance_type || vars.DT_INSTANCE_TYPE || 'r8gd.2xlarge' }}
   VALKEY_REPO: ${{ vars.DT_VALKEY_REPO || github.repository }}
   PERF_BENCHMARK_REPO: ${{ inputs.perf_benchmark_repo || vars.PERF_BENCHMARK_REPO || 'valkey-io/valkey-perf-benchmark' }}
