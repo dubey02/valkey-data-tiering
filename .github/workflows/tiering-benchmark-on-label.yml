@@ -23,8 +23,12 @@ on:
         description: "PR or issue number to post the results on. Empty uses pr_number"
         required: false
       groups:
-        description: "Test groups from configs/tiering.json to run, e.g. 1,4. Empty uses TIERING_BENCHMARK_GROUPS or 1 (Zipfian 80/20)"
+        description: "Test groups to run, e.g. 1,4. Empty uses TIERING_BENCHMARK_GROUPS, or runs every group"
         required: false
+      custom_config:
+        description: "Config JSON to run instead of configs/tiering.json, exactly as entered. Prefilled with Zipfian 80/20. Clear it to run all of configs/tiering.json"
+        required: false
+        default: '{"test_name":"tiering","port":6379,"cluster_mode":false,"tls_mode":false,"build_args":["BUILD_EXT_STORAGE=yes"],"io-threads":1,"keyspacelen":[4000000],"cpu_allocation":{"cores_per_server":8,"cores_per_client":24},"custom-server-configs":{"maxmemory":"1gb","activedefrag":"yes","ext-storage-enabled":"yes","ext-storage-engine":"flashcache","ext-storage-path":"/mnt/nvme/flashcache.db","ext-storage-capacity":"8gb"},"per_second_sampling":true,"test_groups":[{"group":1,"scenarios":[{"id":"zipf80","type":"mixed","restart_before":true,"populate_with":"SET","populate_clients":50,"populate_benchmark_args":["--keysize 100"],"populate_retries":20,"duration":60,"pipeline":1,"data_size":512,"keyspacelen":4000000,"benchmark_args":["--zipfian 1.0","--keysize 100"],"writes":[{"id":"set","test":"SET","clients":40}],"reads":[{"id":"get","test":"GET","clients":160}]}]}]}'
       instance_type:
         description: "EC2 instance type. Empty uses DT_INSTANCE_TYPE or r8gd.2xlarge"
         required: false
@@ -76,6 +80,8 @@ jobs:
       head-sha: ${{ steps.refs.outputs.head-sha }}
       comment-number: ${{ steps.refs.outputs.comment-number }}
       pr-number: ${{ steps.refs.outputs.pr-number }}
+      groups: ${{ steps.config.outputs.groups }}
+      perf-benchmark-sha: ${{ steps.config.outputs.perf-benchmark-sha }}
     steps:
       - name: Resolve commits
         id: refs
@@ -114,6 +120,66 @@ jobs:
             echo "pr-number=$NUMBER"
           } >> "$GITHUB_OUTPUT"
           echo "pr #${NUMBER:-none}, comment on #${COMMENT_ON:-none}, base $BASE, pr $PR, $INSTANCE_TYPE in $AWS_REGION, $PERF_BENCHMARK_REPO@$PERF_BENCHMARK_REF"
+
+      - name: Checkout valkey-perf-benchmark
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.PERF_BENCHMARK_REPO }}
+          ref: ${{ env.PERF_BENCHMARK_REF }}
+          path: valkey-perf-benchmark
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@3605726ffa6ef7750b99ff496e5b88248b414e26 # v4.9.0
+        with:
+          python-version: "3.10"
+
+      - name: Build and check the benchmark config
+        id: config
+        working-directory: valkey-perf-benchmark
+        env:
+          CUSTOM_CONFIG: ${{ inputs.custom_config }}
+          GROUPS_INPUT: ${{ inputs.groups || vars.TIERING_BENCHMARK_GROUPS }}
+        run: |
+          pip install -q --require-hashes -r requirements.txt
+          python - <<'PY'
+          import copy, json, os
+          from benchmark import validate_config, validate_cpu_allocation
+
+          raw = os.environ["CUSTOM_CONFIG"].strip()
+          if not raw:
+              cfg = json.load(open("configs/tiering.json"))
+          else:
+              try:
+                  cfg = json.loads(raw)
+              except json.JSONDecodeError as e:
+                  raise SystemExit(f"::error::custom_config is not valid JSON: {e}")
+              if isinstance(cfg, dict):
+                  cfg = [cfg]
+              if not isinstance(cfg, list) or not cfg or not all(isinstance(e, dict) for e in cfg):
+                  raise SystemExit("::error::custom_config must be a JSON object or a list of objects")
+
+          for entry in cfg:
+              check = copy.deepcopy(entry)
+              try:
+                  validate_config(check)
+                  validate_cpu_allocation(check)
+              except ValueError as e:
+                  raise SystemExit(f"::error::the benchmark config is not valid: {e}")
+              print("entry", entry.get("custom-server-configs"), [g.get("group") for g in entry.get("test_groups", [])])
+
+          json.dump(cfg, open(os.path.join(os.environ["RUNNER_TEMP"], "tiering.json"), "w"), indent=2)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"groups={os.environ['GROUPS_INPUT']}\n")
+          PY
+          echo "perf-benchmark-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the benchmark config
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: tiering-config
+          path: ${{ runner.temp }}/tiering.json
 
       - name: Comment that the benchmark started
         if: steps.refs.outputs.comment-number != '' && env.VALKEY_REPO == github.repository
@@ -235,7 +301,7 @@ jobs:
       contents: read
     env:
       NUM_RUNS: ${{ vars.TIERING_BENCHMARK_RUNS || '3' }}
-      TIERING_GROUPS: ${{ inputs.groups || vars.TIERING_BENCHMARK_GROUPS || '1' }}
+      TIERING_GROUPS: ${{ needs.start-runner.outputs.groups }}
       BASE_SHA: ${{ needs.start-runner.outputs.base-sha }}
       PR_SHA: ${{ needs.start-runner.outputs.pr-sha }}
       EXPECTED_IP: ${{ needs.start-runner.outputs.public-ip }}
@@ -262,10 +328,16 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ env.PERF_BENCHMARK_REPO }}
-          ref: ${{ env.PERF_BENCHMARK_REF }}
+          ref: ${{ needs.start-runner.outputs.perf-benchmark-sha }}
           path: valkey-perf-benchmark
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Download the benchmark config
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tiering-config
+          path: ${{ runner.temp }}/config
 
       - name: Install Python dependencies
         working-directory: valkey-perf-benchmark
@@ -297,7 +369,7 @@ jobs:
           echo "TARGET_IP=$TARGET_IP" >> "$GITHUB_ENV"
           python - <<'PY'
           import json, os
-          cfg = json.load(open("configs/tiering.json"))
+          cfg = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "config", "tiering.json")))
           n = os.cpu_count()
           for c in cfg:
               alloc = c.get("cpu_allocation", {})
@@ -327,7 +399,7 @@ jobs:
             --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
             --target-ip "$TARGET_IP" \
             --results-dir results \
-            --groups "$TIERING_GROUPS" \
+            ${TIERING_GROUPS:+--groups "$TIERING_GROUPS"} \
             --runs "$NUM_RUNS"
           test "$(git -C ../valkey rev-parse HEAD)" = "$BASE_SHA"
 
@@ -342,7 +414,7 @@ jobs:
             --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
             --target-ip "$TARGET_IP" \
             --results-dir results \
-            --groups "$TIERING_GROUPS" \
+            ${TIERING_GROUPS:+--groups "$TIERING_GROUPS"} \
             --runs "$NUM_RUNS"
           test "$(git -C ../valkey rev-parse HEAD)" = "$PR_SHA"
 
