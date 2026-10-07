@@ -103,8 +103,8 @@ void snapshotManagerStartSave(flashcacheSnapshotSecret *snapshot_secret,
                                      snapshot_manager_info.snapshot_version);
     switch (snapshot_manager_info.snapshot_version) {
         case FC_SNAPSHOT_VERSION_ONE:
-            if (snapshot_writer != NULL && snapshot_save_type == FC_SAVE_TYPE_THREADSAVE) {
-                flashcacheAssertWithLogging(0, "Snapshot V1 does not support THREADSAVE replication.", 0);
+            if (snapshot_writer != NULL && snapshot_save_type == FC_SAVE_TYPE_FORKLESS_SAVE) {
+                flashcacheAssertWithLogging(0, "Snapshot V1 does not support forkless save replication.", 0);
             }
             indexPauseGrowth(index);  // If index growth is Running, Pause it.
 
@@ -344,13 +344,13 @@ void snapshotManagerAddReplicationCommandIfRequired(size_t offset, uint32_t dbid
     }
 }
 
-void snapshotManagerSetHasSnapshottingCompletedInRedisLayer(uint8_t value) {
+void snapshotManagerSetHasSnapshottingCompletedInEngineLayer(uint8_t value) {
     switch (snapshot_manager_info.snapshot_version) {
         case FC_SNAPSHOT_VERSION_ONE:
             // nothing to do for this snapshotting version.
             break;
         case FC_SNAPSHOT_VERSION_TWO:
-            snapshot_manager_info.snapshot_version_two_info->snapshot_common.has_snapshotting_completed_in_redis_layer
+            snapshot_manager_info.snapshot_version_two_info->snapshot_common.has_snapshotting_completed_in_engine_layer
                     = value;
             break;
         default:
@@ -379,20 +379,20 @@ void snapshotManagerIncrementNumItemsAddedToRDB() {
     }
 }
 
-int snapshotManagerIsItemInThreadsaveSnapshotRange(size_t offset) {
+int snapshotManagerIsItemInForklessSaveSnapshotRange(size_t offset) {
     int ret = 0;
     switch (snapshot_manager_info.snapshot_version) {
         case FC_SNAPSHOT_VERSION_ONE:
             // nothing to do for this snapshotting version.
             break;
         case FC_SNAPSHOT_VERSION_TWO:
-            ret = snapshotV2IsItemInThreadsaveSnapshotRange(snapshot_manager_info.snapshot_version_two_info,
+            ret = snapshotV2IsItemInForklessSaveSnapshotRange(snapshot_manager_info.snapshot_version_two_info,
                     offset);
             break;
         default:
             // Being here means we have an unsupported version of snapshotting.
             flashcacheAssertWithLogging(0, "Unknown snapshot version %d in "
-                                           "snapshotManagerIsItemInThreadsaveSnapshotRange",
+                                           "snapshotManagerIsItemInForklessSaveSnapshotRange",
                                         snapshot_manager_info.snapshot_version, 0);
             break;
     }
@@ -456,7 +456,7 @@ void snapshotManagerUpdateSnapshottingRangeTailOffset(size_t updated_log_tail_of
             // nothing to do for this snapshotting version.
             break;
         case FC_SNAPSHOT_VERSION_TWO:
-            snapshotV2UpdateSnapshottingRangeDuringThreadsave(snapshot_manager_info.snapshot_version_two_info,
+            snapshotV2UpdateSnapshottingRangeDuringForklessSave(snapshot_manager_info.snapshot_version_two_info,
                                                               updated_log_tail_offset);
             break;
         default:
@@ -465,39 +465,4 @@ void snapshotManagerUpdateSnapshottingRangeTailOffset(size_t updated_log_tail_of
                                            "snapshotManagerUpdateSnapshottingRangeTailOffset", 0);
             break;
     }
-}
-
-int snapshotManagerInvokeProcessingForSnapshotExporter(FILE *source_fdb,
-                                                           FILE *target_rdb,
-                                                           uint64_t *crc64_checksum,
-                                                           flashcacheSnapshotSecret *rdb_secret,
-                                                           crc64_checksum_callback crc64_callback,
-                                                           get_customer_dbid_and_ttl_callback dbid_and_ttl_callback) {
-    // Read the first page of the metadata section
-    char first_page_in_source_fdb[FC_PAGESIZE];
-    if (fread(first_page_in_source_fdb, 1, FC_PAGESIZE, source_fdb) != FC_PAGESIZE) {
-            flashcacheAssertWithLogging(0, "Snapshot Exporter: Unable to read first page of source FDB file.", 0);
-    }
-
-    // Determine the snapshot version
-    flashcacheSnapshotVersion current_snapshot_version;
-    memcpy(&current_snapshot_version, first_page_in_source_fdb, sizeof(uint32_t));
-
-    // Currently only support snapshot exporter for snapshot V2
-    if (current_snapshot_version < FC_SNAPSHOT_VERSION_TWO) {
-        flashcacheLogger(FC_LL_WARNING,
-                        "Unexpected snapshot version `%d`. It should be `%d`",
-                        current_snapshot_version,
-                        FC_SNAPSHOT_VERSION_TWO);
-        return -1;
-    }
-    // Invoke snapshot v2 specific algorithm for processing snapshot data
-    flashcacheLogger(FC_LL_WARNING, "Starting snapshot version `%d` snapshot exporter.", current_snapshot_version);
-    return snapshotV2ProcessSourceFdbForSnapshotExporter(source_fdb,
-                                                      target_rdb,
-                                                      crc64_checksum,
-                                                      rdb_secret,
-                                                      first_page_in_source_fdb,
-                                                      crc64_callback,
-                                                      dbid_and_ttl_callback);
 }

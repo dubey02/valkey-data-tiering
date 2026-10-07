@@ -89,37 +89,27 @@ void snapshotManagerAddReplicationCommandIfRequired(size_t offset, uint32_t dbid
                                                     size_t key_len, char const *value, size_t value_len,
                                                     flashcache_crc_function crc_function);
 
-// Set the flag (has_snapshotting_completed_in_redis_layer) once Redis layer snapshotting is completed
-void snapshotManagerSetHasSnapshottingCompletedInRedisLayer(uint8_t value);
+// Set the flag (has_snapshotting_completed_in_engine_layer) once engine layer snapshotting is completed
+void snapshotManagerSetHasSnapshottingCompletedInEngineLayer(uint8_t value);
 
 // Increments the snapshot manager's tracker for number of items added to the RDB
 void snapshotManagerIncrementNumItemsAddedToRDB();
 
-// Returns 1 if the item is in an active threadsave's snapshot range
-int snapshotManagerIsItemInThreadsaveSnapshotRange(size_t offset);
+// Returns 1 if the item is in an active forkless save's snapshot range
+int snapshotManagerIsItemInForklessSaveSnapshotRange(size_t offset);
 
 // Get metric from the current snapshot
 size_t snapshotManagerGetCountBasedMetric(flashcacheCountBasedMetrics metric);
 
 // Set the time interval for keep alive messages which are sent to keep
-// the replication link alive until Redis layer snapshotting is completed
+// the replication link alive until engine layer snapshotting is completed
 void snapshotManagerSetSnapshotKeepAliveMsgIntervalUs(uint64_t value);
 
-// Set the timeout that the replication link will stay up to wait for Redis layer
+// Set the timeout that the replication link will stay up to wait for engine layer
 // snapshotting to complete
 void snapshotManagerSetReplicationLinkTimeoutSecs(size_t value);
 
-// Updates the Snapshotting range after eviction in flash during Threadsave replication.
+// Updates the Snapshotting range after eviction in flash during forkless save replication.
 void snapshotManagerUpdateSnapshottingRangeTailOffset(size_t updated_log_tail_offset);
-
-// Determines the snapshot type and calls the correct function to start processing the
-// source fdb file bytes.
-// Returns 0 on success; -1 on failure
-int snapshotManagerInvokeProcessingForSnapshotExporter(FILE *source_fdb,
-                                                           FILE *target_rdb,
-                                                           uint64_t *crc64_checksum,
-                                                           flashcacheSnapshotSecret *rdb_secret,
-                                                           crc64_checksum_callback crc64_callback,
-                                                           get_customer_dbid_and_ttl_callback dbid_and_ttl_callback);
 
 #endif  // __FLASHCACHE_SNAPSHOT_MANAGER_H
