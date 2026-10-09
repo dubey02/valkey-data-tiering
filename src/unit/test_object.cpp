@@ -294,3 +294,116 @@ TEST_F(ObjectTest, metadata_changes_embed_threshold) {
     sdsfree(k);
     decrRefCount(obj);
 }
+
+TEST_F(ObjectTest, tiering_state_defaults_to_memory) {
+    robj *raw = createRawStringObject("hello", 5);
+    robj *emb = createStringObject("hello", 5);
+    robj *list = createQuicklistObject(0, 0);
+    robj stack;
+    initStaticStringObject(stack, NULL);
+
+    EXPECT_EQ(objectGetTieringState(raw), TIERING_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetTieringState(emb), TIERING_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetTieringState(list), TIERING_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetTieringState(&stack), TIERING_STATE_ONLY_MEMORY);
+    EXPECT_FALSE(objectIsFlashResident(raw));
+
+    decrRefCount(raw);
+    decrRefCount(emb);
+    decrRefCount(list);
+}
+
+TEST_F(ObjectTest, tiering_state_does_not_clobber_header) {
+    robj *obj = createKeyValueObject("mykey", "myvalue");
+    objectSetLRU(obj, 12345);
+    incrRefCount(obj);
+    unsigned int type = obj->type, encoding = obj->encoding;
+    unsigned int hasexpire = obj->hasexpire, hasembkey = obj->hasembkey, hasembval = obj->hasembval;
+
+    TieringState states[] = {TIERING_STATE_COPYING_TO_FLASH, TIERING_STATE_ONLY_FLASH,
+                             TIERING_STATE_COPYING_TO_MEMORY, TIERING_STATE_PENDING_EVICT,
+                             TIERING_STATE_PENDING_DELETION, TIERING_STATE_ONLY_MEMORY};
+    for (size_t i = 0; i < numElements(states); i++) {
+        objectSetTieringState(obj, states[i]);
+        EXPECT_EQ(objectGetTieringState(obj), states[i]);
+        EXPECT_EQ(objectGetRefcount(obj), 2u);
+        EXPECT_EQ(objectGetLRU(obj), 12345u);
+        EXPECT_EQ(obj->type, type);
+        EXPECT_EQ(obj->encoding, encoding);
+        EXPECT_EQ(obj->hasexpire, hasexpire);
+        EXPECT_EQ(obj->hasembkey, hasembkey);
+        EXPECT_EQ(obj->hasembval, hasembval);
+        EXPECT_STREQ(objectGetKey(obj), "mykey");
+    }
+
+    decrRefCount(obj);
+    decrRefCount(obj);
+}
+
+TEST_F(ObjectTest, flash_resident_states) {
+    robj *obj = createRawStringObject("v", 1);
+    struct {
+        TieringState state;
+        int resident;
+    } cases[] = {
+        {TIERING_STATE_ONLY_MEMORY, 0},
+        {TIERING_STATE_COPYING_TO_FLASH, 0},
+        {TIERING_STATE_ONLY_FLASH, 1},
+        {TIERING_STATE_COPYING_TO_MEMORY, 1},
+        {TIERING_STATE_PENDING_EVICT, 1},
+        {TIERING_STATE_PENDING_DELETION, 1},
+    };
+    for (size_t i = 0; i < numElements(cases); i++) {
+        objectSetTieringState(obj, cases[i].state);
+        EXPECT_EQ(objectIsFlashResident(obj), cases[i].resident) << "state " << cases[i].state;
+    }
+    objectSetTieringState(obj, TIERING_STATE_ONLY_MEMORY);
+    decrRefCount(obj);
+}
+
+TEST_F(ObjectTest, tiering_state_survives_key_and_expire_realloc) {
+    sds key = sdsnew("mykey");
+
+    robj *emb = createStringObject("short", 5);
+    ASSERT_EQ(emb->encoding, (unsigned)OBJ_ENCODING_EMBSTR);
+    objectSetTieringState(emb, TIERING_STATE_ONLY_FLASH);
+    emb = objectSetKeyAndExpire(emb, key, 1234567);
+    EXPECT_EQ(objectGetTieringState(emb), TIERING_STATE_ONLY_FLASH);
+    objectSetTieringState(emb, TIERING_STATE_ONLY_MEMORY);
+    decrRefCount(emb);
+
+    robj *list = createQuicklistObject(0, 0);
+    objectSetTieringState(list, TIERING_STATE_COPYING_TO_MEMORY);
+    list = objectSetKeyAndExpire(list, key, 1234567);
+    EXPECT_EQ(objectGetTieringState(list), TIERING_STATE_COPYING_TO_MEMORY);
+    EXPECT_EQ(objectGetExpire(list), 1234567);
+    objectSetTieringState(list, TIERING_STATE_ONLY_MEMORY);
+    decrRefCount(list);
+
+    sdsfree(key);
+}
+
+TEST_F(ObjectTest, refcount_sentinels_at_reduced_width) {
+    EXPECT_EQ((unsigned)OBJ_SHARED_REFCOUNT, (1u << OBJ_REFCOUNT_BITS) - 1);
+    EXPECT_GT((unsigned)OBJ_STATIC_REFCOUNT, 1u);
+
+    robj *shared = makeObjectShared(createRawStringObject("s", 1));
+    objectSetTieringState(shared, TIERING_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetRefcount(shared), (unsigned)OBJ_SHARED_REFCOUNT);
+    incrRefCount(shared);
+    decrRefCount(shared);
+    EXPECT_EQ(objectGetRefcount(shared), (unsigned)OBJ_SHARED_REFCOUNT);
+    EXPECT_EQ(objectGetTieringState(shared), TIERING_STATE_ONLY_FLASH);
+    shared->refcount = 1;
+    decrRefCount(shared);
+
+    robj *obj = createRawStringObject("v", 1);
+    obj->refcount = OBJ_FIRST_SPECIAL_REFCOUNT - 2;
+    objectSetTieringState(obj, TIERING_STATE_PENDING_DELETION);
+    incrRefCount(obj);
+    EXPECT_EQ(objectGetRefcount(obj), (unsigned)OBJ_FIRST_SPECIAL_REFCOUNT - 1);
+    EXPECT_EQ(objectGetTieringState(obj), TIERING_STATE_PENDING_DELETION);
+    obj->refcount = 1;
+    objectSetTieringState(obj, TIERING_STATE_ONLY_MEMORY);
+    decrRefCount(obj);
+}

@@ -81,6 +81,20 @@ void objectSetLRU(robj *o, unsigned int lru) {
     o->lru = lru;
 }
 
+TieringState objectGetTieringState(const robj *o) {
+    return (TieringState)o->tiering_state;
+}
+
+void objectSetTieringState(robj *o, TieringState state) {
+    o->tiering_state = state;
+}
+
+/* Returns 1 if the object's value is not in memory. */
+int objectIsFlashResident(const robj *o) {
+    TieringState state = objectGetTieringState(o);
+    return state != TIERING_STATE_ONLY_MEMORY && state != TIERING_STATE_COPYING_TO_FLASH;
+}
+
 /* Get beginning of embedded data, which may contain expire, metadata, key, and/or value.
  * Embedded data flags must be accurate when called. */
 static unsigned char *objectEmbeddedData(const robj *o) {
@@ -203,6 +217,7 @@ static robj *createUnembeddedObjectWithKeyAndExpire(int type, void *val, const_s
     objectSetEncoding(o, OBJ_ENCODING_RAW);
     o->refcount = 1;
     objectSetLRU(o, 0);
+    objectSetTieringState(o, TIERING_STATE_ONLY_MEMORY);
     o->hasembkey = has_embkey;
     o->hasembval = 0;
     o->val_ptr = val;
@@ -309,6 +324,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     objectSetEncoding(o, OBJ_ENCODING_EMBSTR);
     o->refcount = 1;
     objectSetLRU(o, 0);
+    objectSetTieringState(o, TIERING_STATE_ONLY_MEMORY);
     o->hasexpire = (expire != EXPIRY_NONE);
     o->hasembkey = has_embkey;
     o->hasembval = 1;
@@ -497,6 +513,7 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
     if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR) {
         robj *new = createStringObjectWithKeyAndExpire(objectGetVal(o), sdslen(objectGetVal(o)), key, expire);
         objectSetLRU(new, objectGetLRU(o));
+        objectSetTieringState(new, objectGetTieringState(o));
         objectCopyMetadata(new, o);
         bgIteration_updateDbEntryPtr(o, new);
         decrRefCount(o);
@@ -524,6 +541,7 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
     robj *new = createUnembeddedObjectWithKeyAndExpire(objectGetType(o), ptr, key, expire);
     objectSetEncoding(new, objectGetEncoding(o));
     objectSetLRU(new, objectGetLRU(o));
+    objectSetTieringState(new, objectGetTieringState(o));
     objectCopyMetadata(new, o);
     bgIteration_updateDbEntryPtr(o, new);
     decrRefCount(o);

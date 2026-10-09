@@ -840,7 +840,7 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_LISTPACK2 12 /* Encoded as a listpack with metadata tag */
 #define OBJ_ENCODING_PATH_HASH 13 /* Path hash backed by a radix tree */
 
-#define OBJ_REFCOUNT_BITS 29
+#define OBJ_REFCOUNT_BITS 25
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
 #define OBJ_STATIC_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 2) /* Object allocated in the stack. */
 #define OBJ_FIRST_SPECIAL_REFCOUNT OBJ_STATIC_REFCOUNT
@@ -849,9 +849,9 @@ typedef struct ValkeyModuleType moduleType;
  * followed by several optional variable-sized fields. The static fields are `type` through `refcount`
  * in the struct-defined order:
  *
- *    +------+----------+-----+-----------+-----------+-----------+----------+----
- *    | type | encoding | lru | hasexpire | hasembkey | hasembval | refcount | ...
- *    +------+----------+-----+-----------+-----------+-----------+----------+----
+ *    +------+----------+-----+-----------+-----------+-----------+---------------+----------+----
+ *    | type | encoding | lru | hasexpire | hasembkey | hasembval | tiering_state | refcount | ...
+ *    +------+----------+-----+-----------+-----------+-----------+---------------+----------+----
  *
  * The optional variable-sized embedded data has 2 possible layouts. If value is embedded (hasembval == 1)
  *  the `val_ptr` pointer is not used - instead the val data is embedded:
@@ -883,6 +883,19 @@ typedef struct ValkeyModuleType moduleType;
  *                                                      +--- present because hasembval == 0
  */
 
+/* Where an object's value resides with data tiering. */
+typedef enum {
+    TIERING_STATE_ONLY_MEMORY = 0,       /* Value in memory */
+    TIERING_STATE_COPYING_TO_FLASH = 1,  /* Spill in flight, value still in memory */
+    TIERING_STATE_ONLY_FLASH = 2,        /* Value on flash only */
+    TIERING_STATE_COPYING_TO_MEMORY = 3, /* Fetch in flight from flash */
+    TIERING_STATE_PENDING_EVICT = 4,     /* Eviction requested during a fetch */
+    TIERING_STATE_PENDING_DELETION = 5,  /* Flash copy delete in flight */
+} TieringState;
+
+#define OBJ_TIERING_STATE_BITS 4
+static_assert(TIERING_STATE_PENDING_DELETION < (1 << OBJ_TIERING_STATE_BITS), "tiering state does not fit its bitfield");
+
 struct serverObject {
     unsigned type : 4;
     unsigned encoding : 4;
@@ -890,6 +903,7 @@ struct serverObject {
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
+    unsigned tiering_state : OBJ_TIERING_STATE_BITS;
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *val_ptr; /* Not always present. Use objectGetVal(obj) and
                     * objectSetVal(obj, val) instead. */
@@ -905,15 +919,16 @@ char *getObjectTypeName(robj *);
  * Note that this macro is taken near the structure definition to make sure
  * we'll update it when the structure is changed, to avoid bugs like
  * bug #85 introduced exactly in this way. */
-#define initStaticStringObject(_var, _ptr)   \
-    do {                                     \
-        _var.refcount = OBJ_STATIC_REFCOUNT; \
-        _var.type = OBJ_STRING;              \
-        _var.encoding = OBJ_ENCODING_RAW;    \
-        _var.hasexpire = 0;                  \
-        _var.hasembkey = 0;                  \
-        _var.hasembval = 0;                  \
-        _var.val_ptr = _ptr;                 \
+#define initStaticStringObject(_var, _ptr)              \
+    do {                                                \
+        _var.refcount = OBJ_STATIC_REFCOUNT;            \
+        _var.type = OBJ_STRING;                         \
+        _var.encoding = OBJ_ENCODING_RAW;               \
+        _var.hasexpire = 0;                             \
+        _var.hasembkey = 0;                             \
+        _var.hasembval = 0;                             \
+        _var.tiering_state = TIERING_STATE_ONLY_MEMORY; \
+        _var.val_ptr = _ptr;                            \
     } while (0)
 
 struct evictionPoolEntry; /* Defined in evict.c */
@@ -3401,6 +3416,9 @@ void objectSetEncoding(robj *o, int encoding);
 unsigned int objectGetRefcount(const robj *o);
 unsigned int objectGetLRU(const robj *o);
 void objectSetLRU(robj *o, unsigned int lru);
+TieringState objectGetTieringState(const robj *o);
+void objectSetTieringState(robj *o, TieringState state);
+int objectIsFlashResident(const robj *o);
 /* Object metadata management */
 void objectSetMetadataSize(size_t size);
 size_t objectGetMetadataSize(const robj *o);

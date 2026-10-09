@@ -64,6 +64,16 @@ start_server {tags {"introspection"}} {
         assert_morethan $newlru $oldlru
     } {} {needs:debug}
 
+    test {DEBUG OBJECT reports tiering_state for in-memory keys} {
+        r flushdb
+        r set str v
+        r rpush list a b
+        r hset hash f v
+        foreach key {str list hash} {
+            assert_match {* tiering_state:0 *} [r debug object $key]
+        }
+    } {} {needs:debug}
+
     test {TOUCH returns the number of existing keys specified} {
         r flushdb
         r set key1{t} 1
