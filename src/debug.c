@@ -744,7 +744,8 @@ void debugCommand(client *c) {
         }
 
         sds s = sdsempty();
-        s = sdscatprintf(s, "Value at:%p refcount:%d encoding:%s", (void *)val, val->refcount, strenc);
+        s = sdscatprintf(s, "Value at:%p refcount:%d encoding:%s tiering_state:%d", (void *)val, val->refcount, strenc,
+                         (int)objectGetTieringState(val));
         if (!fast) s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
         /* Either lru or lfu field could work correctly which depends on server.maxmemory_policy. */
         if (lrulfu_isUsingLFU()) {
