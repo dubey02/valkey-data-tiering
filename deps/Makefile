@@ -149,7 +149,8 @@ endif
 
 flashcache: .make-prerequisites jemalloc
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
-	$(CMAKE) -S flashcache -B flashcache/build $(FLASHCACHE_CMAKE_FLAGS)
+	$(CMAKE) -S flashcache -B flashcache/build -DCMAKE_C_COMPILER="$(CC)" \
+		-DCMAKE_C_FLAGS="-O3 -g $(CFLAGS)" -DCMAKE_EXE_LINKER_FLAGS="$(LDFLAGS)" $(FLASHCACHE_CMAKE_FLAGS)
 	$(CMAKE) --build flashcache/build
 
 .PHONY: flashcache
