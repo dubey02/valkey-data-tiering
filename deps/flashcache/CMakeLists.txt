@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.14)
 project(FlashCache LANGUAGES C)
 
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "FlashCache requires Linux for libaio dependency, "
+                         "detected OS: ${CMAKE_SYSTEM_NAME}")
+endif ()
+if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+    message(FATAL_ERROR "FlashCache requires x86_64 or aarch64 (hardware CRC32c), " 
+                        "detected architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif ()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -27,6 +36,9 @@ target_compile_definitions(flashcache PRIVATE JEMALLOC_MANGLE)
 
 # Link against libaio (required for async I/O)
 target_link_libraries(flashcache PUBLIC aio)
+if (TARGET jemalloc)
+    target_link_libraries(flashcache PUBLIC jemalloc)
+endif ()
 
 # Compiler flags (no -Werror yet)
 target_compile_options(flashcache PRIVATE

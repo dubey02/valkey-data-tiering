@@ -1,5 +1,9 @@
 #include "include/crc.h"
 
+#if !defined(__x86_64__) && !defined(__aarch64__)
+#error "FlashCache CRC32c requires x86_64 (SSE4.2) or aarch64 (ARMv8 CRC)"
+#endif
+
 #if defined(__x86_64__)
 #include <smmintrin.h>
 

@@ -34,6 +34,9 @@ add_subdirectory(fpconv)
 add_subdirectory(hdr_histogram)
 add_subdirectory(fast_float)
 add_subdirectory(lz4)
+if (USE_EXT_STORAGE EQUAL 1)
+    add_subdirectory(flashcache)
+endif ()
 
 # Clear any cached variables passed to libvalkey from the cache
 unset(BUILD_SHARED_LIBS CACHE)
