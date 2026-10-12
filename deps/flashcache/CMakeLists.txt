@@ -27,16 +27,20 @@ target_include_directories(flashcache PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include
 )
 
-# Use in-tree jemalloc (same allocator as Valkey core).
-# JEMALLOC_MANGLE remaps malloc/free/malloc_usable_size to je_* variants.
-target_include_directories(flashcache PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../jemalloc/include
-)
-target_compile_definitions(flashcache PRIVATE JEMALLOC_MANGLE)
+# Allocator. ON routes malloc/free to Valkey's in-tree jemalloc via
+# JEMALLOC_MANGLE; OFF uses the libc allocator, which the server's
+# MALLOC=libc and sanitizer builds need.
+option(FC_USE_JEMALLOC "Allocate through the in-tree jemalloc" ON)
+if (FC_USE_JEMALLOC)
+    target_include_directories(flashcache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../jemalloc/include
+    )
+    target_compile_definitions(flashcache PRIVATE FC_USE_JEMALLOC JEMALLOC_MANGLE)
+endif ()
 
 # Link against libaio (required for async I/O)
 target_link_libraries(flashcache PUBLIC aio)
-if (TARGET jemalloc)
+if (FC_USE_JEMALLOC AND TARGET jemalloc)
     target_link_libraries(flashcache PUBLIC jemalloc)
 endif ()
 

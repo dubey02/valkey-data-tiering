@@ -1,7 +1,11 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#ifdef JEMALLOC_MANGLE
 #include <jemalloc/jemalloc.h>
+#else
+#include <malloc.h>
+#endif
 
 #include "clock_mock.hpp"
 #include "flashcache_test_base.hpp"

@@ -3,13 +3,18 @@
 #include <linux/fs.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <math.h>
 
 #include "include/util.h"
+#ifdef FC_USE_JEMALLOC
 #include <jemalloc/jemalloc.h>
+#else
+#include <malloc.h>
+#endif
 
 // Defined in flashcache.c
 void flashcacheLogState(int level);

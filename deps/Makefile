@@ -146,8 +146,15 @@ FLASHCACHE_CMAKE_FLAGS= -DFC_BUILD_TESTS=OFF
 ifeq ($(FLASHCACHE_TESTS),yes)
 	FLASHCACHE_CMAKE_FLAGS= -DFC_BUILD_TESTS=ON
 endif
+FLASHCACHE_DEPS=
+ifeq ($(or $(MALLOC),jemalloc),jemalloc)
+	FLASHCACHE_CMAKE_FLAGS+= -DFC_USE_JEMALLOC=ON
+	FLASHCACHE_DEPS+= jemalloc
+else
+	FLASHCACHE_CMAKE_FLAGS+= -DFC_USE_JEMALLOC=OFF
+endif
 
-flashcache: .make-prerequisites jemalloc
+flashcache: .make-prerequisites $(FLASHCACHE_DEPS)
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	$(CMAKE) -S flashcache -B flashcache/build -DCMAKE_C_COMPILER="$(CC)" \
 		-DCMAKE_C_FLAGS="-O3 -g $(CFLAGS)" -DCMAKE_EXE_LINKER_FLAGS="$(LDFLAGS)" $(FLASHCACHE_CMAKE_FLAGS)

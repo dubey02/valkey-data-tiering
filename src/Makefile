@@ -408,6 +408,7 @@ ifneq ($(uname_S),Linux)
 endif
 	FINAL_CFLAGS+=-DUSE_EXT_STORAGE=$(BUILD_YES)
 	DEPENDENCY_TARGETS+= flashcache
+	export MALLOC
 	FINAL_CFLAGS+= -I../deps/flashcache/src
 	EXT_STORAGE_LIBS= ../deps/flashcache/build/libflashcache.a -laio
 endif

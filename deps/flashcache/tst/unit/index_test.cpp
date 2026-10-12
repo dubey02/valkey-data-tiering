@@ -18,6 +18,14 @@ void indexResizeTable(flashcacheIndex *index, size_t new_size);
 void indexGrowthIterationCallback(void *context, size_t hash_bucket_idx, indexEntry *head_entry);
 }
 
+/* jemalloc returns exactly the requested size for these power-of-two tables;
+ * libc malloc rounds up. */
+#ifdef JEMALLOC_MANGLE
+#define ASSERT_USABLE_SIZE_EQ(ptr, size) ASSERT_EQ(malloc_usable_size(ptr), (size))
+#else
+#define ASSERT_USABLE_SIZE_EQ(ptr, size) ASSERT_GE(malloc_usable_size(ptr), (size))
+#endif
+
 typedef struct itemDetail {
     char *key;
     size_t key_len;
@@ -222,7 +230,7 @@ TEST_P(IndexTest, testRecreateWithNotRunningStatus) {
     ASSERT_EQ(index->num_items, 0);
     ASSERT_EQ(index->num_hash_bucket_used, 0);
     ASSERT_EQ(indexTableSize(index), 1 << (base_size_bits + collision_bits_used));
-    ASSERT_EQ(malloc_usable_size(index->table),
+    ASSERT_USABLE_SIZE_EQ(index->table,
               sizeof(indexEntry *) * (1 << (base_size_bits + collision_bits_used)));
     ASSERT_EQ(index->base_size_bits, base_size_bits);
     ASSERT_EQ(index->collision_bits_used, collision_bits_used);
@@ -238,7 +246,7 @@ TEST_P(IndexTest, testRecreateWithRunningStatus) {
     ASSERT_EQ(index->num_items, 0);
     ASSERT_EQ(index->num_hash_bucket_used, 0);
     ASSERT_EQ(indexTableSize(index), 1 << (base_size_bits + collision_bits_used));
-    ASSERT_EQ(malloc_usable_size(index->table),
+    ASSERT_USABLE_SIZE_EQ(index->table,
               sizeof(indexEntry *) * (1 << (base_size_bits + collision_bits_used + 1)));
     ASSERT_EQ(index->base_size_bits, base_size_bits);
     ASSERT_EQ(index->collision_bits_used, collision_bits_used);
@@ -254,7 +262,7 @@ TEST_P(IndexTest, testRecreateWithPausedStatus) {
     ASSERT_EQ(index->num_items, 0);
     ASSERT_EQ(index->num_hash_bucket_used, 0);
     ASSERT_EQ(indexTableSize(index), 1 << (base_size_bits + collision_bits_used));
-    ASSERT_EQ(malloc_usable_size(index->table),
+    ASSERT_USABLE_SIZE_EQ(index->table,
                  sizeof(indexEntry *) * (1 << (base_size_bits + collision_bits_used + 1)));
     ASSERT_EQ(index->base_size_bits, base_size_bits);
     ASSERT_EQ(index->collision_bits_used, collision_bits_used);
