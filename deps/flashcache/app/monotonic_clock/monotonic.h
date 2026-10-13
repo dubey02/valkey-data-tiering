@@ -48,10 +48,8 @@ static inline uint64_t elapsedMs(monotime start_time) {
     return elapsedUs(start_time) / 1000;
 }
 
-/* BEGIN AMZN */
 static inline uint64_t elapsedSec(monotime start_time) {
     return elapsedMs(start_time) / 1000;
 }
-/* END AMZN */
 
 #endif

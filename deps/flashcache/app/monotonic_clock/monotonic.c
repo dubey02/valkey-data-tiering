@@ -23,7 +23,6 @@ static char monotonic_info_string[32];
  * To use the processor clock, either uncomment this line, or build with
  *   CFLAGS="-DUSE_PROCESSOR_CLOCK"
  */
-// AMZN - uncommented option
 #define USE_PROCESSOR_CLOCK
 
 
