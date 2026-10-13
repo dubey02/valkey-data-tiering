@@ -840,7 +840,7 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_LISTPACK2 12 /* Encoded as a listpack with metadata tag */
 #define OBJ_ENCODING_PATH_HASH 13 /* Path hash backed by a radix tree */
 
-#define OBJ_REFCOUNT_BITS 25
+#define OBJ_REFCOUNT_BITS 26
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
 #define OBJ_STATIC_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 2) /* Object allocated in the stack. */
 #define OBJ_FIRST_SPECIAL_REFCOUNT OBJ_STATIC_REFCOUNT
@@ -850,7 +850,7 @@ typedef struct ValkeyModuleType moduleType;
  * in the struct-defined order:
  *
  *    +------+----------+-----+-----------+-----------+-----------+---------------+----------+----
- *    | type | encoding | lru | hasexpire | hasembkey | hasembval | tiering_state | refcount | ...
+ *    | type | encoding | lru | hasexpire | hasembkey | hasembval | storage_state | refcount | ...
  *    +------+----------+-----+-----------+-----------+-----------+---------------+----------+----
  *
  * The optional variable-sized embedded data has 2 possible layouts. If value is embedded (hasembval == 1)
@@ -885,16 +885,15 @@ typedef struct ValkeyModuleType moduleType;
 
 /* Where an object's value resides with data tiering. */
 typedef enum {
-    TIERING_STATE_ONLY_MEMORY = 0,       /* Value in memory */
-    TIERING_STATE_COPYING_TO_FLASH = 1,  /* Spill in flight, value still in memory */
-    TIERING_STATE_ONLY_FLASH = 2,        /* Value on flash only */
-    TIERING_STATE_COPYING_TO_MEMORY = 3, /* Fetch in flight from flash */
-    TIERING_STATE_PENDING_EVICT = 4,     /* Eviction requested during a fetch */
-    TIERING_STATE_PENDING_DELETION = 5,  /* Flash copy delete in flight */
-} TieringState;
+    STORAGE_STATE_ONLY_MEMORY = 0,       /* Value in memory */
+    STORAGE_STATE_COPYING_TO_FLASH = 1,  /* Spill in flight, value still in memory */
+    STORAGE_STATE_ONLY_FLASH = 2,        /* Value on flash only */
+    STORAGE_STATE_COPYING_TO_MEMORY = 3, /* Fetch in flight from flash */
+    STORAGE_STATE_NUM_STATES
+} storageState;
 
-#define OBJ_TIERING_STATE_BITS 4
-static_assert(TIERING_STATE_PENDING_DELETION < (1 << OBJ_TIERING_STATE_BITS), "tiering state does not fit its bitfield");
+#define OBJ_STORAGE_STATE_BITS 3
+static_assert(STORAGE_STATE_NUM_STATES <= (1 << OBJ_STORAGE_STATE_BITS), "storage state does not fit its bitfield");
 
 struct serverObject {
     unsigned type : 4;
@@ -903,7 +902,7 @@ struct serverObject {
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
     unsigned hasembval : 1;
-    unsigned tiering_state : OBJ_TIERING_STATE_BITS;
+    unsigned storage_state : OBJ_STORAGE_STATE_BITS;
     unsigned refcount : OBJ_REFCOUNT_BITS;
     void *val_ptr; /* Not always present. Use objectGetVal(obj) and
                     * objectSetVal(obj, val) instead. */
@@ -927,7 +926,7 @@ char *getObjectTypeName(robj *);
         _var.hasexpire = 0;                             \
         _var.hasembkey = 0;                             \
         _var.hasembval = 0;                             \
-        _var.tiering_state = TIERING_STATE_ONLY_MEMORY; \
+        _var.storage_state = STORAGE_STATE_ONLY_MEMORY; \
         _var.val_ptr = _ptr;                            \
     } while (0)
 
@@ -3416,9 +3415,6 @@ void objectSetEncoding(robj *o, int encoding);
 unsigned int objectGetRefcount(const robj *o);
 unsigned int objectGetLRU(const robj *o);
 void objectSetLRU(robj *o, unsigned int lru);
-TieringState objectGetTieringState(const robj *o);
-void objectSetTieringState(robj *o, TieringState state);
-int objectIsFlashResident(const robj *o);
 /* Object metadata management */
 void objectSetMetadataSize(size_t size);
 size_t objectGetMetadataSize(const robj *o);

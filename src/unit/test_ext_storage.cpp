@@ -803,4 +803,58 @@ TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndNoDbId) {
     decrRefCount(entry);
 }
 
+/* ---------------------------------------------------------------------------
+ * Object header storage state
+ * ---------------------------------------------------------------------------*/
+
+extern "C" {
+storageState objectGetStorageState(const robj *o);
+void objectSetStorageState(robj *o, storageState state);
+}
+
+TEST(StorageStateTest, DefaultsToMemory) {
+    robj *raw = createRawStringObject("hello", 5);
+    robj *emb = createStringObject("hello", 5);
+    robj *list = createQuicklistObject(0, 0);
+    robj stack;
+    initStaticStringObject(stack, NULL);
+
+    EXPECT_EQ(objectGetStorageState(raw), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetStorageState(emb), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetStorageState(list), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetStorageState(&stack), STORAGE_STATE_ONLY_MEMORY);
+
+    decrRefCount(raw);
+    decrRefCount(emb);
+    decrRefCount(list);
+}
+
+TEST(StorageStateTest, DoesNotClobberHeader) {
+    sds key = sdsnew("mykey");
+    robj *obj = objectSetKeyAndExpire(createStringObject("myvalue", 7), key, -1);
+    sdsfree(key);
+    objectSetLRU(obj, 12345);
+    incrRefCount(obj);
+    unsigned int type = obj->type, encoding = obj->encoding;
+    unsigned int hasexpire = obj->hasexpire, hasembkey = obj->hasembkey, hasembval = obj->hasembval;
+
+    storageState states[] = {STORAGE_STATE_COPYING_TO_FLASH, STORAGE_STATE_ONLY_FLASH,
+                             STORAGE_STATE_COPYING_TO_MEMORY, STORAGE_STATE_ONLY_MEMORY};
+    for (size_t i = 0; i < numElements(states); i++) {
+        objectSetStorageState(obj, states[i]);
+        EXPECT_EQ(objectGetStorageState(obj), states[i]);
+        EXPECT_EQ(objectGetRefcount(obj), 2u);
+        EXPECT_EQ(objectGetLRU(obj), 12345u);
+        EXPECT_EQ(obj->type, type);
+        EXPECT_EQ(obj->encoding, encoding);
+        EXPECT_EQ(obj->hasexpire, hasexpire);
+        EXPECT_EQ(obj->hasembkey, hasembkey);
+        EXPECT_EQ(obj->hasembval, hasembval);
+        EXPECT_STREQ(objectGetKey(obj), "mykey");
+    }
+
+    decrRefCount(obj);
+    decrRefCount(obj);
+}
+
 #endif /* USE_EXT_STORAGE */
