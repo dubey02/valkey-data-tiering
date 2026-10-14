@@ -812,6 +812,8 @@ storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
 }
 
+#define NUM_TEST_OBJECTS 12
+
 static int createOneOfEachObject(robj **objs) {
     int n = 0;
     objs[n++] = createRawStringObject("hello", 5);
@@ -826,11 +828,12 @@ static int createOneOfEachObject(robj **objs) {
     objs[n++] = createZsetObject();
     objs[n++] = createZsetListpackObject();
     objs[n++] = createStreamObject();
+    assert(n == NUM_TEST_OBJECTS);
     return n;
 }
 
 TEST(StorageStateTest, NewObjectsStartInMemory) {
-    robj *objs[16];
+    robj *objs[NUM_TEST_OBJECTS];
     int n = createOneOfEachObject(objs);
     for (int i = 0; i < n; i++) {
         EXPECT_EQ(getStorageState(objs[i]), STORAGE_STATE_ONLY_MEMORY) << "type " << objs[i]->type << " encoding "
@@ -841,6 +844,20 @@ TEST(StorageStateTest, NewObjectsStartInMemory) {
     robj stack;
     initStaticStringObject(stack, NULL);
     EXPECT_EQ(getStorageState(&stack), STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST(StorageStateTest, SetStorageState) {
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    for (int i = 0; i < n; i++) {
+        for (int state = 0; state < STORAGE_STATE_NUM_STATES; state++) {
+            setStorageState(objs[i], (storageState)state);
+            EXPECT_EQ(getStorageState(objs[i]), (storageState)state)
+                << "type " << objs[i]->type << " encoding " << strEncoding(objs[i]->encoding);
+        }
+        setStorageState(objs[i], STORAGE_STATE_ONLY_MEMORY);
+        decrRefCount(objs[i]);
+    }
 }
 
 #endif /* USE_EXT_STORAGE */
