@@ -446,7 +446,7 @@ jobs:
 
   report:
     needs: [start-runner, benchmark]
-    if: >-
+    if: |
       always() && needs.start-runner.result != 'skipped' &&
       needs.start-runner.outputs.comment-number != '' && (vars.DT_VALKEY_REPO || github.repository) == github.repository
     runs-on: ubuntu-latest
