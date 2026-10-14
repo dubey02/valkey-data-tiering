@@ -80,6 +80,17 @@ jobs:
       groups: ${{ steps.config.outputs.groups }}
       perf-benchmark-sha: ${{ steps.config.outputs.perf-benchmark-sha }}
     steps:
+      - name: Check that the actor has write access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          PERMISSION=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
+          case "$PERMISSION" in
+            admin|write) echo "$ACTOR has $PERMISSION access" ;;
+            *) echo "::error::$ACTOR has $PERMISSION access, write or admin is required to start a benchmark"; exit 1 ;;
+          esac
+
       - name: Resolve commits
         id: refs
         env:
