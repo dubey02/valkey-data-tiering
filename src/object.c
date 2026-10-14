@@ -203,6 +203,7 @@ static robj *createUnembeddedObjectWithKeyAndExpire(int type, void *val, const_s
     objectSetEncoding(o, OBJ_ENCODING_RAW);
     o->refcount = 1;
     objectSetLRU(o, 0);
+    o->storage_state = STORAGE_STATE_ONLY_MEMORY;
     o->hasembkey = has_embkey;
     o->hasembval = 0;
     o->val_ptr = val;
@@ -309,6 +310,7 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
     objectSetEncoding(o, OBJ_ENCODING_EMBSTR);
     o->refcount = 1;
     objectSetLRU(o, 0);
+    o->storage_state = STORAGE_STATE_ONLY_MEMORY;
     o->hasexpire = (expire != EXPIRY_NONE);
     o->hasembkey = has_embkey;
     o->hasembval = 1;
@@ -494,6 +496,8 @@ void objectUnembedVal(robj *o) {
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function. */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
+    /* TODO(#105): Handle values in flashcache when copying or rebuilding objects.
+     * https://github.com/dubey02/valkey-data-tiering/issues/105 */
     if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR) {
         robj *new = createStringObjectWithKeyAndExpire(objectGetVal(o), sdslen(objectGetVal(o)), key, expire);
         objectSetLRU(new, objectGetLRU(o));
