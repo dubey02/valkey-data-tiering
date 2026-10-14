@@ -837,7 +837,7 @@ TEST(StorageStateTest, NewObjectsStartInMemory) {
     int n = createOneOfEachObject(objs);
     for (int i = 0; i < n; i++) {
         EXPECT_EQ(getStorageState(objs[i]), STORAGE_STATE_ONLY_MEMORY) << "type " << objs[i]->type << " encoding "
-                                                                        << strEncoding(objs[i]->encoding);
+                                                                       << strEncoding(objs[i]->encoding);
         decrRefCount(objs[i]);
     }
 
