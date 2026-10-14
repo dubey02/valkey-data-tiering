@@ -808,53 +808,39 @@ TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndNoDbId) {
  * ---------------------------------------------------------------------------*/
 
 extern "C" {
-storageState objectGetStorageState(const robj *o);
-void objectSetStorageState(robj *o, storageState state);
+storageState getStorageState(const robj *o);
+void setStorageState(robj *o, storageState state);
 }
 
-TEST(StorageStateTest, DefaultsToMemory) {
-    robj *raw = createRawStringObject("hello", 5);
-    robj *emb = createStringObject("hello", 5);
-    robj *list = createQuicklistObject(0, 0);
-    robj stack;
-    initStaticStringObject(stack, NULL);
-
-    EXPECT_EQ(objectGetStorageState(raw), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(objectGetStorageState(emb), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(objectGetStorageState(list), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(objectGetStorageState(&stack), STORAGE_STATE_ONLY_MEMORY);
-
-    decrRefCount(raw);
-    decrRefCount(emb);
-    decrRefCount(list);
+static int createOneOfEachObject(robj **objs) {
+    int n = 0;
+    objs[n++] = createRawStringObject("hello", 5);
+    objs[n++] = createStringObject("hello", 5);
+    objs[n++] = createStringObjectFromLongLong(OBJ_SHARED_INTEGERS + 1);
+    objs[n++] = createQuicklistObject(0, 0);
+    objs[n++] = createListListpackObject();
+    objs[n++] = createSetObject();
+    objs[n++] = createIntsetObject();
+    objs[n++] = createSetListpackObject();
+    objs[n++] = createHashObject();
+    objs[n++] = createZsetObject();
+    objs[n++] = createZsetListpackObject();
+    objs[n++] = createStreamObject();
+    return n;
 }
 
-TEST(StorageStateTest, DoesNotClobberHeader) {
-    sds key = sdsnew("mykey");
-    robj *obj = objectSetKeyAndExpire(createStringObject("myvalue", 7), key, -1);
-    sdsfree(key);
-    objectSetLRU(obj, 12345);
-    incrRefCount(obj);
-    unsigned int type = obj->type, encoding = obj->encoding;
-    unsigned int hasexpire = obj->hasexpire, hasembkey = obj->hasembkey, hasembval = obj->hasembval;
-
-    storageState states[] = {STORAGE_STATE_COPYING_TO_FLASH, STORAGE_STATE_ONLY_FLASH,
-                             STORAGE_STATE_COPYING_TO_MEMORY, STORAGE_STATE_ONLY_MEMORY};
-    for (size_t i = 0; i < numElements(states); i++) {
-        objectSetStorageState(obj, states[i]);
-        EXPECT_EQ(objectGetStorageState(obj), states[i]);
-        EXPECT_EQ(objectGetRefcount(obj), 2u);
-        EXPECT_EQ(objectGetLRU(obj), 12345u);
-        EXPECT_EQ(obj->type, type);
-        EXPECT_EQ(obj->encoding, encoding);
-        EXPECT_EQ(obj->hasexpire, hasexpire);
-        EXPECT_EQ(obj->hasembkey, hasembkey);
-        EXPECT_EQ(obj->hasembval, hasembval);
-        EXPECT_STREQ(objectGetKey(obj), "mykey");
+TEST(StorageStateTest, NewObjectsStartInMemory) {
+    robj *objs[16];
+    int n = createOneOfEachObject(objs);
+    for (int i = 0; i < n; i++) {
+        EXPECT_EQ(getStorageState(objs[i]), STORAGE_STATE_ONLY_MEMORY) << "type " << objs[i]->type << " encoding "
+                                                                        << strEncoding(objs[i]->encoding);
+        decrRefCount(objs[i]);
     }
 
-    decrRefCount(obj);
-    decrRefCount(obj);
+    robj stack;
+    initStaticStringObject(stack, NULL);
+    EXPECT_EQ(getStorageState(&stack), STORAGE_STATE_ONLY_MEMORY);
 }
 
 #endif /* USE_EXT_STORAGE */

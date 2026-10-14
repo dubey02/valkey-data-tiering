@@ -213,11 +213,11 @@ sds extStorageInfoString(sds info) {
                         (unsigned long long)st.total_num_items_deleted_from_storage);
 }
 
-storageState objectGetStorageState(const robj *o) {
+storageState getStorageState(const robj *o) {
     return (storageState)o->storage_state;
 }
 
-void objectSetStorageState(robj *o, storageState state) {
+void setStorageState(robj *o, storageState state) {
     o->storage_state = state;
 }
 

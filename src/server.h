@@ -883,7 +883,7 @@ typedef struct ValkeyModuleType moduleType;
  *                                                      +--- present because hasembval == 0
  */
 
-/* Where an object's value resides with data tiering. */
+/* Data tiering storage states */
 typedef enum {
     STORAGE_STATE_ONLY_MEMORY = 0,       /* Value in memory */
     STORAGE_STATE_COPYING_TO_FLASH = 1,  /* Spill in flight, value still in memory */

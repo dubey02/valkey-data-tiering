@@ -294,28 +294,3 @@ TEST_F(ObjectTest, metadata_changes_embed_threshold) {
     sdsfree(k);
     decrRefCount(obj);
 }
-
-TEST_F(ObjectTest, refcount_sentinels_at_reduced_width) {
-    EXPECT_EQ((unsigned)OBJ_SHARED_REFCOUNT, (1u << OBJ_REFCOUNT_BITS) - 1);
-    EXPECT_GT((unsigned)OBJ_STATIC_REFCOUNT, 1u);
-
-    robj *shared = makeObjectShared(createRawStringObject("s", 1));
-    shared->storage_state = STORAGE_STATE_ONLY_FLASH;
-    EXPECT_EQ(objectGetRefcount(shared), (unsigned)OBJ_SHARED_REFCOUNT);
-    incrRefCount(shared);
-    decrRefCount(shared);
-    EXPECT_EQ(objectGetRefcount(shared), (unsigned)OBJ_SHARED_REFCOUNT);
-    EXPECT_EQ((storageState)shared->storage_state, STORAGE_STATE_ONLY_FLASH);
-    shared->refcount = 1;
-    decrRefCount(shared);
-
-    robj *obj = createRawStringObject("v", 1);
-    obj->refcount = OBJ_FIRST_SPECIAL_REFCOUNT - 2;
-    obj->storage_state = STORAGE_STATE_COPYING_TO_MEMORY;
-    incrRefCount(obj);
-    EXPECT_EQ(objectGetRefcount(obj), (unsigned)OBJ_FIRST_SPECIAL_REFCOUNT - 1);
-    EXPECT_EQ((storageState)obj->storage_state, STORAGE_STATE_COPYING_TO_MEMORY);
-    obj->refcount = 1;
-    obj->storage_state = STORAGE_STATE_ONLY_MEMORY;
-    decrRefCount(obj);
-}

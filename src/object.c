@@ -496,7 +496,8 @@ void objectUnembedVal(robj *o) {
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function. */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
-    /* TODO: a flash-resident value needs its own branch, the paths below assume the value is in memory. */
+    /* TODO(#105): Handle values in flashcache when copying or rebuilding objects.
+     * https://github.com/dubey02/valkey-data-tiering/issues/105 */
     if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR) {
         robj *new = createStringObjectWithKeyAndExpire(objectGetVal(o), sdslen(objectGetVal(o)), key, expire);
         objectSetLRU(new, objectGetLRU(o));
