@@ -539,8 +539,8 @@ static int addRequestFinished(void) {
 }
 
 /* Zipfian key selection by rejection-inversion (Hormann and Derflinger, 1996),
- * as in Apache Commons RNG RejectionInversionZipfSampler. It needs no per-key
- * table. zipfianH() is the integral of x^-alpha and zipfianHinv() its inverse. */
+ * as in Apache Commons RNG RejectionInversionZipfSampler. zipfianH() is the
+ * integral of x^-alpha and zipfianHinv() its inverse. */
 static double zipfianHelper1(double x) {
     return x == 0 ? 1 : log1p(x) / x;
 }
