@@ -40,6 +40,7 @@
 #include <signal.h>
 #include <assert.h>
 #include <math.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -175,7 +176,9 @@ static struct config {
     /* Zipfian key selection */
     int zipfian;          /* 0 draws keys uniformly, 1 draws them from a Zipfian distribution */
     double zipfian_alpha; /* Zipfian exponent */
-    double *zipfian_cdf;  /* Cumulative distribution over config.keyspacelen keys */
+    double zipfian_h_x1;  /* Sampler constants, set by zipfianInit() */
+    double zipfian_h_n;
+    double zipfian_s;
 } config;
 
 /* Locations of the placeholders __rand_int__, __rand_1st__,
@@ -535,36 +538,46 @@ static int addRequestFinished(void) {
     return atomic_load_explicit(&config.requests_finished, memory_order_relaxed) + pending_requests_finished;
 }
 
-/* Build the Zipfian cumulative distribution over config.keyspacelen keys. Called
- * once after options are parsed and before any client exists, so every benchmark
- * path shares one read-only table. */
-static void zipfianInit(void) {
-    if (!config.zipfian) return;
-    long long n = config.keyspacelen;
-    config.zipfian_cdf = zmalloc(sizeof(double) * n);
-    double sum = 0.0;
-    for (long long i = 0; i < n; i++) sum += 1.0 / pow((double)(i + 1), config.zipfian_alpha);
-    double cumulative = 0.0;
-    for (long long i = 0; i < n; i++) {
-        cumulative += (1.0 / pow((double)(i + 1), config.zipfian_alpha)) / sum;
-        config.zipfian_cdf[i] = cumulative;
-    }
+/* Zipfian key selection by rejection-inversion (Hormann and Derflinger, 1996),
+ * as in Apache Commons RNG RejectionInversionZipfSampler. It needs no per-key
+ * table. zipfianH() is the integral of x^-alpha and zipfianHinv() its inverse. */
+static double zipfianHelper1(double x) {
+    return x == 0 ? 1 : log1p(x) / x;
 }
 
-/* Draw a key in the range 0..keyspacelen-1 from the Zipfian distribution. The
- * uniform draw uses rand62(), whose state is thread local, so concurrent
- * benchmark threads sample independently without locking. */
+static double zipfianHelper2(double x) {
+    return x == 0 ? 1 : expm1(x) / x;
+}
+
+static double zipfianH(double x) {
+    double log_x = log(x);
+    return zipfianHelper2((1 - config.zipfian_alpha) * log_x) * log_x;
+}
+
+static double zipfianHinv(double x) {
+    double t = x * (1 - config.zipfian_alpha);
+    if (t < -1) t = -1;
+    return exp(zipfianHelper1(t) * x);
+}
+
+static void zipfianInit(void) {
+    if (!config.zipfian) return;
+    config.zipfian_h_x1 = zipfianH(1.5) - 1;
+    config.zipfian_h_n = zipfianH(config.keyspacelen + 0.5);
+    config.zipfian_s = 2 - zipfianHinv(zipfianH(2.5) - pow(2, -config.zipfian_alpha));
+}
+
+/* Returns a key in 0..keyspacelen-1, key 0 being the most frequent. */
 static uint64_t zipfianSample(void) {
-    double u = (double)rand62() / (double)(1ULL << 62);
-    long long lo = 0, hi = config.keyspacelen - 1;
-    while (lo < hi) {
-        long long mid = lo + (hi - lo) / 2;
-        if (config.zipfian_cdf[mid] < u)
-            lo = mid + 1;
-        else
-            hi = mid;
+    while (1) {
+        double r = (double)rand62() / (double)(1ULL << 62);
+        double u = config.zipfian_h_n + r * (config.zipfian_h_x1 - config.zipfian_h_n);
+        double x = zipfianHinv(u);
+        long long k = (long long)(x + 0.5);
+        if (k < 1) k = 1;
+        if (k > config.keyspacelen) k = config.keyspacelen;
+        if (k - x <= config.zipfian_s || u >= zipfianH(k + 0.5) - pow(k, -config.zipfian_alpha)) return k - 1;
     }
-    return (uint64_t)lo;
 }
 
 static void replacePlaceholder(const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter) {
@@ -1901,7 +1914,7 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--keysize")) {
             if (lastarg) goto invalid;
             config.keysize = atoi(argv[++i]);
-            if (config.keysize < 0) config.keysize = 0;
+            if (config.keysize > 1024 * 1024 * 1024) config.keysize = 1024 * 1024 * 1024;
         } else if (!strcmp(argv[i], "-P")) {
             if (lastarg) goto invalid;
             config.pipeline = atoi(argv[++i]);
@@ -1926,15 +1939,14 @@ int parseOptions(int argc, char **argv) {
             config.sequential_replacement = 1;
         } else if (!strcmp(argv[i], "--zipfian")) {
             config.zipfian = 1;
-            /* The next argument is the exponent only when it parses fully as a
-             * positive number, so forms such as "--zipfian -c 50" keep working. */
-            if (!lastarg) {
-                const char *next = argv[i + 1];
+            /* An argument starting with a digit is the exponent. Anything else,
+             * e.g. "-c 50", is the next option or the command. */
+            if (!lastarg && (isdigit((unsigned char)argv[i + 1][0]) || argv[i + 1][0] == '.')) {
                 char *endptr;
-                double alpha = strtod(next, &endptr);
-                if (endptr != next && *endptr == '\0' && alpha > 0.0) {
-                    config.zipfian_alpha = alpha;
-                    i++;
+                config.zipfian_alpha = strtod(argv[++i], &endptr);
+                if (*endptr != '\0' || !isfinite(config.zipfian_alpha) || config.zipfian_alpha <= 0) {
+                    fprintf(stderr, "Invalid value for --zipfian: '%s' is not a positive number\n", argv[i]);
+                    exit(1);
                 }
             }
         } else if (!strcmp(argv[i], "-q")) {
@@ -2172,8 +2184,8 @@ usage:
         " --keysize <size>   Total key length in bytes for the built-in tests that use\n"
         "                    the key:__rand_int__ key. The key becomes 'a' padding\n"
         "                    followed by __rand_int__, with the cluster hash tag kept\n"
-        "                    and counted. Sizes below the 12 digit placeholder add no\n"
-        "                    padding. Default 0 keeps the key:__rand_int__ form.\n"
+        "                    and counted. Minimum 12, or 18 in cluster mode. Default\n"
+        "                    0 keeps the key:__rand_int__ form.\n"
         " --dbnum <db>       SELECT the specified db number (default 0)\n"
         " -3                 Start session in RESP3 protocol mode.\n"
         " --threads <num>    Enable multi-thread mode.\n"
@@ -2213,6 +2225,13 @@ usage:
         "                    them uniformly, so low numbered keys are hit far more\n"
         "                    often. alpha is the exponent and defaults to 1.0. Requires\n"
         "                    -r, and --sequential takes precedence over it.\n"
+        "                    Higher alpha means more skew. Share of requests that go\n"
+        "                    to the hottest keys, with -r 1000000:\n"
+        "                      alpha   top 1% of keys   top 10% of keys\n"
+        "                      0.6     16%              40%\n"
+        "                      0.8     36%              61%\n"
+        "                      1.0     68%              84%\n"
+        "                      1.2     91%              97%\n"
         " -P <numreq>        Pipeline <numreq> requests. That is, send multiple requests\n"
         "                    before waiting for the replies. Default 1 (no pipeline).\n"
         "                    When multiple commands are specified on the command line,\n"
@@ -2499,7 +2518,6 @@ int main(int argc, char **argv) {
     config.has_field_placeholders = 0;
     config.zipfian = 0;
     config.zipfian_alpha = 1.0;
-    config.zipfian_cdf = NULL;
     resetPlaceholders();
 
     i = parseOptions(argc, argv);
@@ -2510,8 +2528,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Option --zipfian requires a keyspace, use -r <keyspacelen>\n");
         exit(1);
     }
-    /* Build the distribution before any client exists so the built-in tests,
-     * arbitrary commands and multi-threaded mode all share one table. */
     zipfianInit();
 
     /* Setup dataset if specified */
@@ -2771,7 +2787,6 @@ int main(int argc, char **argv) {
         sdsfree(title);
         if (config.server_config != NULL) freeServerConfig(config.server_config);
         zfree(argvlen);
-        zfree(config.zipfian_cdf);
         return 0;
     }
 
@@ -2779,9 +2794,12 @@ int main(int argc, char **argv) {
      * --keysize a key is 'a' padding followed by __rand_int__ so the total length
      * equals keysize, and the cluster hash tag counts towards that length. */
     sds key_tmpl;
-    if (config.keysize > 0) {
+    if (config.keysize != 0) {
         int pad = config.keysize - (int)strlen(tag) - (int)PLACEHOLDER_LEN;
-        if (pad < 0) pad = 0;
+        if (pad < 0) {
+            fprintf(stderr, "Option --keysize must be at least %d\n", (int)(strlen(tag) + PLACEHOLDER_LEN));
+            exit(1);
+        }
         key_tmpl = sdsnewlen(NULL, pad);
         memset(key_tmpl, 'a', pad);
         key_tmpl = sdscatprintf(key_tmpl, "%s__rand_int__", tag);
@@ -2987,7 +3005,6 @@ int main(int argc, char **argv) {
 
     zfree(data);
     sdsfree(key_tmpl);
-    zfree(config.zipfian_cdf);
     freeCliConnInfo(config.conn_info);
     if (config.server_config != NULL) freeServerConfig(config.server_config);
     resetPlaceholders();
