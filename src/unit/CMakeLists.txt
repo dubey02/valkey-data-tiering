@@ -36,7 +36,7 @@ endif ()
 # ext_storage tests. add_valkey_server_compiler_options() only reaches
 # CMAKE_C_FLAGS, so without this the C++ target sees test_ext_storage.cpp as
 # an empty translation unit.
-if (USE_EXT_STORAGE EQUAL 1)
+if (USE_EXT_STORAGE)
     list(APPEND COMPILE_DEFINITIONS "USE_EXT_STORAGE=1")
 endif ()
 

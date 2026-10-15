@@ -1,0 +1,19 @@
+FlashCache unit tests
+=====================
+
+Requirements: cmake, a C++17 compiler, libaio, and googletest/googlemock
+(libgtest-dev libgmock-dev). jemalloc is built from deps/ automatically.
+
+Build and run, from the repository root:
+
+    make -C src test-storage
+
+That builds libflashcache.a and the unitTests binary, then runs the suite
+through deps/gtest-parallel. Filter with UNIT_TEST_PATTERN=IndexTest.
+
+If googletest is not installed system-wide, export
+CMAKE_PREFIX_PATH=/path/to/googletest before running make.
+
+Run one test under gdb:
+
+    gdb --args deps/flashcache/build/tst/unit/unitTests --gtest_filter=<test-name>

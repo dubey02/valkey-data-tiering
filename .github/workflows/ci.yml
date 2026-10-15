@@ -110,10 +110,10 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: cmake and make
         run: |
-          sudo apt-get install -y cmake pkg-config libzstd-dev libssl-dev
+          sudo apt-get install -y cmake pkg-config libzstd-dev libssl-dev libaio-dev
           mkdir -p build-release
           cd build-release
-          cmake -DCMAKE_BUILD_TYPE=Release .. -DBUILD_TLS=yes -DBUILD_ZSTD=yes -DBUILD_UNIT_GTESTS=yes
+          cmake -DCMAKE_BUILD_TYPE=Release .. -DBUILD_TLS=yes -DBUILD_ZSTD=yes -DBUILD_UNIT_GTESTS=yes -DBUILD_EXT_STORAGE=ON
           make -j$(nproc)
       - name: test
         run: |
@@ -208,11 +208,13 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: install-test-dependencies
-        run: sudo apt-get install -y tcl8.6 tclx libgtest-dev libgmock-dev
+        run: sudo apt-get install -y tcl8.6 tclx libgtest-dev libgmock-dev libaio-dev
       - name: make-ext-storage
         run: make -j4 all-with-unit-tests SERVER_CFLAGS='-Werror' BUILD_EXT_STORAGE=yes
       - name: test-unit-ext-storage
         run: make test-unit
+      - name: test-storage
+        run: make test-storage UNIT_TEST_PATTERN=-FlashcacheFuzzTest.
       # The feature is off by default even in a build that has it, so the suite
       # here is checking that carrying the code changes nothing, not that tiering
       # works. What proves tiering works are the unit tests above.

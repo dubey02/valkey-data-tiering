@@ -1,0 +1,12 @@
+file(GLOB SRC "*.c")
+
+add_library(${MONOTONIC_CLOCK_LIB} STATIC ${SRC})
+
+# Build with C11
+set_target_properties(
+  ${MONOTONIC_CLOCK_LIB}
+  PROPERTIES
+  C_STANDARD 11
+  C_STANDARD_REQUIRED ON
+  POSITION_INDEPENDENT_CODE ON
+)

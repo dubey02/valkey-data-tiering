@@ -43,6 +43,7 @@ distclean:
 	-(cd hdr_histogram && $(MAKE) clean) > /dev/null || true
 	-(cd fpconv && $(MAKE) clean) > /dev/null || true
 	-(cd lz4 && $(MAKE) clean) > /dev/null || true
+	-(rm -rf flashcache/build) > /dev/null || true
 	-(rm -f .make-*)
 
 .PHONY: distclean
@@ -139,3 +140,24 @@ lz4: .make-prerequisites
 	cd lz4 && $(MAKE) CFLAGS="$(CFLAGS)"
 
 .PHONY: lz4
+
+CMAKE?=cmake
+FLASHCACHE_CMAKE_FLAGS= -DFC_BUILD_TESTS=OFF
+ifeq ($(FLASHCACHE_TESTS),yes)
+	FLASHCACHE_CMAKE_FLAGS= -DFC_BUILD_TESTS=ON
+endif
+FLASHCACHE_DEPS=
+ifeq ($(or $(MALLOC),jemalloc),jemalloc)
+	FLASHCACHE_CMAKE_FLAGS+= -DFC_USE_JEMALLOC=ON
+	FLASHCACHE_DEPS+= jemalloc
+else
+	FLASHCACHE_CMAKE_FLAGS+= -DFC_USE_JEMALLOC=OFF
+endif
+
+flashcache: .make-prerequisites $(FLASHCACHE_DEPS)
+	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
+	$(CMAKE) -S flashcache -B flashcache/build -DCMAKE_C_COMPILER="$(CC)" \
+		-DCMAKE_C_FLAGS="-O2 -g $(CFLAGS)" -DCMAKE_EXE_LINKER_FLAGS="$(LDFLAGS)" $(FLASHCACHE_CMAKE_FLAGS)
+	$(CMAKE) --build flashcache/build
+
+.PHONY: flashcache
