@@ -2184,8 +2184,9 @@ usage:
         " --keysize <size>   Total key length in bytes for the built-in tests that use\n"
         "                    the key:__rand_int__ key. The key becomes 'a' padding\n"
         "                    followed by __rand_int__, with the cluster hash tag kept\n"
-        "                    and counted. Minimum 12, or 18 in cluster mode. Default\n"
-        "                    0 keeps the key:__rand_int__ form.\n"
+        "                    and counted. Minimum 12, or 18 in cluster mode; smaller\n"
+        "                    sizes are raised to it with a warning. Default 0 keeps\n"
+        "                    the key:__rand_int__ form.\n"
         " --dbnum <db>       SELECT the specified db number (default 0)\n"
         " -3                 Start session in RESP3 protocol mode.\n"
         " --threads <num>    Enable multi-thread mode.\n"
@@ -2797,8 +2798,9 @@ int main(int argc, char **argv) {
     if (config.keysize != 0) {
         int pad = config.keysize - (int)strlen(tag) - (int)PLACEHOLDER_LEN;
         if (pad < 0) {
-            fprintf(stderr, "Option --keysize must be at least %d\n", (int)(strlen(tag) + PLACEHOLDER_LEN));
-            exit(1);
+            fprintf(stderr, "WARNING: --keysize %d is below the minimum, using %d.\n", config.keysize,
+                    (int)(strlen(tag) + PLACEHOLDER_LEN));
+            pad = 0;
         }
         key_tmpl = sdsnewlen(NULL, pad);
         memset(key_tmpl, 'a', pad);

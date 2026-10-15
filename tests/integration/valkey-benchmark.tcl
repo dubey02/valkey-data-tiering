@@ -595,10 +595,13 @@ tags {"benchmark network external:skip logreqres:skip"} {
             }
         }
 
-        test {benchmark: keysize rejects sizes below the minimum} {
-            set cmd [valkeybenchmark $master_host $master_port "-r 10 -n 5 --keysize 5 -t set"]
-            catch { exec {*}$cmd } error
-            assert_match "*--keysize must be at least 12*" $error
+        test {benchmark: keysize below the minimum is raised to it with a warning} {
+            set cmd [valkeybenchmark $master_host $master_port "-r 10 -n 10 --keysize 5 -t set"]
+            set output [common_bench_setup $cmd]
+            assert_match "*WARNING: --keysize 5 is below the minimum, using 12.*" $output
+            foreach key [r keys *] {
+                assert_equal 12 [string length $key]
+            }
         }
 
         test {benchmark: warmup applies to all tests in multi-test run} {
