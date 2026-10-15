@@ -229,6 +229,15 @@ jobs:
       - name: test-unit-without-ext-storage
         run: make test-unit
 
+  test-ext-storage-fuzzer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install-test-dependencies
+        run: sudo apt-get install -y libgtest-dev libgmock-dev libaio-dev
+      - name: test-storage-fuzzer
+        run: make test-storage UNIT_TEST_PATTERN=FlashcacheFuzzTest.
+
   build-debian-old:
     runs-on: ubuntu-latest
     container: debian:bookworm
