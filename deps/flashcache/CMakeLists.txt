@@ -1,0 +1,76 @@
+cmake_minimum_required(VERSION 3.14)
+project(FlashCache LANGUAGES C)
+
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "FlashCache requires Linux for libaio dependency, "
+                         "detected OS: ${CMAKE_SYSTEM_NAME}")
+endif ()
+if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$")
+    message(FATAL_ERROR "FlashCache requires x86_64 or aarch64 (hardware CRC32c), " 
+                        "detected architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif ()
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Collect all source files
+file(GLOB FC_SOURCES "src/*.c")
+
+# Create static library
+add_library(flashcache STATIC ${FC_SOURCES})
+
+# Include directories — the source files use #include "include/xxx.h"
+# so we need the src/ directory on the include path.
+target_include_directories(flashcache PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+)
+
+# Allocator. ON routes malloc/free to Valkey's in-tree jemalloc via
+# JEMALLOC_MANGLE; OFF uses the libc allocator, which the server's
+# MALLOC=libc and sanitizer builds need.
+option(FC_USE_JEMALLOC "Allocate through the in-tree jemalloc" ON)
+if (FC_USE_JEMALLOC)
+    target_include_directories(flashcache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../jemalloc/include
+    )
+    target_compile_definitions(flashcache PRIVATE FC_USE_JEMALLOC JEMALLOC_MANGLE)
+endif ()
+
+# Link against libaio (required for async I/O)
+target_link_libraries(flashcache PUBLIC aio)
+if (FC_USE_JEMALLOC AND TARGET jemalloc)
+    target_link_libraries(flashcache PUBLIC jemalloc)
+endif ()
+
+# Compiler flags (no -Werror yet)
+target_compile_options(flashcache PRIVATE
+    -Wall -Wextra
+    -Wno-unused-parameter
+    -Wno-unused-function
+    -Wno-missing-field-initializers
+    -Wno-sign-compare
+    -Wno-cast-qual
+    -Wno-double-promotion
+    -Wno-format-nonliteral
+    -Wno-pedantic
+    -D_GNU_SOURCE
+)
+
+# Architecture-specific flags for CRC32
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    target_compile_options(flashcache PRIVATE -msse4.2)
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    target_compile_options(flashcache PRIVATE -march=armv8-a+crc)
+endif()
+
+# Stress test app
+enable_language(CXX)
+add_subdirectory(app)
+
+# Unit tests (opt-in)
+option(FC_BUILD_TESTS "Build the FlashCache unit tests" OFF)
+if(FC_BUILD_TESTS)
+    add_subdirectory(tst/unit)
+endif()

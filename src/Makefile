@@ -403,7 +403,14 @@ BUILD_MODULE:=2
 
 # Data tiering
 ifeq ($(BUILD_EXT_STORAGE),yes)
+ifneq ($(uname_S),Linux)
+    $(error BUILD_EXT_STORAGE requires Linux (libaio))
+endif
 	FINAL_CFLAGS+=-DUSE_EXT_STORAGE=$(BUILD_YES)
+	DEPENDENCY_TARGETS+= flashcache
+	export MALLOC
+	FINAL_CFLAGS+= -I../deps/flashcache/src
+	EXT_STORAGE_LIBS= ../deps/flashcache/build/libflashcache.a -laio
 endif
 
 ifeq ($(BUILD_TLS),yes)
@@ -783,7 +790,7 @@ endif
 
 # valkey-server
 $(SERVER_NAME): $(ENGINE_SERVER_OBJ) $(LUA_MODULE)
-	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(FINAL_LIBS) $(LUA_LDFLAGS)
+	$(SERVER_LD) -o $@ $(ENGINE_SERVER_OBJ) ../deps/libvalkey/lib/libvalkey.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/lz4/liblz4.a $(EXT_STORAGE_LIBS) $(FINAL_LIBS) $(LUA_LDFLAGS)
 
 # Valkey static library, used to compile against for unit testing
 $(ENGINE_LIB_NAME): $(ENGINE_SERVER_OBJ)
@@ -873,6 +880,13 @@ test: $(ALL_BUILD_PREREQUISITES)
 
 test-unit:
 	@(cd unit && $(MAKE) test-unit)
+
+# Storage engine (FlashCache) unit tests
+test-storage:
+	@(cd ../deps && $(MAKE) flashcache FLASHCACHE_TESTS=yes gtest-parallel)
+	@(cd ../deps/flashcache/build/tst/unit && python3 ../../../../gtest-parallel/gtest_parallel.py ./unitTests --timeout_per_test 3600 --gtest_filter=$(UNIT_TEST_PATTERN)*)
+
+.PHONY: test-storage
 
 # valkey-unit-gtests
 $(ENGINE_UNIT_GTESTS): $(ENGINE_LIB_NAME)
