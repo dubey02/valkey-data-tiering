@@ -3,8 +3,8 @@ name: Ext storage NVMe tests
 # Runs the FlashCache fuzz test, which ci.yml skips, on an on-demand EC2
 # instance with /tmp on local NVMe. Runs on every push to
 # data-tiering-unstable and on every PR. PR runs start only when the person who
-# opened or pushed to the PR has write access; for anyone else, a maintainer
-# runs it manually with the PR's commit as the ref.
+# opened, pushed to or labeled the PR has write access; for anyone else, a
+# maintainer adds the run-nvme-tests label.
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
     paths-ignore:
       - '**/*.md'
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
@@ -38,6 +38,7 @@ permissions:
 
 jobs:
   prepare:
+    if: github.event.action != 'labeled' || github.event.label.name == 'run-nvme-tests'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -45,7 +46,7 @@ jobs:
       sha: ${{ steps.ref.outputs.sha }}
     steps:
       # PR code runs on the instance, so a PR from someone without write access
-      # is skipped, not failed.
+      # is skipped, not failed, until a maintainer labels it.
       - name: Check that the actor has write access
         id: access
         env:
@@ -55,7 +56,7 @@ jobs:
           PERMISSION=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
           case "$PERMISSION" in
             admin|write) echo "$ACTOR has $PERMISSION access"; echo "run=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "::notice::$ACTOR has $PERMISSION access, a maintainer can run these tests with workflow_dispatch"; echo "run=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::notice::$ACTOR has $PERMISSION access, add the run-nvme-tests label to run these tests"; echo "run=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
       - name: Resolve the commit
