@@ -40,6 +40,7 @@
 #include <signal.h>
 #include <assert.h>
 #include <math.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -172,6 +173,12 @@ static struct config {
     int template_argc;
     sds *template_argv;
     int has_field_placeholders;
+    /* Zipfian key selection */
+    int zipfian;          /* 0 draws keys uniformly, 1 draws them from a Zipfian distribution */
+    double zipfian_alpha; /* Zipfian exponent */
+    double zipfian_h_x1;  /* Sampler constants, set by zipfianInit() */
+    double zipfian_h_n;
+    double zipfian_s;
 } config;
 
 /* Locations of the placeholders __rand_int__, __rand_1st__,
@@ -531,6 +538,48 @@ static int addRequestFinished(void) {
     return atomic_load_explicit(&config.requests_finished, memory_order_relaxed) + pending_requests_finished;
 }
 
+/* Zipfian key selection by rejection-inversion (Hormann and Derflinger, 1996),
+ * as in Apache Commons RNG RejectionInversionZipfSampler. zipfianH() is the
+ * integral of x^-alpha and zipfianHinv() its inverse. */
+static double zipfianHelper1(double x) {
+    return x == 0 ? 1 : log1p(x) / x;
+}
+
+static double zipfianHelper2(double x) {
+    return x == 0 ? 1 : expm1(x) / x;
+}
+
+static double zipfianH(double x) {
+    double log_x = log(x);
+    return zipfianHelper2((1 - config.zipfian_alpha) * log_x) * log_x;
+}
+
+static double zipfianHinv(double x) {
+    double t = x * (1 - config.zipfian_alpha);
+    if (t < -1) t = -1;
+    return exp(zipfianHelper1(t) * x);
+}
+
+static void zipfianInit(void) {
+    if (!config.zipfian) return;
+    config.zipfian_h_x1 = zipfianH(1.5) - 1;
+    config.zipfian_h_n = zipfianH(config.keyspacelen + 0.5);
+    config.zipfian_s = 2 - zipfianHinv(zipfianH(2.5) - pow(2, -config.zipfian_alpha));
+}
+
+/* Returns a key in 0..keyspacelen-1, key 0 being the most frequent. */
+static uint64_t zipfianSample(void) {
+    while (1) {
+        double r = (double)rand62() / (double)(1ULL << 62);
+        double u = config.zipfian_h_n + r * (config.zipfian_h_x1 - config.zipfian_h_n);
+        double x = zipfianHinv(u);
+        long long k = (long long)(x + 0.5);
+        if (k < 1) k = 1;
+        if (k > config.keyspacelen) k = config.keyspacelen;
+        if (k - x <= config.zipfian_s || u >= zipfianH(k + 0.5) - pow(k, -config.zipfian_alpha)) return k - 1;
+    }
+}
+
 static void replacePlaceholder(const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter) {
     if (count == 0) return;
 
@@ -538,6 +587,8 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
     if (config.keyspacelen != 0) {
         if (config.sequential_replacement) {
             key = atomic_fetch_add_explicit(key_counter, 1, memory_order_relaxed);
+        } else if (config.zipfian) {
+            key = zipfianSample();
         } else {
             key = rand62();
         }
@@ -1860,6 +1911,10 @@ int parseOptions(int argc, char **argv) {
             config.datasize = atoi(argv[++i]);
             if (config.datasize < 1) config.datasize = 1;
             if (config.datasize > 1024 * 1024 * 1024) config.datasize = 1024 * 1024 * 1024;
+        } else if (!strcmp(argv[i], "--keysize")) {
+            if (lastarg) goto invalid;
+            config.keysize = atoi(argv[++i]);
+            if (config.keysize > 1024 * 1024 * 1024) config.keysize = 1024 * 1024 * 1024;
         } else if (!strcmp(argv[i], "-P")) {
             if (lastarg) goto invalid;
             config.pipeline = atoi(argv[++i]);
@@ -1882,6 +1937,18 @@ int parseOptions(int argc, char **argv) {
             config.keyspacelen = val;
         } else if (!strcmp(argv[i], "--sequential")) {
             config.sequential_replacement = 1;
+        } else if (!strcmp(argv[i], "--zipfian")) {
+            config.zipfian = 1;
+            /* An argument starting with a digit is the exponent. Anything else,
+             * e.g. "-c 50", is the next option or the command. */
+            if (!lastarg && (isdigit((unsigned char)argv[i + 1][0]) || argv[i + 1][0] == '.')) {
+                char *endptr;
+                config.zipfian_alpha = strtod(argv[++i], &endptr);
+                if (*endptr != '\0' || !isfinite(config.zipfian_alpha) || config.zipfian_alpha <= 0) {
+                    fprintf(stderr, "Invalid value for --zipfian: '%s' is not a positive number\n", argv[i]);
+                    exit(1);
+                }
+            }
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -2069,7 +2136,7 @@ usage:
 
 
     printf(
-        "%s%s%s%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
+        "%s%s%s%s%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
         "Usage: valkey-benchmark [OPTIONS] [--] [COMMAND ARGS...]\n\n"
         "Simulates sending commands using multiple clients. The utility provides a\n"
         "default set of tests. You can run a subset of the tests using the -t option or\n"
@@ -2114,6 +2181,12 @@ usage:
         "                    of pre-warmup completions may carry into the counted\n"
         "                    total at the warmup boundary.\n"
         " -d <size>          Data size of SET/GET value in bytes (default 3)\n"
+        " --keysize <size>   Total key length in bytes for the built-in tests that use\n"
+        "                    the key:__rand_int__ key. The key becomes 'a' padding\n"
+        "                    followed by __rand_int__, with the cluster hash tag kept\n"
+        "                    and counted. Minimum 12, or 18 in cluster mode; smaller\n"
+        "                    sizes are raised to it with a warning. Default 0 keeps\n"
+        "                    the key:__rand_int__ form.\n"
         " --dbnum <db>       SELECT the specified db number (default 0)\n"
         " -3                 Start session in RESP3 protocol mode.\n"
         " --threads <num>    Enable multi-thread mode.\n"
@@ -2131,7 +2204,7 @@ usage:
         "                    it is recommended to enable read from replicas only for read\n"
         "                    command tests.\n"
         " --enable-tracking  Send CLIENT TRACKING on before starting benchmark.\n"
-        " -k <boolean>       1=keep alive 0=reconnect (default 1)\n"
+        " -k <boolean>       1=keep alive 0=reconnect (default 1)\n",
         " -r <keyspacelen>   Use random keys for SET/GET/INCR, random values for SADD,\n"
         "                    random members and scores for ZADD.\n"
         "                    Using this option the benchmark will replace the string\n"
@@ -2148,6 +2221,18 @@ usage:
         "                    independent counters. Used to create expected number of\n"
         "                    elements with multiple replacements.\n"
         "                    example: ZADD myzset __rand_int__ element:__rand_1st__\n"
+        " --zipfian [alpha]  Modifies the -r argument to draw __rand_int__ keys from a\n"
+        "                    Zipfian distribution over the keyspace instead of drawing\n"
+        "                    them uniformly, so low numbered keys are hit far more\n"
+        "                    often. alpha is the exponent and defaults to 1.0. Requires\n"
+        "                    -r, and --sequential takes precedence over it.\n"
+        "                    Higher alpha means more skew. Share of requests that go\n"
+        "                    to the hottest keys, with -r 1000000:\n"
+        "                      alpha   top 1% of keys   top 10% of keys\n"
+        "                      0.6     16%              40%\n"
+        "                      0.8     36%              61%\n"
+        "                      1.0     68%              84%\n"
+        "                      1.2     91%              97%\n"
         " -P <numreq>        Pipeline <numreq> requests. That is, send multiple requests\n"
         "                    before waiting for the replies. Default 1 (no pipeline).\n"
         "                    When multiple commands are specified on the command line,\n"
@@ -2390,6 +2475,7 @@ int main(int argc, char **argv) {
     aeCreateTimeEvent(config.el, 1, showThroughput, NULL, NULL);
     config.keepalive = 1;
     config.datasize = 3;
+    config.keysize = 0;
     config.pipeline = 1;
     config.replace_placeholders = 0;
     config.keyspacelen = 0;
@@ -2431,11 +2517,19 @@ int main(int argc, char **argv) {
     config.template_argc = 0;
     config.template_argv = NULL;
     config.has_field_placeholders = 0;
+    config.zipfian = 0;
+    config.zipfian_alpha = 1.0;
     resetPlaceholders();
 
     i = parseOptions(argc, argv);
     argc -= i;
     argv += i;
+
+    if (config.zipfian && config.keyspacelen == 0) {
+        fprintf(stderr, "Option --zipfian requires a keyspace, use -r <keyspacelen>\n");
+        exit(1);
+    }
+    zipfianInit();
 
     /* Setup dataset if specified */
     if (config.dataset_file) {
@@ -2697,6 +2791,24 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* Keys used by the built-in tests that address a single random key. With
+     * --keysize a key is 'a' padding followed by __rand_int__ so the total length
+     * equals keysize, and the cluster hash tag counts towards that length. */
+    sds key_tmpl;
+    if (config.keysize != 0) {
+        int pad = config.keysize - (int)strlen(tag) - (int)PLACEHOLDER_LEN;
+        if (pad < 0) {
+            fprintf(stderr, "WARNING: --keysize %d is below the minimum, using %d.\n", config.keysize,
+                    (int)(strlen(tag) + PLACEHOLDER_LEN));
+            pad = 0;
+        }
+        key_tmpl = sdsnewlen(NULL, pad);
+        memset(key_tmpl, 'a', pad);
+        key_tmpl = sdscatprintf(key_tmpl, "%s__rand_int__", tag);
+    } else {
+        key_tmpl = sdscatprintf(sdsnew(""), "key%s:__rand_int__", tag);
+    }
+
     /* Run default benchmark suite. */
     data = zmalloc(config.datasize + 1);
     do {
@@ -2712,13 +2824,13 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("set")) {
-            len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+            len = valkeyFormatCommand(&cmd, "SET %s %s", key_tmpl, data);
             benchmark("SET", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("get")) {
-            len = valkeyFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
+            len = valkeyFormatCommand(&cmd, "GET %s", key_tmpl);
             benchmark("GET", cmd, len);
             free(cmd);
         }
@@ -2819,28 +2931,24 @@ int main(int argc, char **argv) {
         if (test_is_selected("mset")) {
             const char *cmd_argv[21];
             cmd_argv[0] = "MSET";
-            sds key_placeholder = sdscatprintf(sdsnew(""), "key%s:__rand_int__", tag);
             for (i = 1; i < 21; i += 2) {
-                cmd_argv[i] = key_placeholder;
+                cmd_argv[i] = key_tmpl;
                 cmd_argv[i + 1] = data;
             }
             len = valkeyFormatCommandArgv(&cmd, 21, cmd_argv, NULL);
             benchmark("MSET (10 keys)", cmd, len);
             free(cmd);
-            sdsfree(key_placeholder);
         }
 
         if (test_is_selected("mget")) {
             const char *cmd_argv[11];
             cmd_argv[0] = "MGET";
-            sds key_placeholder = sdscatprintf(sdsnew(""), "key%s:__rand_int__", tag);
             for (i = 1; i < 11; i++) {
-                cmd_argv[i] = key_placeholder;
+                cmd_argv[i] = key_tmpl;
             }
             len = valkeyFormatCommandArgv(&cmd, 11, cmd_argv, NULL);
             benchmark("MGET (10 keys)", cmd, len);
             free(cmd);
-            sdsfree(key_placeholder);
         }
 
         if (test_is_selected("xadd")) {
@@ -2898,6 +3006,7 @@ int main(int argc, char **argv) {
     } while (config.loop);
 
     zfree(data);
+    sdsfree(key_tmpl);
     freeCliConnInfo(config.conn_info);
     if (config.server_config != NULL) freeServerConfig(config.server_config);
     resetPlaceholders();
