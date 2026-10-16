@@ -221,4 +221,12 @@ void setStorageState(robj *o, storageState state) {
     o->storage_state = state;
 }
 
+/* Whether a key's value can be spilled. An embedded or INT-encoded value has no
+ * allocation of its own to free, and a value with other references can't be
+ * freed under them. Module types are not supported yet (#81). */
+int isSpillCandidate(const robj *o) {
+    return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY && !o->hasembval &&
+           objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE;
+}
+
 #endif /* USE_EXT_STORAGE */
