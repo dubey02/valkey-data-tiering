@@ -1,0 +1,203 @@
+name: EC2 runner
+
+# Starts or stops an on-demand EC2 instance registered as a just-in-time
+# runner. Call it with mode: start, run the job on the returned label, then
+# call it with mode: stop and if: always(). The caller must grant
+# id-token: write and pass secrets: inherit.
+#
+# The instance is arm64 Amazon Linux 2023. Its local NVMe drive on NUMA node 0
+# is formatted and mounted at /mnt/nvme, owned by ec2-user, so instance_type
+# must be a Graviton type with instance storage.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "start or stop"
+        required: true
+        type: string
+      instance_type:
+        description: "EC2 instance type, used by start"
+        required: false
+        type: string
+        default: r8gd.2xlarge
+      pre_runner_script:
+        description: "Commands run as root after /mnt/nvme is mounted, before the runner starts"
+        required: false
+        type: string
+        default: ""
+      max_lifetime_minutes:
+        description: "The instance shuts itself down after this long, in case stop never runs"
+        required: false
+        type: number
+        default: 240
+      label:
+        description: "Runner label from start, used by stop"
+        required: false
+        type: string
+        default: ""
+      instance_id:
+        description: "Instance ID from start, used by stop"
+        required: false
+        type: string
+        default: ""
+      security_group_id:
+        description: "Security group ID from start, used by stop"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      label:
+        value: ${{ jobs.start.outputs.label }}
+      instance-id:
+        value: ${{ jobs.start.outputs.instance-id }}
+      security-group-id:
+        value: ${{ jobs.start.outputs.security-group-id }}
+
+defaults:
+  run:
+    shell: "bash -Eeuo pipefail {0}"
+
+env:
+  AWS_REGION: ${{ vars.DT_AWS_REGION || 'us-west-2' }}
+
+jobs:
+  start:
+    if: inputs.mode == 'start'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+      instance-id: ${{ steps.runner.outputs.ec2-instance-id }}
+      security-group-id: ${{ steps.sg.outputs.security-group-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.DT_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create a security group for this run
+        id: sg
+        env:
+          SUBNET_ID: ${{ secrets.DT_SUBNET_ID }}
+        run: |
+          VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET_ID" \
+            --query 'Subnets[0].VpcId' --output text)
+          NAME="dt-pr-benchmark-${{ github.run_id }}-${{ github.run_attempt }}"
+          SG=$(aws ec2 create-security-group --group-name "$NAME" --vpc-id "$VPC" \
+            --description "Data tiering EC2 runner for run ${{ github.run_id }}, no ingress" \
+            --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=$NAME},{Key=purpose,Value=dt-pr-benchmark}]" \
+            --query GroupId --output text)
+          echo "security-group-id=$SG" >> "$GITHUB_OUTPUT"
+          echo "created $SG in $VPC"
+
+      - name: Resolve the AMI
+        id: ami
+        run: |
+          AMI=$(aws ssm get-parameter \
+            --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+            --query Parameter.Value --output text)
+          echo "ami=$AMI" >> "$GITHUB_OUTPUT"
+
+      - name: Create a GitHub App token for runner registration
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DT_RUNNER_APP_ID }}
+          private-key: ${{ secrets.DT_RUNNER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: write
+
+      - name: Start the EC2 runner
+        id: runner
+        uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
+        with:
+          mode: start
+          github-token: ${{ steps.app.outputs.token }}
+          use-jit: true
+          ec2-image-id: ${{ steps.ami.outputs.ami }}
+          ec2-instance-type: ${{ inputs.instance_type }}
+          subnet-id: ${{ secrets.DT_SUBNET_ID }}
+          security-group-id: ${{ steps.sg.outputs.security-group-id }}
+          iam-role-name: ${{ secrets.DT_INSTANCE_PROFILE }}
+          run-runner-as-user: ec2-user
+          startup-timeout-minutes: 15
+          metadata-options: '{"HttpTokens": "required"}'
+          block-device-mappings: '[{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 64, "VolumeType": "gp3", "DeleteOnTermination": true}}]'
+          aws-resource-tags: '[{"Key": "Name", "Value": "dt-pr-benchmark-${{ github.run_id }}"}, {"Key": "purpose", "Value": "dt-pr-benchmark"}]'
+          pre-runner-script: |
+            shutdown -h +${{ inputs.max_lifetime_minutes }}
+            NODES=$(ls -d /sys/devices/system/node/node[0-9]* | wc -l)
+            DEV=
+            for d in /sys/block/nvme*n1; do
+              grep -q "Instance Storage" "$d/device/model" || continue
+              node=$(cat "$d/device/numa_node")
+              if [ "$node" = 0 ] || { [ "$NODES" = 1 ] && [ "$node" = -1 ]; }; then
+                DEV=/dev/$(basename "$d")
+                break
+              fi
+            done
+            # Without instance storage the runner never registers and start
+            # times out, instead of the job running on the wrong disk.
+            [ -n "$DEV" ] || { echo "no instance storage NVMe drive on NUMA node 0"; exit 1; }
+            mkfs.ext4 -q -F "$DEV"
+            mkdir -p /mnt/nvme
+            mount -o noatime "$DEV" /mnt/nvme
+            chown ec2-user:ec2-user /mnt/nvme
+            ${{ inputs.pre_runner_script }}
+
+  stop:
+    if: inputs.mode == 'stop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.DT_AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create a GitHub App token for runner registration
+        id: app
+        if: inputs.instance_id != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.DT_RUNNER_APP_ID }}
+          private-key: ${{ secrets.DT_RUNNER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: write
+
+      - name: Stop the EC2 runner
+        if: inputs.instance_id != ''
+        uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
+        with:
+          mode: stop
+          github-token: ${{ steps.app.outputs.token }}
+          label: ${{ inputs.label }}
+          ec2-instance-id: ${{ inputs.instance_id }}
+
+      - name: Delete the run's security group
+        if: inputs.security_group_id != ''
+        env:
+          IID: ${{ inputs.instance_id }}
+          SG: ${{ inputs.security_group_id }}
+        run: |
+          if [[ -n "$IID" ]]; then
+            aws ec2 wait instance-terminated --instance-ids "$IID"
+          fi
+          for _ in $(seq 1 12); do
+            if aws ec2 delete-security-group --group-id "$SG"; then
+              echo "deleted $SG"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::warning::could not delete $SG"
