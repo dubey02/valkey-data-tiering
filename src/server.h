@@ -2499,6 +2499,7 @@ struct valkeyServer {
     char *ext_storage_engine;                /* Name of the storage engine to use. */
     char *ext_storage_path;                  /* Path the engine stores data under. */
     unsigned long long ext_storage_capacity; /* Max bytes the engine may use. */
+    char *ext_storage_cpulist;               /* cpu affinity list of the storage engine threads. */
     /* Lazy free */
     int lazyfree_lazy_eviction;
     int lazyfree_lazy_expire;

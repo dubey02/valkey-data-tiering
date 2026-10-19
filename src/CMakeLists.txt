@@ -20,6 +20,11 @@ if (USE_ZSTD)
 endif ()
 valkey_build_and_install_bin(valkey-server "${VALKEY_SERVER_SRCS}" "${VALKEY_SERVER_LDFLAGS}" "${SERVER_LIBS}"
                              "redis-server")
+if (USE_EXT_STORAGE)
+    # The storage engine sources in src/storage include the server headers by
+    # bare name, the same way the Makefile build resolves them with -I.
+    target_include_directories(valkey-server PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif ()
 add_dependencies(valkey-server generate_commands_def)
 add_dependencies(valkey-server generate_fmtargs_h)
 add_dependencies(valkey-server release_header)

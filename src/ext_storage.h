@@ -21,6 +21,9 @@ void extStorageInit(void);
 /* Closes the storage engine. */
 void extStorageDeinit(void);
 
+/* Crash handler only. Stops the storage engine threads with no cleanup. */
+void extStorageKillThreads(void);
+
 /* Whether a storage engine is open and ready. */
 int extStorageIsActive(void);
 
@@ -29,9 +32,6 @@ sds extStorageInfoString(sds info);
 
 /* The serialization callbacks. */
 const storageSerializer *extStorageSerializer(void);
-
-/* Test-only: clears the registered storage engine. */
-void extStorageTestResetRegistry(void);
 
 #endif /* USE_EXT_STORAGE */
 

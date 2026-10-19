@@ -38,6 +38,7 @@
 #include "cluster.h"
 #include "threads_mngr.h"
 #include "io_threads.h"
+#include "ext_storage.h"
 #include "sds.h"
 #include "module.h"
 
@@ -2330,6 +2331,9 @@ void killThreads(void) {
     killMainThread();
     bioKillThreads();
     killIOThreads();
+#ifdef USE_EXT_STORAGE
+    extStorageKillThreads();
+#endif
 }
 
 void doFastMemoryTest(void) {

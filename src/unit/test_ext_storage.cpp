@@ -7,6 +7,8 @@
 #include "generated_wrappers.hpp"
 
 #include <cstring>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string>
 
 extern "C" {
@@ -20,7 +22,20 @@ extern "C" {
 #include "module.h"
 #include "storage/storage.h"
 #include "storage/storage_mock.h"
+void extStorageTestResetRegistry(void);
 }
+
+/* The log and the thread setup. */
+static void testLog(storageLogLevel level, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[storage %d] ", level);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+static const storageThreadConfig test_thread_config = {};
 
 /* ---------------------------------------------------------------------------
  * Mock storage engine
@@ -50,6 +65,8 @@ class StorageMockTest : public ::testing::Test {
         cfg.capacity_bytes = 0; /* unbounded unless a test overrides it */
         cfg.num_databases = 4;
         cfg.serializer = *extStorageSerializer();
+        cfg.thread_config = test_thread_config;
+        cfg.logger = testLog;
     }
 
     void openEngine() {
@@ -187,6 +204,19 @@ TEST_F(StorageMockTest, RejectsAnUnknownOption) {
     cfg.options = opts;
     cfg.num_options = 1;
     EXPECT_EQ(engine->open(&cfg), STORAGE_ERR_REJECTED);
+}
+
+TEST_F(StorageMockTest, RejectsABadDbIdAtSubmit) {
+    openEngine();
+    sds key = sdsnew("k");
+    dbEntry *entry = makeEntry(key, "v");
+    EXPECT_EQ(engine->put_async(cfg.num_databases, key, sdslen(key), entry, nullptr), STORAGE_ERR_REJECTED);
+    EXPECT_EQ(engine->get_async(cfg.num_databases, key, sdslen(key), nullptr), STORAGE_ERR_REJECTED);
+    EXPECT_EQ(engine->del_async(cfg.num_databases, key, sdslen(key), nullptr), STORAGE_ERR_REJECTED);
+    storageCompletion comp = {};
+    EXPECT_EQ(engine->poll_completions(&comp, 1), 0);
+    sdsfree(key);
+    decrRefCount(entry);
 }
 
 TEST_F(StorageMockTest, PutGetDelRoundTrip) {

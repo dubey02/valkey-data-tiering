@@ -238,6 +238,20 @@ jobs:
       - name: test-storage-fuzzer
         run: make test-storage UNIT_TEST_PATTERN=FlashcacheFuzzTest.
 
+  test-ext-storage-sanitizer-address:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: install-test-dependencies
+        run: sudo apt-get install -y tcl8.6 tclx libgtest-dev libgmock-dev libaio-dev
+      # The storage engine unit tests check the key copy and the leak path with
+      # plain assertions, so they fail without a sanitizer too. This job is the
+      # one that also catches the use after free behind those assertions.
+      - name: make-ext-storage-asan
+        run: make -j4 all-with-unit-tests SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_EXT_STORAGE=yes
+      - name: test-unit-ext-storage-asan
+        run: make test-unit
+
   build-debian-old:
     runs-on: ubuntu-latest
     container: debian:bookworm

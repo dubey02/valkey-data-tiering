@@ -199,6 +199,7 @@ static storageStatus mockDel(uint32_t db_id, const char *key, size_t klen) {
  * ---------------------------------------------------------------------------*/
 
 static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
+    if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
     if (mock.requests_len == MOCK_MAX_INFLIGHT) return STORAGE_WOULDBLOCK;
     int tail = (mock.requests_head + mock.requests_len) % MOCK_MAX_INFLIGHT;
     char *key_copy = mockAlloc(key_len);
@@ -324,6 +325,7 @@ static void mockClose(void) {
 
 static void mockGetStats(storageStats *out) {
     *out = mock.stats;
+    out->num_completions_pending = (uint64_t)mock.completions_len;
 }
 
 static const storageEngine mock_storage_engine = {
