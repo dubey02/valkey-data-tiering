@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <string>
 #include <map>
 #include <set>
@@ -177,9 +178,16 @@ class FlashcacheFuzzTest : public flashcache::FlashcacheTestBase, public testing
          flashcache::FlashcacheTestBase::SetUp();
          snapshot_filename = createTmpFile(0);
          db_filename = createTmpFile(DB_SIZE_BYTES);
-         unsigned int curr_time = time(nullptr);
-         int seed = rand_r(&curr_time);
-         fuzzTestLogger(FC_LL_NOTICE, "Random number generator seed: %d", seed);
+         const char *seed_env = std::getenv("FLASHCACHE_FUZZ_SEED");
+         unsigned int seed;
+         if (seed_env != nullptr) {
+             seed = static_cast<unsigned int>(std::strtoul(seed_env, nullptr, 10));
+         } else {
+             unsigned int curr_time = time(nullptr);
+             seed = static_cast<unsigned int>(rand_r(&curr_time));
+         }
+         fprintf(stderr, "FlashCache fuzz seed: %u\n", seed);
+         fflush(stderr);
          rng.seed(seed);
          value_start_index_distribution = std::uniform_int_distribution(0ul, MAX_VALUE_SIZE_BYTES - 1);
          value_size_distribution = std::uniform_int_distribution(0ul, MAX_VALUE_SIZE_BYTES);
