@@ -882,9 +882,10 @@ test-unit:
 	@(cd unit && $(MAKE) test-unit)
 
 # Storage engine (FlashCache) unit tests
+STORAGE_TEST_TIMEOUT ?= 3600
 test-storage:
 	@(cd ../deps && $(MAKE) flashcache FLASHCACHE_TESTS=yes gtest-parallel)
-	@(cd ../deps/flashcache/build/tst/unit && python3 ../../../../gtest-parallel/gtest_parallel.py ./unitTests --timeout_per_test 3600 --gtest_filter=$(UNIT_TEST_PATTERN)*)
+	@(cd ../deps/flashcache/build/tst/unit && python3 ../../../../gtest-parallel/gtest_parallel.py ./unitTests --timeout_per_test $(STORAGE_TEST_TIMEOUT) --gtest_filter=$(UNIT_TEST_PATTERN)*)
 
 .PHONY: test-storage
 

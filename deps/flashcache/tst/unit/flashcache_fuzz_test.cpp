@@ -75,6 +75,7 @@ static void fuzzTestLogger(int level, const char *fmt, ...) {
     vprintf(fmt, args);
     va_end(args);
     printf("\n");
+    fflush(stdout);
 }
 
 static bool memdbKeyExists(uint32_t dbid, std::string& key) {
@@ -186,8 +187,7 @@ class FlashcacheFuzzTest : public flashcache::FlashcacheTestBase, public testing
              unsigned int curr_time = time(nullptr);
              seed = static_cast<unsigned int>(rand_r(&curr_time));
          }
-         fprintf(stderr, "FlashCache fuzz seed: %u\n", seed);
-         fflush(stderr);
+         fuzzTestLogger(FC_LL_NOTICE, "FlashCache fuzz seed: %u", seed);
          rng.seed(seed);
          value_start_index_distribution = std::uniform_int_distribution(0ul, MAX_VALUE_SIZE_BYTES - 1);
          value_size_distribution = std::uniform_int_distribution(0ul, MAX_VALUE_SIZE_BYTES);

@@ -236,7 +236,7 @@ jobs:
       - name: install-test-dependencies
         run: sudo apt-get install -y libgtest-dev libgmock-dev libaio-dev
       - name: test-storage-fuzzer
-        run: make test-storage UNIT_TEST_PATTERN=FlashcacheFuzzTest.
+        run: make test-storage UNIT_TEST_PATTERN=FlashcacheFuzzTest. STORAGE_TEST_TIMEOUT=900
 
   build-debian-old:
     runs-on: ubuntu-latest
