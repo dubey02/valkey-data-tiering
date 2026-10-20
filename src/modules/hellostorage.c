@@ -86,7 +86,14 @@ static struct {
     int completions_head;
     int completions_len;
 
-    storageStats stats;
+    /* The counters INFO reports. Everything here runs on the main thread, so
+     * INFO reads them as they are. */
+    struct {
+        /* Number of records stored. */
+        uint64_t total_num_items;
+        /* Bytes the stored records take up. */
+        uint64_t allocated_db_size_bytes;
+    } stats;
 } hello;
 
 /* FNV-1a hash. */
@@ -147,12 +154,12 @@ static storageStatus helloPut(uint32_t db_id, const char *key, size_t key_len, c
      * the final cost. */
     size_t freed = *slot ? (*slot)->val_len : 0;
     if (hello.cfg.capacity_bytes &&
-        hello.stats.total_num_bytes - freed + (uint64_t)len > hello.cfg.capacity_bytes) {
+        hello.stats.allocated_db_size_bytes - freed + (uint64_t)len > hello.cfg.capacity_bytes) {
         st = STORAGE_ERR_FULL;
     } else {
         if (*slot) {
             free((*slot)->val);
-            hello.stats.total_num_bytes -= (*slot)->val_len;
+            hello.stats.allocated_db_size_bytes -= (*slot)->val_len;
         } else {
             helloRecord *r = helloAlloc(sizeof(*r));
             r->key = helloAlloc(key_len);
@@ -168,8 +175,7 @@ static storageStatus helloPut(uint32_t db_id, const char *key, size_t key_len, c
         (*slot)->val = helloAlloc((size_t)len);
         memcpy((*slot)->val, bytes, (size_t)len);
         (*slot)->val_len = (size_t)len;
-        hello.stats.total_num_bytes += (size_t)len;
-        hello.stats.total_num_items_spilled_to_storage++;
+        hello.stats.allocated_db_size_bytes += (size_t)len;
         if (stored_bytes) *stored_bytes = (size_t)len;
     }
 
@@ -187,24 +193,30 @@ static storageStatus helloGet(uint32_t db_id, const char *key, size_t key_len, v
     /* The storage engine turns stored bytes back into a keyless value object through the
      * same serializer. The valkey server owns the object after this. */
     valkeyObject *obj = hello.cfg.serializer.deserialize(key, key_len, (*slot)->val, (int)(*slot)->val_len);
-    if (obj == NULL) return STORAGE_ERR_IO;
 
+    /* A get consumes the record, so the stored copy goes away either way. */
+    helloRecord *victim = *slot;
+    *slot = victim->next;
+    hello.stats.allocated_db_size_bytes -= victim->val_len;
+    hello.stats.total_num_items--;
+    helloFreeRecord(victim);
+
+    if (obj == NULL) return STORAGE_ERR_IO;
     *value_out = obj;
-    hello.stats.total_num_items_fetched_from_storage++;
     return STORAGE_OK;
 }
 
 static storageStatus helloDel(uint32_t db_id, const char *key, size_t key_len) {
     if (db_id >= hello.num_databases) return STORAGE_ERR_REJECTED;
 
+    /* A delete succeeds whether or not a record existed. */
     helloRecord **slot = helloFindSlot(db_id, key, key_len);
-    if (*slot == NULL) return STORAGE_NOT_FOUND;
+    if (*slot == NULL) return STORAGE_OK;
 
     helloRecord *victim = *slot;
     *slot = victim->next;
-    hello.stats.total_num_bytes -= victim->val_len;
+    hello.stats.allocated_db_size_bytes -= victim->val_len;
     hello.stats.total_num_items--;
-    hello.stats.total_num_items_deleted_from_storage++;
     helloFreeRecord(victim);
     return STORAGE_OK;
 }
@@ -303,7 +315,7 @@ static int helloPollCompletions(storageCompletion *out, int max) {
  * Lifecycle and stats
  * ---------------------------------------------------------------------------*/
 
-static void helloClose(void);
+static storageStatus helloClose(void);
 
 static storageStatus helloOpen(const storageConfig *cfg) {
     if (cfg == NULL || cfg->num_databases == 0) return STORAGE_ERR_REJECTED;
@@ -320,8 +332,8 @@ static storageStatus helloOpen(const storageConfig *cfg) {
      * A real storage engine reads the names it knows here. */
     if (cfg->num_options > 0) return STORAGE_ERR_REJECTED;
 
-    /* Start clean in case a prior instance was not closed. */
-    helloClose();
+    /* Reopen is refused while a prior instance has unpolled requests. */
+    if (helloClose() != STORAGE_OK) return STORAGE_WOULDBLOCK;
 
     hello.dbs = helloAlloc(cfg->num_databases * sizeof(helloDb));
     memset(hello.dbs, 0, cfg->num_databases * sizeof(helloDb));
@@ -330,10 +342,10 @@ static storageStatus helloOpen(const storageConfig *cfg) {
     return STORAGE_OK;
 }
 
-static void helloClose(void) {
-    for (int i = 0; i < hello.requests_len; i++) {
-        free(hello.requests[(hello.requests_head + i) % HELLO_MAX_INFLIGHT].key);
-    }
+static storageStatus helloClose(void) {
+    /* An unpolled request may hold a fetched value nobody else has, so the
+     * storage engine stays open until the valkey server has polled it. */
+    if (hello.requests_len > 0 || hello.completions_len > 0) return STORAGE_WOULDBLOCK;
     if (hello.dbs) {
         for (uint32_t d = 0; d < hello.num_databases; d++) {
             for (int b = 0; b < HELLO_BUCKETS; b++) {
@@ -348,10 +360,13 @@ static void helloClose(void) {
         free(hello.dbs);
     }
     memset(&hello, 0, sizeof(hello));
+    return STORAGE_OK;
 }
 
-static void helloGetStats(storageStats *out) {
-    *out = hello.stats;
+/* Reports the counters through the sink. They print in INFO ext_storage. */
+static void helloInfo(const storageInfoSink *s) {
+    s->add_ulong_long(s->ctx, "total_num_items", hello.stats.total_num_items);
+    s->add_ulong_long(s->ctx, "allocated_db_size_bytes", hello.stats.allocated_db_size_bytes);
 }
 
 /* ---------------------------------------------------------------------------
@@ -371,7 +386,7 @@ static storageEngine hellostorage_engine = {
     .get_async = helloGetAsync,
     .del_async = helloDelAsync,
     .poll_completions = helloPollCompletions,
-    .get_stats = helloGetStats,
+    .info = helloInfo,
 };
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {

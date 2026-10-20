@@ -25,8 +25,7 @@ foreach (MODULE_NAME ${MODULES_LIST})
     endif ()
 endforeach ()
 
-# hellostorage also needs the storage engine headers and the build flag.
+# hellostorage also needs the storage engine headers.
 if (USE_EXT_STORAGE EQUAL 1)
     target_include_directories(hellostorage PRIVATE "${CMAKE_SOURCE_DIR}/src/storage")
-    target_compile_definitions(hellostorage PRIVATE USE_EXT_STORAGE=1)
 endif ()

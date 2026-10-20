@@ -109,9 +109,8 @@ else
 	$(LD) -o $@ hellovalkey.xo $(SHOBJ_LDFLAGS) $(LDFLAGS) $(LIBS)
 endif
 
-# storage_mock_module links the shared mock engine from src/storage. Both
-# objects need the data tiering flag so the engine code compiles in.
-EXT_STORAGE_CFLAGS = -DUSE_EXT_STORAGE=1 -I../../src/storage
+# storage_mock_module links the shared mock storage engine from src/storage.
+EXT_STORAGE_CFLAGS = -I../../src/storage
 
 storage_mock_module.xo: storage_mock_module.c ../../src/valkeymodule.h ../../src/storage/storage.h
 	$(CC) -I../../src $(EXT_STORAGE_CFLAGS) $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
@@ -119,8 +118,11 @@ storage_mock_module.xo: storage_mock_module.c ../../src/valkeymodule.h ../../src
 storage_mock.xo: ../../src/storage/storage_mock.c ../../src/storage/storage.h
 	$(CC) -I../../src $(EXT_STORAGE_CFLAGS) $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
 
+# The valkey server exports its own copy of storageMockEngine, so the module
+# binds its references at link time. Otherwise the dynamic linker could resolve
+# them to the valkey server's copy and the module would alias the built-in mock.
 storage_mock_module.so: storage_mock_module.xo storage_mock.xo
-	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LDFLAGS) $(LIBS)
+	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) -Wl,-Bsymbolic $(LDFLAGS) $(LIBS)
 
 .PHONY: clean
 
