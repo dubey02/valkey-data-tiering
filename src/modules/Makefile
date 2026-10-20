@@ -77,9 +77,9 @@ helloacl.xo: ../valkeymodule.h
 helloacl.so: helloacl.xo
 	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lc
 
-# hellostorage needs the storage engine interface and the data tiering flag.
+# hellostorage needs the storage engine interface header.
 hellostorage.xo: hellostorage.c ../valkeymodule.h ../storage/storage.h
-	$(CC) -I. -I.. -I../storage -DUSE_EXT_STORAGE=1 $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
+	$(CC) -I. -I.. -I../storage $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
 
 hellostorage.so: hellostorage.xo
 	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lc
