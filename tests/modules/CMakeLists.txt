@@ -65,10 +65,14 @@ foreach (MODULE_NAME ${MODULES_LIST})
     endif ()
 endforeach ()
 
-# storage_mock_module also links the shared mock engine from src/storage and
-# needs the storage engine headers and the data tiering flag.
+# storage_mock_module also links the shared mock storage engine from src/storage
+# and needs the storage engine headers. The valkey server exports its own copy
+# of storageMockEngine, so -Bsymbolic binds the module's references at link
+# time rather than letting the dynamic linker pick the valkey server's copy.
 if (USE_EXT_STORAGE EQUAL 1)
     target_sources(storage_mock_module PRIVATE "${CMAKE_SOURCE_DIR}/src/storage/storage_mock.c")
     target_include_directories(storage_mock_module PRIVATE "${CMAKE_SOURCE_DIR}/src/storage")
-    target_compile_definitions(storage_mock_module PRIVATE "USE_EXT_STORAGE=1")
+    if (NOT APPLE)
+        target_link_options(storage_mock_module PRIVATE -Wl,-Bsymbolic)
+    endif ()
 endif ()
