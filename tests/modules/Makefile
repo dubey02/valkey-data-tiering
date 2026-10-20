@@ -74,6 +74,16 @@ TEST_MODULES = \
     unsupported_features.so \
     deferred_reply.so
 
+# storage_mock_module registers a storage engine, so it needs data tiering.
+# When BUILD_EXT_STORAGE is not passed in, fall back to how the server was
+# built, recorded in src/.make-settings.
+ifeq ($(BUILD_EXT_STORAGE),)
+BUILD_EXT_STORAGE := $(shell sed -n 's/^BUILD_EXT_STORAGE=//p' ../../src/.make-settings 2>/dev/null)
+endif
+ifeq ($(BUILD_EXT_STORAGE),yes)
+TEST_MODULES += storage_mock_module.so
+endif
+
 .PHONY: all
 
 all: $(TEST_MODULES)
@@ -99,7 +109,20 @@ else
 	$(LD) -o $@ hellovalkey.xo $(SHOBJ_LDFLAGS) $(LDFLAGS) $(LIBS)
 endif
 
+# storage_mock_module links the shared mock engine from src/storage. Both
+# objects need the data tiering flag so the engine code compiles in.
+EXT_STORAGE_CFLAGS = -DUSE_EXT_STORAGE=1 -I../../src/storage
+
+storage_mock_module.xo: storage_mock_module.c ../../src/valkeymodule.h ../../src/storage/storage.h
+	$(CC) -I../../src $(EXT_STORAGE_CFLAGS) $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
+
+storage_mock.xo: ../../src/storage/storage_mock.c ../../src/storage/storage.h
+	$(CC) -I../../src $(EXT_STORAGE_CFLAGS) $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
+
+storage_mock_module.so: storage_mock_module.xo storage_mock.xo
+	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LDFLAGS) $(LIBS)
+
 .PHONY: clean
 
 clean:
-	rm -f $(TEST_MODULES) $(TEST_MODULES:.so=.xo)
+	rm -f $(TEST_MODULES) $(TEST_MODULES:.so=.xo) storage_mock.xo
