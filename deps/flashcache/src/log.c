@@ -1344,7 +1344,20 @@ void waitTillNoPendingIoAndGarbageCollection(flashcacheLog *log, int is_empty_st
            log->garbage_collector_info.is_running ||
            (is_empty_staging_buffer_required && stagingBufferGetTotalItemSize(log->staging_buffer))) {
         logFlushStagingBufferIfRequired(log, 0);
+
+        // Callers pause garbage collection before waiting. When the log is full, the flush above
+        // cannot submit a write and only garbage collection can free space, so the wait would spin
+        // forever. Allow garbage collection for this cron pass only in that case. Leaving it enabled
+        // for the whole wait does not work, because log compaction keeps moving live items back
+        // into the staging buffer and the buffer never drains.
+        uint8_t can_start_garbage_collection = log->garbage_collector_info.can_start_garbage_collection;
+        if (is_empty_staging_buffer_required &&
+            stagingBufferGetTotalItemSize(log->staging_buffer) &&
+            fioRequestIsEmpty(&(log->log_flush_fio_request))) {
+            log->garbage_collector_info.can_start_garbage_collection = 1;
+        }
         flashcacheAssert(logRunCronTasks(log) == FC_OK);
+        log->garbage_collector_info.can_start_garbage_collection = can_start_garbage_collection;
     }
 }
 
@@ -1419,16 +1432,17 @@ void logLoadSnapshot(flashcacheLog *log,
                      int *checksum_comparison_result) {
     log->metrics.num_load_request++;
 
+    // Cancel any ongoing snapshot before waiting. A forkless save pauses log compaction, and the
+    // wait below may need garbage collection to free space for the staging buffer.
+    if (snapshotManagerIsRunning()) {
+        snapshotManagerCancelSave();
+    }
+
     // Pause garbage collection so no new garbage collection starts
     log->garbage_collector_info.can_start_garbage_collection = 0;
 
     // Wait till all all the pending IO request has been served and there is no garbage collection in progress
     waitTillNoPendingIoAndGarbageCollection(log, 1);
-
-    // Cancel any ongoing snapshot before loading a new snapshot
-    if (snapshotManagerIsRunning()) {
-        snapshotManagerCancelSave();
-    }
 
     // Load the new snapshot
     snapshotManagerLoad(log, snapshot_filename, secret_response, checksum_comparison_result);
