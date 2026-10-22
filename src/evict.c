@@ -88,7 +88,7 @@ static struct evictionPoolEntry *EvictionPoolLRU;
  * evicted in the whole database. */
 
 /* Create a new eviction pool. */
-struct evictionPoolEntry *evictionPoolCreate(void) {
+void evictionPoolAlloc(void) {
     struct evictionPoolEntry *ep;
     int j;
 
@@ -99,26 +99,12 @@ struct evictionPoolEntry *evictionPoolCreate(void) {
         ep[j].cached = sdsnewlen(NULL, EVPOOL_CACHED_SDS_SIZE);
         ep[j].dbid = 0;
     }
-    return ep;
+    EvictionPoolLRU = ep;
 }
 
-/* Frees a pool and the keys it holds. */
-void evictionPoolRelease(struct evictionPoolEntry *pool) {
-    for (int j = 0; j < EVPOOL_SIZE; j++) {
-        if (pool[j].key != pool[j].cached) sdsfree(pool[j].key);
-        sdsfree(pool[j].cached);
-    }
-    zfree(pool);
-}
-
-/* Creates the pool performEvictions() uses. */
-void evictionPoolAlloc(void) {
-    EvictionPoolLRU = evictionPoolCreate();
-}
-
-/* This is a helper function for performEvictions() and spill selection, it
- * is used in order to populate a pool with a few entries every time we want
- * to evict or spill a key. Keys with idle time bigger than one of the current
+/* This is a helper function for performEvictions(), it is used in order
+ * to populate the evictionPool with a few entries every time we want to
+ * expire a key. Keys with idle time bigger than one of the current
  * keys are added. Keys are always added if there are free entries.
  * If 'filter' is set, keys it rejects are skipped.
  *
@@ -206,13 +192,32 @@ int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEn
     return count;
 }
 
-/* Go backward from best to worst element, removing each one, and return the
- * first key that still exists and passes 'filter'. Sets *dbid and *slot.
- * Returns NULL if the pool runs out. */
-robj *evictionPoolPop(struct evictionPoolEntry *pool, evictionPoolFilter *filter, int *dbid, int *slot) {
+/* Samples every DB into the eviction pool and returns the coldest key that
+ * 'filter' accepts, setting *dbid, or NULL if none of the sampled keys pass.
+ * Entries looked at are removed from the pool, like in performEvictions(). */
+robj *evictionPoolPopColdest(evictionPoolFilter *filter, int *dbid) {
+    struct evictionPoolEntry *pool = EvictionPoolLRU;
+
+    for (int i = 0; i < server.dbnum; i++) {
+        serverDb *db = server.db[i];
+        if (db == NULL) continue;
+        kvstore *kvs = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
+        unsigned long db_keys = kvstoreSize(kvs);
+        if (db_keys == 0) continue;
+        unsigned long sampled = 0;
+        int l = kvstoreNumNonEmptyHashtables(kvs);
+        while (l--) {
+            sampled += evictionPoolPopulate(db, kvs, pool, filter);
+            if (sampled >= (unsigned long)server.maxmemory_samples) break;
+            if (db_keys < (unsigned long)server.maxmemory_samples * 10) break;
+        }
+    }
+
+    /* Go backward from best to worst element. */
     for (int k = EVPOOL_SIZE - 1; k >= 0; k--) {
         if (pool[k].key == NULL) continue;
-        serverDb *db = server.db[pool[k].dbid];
+        int pool_dbid = pool[k].dbid;
+        serverDb *db = server.db[pool_dbid];
         kvstore *kvs = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
         void *entry = NULL;
         bool found = kvstoreHashtableFind(kvs, pool[k].slot, pool[k].key, &entry);
@@ -222,12 +227,11 @@ robj *evictionPoolPop(struct evictionPoolEntry *pool, evictionPoolFilter *filter
         pool[k].key = NULL;
         pool[k].idle = 0;
 
-        if (found && (!filter || filter(entry))) {
-            *dbid = pool[k].dbid;
-            *slot = pool[k].slot;
+        /* The key may have been deleted or changed since it was sampled. */
+        if (found && filter(entry)) {
+            *dbid = pool_dbid;
             return entry;
         }
-        /* Deleted or rejected by the filter: try the next one. */
     }
     return NULL;
 }
@@ -518,12 +522,13 @@ int performEvictions(void) {
     /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {
-        int j, i;
+        int j, k, i;
         static unsigned int next_db = 0;
         sds bestkey = NULL;
         int bestdbid;
         int bestslot;
         serverDb *db;
+        robj *valkey;
 
         if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
             server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
@@ -562,8 +567,37 @@ int performEvictions(void) {
                 }
                 if (!total_keys) break; /* No keys to evict. */
 
-                robj *o = evictionPoolPop(pool, NULL, &bestdbid, &bestslot);
-                if (o) bestkey = objectGetKey(o);
+                /* Go backward from best to worst element to evict. */
+                for (k = EVPOOL_SIZE - 1; k >= 0; k--) {
+                    if (pool[k].key == NULL) continue;
+                    bestdbid = pool[k].dbid;
+
+                    kvstore *kvs;
+                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                        kvs = server.db[bestdbid]->keys;
+                    } else {
+                        kvs = server.db[bestdbid]->expires;
+                    }
+                    void *entry = NULL;
+
+                    bool found = kvstoreHashtableFind(kvs, pool[k].slot, pool[k].key, &entry);
+
+                    /* Remove the entry from the pool. */
+                    if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
+                    pool[k].key = NULL;
+                    pool[k].idle = 0;
+
+                    /* If the key exists, is our pick. Otherwise, it is
+                     * a ghost and we need to try the next element. */
+                    if (found) {
+                        valkey = entry;
+                        bestkey = objectGetKey(valkey);
+                        bestslot = pool[k].slot;
+                        break;
+                    } else {
+                        /* Ghost... Iterate again. */
+                    }
+                }
             }
         }
 

@@ -904,6 +904,12 @@ TEST(SpillCandidateTest, EveryTypeIsACandidateExceptEmbeddedAndIntStrings) {
 
 class SpillSelectTest : public ::testing::Test {
   protected:
+    static void SetUpTestSuite() {
+        static bool pool_allocated = false;
+        if (!pool_allocated) evictionPoolAlloc();
+        pool_allocated = true;
+    }
+
     void SetUp() override {
         memset(&server, 0, sizeof(valkeyServer));
         server.dbnum = 1;
@@ -912,11 +918,14 @@ class SpillSelectTest : public ::testing::Test {
         server.db = (serverDb **)zcalloc(sizeof(serverDb *));
         server.db[0] = (serverDb *)zcalloc(sizeof(serverDb));
         server.db[0]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
-        spillPoolCreate();
     }
 
     void TearDown() override {
-        spillPoolRelease();
+        /* With the keys gone, one more selection empties the shared pool. */
+        kvstoreEmpty(server.db[0]->keys, NULL);
+        int dbid;
+        server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+        spillSelectCandidate(&dbid);
         kvstoreRelease(server.db[0]->keys);
         zfree(server.db[0]);
         zfree(server.db);

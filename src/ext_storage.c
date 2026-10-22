@@ -216,7 +216,6 @@ void extStorageInit(void) {
     ext_storage.engine = engine;
     ext_storage.open = 1;
     ext_storage.capacity_bytes = cfg.capacity_bytes;
-    spillPoolCreate();
 
     serverLog(LL_NOTICE, "Data tiering enabled. Engine \"%s\", capacity %llu bytes.", engine->name,
               (unsigned long long)server.ext_storage_capacity);
@@ -224,7 +223,6 @@ void extStorageInit(void) {
 /* Deinitializes the storage engine */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
-    spillPoolRelease();
     ext_storage.engine->close();
     ext_storage.open = 0;
     ext_storage.engine = NULL;
@@ -274,6 +272,22 @@ storageState getStorageState(const robj *o) {
 
 void setStorageState(robj *o, storageState state) {
     o->storage_state = state;
+}
+
+/* Embedded and INT values have nothing separate to free, shared values can't be
+ * freed, and module values aren't supported yet (#81). */
+bool isSpillCandidate(const robj *o) {
+    return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY && !o->hasembval &&
+           objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE;
+}
+
+/* Returns the coldest spillable key, or NULL if none was sampled.
+ * TODO(#111): eviction must skip keys that are COPYING_TO_FLASH. */
+robj *spillSelectCandidate(int *dbid) {
+    if (server.maxmemory_policy != MAXMEMORY_ALLKEYS_LRU && server.maxmemory_policy != MAXMEMORY_ALLKEYS_LFU) {
+        return NULL;
+    }
+    return evictionPoolPopColdest(isSpillCandidate, dbid);
 }
 
 #endif /* USE_EXT_STORAGE */
