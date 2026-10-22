@@ -12,7 +12,7 @@
 
 #ifdef USE_EXT_STORAGE
 
-#include "sds.h"
+#include "server.h"
 #include "storage/storage.h"
 
 /* Opens the configured storage engine. */
@@ -32,6 +32,12 @@ sds extStorageInfoString(sds info);
 
 /* The serialization callbacks. */
 const storageSerializer *extStorageSerializer(void);
+
+storageState getStorageState(const robj *o);
+void setStorageState(robj *o, storageState state);
+void spillPoolCreate(void);
+void spillPoolRelease(void);
+robj *spillSelectCandidate(int *dbid);
 
 #endif /* USE_EXT_STORAGE */
 

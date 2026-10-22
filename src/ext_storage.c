@@ -216,6 +216,7 @@ void extStorageInit(void) {
     ext_storage.engine = engine;
     ext_storage.open = 1;
     ext_storage.capacity_bytes = cfg.capacity_bytes;
+    spillPoolCreate();
 
     serverLog(LL_NOTICE, "Data tiering enabled. Engine \"%s\", capacity %llu bytes.", engine->name,
               (unsigned long long)server.ext_storage_capacity);
@@ -223,6 +224,7 @@ void extStorageInit(void) {
 /* Deinitializes the storage engine */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
+    spillPoolRelease();
     ext_storage.engine->close();
     ext_storage.open = 0;
     ext_storage.engine = NULL;

@@ -23,6 +23,7 @@ extern "C" {
 #include "storage/storage.h"
 #include "storage/storage_mock.h"
 void extStorageTestResetRegistry(void);
+bool isSpillCandidate(const robj *o);
 }
 
 /* The log and the thread setup. */
@@ -837,11 +838,6 @@ TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndNoDbId) {
  * Object header storage state
  * ---------------------------------------------------------------------------*/
 
-extern "C" {
-storageState getStorageState(const robj *o);
-void setStorageState(robj *o, storageState state);
-}
-
 #define NUM_TEST_OBJECTS 12
 
 static int createOneOfEachObject(robj **objs) {
@@ -887,6 +883,223 @@ TEST(StorageStateTest, SetStorageState) {
         }
         setStorageState(objs[i], STORAGE_STATE_ONLY_MEMORY);
         decrRefCount(objs[i]);
+    }
+}
+
+/* Only embedded and INT strings have no separate value to free. */
+TEST(SpillCandidateTest, EveryTypeIsACandidateExceptEmbeddedAndIntStrings) {
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    for (int i = 0; i < n; i++) {
+        bool expected = objs[i]->encoding != OBJ_ENCODING_EMBSTR && objs[i]->encoding != OBJ_ENCODING_INT;
+        EXPECT_EQ(isSpillCandidate(objs[i]), expected)
+            << "type " << objs[i]->type << " encoding " << strEncoding(objs[i]->encoding);
+        decrRefCount(objs[i]);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Spill candidate selection
+ * ---------------------------------------------------------------------------*/
+
+class SpillSelectTest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        memset(&server, 0, sizeof(valkeyServer));
+        server.dbnum = 1;
+        server.maxmemory_samples = 5;
+        server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+        server.db = (serverDb **)zcalloc(sizeof(serverDb *));
+        server.db[0] = (serverDb *)zcalloc(sizeof(serverDb));
+        server.db[0]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+        spillPoolCreate();
+    }
+
+    void TearDown() override {
+        spillPoolRelease();
+        kvstoreRelease(server.db[0]->keys);
+        zfree(server.db[0]);
+        zfree(server.db);
+    }
+
+    void usePolicy(int policy) {
+        server.maxmemory_policy = policy;
+        lrulfu_updateClockAndPolicy(mstime(), (policy & MAXMEMORY_FLAG_LFU) != 0);
+    }
+
+    /* Adds a key to DB 0 and returns its entry. */
+    robj *addKey(const char *key, robj *val) {
+        sds k = sdsnew(key);
+        robj *entry = objectSetKeyAndExpire(val, k, -1);
+        sdsfree(k);
+        initObjectLRUOrLFU(entry);
+        kvstoreHashtableAdd(server.db[0]->keys, 0, entry);
+        return entry;
+    }
+
+    robj *addRawKey(const char *key) {
+        /* Too big to embed. */
+        char val[200];
+        memset(val, 'v', sizeof(val));
+        robj *entry = addKey(key, createStringObject(val, sizeof(val)));
+        EXPECT_EQ(entry->encoding, OBJ_ENCODING_RAW);
+        EXPECT_FALSE(entry->hasembval);
+        return entry;
+    }
+};
+
+TEST_F(SpillSelectTest, PicksTheLeastRecentlyUsedKeyUnderAllkeysLru) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    objectSetLRUOrLFU(addRawKey("recent"), -1, 10);
+    robj *oldest = addRawKey("oldest");
+    objectSetLRUOrLFU(oldest, -1, 1000);
+    objectSetLRUOrLFU(addRawKey("middle"), -1, 100);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), oldest);
+    EXPECT_EQ(dbid, 0);
+}
+
+TEST_F(SpillSelectTest, PicksTheLeastFrequentlyUsedKeyUnderAllkeysLfu) {
+    usePolicy(MAXMEMORY_ALLKEYS_LFU);
+    objectSetLRUOrLFU(addRawKey("hot"), 200, -1);
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, 1, -1);
+    objectSetLRUOrLFU(addRawKey("warm"), 50, -1);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
+}
+
+/* Colder keys that can't be spilled are passed over. */
+TEST_F(SpillSelectTest, SkipsKeysThatCannotBeSpilled) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    robj *embedded = addKey("embedded", createStringObject("short", 5));
+    ASSERT_TRUE(embedded->hasembval);
+    objectSetLRUOrLFU(embedded, -1, 5000);
+
+    robj *int_encoded = addKey("int", createStringObjectFromLongLong(OBJ_SHARED_INTEGERS + 1));
+    ASSERT_EQ(int_encoded->encoding, OBJ_ENCODING_INT);
+    objectSetLRUOrLFU(int_encoded, -1, 4000);
+
+    robj *in_flight = addRawKey("in_flight");
+    setStorageState(in_flight, STORAGE_STATE_COPYING_TO_FLASH);
+    objectSetLRUOrLFU(in_flight, -1, 3000);
+
+    robj *referenced = addRawKey("referenced");
+    incrRefCount(referenced);
+    objectSetLRUOrLFU(referenced, -1, 2000);
+
+    robj *candidate = addRawKey("candidate");
+    objectSetLRUOrLFU(candidate, -1, 10);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+    decrRefCount(referenced);
+}
+
+/* Module keys aren't spillable yet (#81). */
+TEST_F(SpillSelectTest, SkipsModuleKeys) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    static moduleType mt = {};
+    mt.free = freeNothingOnRelease;
+    moduleValue *mv = (moduleValue *)zmalloc(sizeof(*mv));
+    mv->type = &mt;
+    mv->value = nullptr;
+    robj *module_key = addKey("module", createObject(OBJ_MODULE, mv));
+    ASSERT_FALSE(module_key->hasembval);
+    objectSetLRUOrLFU(module_key, -1, 5000);
+
+    robj *candidate = addRawKey("candidate");
+    objectSetLRUOrLFU(candidate, -1, 10);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+}
+
+/* Non-candidates must not crowd the candidate out of the pool. */
+TEST_F(SpillSelectTest, KeysThatCannotBeSpilledDoNotFillThePool) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    char name[32];
+    for (int i = 0; i < 20; i++) {
+        snprintf(name, sizeof(name), "embedded:%d", i);
+        objectSetLRUOrLFU(addKey(name, createStringObject("short", 5)), -1, 1000 + i);
+    }
+    robj *candidate = addRawKey("candidate");
+    objectSetLRUOrLFU(candidate, -1, 10);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+}
+
+/* Deleted keys left in the pool must not hide a live one. */
+TEST_F(SpillSelectTest, DeletedPooledKeysDoNotHideACandidate) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    char name[32];
+    for (int i = 0; i < 20; i++) {
+        snprintf(name, sizeof(name), "cold:%d", i);
+        objectSetLRUOrLFU(addRawKey(name), -1, 1000 + i);
+    }
+    int dbid = -1;
+    ASSERT_NE(spillSelectCandidate(&dbid), nullptr);
+
+    /* Leave the pool holding only deleted keys. */
+    for (int i = 0; i < 20; i++) {
+        snprintf(name, sizeof(name), "cold:%d", i);
+        sds key = sdsnew(name);
+        kvstoreHashtableDelete(server.db[0]->keys, 0, key);
+        sdsfree(key);
+    }
+    robj *candidate = addRawKey("candidate");
+    objectSetLRUOrLFU(candidate, -1, 10);
+
+    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+}
+
+/* A pooled key that has since been overwritten with a short value is skipped. */
+TEST_F(SpillSelectTest, SkipsPooledKeysOverwrittenWithEmbeddedValues) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, -1, 3000);
+    objectSetLRUOrLFU(addRawKey("overwritten"), -1, 2000);
+    robj *candidate = addRawKey("candidate");
+    objectSetLRUOrLFU(candidate, -1, 10);
+
+    int dbid = -1;
+    ASSERT_EQ(spillSelectCandidate(&dbid), coldest);
+    setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH); /* submitted */
+
+    /* As dbSetValue() does for a short value: a new embedded object under the
+     * same name, keeping the old LRU. */
+    sds key = sdsnew("overwritten");
+    kvstoreHashtableDelete(server.db[0]->keys, 0, key);
+    sdsfree(key);
+    robj *embedded = addKey("overwritten", createStringObject("short", 5));
+    ASSERT_TRUE(embedded->hasembval);
+    objectSetLRUOrLFU(embedded, -1, 2000);
+
+    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+}
+
+TEST_F(SpillSelectTest, ReturnsNullWhenNoKeyCanBeSpilled) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    addKey("embedded", createStringObject("short", 5));
+    setStorageState(addRawKey("on_flash"), STORAGE_STATE_ONLY_FLASH);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), nullptr);
+}
+
+TEST_F(SpillSelectTest, SelectsNothingUnderOtherPolicies) {
+    addRawKey("key");
+    int policies[] = {MAXMEMORY_NO_EVICTION, MAXMEMORY_VOLATILE_LRU, MAXMEMORY_ALLKEYS_RANDOM};
+    for (int i = 0; i < 3; i++) {
+        usePolicy(policies[i]);
+        int dbid = -1;
+        EXPECT_EQ(spillSelectCandidate(&dbid), nullptr) << "policy " << policies[i];
     }
 }
 

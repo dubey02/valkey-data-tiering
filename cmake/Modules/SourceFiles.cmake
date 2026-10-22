@@ -144,6 +144,7 @@ set(VALKEY_SERVER_SRCS
 if (USE_EXT_STORAGE EQUAL 1)
     list(APPEND VALKEY_SERVER_SRCS
          ${CMAKE_SOURCE_DIR}/src/ext_storage.c
+         ${CMAKE_SOURCE_DIR}/src/ext_storage_spill.c
          ${CMAKE_SOURCE_DIR}/src/storage/storage_mock.c
          ${CMAKE_SOURCE_DIR}/src/storage/storage_flashcache.c)
 endif ()

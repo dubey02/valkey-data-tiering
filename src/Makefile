@@ -655,6 +655,7 @@ ENGINE_SERVER_OBJ+=$(ENGINE_TRACE_OBJ)
 
 ENGINE_EXT_STORAGE_OBJ = \
     ext_storage.o \
+    ext_storage_spill.o \
     storage/storage_mock.o \
     storage/storage_flashcache.o
 ifeq ($(BUILD_EXT_STORAGE),yes)
