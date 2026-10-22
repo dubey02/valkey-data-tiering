@@ -192,6 +192,37 @@ int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEn
     return count;
 }
 
+/* Go backward from best to worst element, removing each one, and return the
+ * first key that still exists and passes 'filter' (if set). Sets *dbid and
+ * *slot. Returns NULL if the pool runs out. */
+static robj *evictionPoolPop(evictionPoolFilter *filter, int *dbid, int *slot) {
+    struct evictionPoolEntry *pool = EvictionPoolLRU;
+
+    for (int k = EVPOOL_SIZE - 1; k >= 0; k--) {
+        if (pool[k].key == NULL) continue;
+        int pool_dbid = pool[k].dbid;
+        int pool_slot = pool[k].slot;
+        serverDb *db = server.db[pool_dbid];
+        kvstore *kvs = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
+        void *entry = NULL;
+        bool found = kvstoreHashtableFind(kvs, pool_slot, pool[k].key, &entry);
+
+        /* Remove the entry from the pool. */
+        if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
+        pool[k].key = NULL;
+        pool[k].idle = 0;
+
+        /* If the key exists and passes the filter, it is our pick. Otherwise
+         * it is a ghost or was rejected, try the next element. */
+        if (found && (!filter || filter(entry))) {
+            *dbid = pool_dbid;
+            *slot = pool_slot;
+            return entry;
+        }
+    }
+    return NULL;
+}
+
 /* Samples every DB into the eviction pool and returns the coldest key that
  * 'filter' accepts, setting *dbid, or NULL if none of the sampled keys pass.
  * Entries looked at are removed from the pool, like in performEvictions(). */
@@ -213,27 +244,8 @@ robj *evictionPoolPopColdest(evictionPoolFilter *filter, int *dbid) {
         }
     }
 
-    /* Go backward from best to worst element. */
-    for (int k = EVPOOL_SIZE - 1; k >= 0; k--) {
-        if (pool[k].key == NULL) continue;
-        int pool_dbid = pool[k].dbid;
-        serverDb *db = server.db[pool_dbid];
-        kvstore *kvs = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
-        void *entry = NULL;
-        bool found = kvstoreHashtableFind(kvs, pool[k].slot, pool[k].key, &entry);
-
-        /* Remove the entry from the pool. */
-        if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
-        pool[k].key = NULL;
-        pool[k].idle = 0;
-
-        /* The key may have been deleted or changed since it was sampled. */
-        if (found && filter(entry)) {
-            *dbid = pool_dbid;
-            return entry;
-        }
-    }
-    return NULL;
+    int slot;
+    return evictionPoolPop(filter, dbid, &slot);
 }
 
 /* We don't want to count AOF buffers and replicas output buffers as
@@ -522,13 +534,12 @@ int performEvictions(void) {
     /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {
-        int j, k, i;
+        int j, i;
         static unsigned int next_db = 0;
         sds bestkey = NULL;
         int bestdbid;
         int bestslot;
         serverDb *db;
-        robj *valkey;
 
         if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
             server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
@@ -567,37 +578,8 @@ int performEvictions(void) {
                 }
                 if (!total_keys) break; /* No keys to evict. */
 
-                /* Go backward from best to worst element to evict. */
-                for (k = EVPOOL_SIZE - 1; k >= 0; k--) {
-                    if (pool[k].key == NULL) continue;
-                    bestdbid = pool[k].dbid;
-
-                    kvstore *kvs;
-                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
-                        kvs = server.db[bestdbid]->keys;
-                    } else {
-                        kvs = server.db[bestdbid]->expires;
-                    }
-                    void *entry = NULL;
-
-                    bool found = kvstoreHashtableFind(kvs, pool[k].slot, pool[k].key, &entry);
-
-                    /* Remove the entry from the pool. */
-                    if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
-                    pool[k].key = NULL;
-                    pool[k].idle = 0;
-
-                    /* If the key exists, is our pick. Otherwise, it is
-                     * a ghost and we need to try the next element. */
-                    if (found) {
-                        valkey = entry;
-                        bestkey = objectGetKey(valkey);
-                        bestslot = pool[k].slot;
-                        break;
-                    } else {
-                        /* Ghost... Iterate again. */
-                    }
-                }
+                robj *valkey = evictionPoolPop(NULL, &bestdbid, &bestslot);
+                if (valkey) bestkey = objectGetKey(valkey);
             }
         }
 
