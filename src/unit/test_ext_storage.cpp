@@ -918,14 +918,17 @@ class SpillSelectTest : public ::testing::Test {
         server.db = (serverDb **)zcalloc(sizeof(serverDb *));
         server.db[0] = (serverDb *)zcalloc(sizeof(serverDb));
         server.db[0]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+        server.db[0]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, 0, 0);
     }
 
     void TearDown() override {
         /* With the keys gone, one more selection empties the shared pool. */
+        kvstoreEmpty(server.db[0]->expires, NULL);
         kvstoreEmpty(server.db[0]->keys, NULL);
         int dbid;
         server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
         spillSelectCandidate(&dbid);
+        kvstoreRelease(server.db[0]->expires);
         kvstoreRelease(server.db[0]->keys);
         zfree(server.db[0]);
         zfree(server.db);
@@ -936,24 +939,33 @@ class SpillSelectTest : public ::testing::Test {
         lrulfu_updateClockAndPolicy(mstime(), (policy & MAXMEMORY_FLAG_LFU) != 0);
     }
 
-    /* Adds a key to DB 0 and returns its entry. */
-    robj *addKey(const char *key, robj *val) {
+    /* Adds a key to DB 0, with a TTL unless expire is -1, and returns its entry. */
+    robj *addKeyWithExpire(const char *key, robj *val, long long expire) {
         sds k = sdsnew(key);
-        robj *entry = objectSetKeyAndExpire(val, k, -1);
+        robj *entry = objectSetKeyAndExpire(val, k, expire);
         sdsfree(k);
         initObjectLRUOrLFU(entry);
         kvstoreHashtableAdd(server.db[0]->keys, 0, entry);
+        if (expire != -1) kvstoreHashtableAdd(server.db[0]->expires, 0, entry);
+        return entry;
+    }
+
+    robj *addKey(const char *key, robj *val) {
+        return addKeyWithExpire(key, val, -1);
+    }
+
+    robj *addRawKeyWithExpire(const char *key, long long expire) {
+        /* Too big to embed. */
+        char val[200];
+        memset(val, 'v', sizeof(val));
+        robj *entry = addKeyWithExpire(key, createStringObject(val, sizeof(val)), expire);
+        EXPECT_EQ(entry->encoding, OBJ_ENCODING_RAW);
+        EXPECT_FALSE(entry->hasembval);
         return entry;
     }
 
     robj *addRawKey(const char *key) {
-        /* Too big to embed. */
-        char val[200];
-        memset(val, 'v', sizeof(val));
-        robj *entry = addKey(key, createStringObject(val, sizeof(val)));
-        EXPECT_EQ(entry->encoding, OBJ_ENCODING_RAW);
-        EXPECT_FALSE(entry->hasembval);
-        return entry;
+        return addRawKeyWithExpire(key, -1);
     }
 };
 
@@ -1102,10 +1114,33 @@ TEST_F(SpillSelectTest, ReturnsNullWhenNoKeyCanBeSpilled) {
     EXPECT_EQ(spillSelectCandidate(&dbid), nullptr);
 }
 
+/* Under a volatile policy spill picks from the keys eviction would pick from:
+ * those with a TTL. */
+TEST_F(SpillSelectTest, PicksKeysWithATtlUnderVolatilePolicies) {
+    usePolicy(MAXMEMORY_VOLATILE_LRU);
+    long long expire = mstime() + 3600 * 1000;
+    robj *no_ttl = addRawKey("no_ttl");
+    robj *recent = addRawKeyWithExpire("recent", expire);
+    robj *oldest = addRawKeyWithExpire("oldest", expire);
+    objectSetLRUOrLFU(no_ttl, -1, 5000);
+    objectSetLRUOrLFU(recent, -1, 10);
+    objectSetLRUOrLFU(oldest, -1, 1000);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), oldest);
+
+    usePolicy(MAXMEMORY_VOLATILE_LFU);
+    objectSetLRUOrLFU(no_ttl, 0, -1);
+    objectSetLRUOrLFU(recent, 200, -1);
+    objectSetLRUOrLFU(oldest, 1, -1);
+    EXPECT_EQ(spillSelectCandidate(&dbid), oldest);
+}
+
 TEST_F(SpillSelectTest, SelectsNothingUnderOtherPolicies) {
     addRawKey("key");
-    int policies[] = {MAXMEMORY_NO_EVICTION, MAXMEMORY_VOLATILE_LRU, MAXMEMORY_ALLKEYS_RANDOM};
-    for (int i = 0; i < 3; i++) {
+    int policies[] = {MAXMEMORY_NO_EVICTION, MAXMEMORY_VOLATILE_TTL, MAXMEMORY_VOLATILE_RANDOM,
+                      MAXMEMORY_ALLKEYS_RANDOM};
+    for (int i = 0; i < 4; i++) {
         usePolicy(policies[i]);
         int dbid = -1;
         EXPECT_EQ(spillSelectCandidate(&dbid), nullptr) << "policy " << policies[i];
