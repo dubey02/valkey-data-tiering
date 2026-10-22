@@ -40,7 +40,7 @@ robj *spillSelectCandidate(int *dbid) {
     if (server.maxmemory_policy != MAXMEMORY_ALLKEYS_LRU && server.maxmemory_policy != MAXMEMORY_ALLKEYS_LFU) {
         return NULL;
     }
-    serverAssert(spill_pool != NULL);
+    if (spill_pool == NULL) return NULL;
 
     for (int i = 0; i < server.dbnum; i++) {
         serverDb *db = server.db[i];
