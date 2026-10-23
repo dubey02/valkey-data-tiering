@@ -517,6 +517,93 @@ tags {"benchmark network external:skip logreqres:skip"} {
             assert_equal 1 $found_large
         }
 
+        # Count how often each key k:000000000000 .. k:<n-1> was hit by INCR
+        proc zipfian_counts {n} {
+            set counts {}
+            for {set k 0} {$k < $n} {incr k} {
+                set v [r get [format "k:%012d" $k]]
+                if {$v eq {}} {set v 0}
+                lappend counts $v
+            }
+            return $counts
+        }
+
+        # Expected share of key rank k (0-based) under Zipf(alpha) over n keys
+        proc zipfian_expected {k n alpha} {
+            set sum 0.0
+            for {set i 1} {$i <= $n} {incr i} {set sum [expr {$sum + pow($i, -$alpha)}]}
+            return [expr {pow($k + 1, -$alpha) / $sum}]
+        }
+
+        foreach alpha {1 0.5 2} {
+            test "benchmark: zipfian alpha $alpha matches the expected distribution" {
+                set n 10
+                set total 20000
+                set cmd [valkeybenchmark $master_host $master_port "-r $n -n $total --zipfian $alpha -- incr k:__rand_int__"]
+                common_bench_setup $cmd
+                set counts [zipfian_counts $n]
+                assert_equal $total [::tcl::mathop::+ {*}$counts]
+                # Each key's count is within 5 standard deviations (binomial) of
+                # its expected count. A uniform draw would put key 0 dozens of
+                # deviations away at every alpha here.
+                for {set k 0} {$k < $n} {incr k} {
+                    set p [zipfian_expected $k $n $alpha]
+                    set want [expr {$p * $total}]
+                    set sigma [expr {sqrt($total * $p * (1 - $p))}]
+                    set got [lindex $counts $k]
+                    if {abs($got - $want) > 5 * $sigma} {
+                        fail "key $k: got $got hits, expected about [format %.0f $want] +/- [format %.0f [expr {5 * $sigma}]]"
+                    }
+                }
+            }
+        }
+
+        test {benchmark: zipfian works with the largest keyspace} {
+            set cmd [valkeybenchmark $master_host $master_port "-r 999999999999 -n 1000 --zipfian -t set"]
+            common_bench_setup $cmd
+            assert_match {*calls=1000,*} [cmdstat set]
+            # The hottest key alone gets about 3.5% of requests at this size
+            assert_equal 1 [r exists key:000000000000]
+        }
+
+        test {benchmark: zipfian requires a keyspace} {
+            set cmd [valkeybenchmark $master_host $master_port "-n 5 --zipfian -t set"]
+            catch { exec {*}$cmd } error
+            assert_match "*--zipfian requires a keyspace*" $error
+        }
+
+        foreach bad {0 1.2x} {
+            test "benchmark: zipfian rejects alpha '$bad'" {
+                set cmd [valkeybenchmark $master_host $master_port "-r 10 -n 5 --zipfian $bad -t set"]
+                catch { exec {*}$cmd } error
+                assert_match "*Invalid value for --zipfian*" $error
+            }
+        }
+
+        test {benchmark: zipfian without alpha keeps the next option} {
+            set cmd [valkeybenchmark $master_host $master_port "-r 10 --zipfian -n 10 -t set"]
+            common_bench_setup $cmd
+            assert_match {*calls=10,*} [cmdstat set]
+        }
+
+        test {benchmark: keysize sets the total key length} {
+            set cmd [valkeybenchmark $master_host $master_port "-r 10 -n 10 --keysize 40 -t set"]
+            common_bench_setup $cmd
+            foreach key [r keys *] {
+                assert_equal 40 [string length $key]
+                assert_match {aaaaaaaaaaaaaaaaaaaaaaaaaaaa[0-9]*} $key
+            }
+        }
+
+        test {benchmark: keysize below the minimum is raised to it with a warning} {
+            set cmd [valkeybenchmark $master_host $master_port "-r 10 -n 10 --keysize 5 -t set"]
+            set output [common_bench_setup $cmd]
+            assert_match "*WARNING: --keysize 5 is below the minimum, using 12.*" $output
+            foreach key [r keys *] {
+                assert_equal 12 [string length $key]
+            }
+        }
+
         test {benchmark: warmup applies to all tests in multi-test run} {
             set start_time [clock clicks -millisec]
             set cmd [valkeybenchmark $master_host $master_port "-r 5 --warmup 2 -n 50 -t set,get,incr"]
