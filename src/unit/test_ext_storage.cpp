@@ -23,7 +23,6 @@ extern "C" {
 #include "storage/storage.h"
 #include "storage/storage_mock.h"
 void extStorageTestResetRegistry(void);
-bool isSpillCandidate(const robj *o);
 void createSharedObjects(void);
 }
 
@@ -887,18 +886,6 @@ TEST(StorageStateTest, SetStorageState) {
     }
 }
 
-/* Only embedded and INT strings have no separate value to free. */
-TEST(SpillCandidateTest, EveryTypeIsACandidateExceptEmbeddedAndIntStrings) {
-    robj *objs[NUM_TEST_OBJECTS];
-    int n = createOneOfEachObject(objs);
-    for (int i = 0; i < n; i++) {
-        bool expected = objs[i]->encoding != OBJ_ENCODING_EMBSTR && objs[i]->encoding != OBJ_ENCODING_INT;
-        EXPECT_EQ(isSpillCandidate(objs[i]), expected)
-            << "type " << objs[i]->type << " encoding " << strEncoding(objs[i]->encoding);
-        decrRefCount(objs[i]);
-    }
-}
-
 /* ---------------------------------------------------------------------------
  * Spill candidate selection
  * ---------------------------------------------------------------------------*/
@@ -946,6 +933,38 @@ class SpillSelectTest : public ::testing::Test {
         lrulfu_updateClockAndPolicy(mstime(), (policy & MAXMEMORY_FLAG_LFU) != 0);
     }
 
+    /* Runs performEvictions() one byte over maxmemory, so it evicts one key and
+     * leaves the rest of its sample in the pool. */
+    void evictOneKey(void) {
+        /* Evicting a key notifies modules, touches watched keys and propagates a DEL. */
+        static bool server_initialized = false;
+        if (!server_initialized) {
+            monotonicInit();
+            createSharedObjects();
+            moduleInitModulesSystem();
+            server_initialized = true;
+        }
+        server.replicas = listCreate();
+        server.db[0]->watched_keys = dictCreate(&keylistDictType);
+
+        server.maxmemory = zmalloc_used_memory() - 1;
+        EXPECT_EQ(performEvictions(), EVICT_OK);
+        server.maxmemory = 0;
+
+        dictRelease(server.db[0]->watched_keys);
+        server.db[0]->watched_keys = NULL;
+        listRelease(server.replicas);
+        server.replicas = NULL;
+    }
+
+    bool keyExists(const char *key) {
+        sds k = sdsnew(key);
+        void *entry;
+        bool found = kvstoreHashtableFind(server.db[0]->keys, 0, k, &entry);
+        sdsfree(k);
+        return found;
+    }
+
     /* Adds a key to 'db' in 'slot', with a TTL unless expire is -1, and returns its entry. */
     robj *addKeyTo(serverDb *db, int slot, const char *key, robj *val, long long expire) {
         sds k = sdsnew(key);
@@ -983,6 +1002,24 @@ class SpillSelectTest : public ::testing::Test {
         return addRawKeyWithExpire(key, -1);
     }
 };
+
+/* Only embedded and INT strings have no separate value to free. */
+TEST_F(SpillSelectTest, EveryTypeIsACandidateExceptEmbeddedAndIntStrings) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    for (int i = 0; i < n; i++) {
+        int type = objs[i]->type;
+        int encoding = objs[i]->encoding;
+        bool expected = encoding != OBJ_ENCODING_EMBSTR && encoding != OBJ_ENCODING_INT;
+        robj *entry = addKey("key", objs[i]);
+
+        int dbid = -1;
+        EXPECT_EQ(spillSelectCandidate(&dbid), expected ? entry : nullptr)
+            << "type " << type << " encoding " << strEncoding(encoding);
+        kvstoreEmpty(server.db[0]->keys, NULL);
+    }
+}
 
 TEST_F(SpillSelectTest, PicksTheLeastRecentlyUsedKeyUnderAllkeysLru) {
     usePolicy(MAXMEMORY_ALLKEYS_LRU);
@@ -1168,42 +1205,53 @@ TEST_F(SpillSelectTest, PicksTheColdestKeyUnderEveryPolicy) {
 }
 
 /* Under volatile-ttl eviction leaves entries scored by expiry in the pool.
- * Those outrank every idleness score, so spill must not pick from them. */
+ * Those outrank every idleness score, so spill must not pick from them, also
+ * after maxmemory-policy has been changed away from volatile-ttl. */
 TEST_F(SpillSelectTest, IgnoresTtlScoresEvictionLeftInThePool) {
-    usePolicy(MAXMEMORY_VOLATILE_TTL);
     server.maxmemory_samples = 64; /* sample every key in one pass */
-    /* Evicting a key notifies modules and propagates a DEL. */
-    static bool server_initialized = false;
-    if (!server_initialized) {
-        monotonicInit();
-        createSharedObjects();
-        moduleInitModulesSystem();
-        server_initialized = true;
+    int policies[] = {MAXMEMORY_VOLATILE_TTL, MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_NO_EVICTION};
+    for (int i = 0; i < 3; i++) {
+        usePolicy(MAXMEMORY_VOLATILE_TTL);
+        long long now = mstime();
+        robj *coldest = addRawKey("coldest");
+        objectSetLRUOrLFU(coldest, -1, 5000);
+        objectSetLRUOrLFU(addRawKeyWithExpire("expires_soon", now + 1000), -1, 10);
+        objectSetLRUOrLFU(addRawKeyWithExpire("expires_later", now + 2000), -1, 10);
+
+        /* Evicts expires_soon and leaves expires_later in the pool. */
+        evictOneKey();
+        ASSERT_FALSE(keyExists("expires_soon"));
+
+        usePolicy(policies[i]);
+        int dbid = -1;
+        EXPECT_EQ(spillSelectCandidate(&dbid), coldest) << "policy " << policies[i];
+        drainPool();
     }
-    server.replicas = listCreate();
-    server.db[0]->watched_keys = dictCreate(&keylistDictType);
-    long long now = mstime();
-    robj *coldest = addRawKey("coldest");
-    objectSetLRUOrLFU(coldest, -1, 5000);
-    objectSetLRUOrLFU(addRawKeyWithExpire("expires_soon", now + 1000), -1, 10);
-    objectSetLRUOrLFU(addRawKeyWithExpire("expires_later", now + 2000), -1, 10);
+}
 
-    /* One byte over the limit: eviction pools both keys with a TTL, evicts
-     * expires_soon and leaves expires_later in the pool. */
-    server.maxmemory = zmalloc_used_memory() - 1;
-    ASSERT_EQ(performEvictions(), EVICT_OK);
-    server.maxmemory = 0;
-    sds evicted = sdsnew("expires_soon");
-    void *entry;
-    ASSERT_FALSE(kvstoreHashtableFind(server.db[0]->keys, 0, evicted, &entry));
-    sdsfree(evicted);
+/* A key that loses its TTL after eviction pooled it is no longer evictable
+ * under a volatile policy, so eviction must skip it and pick another key. */
+TEST_F(SpillSelectTest, EvictionSkipsPooledKeysThatLostTheirTtl) {
+    usePolicy(MAXMEMORY_VOLATILE_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    long long expire = mstime() + 3600 * 1000;
+    objectSetLRUOrLFU(addRawKeyWithExpire("coldest", expire), -1, 5000);
+    robj *persisted = addRawKeyWithExpire("persisted", expire);
+    objectSetLRUOrLFU(persisted, -1, 4000);
+    objectSetLRUOrLFU(addRawKeyWithExpire("recent", expire), -1, 10);
 
-    int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
-    listRelease(server.replicas);
-    server.replicas = NULL;
-    dictRelease(server.db[0]->watched_keys);
-    server.db[0]->watched_keys = NULL;
+    /* Evicts coldest and leaves persisted and recent in the pool. */
+    evictOneKey();
+    ASSERT_FALSE(keyExists("coldest"));
+
+    /* As PERSIST does. */
+    void *popped;
+    ASSERT_TRUE(kvstoreHashtablePop(server.db[0]->expires, 0, objectGetKey(persisted), &popped));
+    ASSERT_EQ(objectSetExpire(persisted, -1), persisted);
+
+    evictOneKey();
+    EXPECT_TRUE(keyExists("persisted"));
+    EXPECT_FALSE(keyExists("recent"));
 }
 
 TEST_F(SpillSelectTest, ReportsTheDbOfTheChosenKey) {

@@ -272,20 +272,19 @@ static unsigned long evictionPoolSample(int policy, evictionPoolFilter *filter) 
 /* Samples under 'policy', which must rank by LRU or LFU, and returns the
  * coldest key that 'filter' accepts, setting *dbid, or NULL if none of the
  * sampled keys pass.
- * Under volatile-ttl eviction scores the pool by expiry, which outranks any
- * idleness score, so the pool is cleared before sampling and again after the
- * pick. Under the other policies eviction's scores are idleness too, so the
- * candidates in the pool are kept. */
+ * The pool is borrowed: it is cleared before sampling, as eviction may have
+ * left entries scored another way (by TTL under volatile-ttl, or before a
+ * maxmemory-policy change), and cleared after the pick so eviction never sees
+ * entries it would not have sampled. */
 robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid) {
     serverAssert(policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU));
-    bool scored_by_ttl = server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL;
-    if (scored_by_ttl) evictionPoolClear();
+    evictionPoolClear();
 
     evictionPoolSample(policy, filter);
     int slot;
     robj *pick = evictionPoolPop(policy, filter, dbid, &slot);
 
-    if (scored_by_ttl) evictionPoolClear();
+    evictionPoolClear();
     return pick;
 }
 
