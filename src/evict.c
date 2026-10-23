@@ -106,12 +106,17 @@ void evictionPoolAlloc(void) {
  * to populate the evictionPool with a few entries every time we want to
  * expire a key. Keys with idle time bigger than one of the current
  * keys are added. Keys are always added if there are free entries.
- * If 'filter' is set, keys it rejects are skipped.
+ * Keys are scored according to 'policy'. If 'filter' is set, keys it rejects
+ * are skipped.
  *
  * We insert keys on place in ascending order, so keys with the smaller
  * idle time are on the left, and keys with the higher idle time on the
  * right. */
-int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEntry *pool, evictionPoolFilter *filter) {
+static int evictionPoolPopulate(serverDb *db,
+                                kvstore *samplekvs,
+                                struct evictionPoolEntry *pool,
+                                int policy,
+                                evictionPoolFilter *filter) {
     int j, k, count;
     void *samples[server.maxmemory_samples];
 
@@ -129,9 +134,9 @@ int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEn
         /* Calculate the idle time according to the policy. This is called
          * idle just because the code initially handled LRU, but is in fact
          * just a score where a higher score means better candidate. */
-        if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU)) {
+        if (policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU)) {
             idle = objectGetIdleness(o);
-        } else if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+        } else if (policy == MAXMEMORY_VOLATILE_TTL) {
             /* In this case the sooner the expire the better. */
             idle = ULLONG_MAX - objectGetExpire(o);
         } else {
@@ -193,9 +198,9 @@ int evictionPoolPopulate(serverDb *db, kvstore *samplekvs, struct evictionPoolEn
 }
 
 /* Go backward from best to worst element, removing each one, and return the
- * first key that still exists and passes 'filter' (if set). Sets *dbid and
- * *slot. Returns NULL if the pool runs out. */
-static robj *evictionPoolPop(evictionPoolFilter *filter, int *dbid, int *slot) {
+ * first key that still exists in the keyspace 'policy' samples and passes
+ * 'filter' (if set). Sets *dbid and *slot. Returns NULL if the pool runs out. */
+static robj *evictionPoolPop(int policy, evictionPoolFilter *filter, int *dbid, int *slot) {
     struct evictionPoolEntry *pool = EvictionPoolLRU;
 
     for (int k = EVPOOL_SIZE - 1; k >= 0; k--) {
@@ -203,7 +208,7 @@ static robj *evictionPoolPop(evictionPoolFilter *filter, int *dbid, int *slot) {
         int pool_dbid = pool[k].dbid;
         int pool_slot = pool[k].slot;
         serverDb *db = server.db[pool_dbid];
-        kvstore *kvs = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
+        kvstore *kvs = (policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
         void *entry = NULL;
         bool found = kvstoreHashtableFind(kvs, pool_slot, pool[k].key, &entry);
 
@@ -223,29 +228,44 @@ static robj *evictionPoolPop(evictionPoolFilter *filter, int *dbid, int *slot) {
     return NULL;
 }
 
-/* Samples every DB into the eviction pool and returns the coldest key that
- * 'filter' accepts, setting *dbid, or NULL if none of the sampled keys pass.
- * Entries looked at are removed from the pool, like in performEvictions(). */
-robj *evictionPoolPopColdest(evictionPoolFilter *filter, int *dbid) {
+/* Drops every pooled key. The next sampling round starts from scratch. */
+static void evictionPoolClear(void) {
     struct evictionPoolEntry *pool = EvictionPoolLRU;
+    for (int k = 0; k < EVPOOL_SIZE; k++) {
+        if (pool[k].key == NULL) continue;
+        if (pool[k].key != pool[k].cached) sdsfree(pool[k].key);
+        pool[k].key = NULL;
+        pool[k].idle = 0;
+    }
+}
+
+/* Samples under 'policy', not under maxmemory-policy, so the caller picks the
+ * key space and the score. The pool is borrowed: it is cleared on entry so
+ * leftovers scored by another policy do not win, and cleared on exit so
+ * performEvictions() starts clean. */
+robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid) {
+    struct evictionPoolEntry *pool = EvictionPoolLRU;
+    evictionPoolClear();
 
     for (int i = 0; i < server.dbnum; i++) {
         serverDb *db = server.db[i];
         if (db == NULL) continue;
-        kvstore *kvs = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
+        kvstore *kvs = (policy & MAXMEMORY_FLAG_ALLKEYS) ? db->keys : db->expires;
         unsigned long db_keys = kvstoreSize(kvs);
         if (db_keys == 0) continue;
         unsigned long sampled = 0;
         int l = kvstoreNumNonEmptyHashtables(kvs);
         while (l--) {
-            sampled += evictionPoolPopulate(db, kvs, pool, filter);
+            sampled += evictionPoolPopulate(db, kvs, pool, policy, filter);
             if (sampled >= (unsigned long)server.maxmemory_samples) break;
             if (db_keys < (unsigned long)server.maxmemory_samples * 10) break;
         }
     }
 
     int slot;
-    return evictionPoolPop(filter, dbid, &slot);
+    robj *pick = evictionPoolPop(policy, filter, dbid, &slot);
+    evictionPoolClear();
+    return pick;
 }
 
 /* We don't want to count AOF buffers and replicas output buffers as
@@ -567,7 +587,7 @@ int performEvictions(void) {
                     int l = kvstoreNumNonEmptyHashtables(kvs);
                     /* Do not exceed the number of non-empty slots when looping. */
                     while (l--) {
-                        sampled_keys += evictionPoolPopulate(db, kvs, pool, NULL);
+                        sampled_keys += evictionPoolPopulate(db, kvs, pool, server.maxmemory_policy, NULL);
                         /* We have sampled enough keys in the current db, exit the loop. */
                         if (sampled_keys >= (unsigned long)server.maxmemory_samples) break;
                         /* If there are not a lot of keys in the current db, dict/s may be very
@@ -578,7 +598,7 @@ int performEvictions(void) {
                 }
                 if (!total_keys) break; /* No keys to evict. */
 
-                robj *valkey = evictionPoolPop(NULL, &bestdbid, &bestslot);
+                robj *valkey = evictionPoolPop(server.maxmemory_policy, NULL, &bestdbid, &bestslot);
                 if (valkey) bestkey = objectGetKey(valkey);
             }
         }

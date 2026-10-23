@@ -4183,7 +4183,7 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms);
 /* evict.c -- maxmemory handling and LRU eviction. */
 void evictionPoolAlloc(void);
 typedef bool evictionPoolFilter(const robj *o);
-robj *evictionPoolPopColdest(evictionPoolFilter *filter, int *dbid);
+robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid);
 #define EVICT_OK 0
 #define EVICT_RUNNING 1
 #define EVICT_FAIL 2

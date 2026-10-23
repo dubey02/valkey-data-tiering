@@ -922,12 +922,6 @@ class SpillSelectTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        /* With the keys gone, one more selection empties the shared pool. */
-        kvstoreEmpty(server.db[0]->expires, NULL);
-        kvstoreEmpty(server.db[0]->keys, NULL);
-        int dbid;
-        server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
-        spillSelectCandidate(&dbid);
         kvstoreRelease(server.db[0]->expires);
         kvstoreRelease(server.db[0]->keys);
         zfree(server.db[0]);
@@ -939,26 +933,34 @@ class SpillSelectTest : public ::testing::Test {
         lrulfu_updateClockAndPolicy(mstime(), (policy & MAXMEMORY_FLAG_LFU) != 0);
     }
 
-    /* Adds a key to DB 0, with a TTL unless expire is -1, and returns its entry. */
-    robj *addKeyWithExpire(const char *key, robj *val, long long expire) {
+    /* Adds a key to 'db' in 'slot', with a TTL unless expire is -1, and returns its entry. */
+    robj *addKeyTo(serverDb *db, int slot, const char *key, robj *val, long long expire) {
         sds k = sdsnew(key);
         robj *entry = objectSetKeyAndExpire(val, k, expire);
         sdsfree(k);
         initObjectLRUOrLFU(entry);
-        kvstoreHashtableAdd(server.db[0]->keys, 0, entry);
-        if (expire != -1) kvstoreHashtableAdd(server.db[0]->expires, 0, entry);
+        kvstoreHashtableAdd(db->keys, slot, entry);
+        if (expire != -1) kvstoreHashtableAdd(db->expires, slot, entry);
         return entry;
+    }
+
+    robj *addKeyWithExpire(const char *key, robj *val, long long expire) {
+        return addKeyTo(server.db[0], 0, key, val, expire);
     }
 
     robj *addKey(const char *key, robj *val) {
         return addKeyWithExpire(key, val, -1);
     }
 
-    robj *addRawKeyWithExpire(const char *key, long long expire) {
+    robj *rawValue(void) {
         /* Too big to embed. */
         char val[200];
         memset(val, 'v', sizeof(val));
-        robj *entry = addKeyWithExpire(key, createStringObject(val, sizeof(val)), expire);
+        return createStringObject(val, sizeof(val));
+    }
+
+    robj *addRawKeyWithExpire(const char *key, long long expire) {
+        robj *entry = addKeyWithExpire(key, rawValue(), expire);
         EXPECT_EQ(entry->encoding, OBJ_ENCODING_RAW);
         EXPECT_FALSE(entry->hasembval);
         return entry;
@@ -1114,37 +1116,99 @@ TEST_F(SpillSelectTest, ReturnsNullWhenNoKeyCanBeSpilled) {
     EXPECT_EQ(spillSelectCandidate(&dbid), nullptr);
 }
 
-/* Under a volatile policy spill picks from the keys eviction would pick from:
- * those with a TTL. */
-TEST_F(SpillSelectTest, PicksKeysWithATtlUnderVolatilePolicies) {
-    usePolicy(MAXMEMORY_VOLATILE_LRU);
-    long long expire = mstime() + 3600 * 1000;
-    robj *no_ttl = addRawKey("no_ttl");
-    robj *recent = addRawKeyWithExpire("recent", expire);
-    robj *oldest = addRawKeyWithExpire("oldest", expire);
-    objectSetLRUOrLFU(no_ttl, -1, 5000);
-    objectSetLRUOrLFU(recent, -1, 10);
-    objectSetLRUOrLFU(oldest, -1, 1000);
+/* Spill ranks every key by LRU or LFU whatever the maxmemory-policy: keys
+ * without a TTL are picked under volatile-*, and volatile-ttl doesn't rank by
+ * TTL. */
+TEST_F(SpillSelectTest, PicksTheColdestKeyUnderEveryPolicy) {
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_LFU, MAXMEMORY_VOLATILE_LRU,
+                      MAXMEMORY_VOLATILE_LFU, MAXMEMORY_VOLATILE_TTL, MAXMEMORY_VOLATILE_RANDOM,
+                      MAXMEMORY_ALLKEYS_RANDOM, MAXMEMORY_NO_EVICTION};
+    for (int i = 0; i < 8; i++) {
+        usePolicy(policies[i]);
+        bool lfu = policies[i] & MAXMEMORY_FLAG_LFU;
+        robj *coldest = addRawKey("coldest");
+        robj *warm = addRawKeyWithExpire("warm", mstime() + 3600 * 1000);
+        robj *expires_soonest = addRawKeyWithExpire("expires_soonest", mstime() + 1000);
+        objectSetLRUOrLFU(coldest, lfu ? 1 : -1, lfu ? -1 : 5000);
+        objectSetLRUOrLFU(warm, lfu ? 50 : -1, lfu ? -1 : 100);
+        objectSetLRUOrLFU(expires_soonest, lfu ? 200 : -1, lfu ? -1 : 10);
 
-    int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), oldest);
+        int dbid = -1;
+        EXPECT_EQ(spillSelectCandidate(&dbid), coldest) << "policy " << policies[i];
 
-    usePolicy(MAXMEMORY_VOLATILE_LFU);
-    objectSetLRUOrLFU(no_ttl, 0, -1);
-    objectSetLRUOrLFU(recent, 200, -1);
-    objectSetLRUOrLFU(oldest, 1, -1);
-    EXPECT_EQ(spillSelectCandidate(&dbid), oldest);
+        kvstoreEmpty(server.db[0]->expires, NULL);
+        kvstoreEmpty(server.db[0]->keys, NULL);
+    }
 }
 
-TEST_F(SpillSelectTest, SelectsNothingUnderOtherPolicies) {
-    addRawKey("key");
-    int policies[] = {MAXMEMORY_NO_EVICTION, MAXMEMORY_VOLATILE_TTL, MAXMEMORY_VOLATILE_RANDOM,
-                      MAXMEMORY_ALLKEYS_RANDOM};
-    for (int i = 0; i < 4; i++) {
-        usePolicy(policies[i]);
-        int dbid = -1;
-        EXPECT_EQ(spillSelectCandidate(&dbid), nullptr) << "policy " << policies[i];
+/* Under volatile-ttl the pool is scored by expiry when eviction uses it. Those
+ * scores outrank every idleness score, so spill must not reuse them. */
+TEST_F(SpillSelectTest, IgnoresTtlScoresLeftInThePool) {
+    usePolicy(MAXMEMORY_VOLATILE_TTL);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    long long now = mstime();
+    robj *coldest = addRawKey("coldest");
+    robj *expires_soon = addRawKeyWithExpire("expires_soon", now + 1000);
+    robj *expires_later = addRawKeyWithExpire("expires_later", now + 2000);
+    objectSetLRUOrLFU(coldest, -1, 5000);
+    objectSetLRUOrLFU(expires_soon, -1, 10);
+    objectSetLRUOrLFU(expires_later, -1, 10);
+
+    /* Eviction's view: pops the soonest expiry, leaves the other one scored by TTL. */
+    int dbid = -1;
+    ASSERT_EQ(evictionPoolPopColdest(MAXMEMORY_VOLATILE_TTL, NULL, &dbid), expires_soon);
+    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
+}
+
+TEST_F(SpillSelectTest, ReportsTheDbOfTheChosenKey) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    server.dbnum = 3;
+    server.db = (serverDb **)zrealloc(server.db, sizeof(serverDb *) * 3);
+    for (int i = 1; i < 3; i++) {
+        server.db[i] = (serverDb *)zcalloc(sizeof(serverDb));
+        server.db[i]->id = i;
+        server.db[i]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+        server.db[i]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, 0, 0);
     }
+    /* Longer than the pool's cached key buffer, so the pool holds its own copy. */
+    char long_name[300];
+    memset(long_name, 'k', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    objectSetLRUOrLFU(addKeyTo(server.db[0], 0, long_name, rawValue(), -1), -1, 100);
+    objectSetLRUOrLFU(addKeyTo(server.db[1], 0, "warm", rawValue(), -1), -1, 200);
+    robj *coldest = addKeyTo(server.db[2], 0, "coldest", rawValue(), -1);
+    objectSetLRUOrLFU(coldest, -1, 5000);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
+    EXPECT_EQ(dbid, 2);
+
+    for (int i = 1; i < 3; i++) {
+        kvstoreRelease(server.db[i]->expires);
+        kvstoreRelease(server.db[i]->keys);
+        zfree(server.db[i]);
+    }
+    server.dbnum = 1;
+}
+
+/* In cluster mode keys live in per-slot tables. The pool must look the key up
+ * in the slot it was sampled from. */
+TEST_F(SpillSelectTest, PicksKeysOutsideSlotZero) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    kvstoreRelease(server.db[0]->expires);
+    kvstoreRelease(server.db[0]->keys);
+    server.db[0]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 14, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
+    server.db[0]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, 14, KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND);
+
+    objectSetLRUOrLFU(addKeyTo(server.db[0], 9000, "recent", rawValue(), -1), -1, 10);
+    robj *coldest = addKeyTo(server.db[0], 9000, "coldest", rawValue(), -1);
+    objectSetLRUOrLFU(coldest, -1, 5000);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
 }
 
 #endif /* USE_EXT_STORAGE */

@@ -281,12 +281,17 @@ bool isSpillCandidate(const robj *o) {
            objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE;
 }
 
-/* Returns the coldest spillable key, or NULL if none was sampled. Spilling
- * ranks keys by LRU or LFU, so it needs an LRU or LFU maxmemory policy.
+/* Spill samples every key and ranks it by idleness, whatever maxmemory-policy
+ * says. The lru field holds an LFU counter only under an LFU policy, so only
+ * that bit of the policy is followed. */
+static int spillSamplingPolicy(void) {
+    return (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) ? MAXMEMORY_ALLKEYS_LFU : MAXMEMORY_ALLKEYS_LRU;
+}
+
+/* Returns the coldest spillable key, or NULL if none was sampled.
  * TODO(#111): eviction must skip keys that are COPYING_TO_FLASH. */
 robj *spillSelectCandidate(int *dbid) {
-    if (!(server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU))) return NULL;
-    return evictionPoolPopColdest(isSpillCandidate, dbid);
+    return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
 }
 
 #endif /* USE_EXT_STORAGE */
