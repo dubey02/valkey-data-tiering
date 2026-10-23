@@ -274,24 +274,27 @@ void setStorageState(robj *o, storageState state) {
     o->storage_state = state;
 }
 
-/* Embedded and INT values have nothing separate to free, shared values can't be
- * freed, and module values aren't supported yet (#81). An expired key is left
- * for expiry to delete instead. */
+/* True when the value of 'o' may be moved to the storage engine. The value
+ * must still be in memory and be the only reference to its allocation.
+ * Embedded strings and INT encodings have no separate allocation to free.
+ * Module values have no serializer yet (#81). Expired keys are left for
+ * expiry to delete. */
 static bool isSpillCandidate(const robj *o) {
     return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY && !o->hasembval &&
            objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE &&
            !timestampIsExpired(objectGetExpire(o));
 }
 
-/* Spill samples every key and ranks it by idleness, whatever maxmemory-policy
- * says. The lru field holds an LFU counter only under an LFU policy, so only
- * that bit of the policy is followed. */
+/* Picks the eviction policy used to sample and rank keys for spilling.
+ * Spill ignores maxmemory-policy and ranks every key by how long it has
+ * been idle. That maps to allkeys-lru. The one exception is an LFU
+ * maxmemory-policy. The lru field then holds an LFU counter instead of an
+ * LRU clock, so allkeys-lfu is returned to read that field correctly. */
 static int spillSamplingPolicy(void) {
     return (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) ? MAXMEMORY_ALLKEYS_LFU : MAXMEMORY_ALLKEYS_LRU;
 }
 
-/* Returns the coldest spillable key, or NULL if none was sampled.
- * TODO(#111): eviction must skip keys that are COPYING_TO_FLASH. */
+/* Returns the coldest spillable key, or NULL if none was sampled. */
 robj *spillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
 }

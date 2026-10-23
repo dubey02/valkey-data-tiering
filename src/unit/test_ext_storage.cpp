@@ -1284,22 +1284,75 @@ TEST_F(SpillSelectTest, ReportsTheDbOfTheChosenKey) {
 }
 
 /* Key names longer than the pool's cached buffer get their own copy, which the
- * pool must free. Under volatile-ttl the pool is cleared after the pick, so the
- * warmer key's copy is freed in the same call. */
+ * pool must free when it pops the entry. */
 TEST_F(SpillSelectTest, FreesPoolCopiesOfLongKeyNames) {
-    usePolicy(MAXMEMORY_VOLATILE_TTL);
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
     server.maxmemory_samples = 64; /* sample every key in one pass */
     char long_name[300];
     memset(long_name, 'k', sizeof(long_name) - 1);
     long_name[sizeof(long_name) - 1] = '\0';
-    objectSetLRUOrLFU(addRawKey(long_name), -1, 100);
+    robj *long_key = addRawKey(long_name);
+    objectSetLRUOrLFU(long_key, -1, 100);
     robj *coldest = addRawKey("coldest");
     objectSetLRUOrLFU(coldest, -1, 5000);
 
     size_t used = zmalloc_used_memory();
     int dbid = -1;
     EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
+
+    /* With neither key spillable, the next selection pops the long name
+     * without pooling it again. */
+    setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH);
+    setStorageState(long_key, STORAGE_STATE_COPYING_TO_FLASH);
+    EXPECT_EQ(spillSelectCandidate(&dbid), nullptr);
     EXPECT_EQ(zmalloc_used_memory(), used);
+}
+
+/* Keys sampled by an earlier selection stay in the pool, so a later selection
+ * still finds them when its own sample misses them. */
+TEST_F(SpillSelectTest, KeepsCandidatesFromEarlierSelections) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, -1, 5000);
+    robj *second = addRawKey("second");
+    objectSetLRUOrLFU(second, -1, 4000);
+
+    int dbid = -1;
+    ASSERT_EQ(spillSelectCandidate(&dbid), coldest);
+    setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH); /* submitted */
+
+    /* One sample out of a thousand recent keys is unlikely to hit second. */
+    char name[32];
+    for (int i = 0; i < 1000; i++) {
+        snprintf(name, sizeof(name), "recent:%d", i);
+        addRawKey(name);
+    }
+    server.maxmemory_samples = 1;
+
+    EXPECT_EQ(spillSelectCandidate(&dbid), second);
+}
+
+/* LRU scores are idle times and LFU scores are at most 255, so entries scored
+ * under LRU would outrank every key once the policy switches to LFU. */
+TEST_F(SpillSelectTest, IgnoresLruScoresAfterSwitchingToLfu) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, -1, 5000);
+    robj *frequent = addRawKey("frequent");
+    objectSetLRUOrLFU(frequent, -1, 4000);
+
+    int dbid = -1;
+    ASSERT_EQ(spillSelectCandidate(&dbid), coldest);
+    setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH); /* submitted */
+
+    usePolicy(MAXMEMORY_ALLKEYS_LFU);
+    objectSetLRUOrLFU(frequent, 200, -1);
+    robj *rare = addRawKey("rare");
+    objectSetLRUOrLFU(rare, 1, -1);
+
+    EXPECT_EQ(spillSelectCandidate(&dbid), rare);
 }
 
 /* In cluster mode keys live in per-slot tables. With one key per slot and a

@@ -239,6 +239,19 @@ static void evictionPoolClear(void) {
     }
 }
 
+/* Scale the pooled keys were scored on: the LRU or LFU flag of the policy
+ * that scored them, or 0 for TTL. */
+static int EvictionPoolScale;
+
+/* Empties the pool when 'policy' scores keys on a different scale than the
+ * entries already in it. */
+static void evictionPoolSetPolicy(int policy) {
+    int scale = policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU);
+    if (scale == EvictionPoolScale) return;
+    evictionPoolClear();
+    EvictionPoolScale = scale;
+}
+
 /* Samples every DB into the pool under 'policy'. Returns the number of keys in
  * the sampled keyspaces. */
 static unsigned long evictionPoolSample(int policy, evictionPoolFilter *filter) {
@@ -272,20 +285,15 @@ static unsigned long evictionPoolSample(int policy, evictionPoolFilter *filter) 
 /* Samples under 'policy', which must rank by LRU or LFU, and returns the
  * coldest key that 'filter' accepts, setting *dbid, or NULL if none of the
  * sampled keys pass.
- * The pool is borrowed: it is cleared before sampling, as eviction may have
- * left entries scored another way (by TTL under volatile-ttl, or before a
- * maxmemory-policy change), and cleared after the pick so eviction never sees
- * entries it would not have sampled. */
+ * The pool is shared with eviction. Entries left by the other caller are kept
+ * when they were scored on the same scale, and every pop rechecks its key. */
 robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid) {
     serverAssert(policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU));
-    evictionPoolClear();
+    evictionPoolSetPolicy(policy);
 
     evictionPoolSample(policy, filter);
     int slot;
-    robj *pick = evictionPoolPop(policy, filter, dbid, &slot);
-
-    evictionPoolClear();
-    return pick;
+    return evictionPoolPop(policy, filter, dbid, &slot);
 }
 
 /* We don't want to count AOF buffers and replicas output buffers as
@@ -583,6 +591,7 @@ int performEvictions(void) {
 
         if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
             server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+            evictionPoolSetPolicy(server.maxmemory_policy);
             while (bestkey == NULL) {
                 /* We don't want to make local-db choices when expiring keys,
                  * so to start populate the eviction pool sampling keys from
