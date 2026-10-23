@@ -275,10 +275,12 @@ void setStorageState(robj *o, storageState state) {
 }
 
 /* Embedded and INT values have nothing separate to free, shared values can't be
- * freed, and module values aren't supported yet (#81). */
+ * freed, and module values aren't supported yet (#81). An expired key is left
+ * for expiry to delete instead. */
 bool isSpillCandidate(const robj *o) {
     return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY && !o->hasembval &&
-           objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE;
+           objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE &&
+           !timestampIsExpired(objectGetExpire(o));
 }
 
 /* Spill samples every key and ranks it by idleness, whatever maxmemory-policy

@@ -1053,6 +1053,19 @@ TEST_F(SpillSelectTest, SkipsModuleKeys) {
     EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
 }
 
+/* An expired key that expiry hasn't deleted yet would be written to flash for
+ * nothing, however cold it is. */
+TEST_F(SpillSelectTest, SkipsExpiredKeys) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.cmd_time_snapshot = mstime();
+    objectSetLRUOrLFU(addRawKeyWithExpire("expired", server.cmd_time_snapshot - 1000), -1, 5000);
+    robj *live = addRawKeyWithExpire("live", server.cmd_time_snapshot + 3600 * 1000);
+    objectSetLRUOrLFU(live, -1, 10);
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), live);
+}
+
 /* Non-candidates must not crowd the candidate out of the pool. */
 TEST_F(SpillSelectTest, KeysThatCannotBeSpilledDoNotFillThePool) {
     usePolicy(MAXMEMORY_ALLKEYS_LRU);
