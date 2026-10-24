@@ -12,6 +12,7 @@
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
+#include "bgiteration.h"
 #include "rdb.h"
 #include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
@@ -236,11 +237,14 @@ void extStorageInit(void) {
 /* Completions
  * extStorageBeforeSleep and the shutdown drain both go through here. */
 
+static void spillComplete(const storageCompletion *comp);
+
 /* Handles one finished request. */
 static void extStorageProcessCompletion(const storageCompletion *c) {
     switch (c->op_type) {
     case STORAGE_OP_PUT:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
+        spillComplete(c);
         break;
     case STORAGE_OP_GET:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
@@ -262,10 +266,11 @@ static int extStoragePollCompletions(void) {
 }
 
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
- * the loop at least every tick, so a completion waits at most that long. */
-void extStorageBeforeSleep(void) {
-    if (!ext_storage.open) return;
-    extStoragePollCompletions();
+ * the loop at least every tick, so a completion waits at most that long.
+ * Returns how many completions were handled. */
+int extStorageBeforeSleep(void) {
+    if (!ext_storage.open) return 0;
+    return extStoragePollCompletions();
 }
 
 /* Closes the storage engine. Outstanding requests are polled and handled first.
@@ -456,8 +461,7 @@ robj *extStorageSpillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
 }
 
-/* A put in flight, passed to the engine as its request_ctx.
- * TODO(#109): free it when the completion is polled. */
+/* A put in flight, passed to the engine as its request_ctx. */
 typedef struct spillRequest {
     robj *entry;
 } spillRequest;
@@ -478,6 +482,27 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
     return STORAGE_OK;
+}
+
+/* Finishes a spill. On success the value is freed and only the key stays in
+ * DRAM. On failure the value was never released, so the key is back in memory
+ * and can be picked again. */
+static void spillComplete(const storageCompletion *comp) {
+    spillRequest *req = comp->request_ctx;
+    robj *entry = req->entry;
+    serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
+
+    /* Keep a value that something else still references. */
+    bool in_use = objectGetRefcount(entry) != 1 || bgIteration_isEntryInuse(entry);
+    if (comp->status == STORAGE_OK && !in_use) {
+        freeObjectVal(entry);
+        objectSetVal(entry, NULL);
+        setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    } else {
+        /* TODO(#34): delete the flash copy when the write succeeded. */
+        setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
+    }
+    zfree(req);
 }
 
 #endif /* USE_EXT_STORAGE */

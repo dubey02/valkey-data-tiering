@@ -773,21 +773,24 @@ void incrRefCount(robj *o) {
     }
 }
 
+/* Frees the object's value but not the object itself. */
+void freeObjectVal(robj *o) {
+    switch (objectGetType(o)) {
+    case OBJ_STRING: freeStringObject(o); break;
+    case OBJ_LIST: freeListObject(o); break;
+    case OBJ_SET: freeSetObject(o); break;
+    case OBJ_ZSET: freeZsetObject(o); break;
+    case OBJ_HASH: freeHashObject(o); break;
+    case OBJ_MODULE: freeModuleObject(o); break;
+    case OBJ_STREAM: freeStreamObject(o); break;
+    case OBJ_PATH_HASH: freePathHashObject(o); break;
+    default: serverPanic("Unknown object type"); break;
+    }
+}
+
 void decrRefCount(robj *o) {
     if (objectGetRefcount(o) == 1) {
-        if (objectGetVal(o) != NULL) {
-            switch (objectGetType(o)) {
-            case OBJ_STRING: freeStringObject(o); break;
-            case OBJ_LIST: freeListObject(o); break;
-            case OBJ_SET: freeSetObject(o); break;
-            case OBJ_ZSET: freeZsetObject(o); break;
-            case OBJ_HASH: freeHashObject(o); break;
-            case OBJ_MODULE: freeModuleObject(o); break;
-            case OBJ_STREAM: freeStreamObject(o); break;
-            case OBJ_PATH_HASH: freePathHashObject(o); break;
-            default: serverPanic("Unknown object type"); break;
-            }
-        }
+        if (objectGetVal(o) != NULL) freeObjectVal(o);
         zfree(o);
     } else {
         if (objectGetRefcount(o) <= 0) serverPanic("decrRefCount against refcount <= 0");
