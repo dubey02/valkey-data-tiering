@@ -513,6 +513,10 @@ void debugCommand(client *c) {
             "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
+#ifdef USE_EXT_STORAGE
+            "SPILL <key>",
+            "    Submit the key's value to the storage engine.",
+#endif
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -943,6 +947,10 @@ void debugCommand(client *c) {
         tv.tv_nsec = (utime % 1000000) * 1000;
         nanosleep(&tv, NULL);
         addReply(c, shared.ok);
+#ifdef USE_EXT_STORAGE
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc == 3) {
+        debugSpillCommand(c);
+#endif
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-active-expire") && c->argc == 3) {
         server.active_expire_enabled = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
