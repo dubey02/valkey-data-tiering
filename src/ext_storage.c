@@ -274,15 +274,25 @@ void setStorageState(robj *o, storageState state) {
     o->storage_state = state;
 }
 
+/* Elements sampled to size a collection, the same default as MEMORY USAGE. */
+#define SPILL_SIZE_SAMPLES 5
+
+/* Returns the memory freed by spilling the value of 'o'. The object, which
+ * holds the key, stays. Collections are sampled, as in MEMORY USAGE. The key
+ * and dbid are only read for module values, which aren't spilled. */
+static size_t spillValueRamBytes(const robj *o) {
+    return objectComputeSize(NULL, (robj *)o, SPILL_SIZE_SAMPLES, 0) - zmalloc_size((void *)o);
+}
+
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
  * Module values have no serializer yet (#81). Expired keys are left for
- * expiry to delete. */
+ * expiry to delete. Values over ext-storage-max-spill-size stay in DRAM. */
 static bool isSpillCandidate(const robj *o) {
     return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY && !o->hasembval &&
            objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE &&
-           !timestampIsExpired(objectGetExpire(o));
+           !timestampIsExpired(objectGetExpire(o)) && spillValueRamBytes(o) <= server.ext_storage_max_spill_size;
 }
 
 /* Picks the eviction policy used to sample and rank keys for spilling.
@@ -297,6 +307,67 @@ static int spillSamplingPolicy(void) {
 /* Returns the coldest spillable key, or NULL if none was sampled. */
 robj *spillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
+}
+
+/* A put in flight, passed to the engine as its request_ctx.
+ * TODO(#109): free it when the completion is polled. */
+typedef struct spillRequest {
+    robj *entry;
+    size_t ram_bytes;
+} spillRequest;
+
+/* DRAM held by values that are being written to the storage engine. */
+static size_t inflight_ram_bytes;
+
+size_t spillInflightRamBytes(void) {
+    return inflight_ram_bytes;
+}
+
+/* Submits an item to the storage engine, which borrows it until the completion
+ * is polled. On any status other than STORAGE_OK nothing changes. */
+storageStatus spillItem(int dbid, robj *entry) {
+    serverAssert(ext_storage.open && isSpillCandidate(entry));
+
+    size_t ram_bytes = spillValueRamBytes(entry);
+
+    spillRequest *req = zmalloc(sizeof(*req));
+    req->entry = entry;
+    req->ram_bytes = ram_bytes;
+    sds key = objectGetKey(entry);
+    storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
+    if (status != STORAGE_OK) {
+        zfree(req);
+        return status;
+    }
+
+    setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
+    inflight_ram_bytes += ram_bytes;
+    return STORAGE_OK;
+}
+
+/* DEBUG SPILL <key>: submits the key's value to the storage engine. */
+void debugSpillCommand(client *c) {
+    if (!extStorageIsActive()) {
+        addReplyError(c, "Data tiering is not enabled");
+        return;
+    }
+    robj *entry = dbFind(c->db, objectGetVal(c->argv[2]));
+    if (entry == NULL) {
+        addReplyErrorObject(c, shared.nokeyerr);
+        return;
+    }
+    if (!isSpillCandidate(entry)) {
+        addReplyError(c, "The key can't be spilled");
+        return;
+    }
+    storageStatus status = spillItem(c->db->id, entry);
+    if (status == STORAGE_OK) {
+        addReply(c, shared.ok);
+    } else if (status == STORAGE_WOULDBLOCK) {
+        addReplyError(c, "The storage engine is busy");
+    } else {
+        addReplyError(c, "The storage engine rejected the item");
+    }
 }
 
 #endif /* USE_EXT_STORAGE */

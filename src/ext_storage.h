@@ -36,6 +36,9 @@ const storageSerializer *extStorageSerializer(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
 robj *spillSelectCandidate(int *dbid);
+storageStatus spillItem(int dbid, robj *entry);
+size_t spillInflightRamBytes(void);
+void debugSpillCommand(client *c);
 
 #endif /* USE_EXT_STORAGE */
 

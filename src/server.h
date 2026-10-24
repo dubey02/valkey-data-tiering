@@ -2500,6 +2500,7 @@ struct valkeyServer {
     char *ext_storage_path;                  /* Path the engine stores data under. */
     unsigned long long ext_storage_capacity; /* Max bytes the engine may use. */
     char *ext_storage_cpulist;               /* cpu affinity list of the storage engine threads. */
+    size_t ext_storage_max_spill_size;       /* Max bytes of a value that may be spilled. */
     /* Lazy free */
     int lazyfree_lazy_eviction;
     int lazyfree_lazy_expire;

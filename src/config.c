@@ -3682,6 +3682,8 @@ standardConfig static_configs[] = {
     createStringConfig("ext-storage-path", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.ext_storage_path, "", NULL, NULL),
     createULongLongConfig("ext-storage-capacity", NULL, IMMUTABLE_CONFIG, 1, ULLONG_MAX, server.ext_storage_capacity, 1024ULL * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
     createStringConfig("ext-storage-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ext_storage_cpulist, NULL, NULL, NULL),
+    /* The serializer returns an int length, so nothing larger can be stored. */
+    createSizeTConfig("ext-storage-max-spill-size", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.ext_storage_max_spill_size, 128 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
 
     /* Tls configs */
     createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */
