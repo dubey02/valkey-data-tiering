@@ -8,6 +8,11 @@ list(APPEND MODULES_LIST "hellotimer")
 list(APPEND MODULES_LIST "hellotype")
 list(APPEND MODULES_LIST "helloworld")
 
+# hellostorage registers a storage engine, so it builds only with data tiering.
+if (USE_EXT_STORAGE EQUAL 1)
+    list(APPEND MODULES_LIST "hellostorage")
+endif ()
+
 foreach (MODULE_NAME ${MODULES_LIST})
     message(STATUS "Building module: ${MODULE_NAME}")
     add_library(${MODULE_NAME} SHARED "${CMAKE_CURRENT_LIST_DIR}/${MODULE_NAME}.c")
@@ -19,3 +24,8 @@ foreach (MODULE_NAME ${MODULES_LIST})
         target_link_options(${MODULE_NAME} PRIVATE -undefined dynamic_lookup)
     endif ()
 endforeach ()
+
+# hellostorage also needs the storage engine headers.
+if (USE_EXT_STORAGE EQUAL 1)
+    target_include_directories(hellostorage PRIVATE "${CMAKE_SOURCE_DIR}/src/storage")
+endif ()
