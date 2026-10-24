@@ -21,8 +21,8 @@ void extStorageInit(void);
 /* Closes the storage engine. Outstanding requests are handled first. */
 void extStorageDeinit(void);
 
-/* Handles finished requests. */
-void extStorageBeforeSleep(void);
+/* Handles finished requests. Returns how many were handled. */
+int extStorageBeforeSleep(void);
 
 /* Crash handler only. Stops the storage engine threads with no cleanup. */
 void extStorageKillThreads(void);

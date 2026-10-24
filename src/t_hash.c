@@ -119,7 +119,8 @@ long long hashTypeVolatileCount(robj *o) {
 }
 
 bool hashTypeHasVolatileFields(robj *o) {
-    if (o == NULL) return false;
+    /* A value moved to flash had no field expirations. */
+    if (o == NULL || objectGetVal(o) == NULL) return false;
     serverAssert(objectGetType(o) == OBJ_HASH);
 
     if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {

@@ -1503,19 +1503,18 @@ class SpillSubmitTest : public SpillSelectTest {
     }
 
     void TearDown() override {
-        storageMockRunIo(1000);
-        storageCompletion done[16];
-        int n;
-        while ((n = storageMockEngine()->poll_completions(done, 16)) > 0) {
-            for (int i = 0; i < n; i++) {
-                if (done[i].op_type == STORAGE_OP_PUT) zfree(done[i].request_ctx);
-            }
-        }
+        finishSpills();
         extStorageDeinit();
         zfree(server.ext_storage_engine);
         zfree(server.ext_storage_path);
         zfree(server.logfile);
         SpillSelectTest::TearDown();
+    }
+
+    /* Runs every queued request and processes its completion. */
+    int finishSpills() {
+        storageMockRunIo(1000);
+        return extStorageBeforeSleep();
     }
 };
 
@@ -1526,15 +1525,6 @@ TEST_F(SpillSubmitTest, SubmitsTheValueAndCountsItsDram) {
     ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
     EXPECT_EQ(spillInflightRamBytes() - before, sdsAllocSize((sds)objectGetVal(entry)));
-
-    /* The engine writes the borrowed value and hands back our request. */
-    ASSERT_EQ(storageMockRunIo(1), 1);
-    storageCompletion comp = {};
-    ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
-    EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
-    EXPECT_EQ(comp.status, STORAGE_OK);
-    EXPECT_NE(comp.request_ctx, nullptr);
-    zfree(comp.request_ctx);
 }
 
 /* A collection is sized from sampled elements, so only the value's DRAM is
@@ -1584,6 +1574,121 @@ TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
     EXPECT_EQ(spillItem(server.dbnum, entry), STORAGE_ERR_REJECTED);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
     EXPECT_EQ(spillInflightRamBytes(), before);
+}
+
+/* ---------------------------------------------------------------------------
+ * Spill completion
+ * ---------------------------------------------------------------------------*/
+
+TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_STREQ(objectGetKey(entry), "key");
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+    EXPECT_FALSE(isSelected(entry));
+}
+
+/* A failed write leaves the value in DRAM, so the key can be picked again. */
+TEST_F(SpillSubmitTest, AFailedSpillKeepsTheValueInMemory) {
+    extStorageDeinit();
+    server.ext_storage_capacity = 1;
+    extStorageInit();
+
+    robj *entry = addRawKey("key");
+    sds val = sdsdup((sds)objectGetVal(entry));
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), val), 0);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+    EXPECT_TRUE(isSelected(entry));
+    sdsfree(val);
+}
+
+/* Each type's value is freed by its own free function. */
+TEST_F(SpillSubmitTest, EverySpillableTypeCompletes) {
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    robj *spilled[NUM_TEST_OBJECTS];
+    int num_spilled = 0;
+    for (int i = 0; i < n; i++) {
+        addOneElement(objs[i]);
+
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addKey(key, objs[i]);
+        /* Embedded and INT strings have no separate value to spill. */
+        if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
+        ASSERT_EQ(spillItem(0, entry), STORAGE_OK) << "type " << entry->type;
+        spilled[num_spilled++] = entry;
+    }
+    /* All but the embedded and INT strings. */
+    ASSERT_EQ(num_spilled, n - 2);
+    ASSERT_GT(spillInflightRamBytes(), 0u);
+
+    EXPECT_EQ(finishSpills(), num_spilled);
+    for (int i = 0; i < num_spilled; i++) {
+        EXPECT_EQ(getStorageState(spilled[i]), STORAGE_STATE_ONLY_FLASH)
+            << "type " << spilled[i]->type << " encoding " << strEncoding(spilled[i]->encoding);
+        EXPECT_EQ(objectGetVal(spilled[i]), nullptr);
+    }
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+}
+
+/* Freeing a value something else references would leave it dangling. */
+TEST_F(SpillSubmitTest, AReferencedValueStaysInMemory) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    incrRefCount(entry);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_NE(objectGetVal(entry), nullptr);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+    decrRefCount(entry);
+}
+
+/* Deleting or overwriting a hash checks it for field expirations. */
+TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
+    robj *listpack = createHashObject();
+    robj *hashtable = createHashObject();
+    hashTypeConvert(hashtable, OBJ_ENCODING_HASHTABLE);
+    robj *hashes[] = {addKey("listpack", listpack), addKey("hashtable", hashtable)};
+    for (int i = 0; i < 2; i++) {
+        sds field = sdsnew("field");
+        hashTypeSet(hashes[i], field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+        sdsfree(field);
+        ASSERT_EQ(spillItem(0, hashes[i]), STORAGE_OK);
+    }
+    ASSERT_EQ(finishSpills(), 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(objectGetVal(hashes[i]), nullptr);
+        EXPECT_FALSE(hashTypeHasVolatileFields(hashes[i]));
+    }
+}
+
+/* Deleting a key on flash frees only the object, so lazy free must not read
+ * the quicklist it no longer has. */
+TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    ASSERT_EQ(objectGetVal(entry), nullptr);
+
+    /* As a lazy delete does, after taking the key out of the keyspace. */
+    void *popped;
+    ASSERT_TRUE(kvstoreHashtablePop(server.db[0]->keys, 0, objectGetKey(entry), &popped));
+    robj *key = createStringObject("list", 4);
+    freeObjAsync(key, entry, 0);
+    decrRefCount(key);
 }
 
 #endif /* USE_EXT_STORAGE */
