@@ -1333,6 +1333,34 @@ TEST_F(SpillSelectTest, KeepsCandidatesFromEarlierSelections) {
     EXPECT_EQ(spillSelectCandidate(&dbid), second);
 }
 
+/* Eviction under volatile-lru and spill under allkeys-lru both score by idle
+ * time. Only the scale decides whether the pool is cleared, so the keys
+ * eviction left in the pool must stay there for spill to pick. */
+TEST_F(SpillSelectTest, KeepsEvictionCandidatesScoredOnTheSameScale) {
+    usePolicy(MAXMEMORY_VOLATILE_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    long long expire = mstime() + 3600 * 1000;
+    objectSetLRUOrLFU(addRawKeyWithExpire("coldest", expire), -1, 5000);
+    robj *second = addRawKeyWithExpire("second", expire);
+    objectSetLRUOrLFU(second, -1, 4000);
+    objectSetLRUOrLFU(addRawKeyWithExpire("warm", expire), -1, 10);
+
+    /* Evicts coldest and leaves second and warm in the pool. */
+    evictOneKey();
+    ASSERT_FALSE(keyExists("coldest"));
+
+    /* One sample out of a thousand recent keys is unlikely to hit second. */
+    char name[32];
+    for (int i = 0; i < 1000; i++) {
+        snprintf(name, sizeof(name), "recent:%d", i);
+        addRawKey(name);
+    }
+    server.maxmemory_samples = 1;
+
+    int dbid = -1;
+    EXPECT_EQ(spillSelectCandidate(&dbid), second);
+}
+
 /* LRU scores are idle times and LFU scores are at most 255, so entries scored
  * under LRU would outrank every key once the policy switches to LFU. */
 TEST_F(SpillSelectTest, IgnoresLruScoresAfterSwitchingToLfu) {
