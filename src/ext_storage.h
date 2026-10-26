@@ -33,8 +33,11 @@ int extStorageIsActive(void);
 /* Appends the Ext_storage INFO fields, the ones the valkey server counts. */
 sds extStorageInfoString(sds info);
 
-/* Appends the Storage_engine INFO fields, the ones the storage engine reports.
- * Appends nothing when no storage engine is open. */
+/* Returns 1 while an open storage engine has INFO fields to report. The
+ * Storage_engine section is printed only then. */
+int extStorageEngineHasInfo(void);
+
+/* Appends the Storage_engine INFO fields, the ones the storage engine reports. */
 sds extStorageEngineInfoString(sds info);
 
 /* The serialization callbacks. */

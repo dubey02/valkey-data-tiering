@@ -7221,7 +7221,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscat(info, "# Ext_storage\r\n");
         info = extStorageInfoString(info);
     }
-    if (extStorageIsActive() && (all_sections || (dictFind(section_dict, "storage_engine") != NULL))) {
+    if (extStorageEngineHasInfo() && (all_sections || (dictFind(section_dict, "storage_engine") != NULL))) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscat(info, "# Storage_engine\r\n");
         info = extStorageEngineInfoString(info);

@@ -396,8 +396,12 @@ static void extStorageInfoBeginDict(void *c, const char *name) {
     ctx->in_dict = 1;
 }
 
+int extStorageEngineHasInfo(void) {
+    return ext_storage.open && ext_storage.engine->info != NULL;
+}
+
 sds extStorageEngineInfoString(sds info) {
-    if (!extStorageIsActive() || ext_storage.engine->info == NULL) return info;
+    if (!extStorageEngineHasInfo()) return info;
 
     extStorageInfoCtx ctx = {.info = info, .in_dict = 0};
     const storageInfoSink sink = {

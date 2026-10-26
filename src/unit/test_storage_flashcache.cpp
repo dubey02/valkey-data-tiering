@@ -573,7 +573,7 @@ TEST_F(StorageFlashCacheTest, InfoReportsTheItemsHeld) {
 
     ASSERT_EQ(delAndWait(0, key), STORAGE_OK);
     unsigned long long held = after_put["total_num_items"];
-    EXPECT_TRUE(waitForStat("total_num_items", [held](unsigned long long v) { return v <= held; }));
+    EXPECT_TRUE(waitForStat("total_num_items", [held](unsigned long long v) { return v < held; }));
     StatMap after_del = readStats();
     EXPECT_EQ(after_del["total_num_requests_throttled"], 0u);
     EXPECT_EQ(after_del["total_num_items_evicted"], 0u);
