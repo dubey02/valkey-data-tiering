@@ -142,11 +142,9 @@ typedef struct storageConfig {
  * INFO
  * ---------------------------------------------------------------------------*/
 
-/* The valkey server owns the INFO buffer and the storage engine never sees it.
- * The storage engine reports its fields through this sink from inside its info
- * callback. Each field is printed as storage_engine_<name>:<value>. A dict
- * field prints storage_engine_<name>: followed by the fields added before
- * end_dict, as name=value pairs separated by commas. A dict cannot nest. */
+/* The storage engine reports INFO fields through this sink from inside its
+ * info callback. Fields print as storage_engine_<name>:<value>. A dict prints
+ * its fields as name=value pairs on one line and cannot nest. */
 typedef struct storageInfoSink {
     /* Passed back as the first argument of every call below. */
     void *ctx;
@@ -171,11 +169,9 @@ typedef struct storageEngine {
 
     /* Opens the storage engine. */
     storageStatus (*open)(const storageConfig *cfg);
-    /* Closes the storage engine. A fetched value is the only copy once the key
-     * was spilled, so nothing may be dropped here. While any submitted request
-     * is still unpolled this does nothing, keeps running, and returns
-     * STORAGE_WOULDBLOCK. The caller then polls completions and calls it
-     * again. */
+    /* Closes the storage engine. Returns STORAGE_WOULDBLOCK while any request
+     * is unpolled, since an unpolled fetch may hold the only copy of a value.
+     * The caller polls and retries. */
     storageStatus (*close)(void);
     /* Crash handler only. Stops the storage engine threads with no cleanup.
      * May be NULL. */
@@ -183,9 +179,7 @@ typedef struct storageEngine {
 
     /* Asynchronous put, get, and delete. The key is freed by the caller
      * after the call returns. The entry lives until its completion is polled.
-     * A delete completes with STORAGE_OK whether or not a record existed. The
-     * caller tracks which keys are spilled, so it never needs the answer, and
-     * a storage engine that skips reading the value cannot give one. */
+     * A delete completes with STORAGE_OK whether or not a record existed. */
     storageStatus (*put_async)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx);
     storageStatus (*get_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
     storageStatus (*del_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);

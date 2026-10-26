@@ -40,9 +40,7 @@ void extStorageTestResetRegistry(void) {
     registered_engine = NULL;
 }
 
-/* The counters the valkey server owns, counted as completions are handled, so
- * only the main thread touches them. The storage engine reports its own
- * through its info callback. */
+/* Counted on the main thread as completions are handled. */
 typedef struct extStorageStats {
     uint64_t total_num_items_spilled;
     uint64_t total_num_items_fetched;
@@ -52,7 +50,7 @@ typedef struct extStorageStats {
 /* Storage Context. */
 typedef struct extStorageContext {
     const storageEngine *engine;
-    /* Whether the storage engine is open. */
+    /* Set while the storage engine is open. */
     int open;
     /* The byte budget the storage engine was opened with. */
     uint64_t capacity_bytes;
@@ -236,8 +234,7 @@ void extStorageInit(void) {
 }
 
 /* Completions
- * Every finished request goes through here, from cron and from the shutdown
- * drain alike. */
+ * Cron and the shutdown drain both go through here. */
 
 /* Handles one finished request. */
 static void extStorageProcessCompletion(const storageCompletion *c) {
@@ -270,10 +267,8 @@ void extStorageCron(void) {
     extStoragePollCompletions();
 }
 
-/* Closes the storage engine. Requests still outstanding are polled and handled
- * the normal way first, so a fetched value is never dropped. The storage engine
- * keeps running until close succeeds, and nothing new is submitted, so the
- * drain ends once it has finished them. */
+/* Closes the storage engine. Outstanding requests are polled and handled first.
+ * Nothing new is submitted, so the drain ends when they finish. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
     storageStatus st;
@@ -316,7 +311,7 @@ int extStorageIsActive(void) {
 /* INFO
  * The Ext_storage section holds what the valkey server counts. The
  * Storage_engine section holds what the storage engine reports through the
- * sink below, the same way a module fills its own INFO section. */
+ * sink below. */
 
 sds extStorageInfoString(sds info) {
     if (!extStorageIsActive()) return sdscatprintf(info, "ext_storage_enabled:0\r\n");
@@ -341,7 +336,7 @@ sds extStorageInfoString(sds info) {
  * sink's opaque context. */
 typedef struct extStorageInfoCtx {
     sds info;
-    /* Whether a dict field is open. Fields added inside it print as
+    /* Set while a dict field is open. Fields added inside it print as
      * name=value pairs on the dict's line. */
     int in_dict;
 } extStorageInfoCtx;

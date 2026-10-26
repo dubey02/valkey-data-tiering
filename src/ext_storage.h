@@ -27,7 +27,7 @@ void extStorageCron(void);
 /* Crash handler only. Stops the storage engine threads with no cleanup. */
 void extStorageKillThreads(void);
 
-/* Whether a storage engine is open and ready. */
+/* Returns 1 while a storage engine is open and ready. */
 int extStorageIsActive(void);
 
 /* Appends the Ext_storage INFO fields, the ones the valkey server counts. */

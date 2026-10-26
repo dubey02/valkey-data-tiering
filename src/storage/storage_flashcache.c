@@ -39,10 +39,9 @@
 /* Maximum number of requests in flight. */
 #define FC_QUEUE_DEPTH 256
 
-/* How long the idle IO thread waits before it runs FlashCache's cron again.
- * A request wakes it at once. The tick only keeps garbage collection going
- * when no requests arrive. FlashCache budgets garbage collection per second,
- * so 10 milliseconds costs it about one percent. */
+/* The idle IO thread runs FlashCache's cron once per tick. A request wakes it
+ * at once. The tick only keeps garbage collection going when no requests
+ * arrive. */
 #define FC_IDLE_TICK_MS 10
 
 /* FlashCache init parameters, fixed until they come from configuration. */
@@ -74,7 +73,7 @@ typedef struct fcStatsSnapshot {
     uint64_t evicted;
 } fcStatsSnapshot;
 
-/* How often the IO thread refreshes the snapshot INFO reads. */
+/* The IO thread refreshes the snapshot INFO reads at this interval. */
 #define FC_STATS_REFRESH_US 100000
 
 /* Tells the IO thread to exit. fcClose queues it only once no request is
@@ -94,7 +93,7 @@ static struct {
     uint32_t num_databases;
     /* The db file, inside the configured directory. */
     char db_path[PATH_MAX];
-    /* Whether FlashCache was initialized and must be torn down on close. */
+    /* Set once FlashCache is initialized. Close tears it down. */
     int fc_initialized;
 
     /* Requests waiting for the IO thread. */
@@ -121,7 +120,7 @@ static struct {
 
     /* The IO thread. */
     pthread_t io_thread;
-    /* Whether the storage engine is open. */
+    /* Set while the storage engine is open. */
     int running;
 } fc_io;
 
@@ -130,9 +129,9 @@ static struct {
  * ---------------------------------------------------------------------------*/
 
 /* Runs on the IO thread when a read or a delete finishes. FlashCache frees the
- * value once this returns, so a read deserializes it here. A delete is always
- * done, since FlashCache gives the same NULL value for a deleted record and a
- * missing one. */
+ * value once this returns, so a read deserializes it here. A delete always
+ * completes OK. FlashCache returns NULL for a deleted and a missing record
+ * alike. */
 static void fcGetItemCallback(void *request_context, char *value, size_t value_len, int add_item_to_rdb) {
     (void)add_item_to_rdb; /* snapshot only, not used here */
     fcRequest *r = request_context;
@@ -177,10 +176,9 @@ static void fcRefreshStatsSnapshot(void) {
  * so the same request is tried again after a cron pass. A put completes here.
  * A read or a delete completes in fcGetItemCallback.
  *
- * The retry is defensive and no test drives it. A read cannot be throttled,
- * since FC_QUEUE_DEPTH is also FlashCache's in-flight read limit. A put is
- * throttled only once 512 MiB of writes are buffered, a limit FlashCache fixes
- * at init. */
+ * The retry is defensive. FC_QUEUE_DEPTH is also FlashCache's read limit, so a
+ * read stays under it. A put throttles only past FlashCache's 512 MiB write
+ * buffer. */
 static bool fcSubmitToFlashCache(fcRequest *r) {
     flashcacheReturnCode rc;
 
@@ -276,9 +274,8 @@ static void *fcIOThreadMain(void *arg) {
         flashcacheRunCronTasks();
         fcRefreshStatsSnapshot();
 
-        /* A held request is retried on the next pass. When FlashCache has
-         * nothing in flight, only the tick can turn its garbage collection
-         * window, so waiting for it costs nothing. */
+        /* A held request is retried on the next pass. Wait only when nothing
+         * moved and FlashCache has nothing in flight. */
         if (!progressed && !flashcacheShouldRunCronTasksImmediately()) fcWaitForWork();
     }
     return NULL;
@@ -467,7 +464,7 @@ static storageStatus fcOpen(const storageConfig *cfg) {
         return STORAGE_ERR_REJECTED;
     }
 
-    /* A prior instance that still has work outstanding keeps its state. */
+    /* Reopen is refused while a prior instance has unpolled requests. */
     if (fcClose() != STORAGE_OK) return STORAGE_WOULDBLOCK;
 
     fc_io.serializer = cfg->serializer;
@@ -547,7 +544,7 @@ static storageStatus fcClose(void) {
     assert(join_err == 0);
     fc_io.running = 0;
 
-    /* Nothing can call into FlashCache once the IO thread is gone. */
+    /* The IO thread was the only caller, so teardown is safe now. */
     if (fc_io.fc_initialized) {
         flashcacheTearDown();
         fc_io.fc_initialized = 0;

@@ -300,8 +300,7 @@ static storageStatus mockOpen(const storageConfig *cfg) {
      * names it knows here. */
     if (cfg->num_options > 0) return STORAGE_ERR_REJECTED;
 
-    /* Start from a clean slate. A prior instance that still has work
-     * outstanding keeps its state. */
+    /* Reopen is refused while a prior instance has unpolled requests. */
     if (mockClose() != STORAGE_OK) return STORAGE_WOULDBLOCK;
 
     mock.dbs = mockAlloc(cfg->num_databases * sizeof(mockDb));

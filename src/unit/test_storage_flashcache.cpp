@@ -443,8 +443,7 @@ TEST_F(StorageFlashCacheTest, CloseIsRefusedWhileARequestIsUnpolled) {
     decrRefCount(entry);
 }
 
-/* A put, then a get of the same key, returns the stored value. This is the
- * spill then fetch round trip against real FlashCache. */
+/* A put, then a get of the same key, returns the stored value. */
 TEST_F(StorageFlashCacheTest, PutThenGetReturnsTheStoredValue) {
     openEngine();
     sds key = sdsnew("round-trip-key");
@@ -556,11 +555,9 @@ TEST_F(StorageFlashCacheTest, BinaryValueSurvivesTheRoundTrip) {
     decrRefCount(entry);
 }
 
-/* The info callback reports FlashCache's own counters from the snapshot the IO
- * thread refreshes. A put raises the items held and the bytes used, and a
- * delete does not raise them. The checks are one-sided because FlashCache
- * background work can move a live gauge. Nothing here can be throttled or
- * evicted, so those counters stay at zero. */
+/* The info callback reports FlashCache's counters from the snapshot the IO
+ * thread refreshes. A put raises items and bytes, a delete does not. One-sided
+ * checks, since background work can move a live gauge. */
 TEST_F(StorageFlashCacheTest, InfoReportsTheItemsHeld) {
     openEngine();
     StatMap empty = readStats();
@@ -585,8 +582,7 @@ TEST_F(StorageFlashCacheTest, InfoReportsTheItemsHeld) {
     decrRefCount(entry);
 }
 
-/* A value larger than one FlashCache block round trips whole. This drives
- * FlashCache's own chunking of a record across blocks. */
+/* A value larger than one FlashCache block round trips whole. */
 TEST_F(StorageFlashCacheTest, LargeValueSurvivesTheRoundTrip) {
     openEngine();
     const size_t big = 4 * 1024 * 1024; /* 4mb, well past one block */
@@ -611,8 +607,7 @@ TEST_F(StorageFlashCacheTest, LargeValueSurvivesTheRoundTrip) {
 }
 
 /* A non-string type round trips. The DUMP codec carries the type, so the
- * fetched object is a set with the same members, not a string. This proves the
- * round trip is not string-only. */
+ * fetched object is a set with the same members, not a string. */
 TEST_F(StorageFlashCacheTest, NonStringTypeSurvivesTheRoundTrip) {
     openEngine();
     robj *set = createSetObject();
