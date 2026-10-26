@@ -539,11 +539,7 @@ static storageStatus fcOpen(const storageConfig *cfg) {
 static storageStatus fcClose(void) {
     if (!fc_io.running) return STORAGE_OK;
     /* An unpolled completion may hold a fetched value nobody else owns. */
-    if (fc_io.outstanding > 0) {
-        fc_io.logger(STORAGE_LOG_WARNING, "flashcache: cannot close, %zu requests are still outstanding",
-                     fc_io.outstanding);
-        return STORAGE_WOULDBLOCK;
-    }
+    if (fc_io.outstanding > 0) return STORAGE_WOULDBLOCK;
 
     mutexQueuePushPriority(fc_io.requests, &FC_STOP_REQUEST);
     fcWakeIoThread();

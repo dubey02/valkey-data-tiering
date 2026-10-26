@@ -271,13 +271,27 @@ void extStorageCron(void) {
 }
 
 /* Closes the storage engine. Requests still outstanding are polled and handled
- * the normal way first, so a fetched value is never dropped. Nothing new is
- * submitted, so the drain ends once the storage engine has finished them. */
+ * the normal way first, so a fetched value is never dropped. The storage engine
+ * keeps running until close succeeds, and nothing new is submitted, so the
+ * drain ends once it has finished them. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
     storageStatus st;
+    int drained = 0;
+    mstime_t drain_start = 0;
     while ((st = ext_storage.engine->close()) == STORAGE_WOULDBLOCK) {
-        if (extStoragePollCompletions() == 0) usleep(1000);
+        if (drain_start == 0) {
+            drain_start = mstime();
+            serverLog(LL_NOTICE, "Storage engine \"%s\" has requests outstanding, draining before close.",
+                      ext_storage.engine->name);
+        }
+        int n = extStoragePollCompletions();
+        drained += n;
+        if (n == 0) usleep(1000);
+    }
+    if (drain_start != 0) {
+        serverLog(LL_NOTICE, "Storage engine \"%s\" drained %d requests in %lld ms.", ext_storage.engine->name,
+                  drained, (long long)(mstime() - drain_start));
     }
     if (st != STORAGE_OK) {
         serverLog(LL_WARNING, "Storage engine \"%s\" failed to close, status %d.", ext_storage.engine->name, (int)st);

@@ -171,11 +171,11 @@ typedef struct storageEngine {
 
     /* Opens the storage engine. */
     storageStatus (*open)(const storageConfig *cfg);
-    /* Closes the storage engine. The caller polls every submitted request
-     * before calling this. A fetched value is the only copy once the key was
-     * spilled, so nothing may be dropped here. Returns STORAGE_WOULDBLOCK and
-     * stays open while anything is outstanding, so the caller can poll and
-     * retry. */
+    /* Closes the storage engine. A fetched value is the only copy once the key
+     * was spilled, so nothing may be dropped here. While any submitted request
+     * is still unpolled this does nothing, keeps running, and returns
+     * STORAGE_WOULDBLOCK. The caller then polls completions and calls it
+     * again. */
     storageStatus (*close)(void);
     /* Crash handler only. Stops the storage engine threads with no cleanup.
      * May be NULL. */

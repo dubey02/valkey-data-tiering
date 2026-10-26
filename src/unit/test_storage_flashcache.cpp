@@ -194,28 +194,27 @@ class StorageFlashCacheTest : public ::testing::Test {
         return comp.status;
     }
 
-    /* Polls until the IO thread has been quiet for 20 ms. A test that failed
-     * early may still have requests in flight, and close asserts there are
-     * none. */
-    void drainCompletions() {
+    /* Polls until close accepts, so a test that failed early cannot leave a
+     * request in flight. Close refuses with STORAGE_WOULDBLOCK while anything
+     * is unpolled. Gives up after five seconds. */
+    void drainAndClose() {
         storageCompletion done[16];
-        for (int quiet = 0; quiet < 20;) {
+        storageStatus st;
+        for (int waited_us = 0; (st = engine->close()) == STORAGE_WOULDBLOCK && waited_us < 5000000;) {
             int n = engine->poll_completions(done, 16);
-            if (n == 0) {
-                quiet++;
-                usleep(WAIT_STEP_US);
-                continue;
-            }
-            quiet = 0;
             for (int i = 0; i < n; i++) {
                 if (done[i].value) decrRefCount((robj *)done[i].value);
             }
+            if (n == 0) {
+                usleep(WAIT_STEP_US);
+                waited_us += WAIT_STEP_US;
+            }
         }
+        EXPECT_EQ(st, STORAGE_OK) << "close did not accept within five seconds";
     }
 
     void TearDown() override {
-        drainCompletions();
-        EXPECT_EQ(engine->close(), STORAGE_OK);
+        drainAndClose();
         extStorageTestResetRegistry();
         zfree(server.logfile);
         server.logfile = NULL;
