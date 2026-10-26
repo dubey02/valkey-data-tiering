@@ -40,6 +40,15 @@ void extStorageTestResetRegistry(void) {
     registered_engine = NULL;
 }
 
+/* The counters the valkey server owns, counted as completions are handled, so
+ * only the main thread touches them. The storage engine reports its own
+ * through its info callback. */
+typedef struct extStorageStats {
+    uint64_t total_num_items_spilled;
+    uint64_t total_num_items_fetched;
+    uint64_t total_num_items_deleted;
+} extStorageStats;
+
 /* Storage Context. */
 typedef struct extStorageContext {
     const storageEngine *engine;
@@ -47,9 +56,13 @@ typedef struct extStorageContext {
     int open;
     /* The byte budget the storage engine was opened with. */
     uint64_t capacity_bytes;
+    extStorageStats stats;
 } extStorageContext;
 
 static extStorageContext ext_storage = {0};
+
+/* Completions handled per poll. */
+#define EXT_STORAGE_POLL_BATCH 64
 
 /* Guards rdbLoadObject during deserialization. */
 static pthread_mutex_t ext_storage_loading_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -200,6 +213,7 @@ void extStorageInit(void) {
         .serializer = ext_storage_serializer,
         .thread_config = ext_storage_thread_config,
         .logger = extStorageLog,
+        .monotonic_clock_us = getMonotonicUs,
         /* No storage-engine-specific options are forwarded yet. The
          * configuration directive that collects them is future work. */
         .options = NULL,
@@ -217,13 +231,57 @@ void extStorageInit(void) {
     ext_storage.open = 1;
     ext_storage.capacity_bytes = cfg.capacity_bytes;
 
-    serverLog(LL_NOTICE, "Data tiering enabled. Engine \"%s\", capacity %llu bytes.", engine->name,
+    serverLog(LL_NOTICE, "Data tiering enabled. Storage engine \"%s\", capacity %llu bytes.", engine->name,
               (unsigned long long)server.ext_storage_capacity);
 }
-/* Deinitializes the storage engine */
+
+/* Completions
+ * Every finished request goes through here, from cron and from the shutdown
+ * drain alike. */
+
+/* Handles one finished request. */
+static void extStorageProcessCompletion(const storageCompletion *c) {
+    switch (c->op_type) {
+    case STORAGE_OP_PUT:
+        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
+        break;
+    case STORAGE_OP_GET:
+        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
+        /* No command path reads a fetched value yet, so it has no owner. */
+        if (c->value) decrRefCount((robj *)c->value);
+        break;
+    case STORAGE_OP_DEL:
+        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_deleted++;
+        break;
+    }
+}
+
+/* Polls the storage engine once and handles what finished. Returns the count. */
+static int extStoragePollCompletions(void) {
+    storageCompletion done[EXT_STORAGE_POLL_BATCH];
+    int n = ext_storage.engine->poll_completions(done, EXT_STORAGE_POLL_BATCH);
+    for (int i = 0; i < n; i++) extStorageProcessCompletion(&done[i]);
+    return n;
+}
+
+/* Runs from serverCron. */
+void extStorageCron(void) {
+    if (!ext_storage.open) return;
+    extStoragePollCompletions();
+}
+
+/* Closes the storage engine. Requests still outstanding are polled and handled
+ * the normal way first, so a fetched value is never dropped. Nothing new is
+ * submitted, so the drain ends once the storage engine has finished them. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
-    ext_storage.engine->close();
+    storageStatus st;
+    while ((st = ext_storage.engine->close()) == STORAGE_WOULDBLOCK) {
+        if (extStoragePollCompletions() == 0) usleep(1000);
+    }
+    if (st != STORAGE_OK) {
+        serverLog(LL_WARNING, "Storage engine \"%s\" failed to close, status %d.", ext_storage.engine->name, (int)st);
+    }
     ext_storage.open = 0;
     ext_storage.engine = NULL;
 }
@@ -241,29 +299,111 @@ int extStorageIsActive(void) {
     return ext_storage.open;
 }
 
-/* Storage Info Metrics. */
+/* INFO
+ * The Ext_storage section holds what the valkey server counts. The
+ * Storage_engine section holds what the storage engine reports through the
+ * sink below, the same way a module fills its own INFO section. */
+
 sds extStorageInfoString(sds info) {
     if (!extStorageIsActive()) return sdscatprintf(info, "ext_storage_enabled:0\r\n");
 
-    storageStats st = {0};
-    ext_storage.engine->get_stats(&st);
-
+    const extStorageStats *st = &ext_storage.stats;
     return sdscatprintf(info,
                         "ext_storage_enabled:1\r\n"
                         "ext_storage_engine:%s\r\n"
                         "ext_storage_api_version:%d\r\n"
                         "ext_storage_capacity_bytes:%llu\r\n"
-                        "ext_storage_total_num_items:%llu\r\n"
-                        "ext_storage_total_num_bytes:%llu\r\n"
                         "ext_storage_total_num_items_spilled_to_storage:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
-                        (unsigned long long)st.total_num_items, (unsigned long long)st.total_num_bytes,
-                        (unsigned long long)st.total_num_items_spilled_to_storage,
-                        (unsigned long long)st.total_num_items_fetched_from_storage,
-                        (unsigned long long)st.total_num_items_deleted_from_storage);
+                        (unsigned long long)st->total_num_items_spilled,
+                        (unsigned long long)st->total_num_items_fetched,
+                        (unsigned long long)st->total_num_items_deleted);
+}
+
+/* The INFO buffer under construction, handed to the storage engine as the
+ * sink's opaque context. */
+typedef struct extStorageInfoCtx {
+    sds info;
+    /* Whether a dict field is open. Fields added inside it print as
+     * name=value pairs on the dict's line. */
+    int in_dict;
+} extStorageInfoCtx;
+
+#define EXT_STORAGE_ENGINE_INFO_PREFIX "storage_engine_"
+
+static void extStorageInfoAddLongLong(void *c, const char *name, long long value) {
+    extStorageInfoCtx *ctx = c;
+    if (ctx->in_dict) {
+        ctx->info = sdscatfmt(ctx->info, "%s=%I,", name, value);
+    } else {
+        ctx->info = sdscatfmt(ctx->info, EXT_STORAGE_ENGINE_INFO_PREFIX "%s:%I\r\n", name, value);
+    }
+}
+
+static void extStorageInfoAddULongLong(void *c, const char *name, unsigned long long value) {
+    extStorageInfoCtx *ctx = c;
+    if (ctx->in_dict) {
+        ctx->info = sdscatfmt(ctx->info, "%s=%U,", name, value);
+    } else {
+        ctx->info = sdscatfmt(ctx->info, EXT_STORAGE_ENGINE_INFO_PREFIX "%s:%U\r\n", name, value);
+    }
+}
+
+static void extStorageInfoAddDouble(void *c, const char *name, double value) {
+    extStorageInfoCtx *ctx = c;
+    if (ctx->in_dict) {
+        ctx->info = sdscatprintf(ctx->info, "%s=%.17g,", name, value);
+    } else {
+        ctx->info = sdscatprintf(ctx->info, EXT_STORAGE_ENGINE_INFO_PREFIX "%s:%.17g\r\n", name, value);
+    }
+}
+
+static void extStorageInfoAddCString(void *c, const char *name, const char *value) {
+    extStorageInfoCtx *ctx = c;
+    if (ctx->in_dict) {
+        ctx->info = sdscatfmt(ctx->info, "%s=%s,", name, value);
+    } else {
+        ctx->info = sdscatfmt(ctx->info, EXT_STORAGE_ENGINE_INFO_PREFIX "%s:%s\r\n", name, value);
+    }
+}
+
+static void extStorageInfoEndDict(void *c) {
+    extStorageInfoCtx *ctx = c;
+    if (!ctx->in_dict) return;
+    /* The last pair leaves a trailing comma. */
+    if (ctx->info[sdslen(ctx->info) - 1] == ',') sdsIncrLen(ctx->info, -1);
+    ctx->info = sdscat(ctx->info, "\r\n");
+    ctx->in_dict = 0;
+}
+
+static void extStorageInfoBeginDict(void *c, const char *name) {
+    extStorageInfoCtx *ctx = c;
+    /* A dict cannot nest. Opening one closes the one before it. */
+    extStorageInfoEndDict(ctx);
+    ctx->info = sdscatfmt(ctx->info, EXT_STORAGE_ENGINE_INFO_PREFIX "%s:", name);
+    ctx->in_dict = 1;
+}
+
+sds extStorageEngineInfoString(sds info) {
+    if (!extStorageIsActive() || ext_storage.engine->info == NULL) return info;
+
+    extStorageInfoCtx ctx = {.info = info, .in_dict = 0};
+    const storageInfoSink sink = {
+        .ctx = &ctx,
+        .add_long_long = extStorageInfoAddLongLong,
+        .add_ulong_long = extStorageInfoAddULongLong,
+        .add_double = extStorageInfoAddDouble,
+        .add_cstring = extStorageInfoAddCString,
+        .begin_dict = extStorageInfoBeginDict,
+        .end_dict = extStorageInfoEndDict,
+    };
+    ext_storage.engine->info(&sink);
+    /* A dict the storage engine left open still ends its line. */
+    extStorageInfoEndDict(&ctx);
+    return ctx.info;
 }
 
 storageState getStorageState(const robj *o) {

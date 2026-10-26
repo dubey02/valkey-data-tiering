@@ -28,9 +28,11 @@ typedef struct serverObject valkeyObject;
 /* Result of a storage operation. Negative values are failures. */
 typedef enum {
     STORAGE_OK = 0,
-    /* No record for this (db_id, key). */
+    /* No record for this (db_id, key), on a get. */
     STORAGE_NOT_FOUND = 1,
-    /* Busy. The request was not taken and may be retried. */
+    /* Busy. The request was not taken and may be retried. Returned by
+     * put_async, get_async, del_async and close, never carried by a
+     * completion. */
     STORAGE_WOULDBLOCK = 2,
     /* An IO error. */
     STORAGE_ERR_IO = -1,
@@ -110,6 +112,9 @@ typedef enum storageLogLevel {
 /* Writes one line to the valkey server log. */
 typedef void (*storageLogFn)(storageLogLevel level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
+/* Reads the valkey server's monotonic clock in microseconds. */
+typedef uint64_t (*storageMonotonicClockFn)(void);
+
 /* Settings a storage engine is opened with. */
 typedef struct storageConfig {
     /* Directory for the storage engine's data. */
@@ -124,6 +129,8 @@ typedef struct storageConfig {
     storageThreadConfig thread_config;
     /* Logging. Never NULL. */
     storageLogFn logger;
+    /* Monotonic clock in microseconds. Never NULL. */
+    storageMonotonicClockFn monotonic_clock_us;
     /* Storage-engine-specific options, forwarded uninterpreted by the valkey
      * server. Only the storage engine understands them. */
     const storageOption *options;
@@ -131,19 +138,25 @@ typedef struct storageConfig {
     size_t num_options;
 } storageConfig;
 
-/* Counters reported by a storage engine. */
-typedef struct storageStats {
-    /* Items spilled to, fetched from, and deleted from storage. */
-    uint64_t total_num_items_spilled_to_storage;
-    uint64_t total_num_items_fetched_from_storage;
-    uint64_t total_num_items_deleted_from_storage;
-    /* Items currently held. */
-    uint64_t total_num_items;
-    /* Serialized bytes currently held. */
-    uint64_t total_num_bytes;
-    /* Finished requests whose completion waits for poll_completions. */
-    uint64_t num_completions_pending;
-} storageStats;
+/* ---------------------------------------------------------------------------
+ * INFO
+ * ---------------------------------------------------------------------------*/
+
+/* The valkey server owns the INFO buffer and the storage engine never sees it.
+ * The storage engine reports its fields through this sink from inside its info
+ * callback. Each field is printed as storage_engine_<name>:<value>. A dict
+ * field prints storage_engine_<name>: followed by the fields added before
+ * end_dict, as name=value pairs separated by commas. A dict cannot nest. */
+typedef struct storageInfoSink {
+    /* Passed back as the first argument of every call below. */
+    void *ctx;
+    void (*add_long_long)(void *ctx, const char *name, long long value);
+    void (*add_ulong_long)(void *ctx, const char *name, unsigned long long value);
+    void (*add_double)(void *ctx, const char *name, double value);
+    void (*add_cstring)(void *ctx, const char *name, const char *value);
+    void (*begin_dict)(void *ctx, const char *name);
+    void (*end_dict)(void *ctx);
+} storageInfoSink;
 
 /* ---------------------------------------------------------------------------
  * The storage engine
@@ -158,16 +171,21 @@ typedef struct storageEngine {
 
     /* Opens the storage engine. */
     storageStatus (*open)(const storageConfig *cfg);
-    /* Closes the storage engine. Anything still queued or unpolled is freed,
-     * not finished. A request in flight completes and its result is dropped.
-     * Caller should poll everything before calling this. */
-    void (*close)(void);
+    /* Closes the storage engine. The caller polls every submitted request
+     * before calling this. A fetched value is the only copy once the key was
+     * spilled, so nothing may be dropped here. Returns STORAGE_WOULDBLOCK and
+     * stays open while anything is outstanding, so the caller can poll and
+     * retry. */
+    storageStatus (*close)(void);
     /* Crash handler only. Stops the storage engine threads with no cleanup.
      * May be NULL. */
     void (*kill_threads)(void);
 
     /* Asynchronous put, get, and delete. The key is freed by the caller
-     * after the call returns. The entry lives until its completion is polled. */
+     * after the call returns. The entry lives until its completion is polled.
+     * A delete completes with STORAGE_OK whether or not a record existed. The
+     * caller tracks which keys are spilled, so it never needs the answer, and
+     * a storage engine that skips reading the value cannot give one. */
     storageStatus (*put_async)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx);
     storageStatus (*get_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
     storageStatus (*del_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
@@ -176,8 +194,10 @@ typedef struct storageEngine {
      * Must not block the valkey server's main thread. */
     int (*poll_completions)(storageCompletion *out, int max);
 
-    /* Reports the storage engine's counters. */
-    void (*get_stats)(storageStats *out);
+    /* Reports the storage engine's own counters for INFO. Runs on the main
+     * thread, so a storage engine with its own threads reads a snapshot it
+     * refreshes itself. May be NULL when there is nothing to report. */
+    void (*info)(const storageInfoSink *sink);
 } storageEngine;
 
 /* ---------------------------------------------------------------------------
