@@ -45,11 +45,11 @@
 #define FC_IDLE_TICK_MS 10
 
 /* FlashCache init parameters, fixed until they come from configuration. */
-#define FC_INITIAL_INDEX_SIZE 1024 /* index entries per database */
-#define FC_MAX_DB_SIZE_PERCENT 90  /* garbage collection starts here */
-#define FC_MIN_GC_RATE 0           /* FlashCache picks the floor */
-#define FC_EVICT_TIME_LIMIT_US 5   /* eviction time budget */
-#define FC_OPTIMIZED_DELETE 1      /* a delete reads only the record header */
+#define FC_INITIAL_INDEX_SIZE 1024    /* index entries per database */
+#define FC_MAX_DB_SIZE_PERCENT 90     /* garbage collection starts here */
+#define FC_MIN_GC_RATE 0              /* FlashCache picks the floor */
+#define FC_EVICT_TIME_LIMIT_US 100000 /* eviction window, 100 ms. Inert until a control message arms it. */
+#define FC_OPTIMIZED_DELETE 1         /* a delete reads only the record header */
 
 typedef struct fcRequest {
     storageOpType op;
@@ -193,10 +193,7 @@ static bool fcSubmitToFlashCache(fcRequest *r) {
             }
         }
         rc = flashcachePutItem(r->db_id, r->key, r->key_len, r->put_bytes, (size_t)r->put_len);
-        if (rc == FC_ERR_THROTTLED) {
-            fc_io.io_stats.throttled++;
-            return false;
-        }
+        if (rc == FC_ERR_THROTTLED) return false;
         /* FlashCache copied the key and value. */
         fc_io.serializer.free_serialized(r->put_bytes);
         r->put_bytes = NULL;
@@ -210,10 +207,7 @@ static bool fcSubmitToFlashCache(fcRequest *r) {
      * request right after, so the request is not touched once it is handed over. */
     flashcacheReadTypes read_type = (r->op == STORAGE_OP_DEL) ? FC_DELETE : FC_READ;
     rc = flashcacheGetItem(r->db_id, r->key, r->key_len, read_type, r, fcGetItemCallback);
-    if (rc == FC_ERR_THROTTLED) {
-        fc_io.io_stats.throttled++;
-        return false;
-    }
+    if (rc == FC_ERR_THROTTLED) return false;
     if (rc != FC_OK) {
         /* No callback on failure. */
         r->completed_request.status = STORAGE_ERR_IO;
@@ -266,7 +260,11 @@ static void *fcIOThreadMain(void *arg) {
             if (r == &FC_STOP_REQUEST) break;
             if (r != NULL) {
                 progressed = true;
-                if (!fcSubmitToFlashCache(r)) held = r;
+                if (!fcSubmitToFlashCache(r)) {
+                    /* Counted once per request, not once per retry. */
+                    fc_io.io_stats.throttled++;
+                    held = r;
+                }
             }
         }
 

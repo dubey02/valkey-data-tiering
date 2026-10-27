@@ -10,7 +10,8 @@
  * where the key is raw bytes. It stores the serialized value bytes a callback
  * hands it, so a storage engine need not know the object layout.
  *
- * Every call into a storage engine comes from the main thread. */
+ * Every call into a storage engine comes from the main thread, except
+ * kill_threads, which the crash handler calls. */
 
 #ifndef VALKEY_STORAGE_H
 #define VALKEY_STORAGE_H
@@ -19,7 +20,7 @@
 #include <stdint.h>
 
 /* Version of this interface. A storage engine reports the one it was built
- * against. */
+ * against. Any layout change in this header bumps it. */
 #define VALKEY_STORAGE_API_VERSION 1
 
 /* A valkey object, opaque to a storage engine. */
@@ -178,8 +179,9 @@ typedef struct storageEngine {
     void (*kill_threads)(void);
 
     /* Asynchronous put, get, and delete. The key is freed by the caller
-     * after the call returns. The entry lives until its completion is polled.
-     * A delete completes with STORAGE_OK whether or not a record existed. */
+     * after the call returns. The entry is not modified or freed until its
+     * completion is polled. A delete completes with STORAGE_OK whether or not
+     * a record existed. */
     storageStatus (*put_async)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx);
     storageStatus (*get_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
     storageStatus (*del_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
