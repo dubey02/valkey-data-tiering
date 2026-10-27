@@ -50,7 +50,8 @@ typedef enum {
     STORAGE_OP_DEL = 2,
 } storageOpType;
 
-/* Callbacks that convert between a keyspace entry and its serialized bytes. */
+/* Callbacks that convert between a keyspace entry and its serialized bytes.
+ * A storage engine calls them on its own thread, never on the main thread. */
 typedef struct storageSerializer {
     /* A keyspace entry to bytes. Returns the byte length, or -1 on failure. A
      * storage engine reports a failure here as STORAGE_ERR_REJECTED. */
@@ -180,14 +181,16 @@ typedef struct storageEngine {
 
     /* Asynchronous put, get, and delete. The key is freed by the caller
      * after the call returns. The entry is not modified or freed until its
-     * completion is polled. A delete completes with STORAGE_OK whether or not
-     * a record existed. */
+     * completion is polled. A get consumes the record, so a second get of the
+     * same key reports STORAGE_NOT_FOUND until it is put again. A delete
+     * completes with STORAGE_OK whether or not a record existed. */
     storageStatus (*put_async)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx);
     storageStatus (*get_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
     storageStatus (*del_async)(uint32_t db_id, const char *key, size_t key_len, void *request_ctx);
 
-    /* Collects finished asynchronous requests, oldest first, at most max.
-     * Must not block the valkey server's main thread. */
+    /* Collects finished asynchronous requests, in completion order, at most
+     * max. Requests may finish out of submission order. Must not block the
+     * valkey server's main thread. */
     int (*poll_completions)(storageCompletion *out, int max);
 
     /* Reports the storage engine's own counters for INFO. Runs on the main

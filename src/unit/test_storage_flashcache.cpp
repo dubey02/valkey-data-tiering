@@ -368,9 +368,8 @@ TEST_F(StorageFlashCacheTest, EveryRequestCompletesExactlyOnce) {
     }
 }
 
-/* Completions come out in submission order when polled a few at a time. A
- * delete is queued last, so it arrives after every get. */
-TEST_F(StorageFlashCacheTest, PartialPollsPreserveCompletionOrder) {
+/* Polling a few at a time delivers every completion exactly once. */
+TEST_F(StorageFlashCacheTest, PartialPollsDeliverEveryCompletionOnce) {
     openEngine();
     const int total = 20;
     sds key = sdsnew("k");
@@ -379,19 +378,21 @@ TEST_F(StorageFlashCacheTest, PartialPollsPreserveCompletionOrder) {
     }
     ASSERT_EQ(engine->del_async(0, key, sdslen(key), (void *)(intptr_t)total), STORAGE_OK);
 
-    int seen = 0;
-    bool saw_del = false;
+    int seen[total + 1] = {};
+    int delivered = 0;
     storageCompletion out[3];
-    while (!saw_del) {
+    while (delivered < total + 1) {
         int n = waitForCompletions(out, 3);
         ASSERT_GT(n, 0) << "no completion arrived";
         for (int i = 0; i < n; i++) {
-            EXPECT_EQ((int)(intptr_t)out[i].request_ctx, seen) << "completion " << seen << " out of order";
-            if (out[i].op_type == STORAGE_OP_DEL) saw_del = true;
-            seen++;
+            int id = (int)(intptr_t)out[i].request_ctx;
+            ASSERT_GE(id, 0);
+            ASSERT_LE(id, total);
+            seen[id]++;
+            delivered++;
         }
     }
-    EXPECT_EQ(seen, total + 1);
+    for (int i = 0; i <= total; i++) EXPECT_EQ(seen[i], 1) << "completion " << i;
     sdsfree(key);
 }
 
@@ -458,8 +459,80 @@ TEST_F(StorageFlashCacheTest, PutThenGetReturnsTheStoredValue) {
     decrRefCount(want);
     decrRefCount((robj *)comp.value);
 
+    /* The get consumed the record. */
+    storageCompletion again = getAndWait(0, key);
+    EXPECT_EQ(again.status, STORAGE_NOT_FOUND);
+    EXPECT_EQ(again.value, nullptr);
+
     sdsfree(key);
     decrRefCount(entry);
+}
+
+/* An empty key is a valid key. */
+TEST_F(StorageFlashCacheTest, EmptyKeyRoundTrips) {
+    openEngine();
+    sds key = sdsempty();
+    dbEntry *entry = makeEntry(key, "v");
+    ASSERT_EQ(putAndWait(0, key, entry), STORAGE_OK);
+
+    storageCompletion comp = getAndWait(0, key);
+    ASSERT_EQ(comp.status, STORAGE_OK);
+    ASSERT_NE(comp.value, nullptr);
+    robj *want = createStringObject("v", 1);
+    EXPECT_TRUE(equalStringObjects((robj *)comp.value, want));
+    decrRefCount(want);
+    decrRefCount((robj *)comp.value);
+    EXPECT_EQ(delAndWait(0, key), STORAGE_OK);
+
+    sdsfree(key);
+    decrRefCount(entry);
+}
+
+/* FlashCache sizes its log in 4096 byte pages. 1g parses to 10^9 bytes, which
+ * is not one, so open refuses it instead of letting FlashCache assert. */
+TEST_F(StorageFlashCacheTest, RejectsACapacityThatIsNotPageAligned) {
+    cfg.capacity_bytes = 1000000000;
+    cfg.logger = recordingLog;
+    logged_msg[0] = '\0';
+    logged_level = -1;
+
+    EXPECT_EQ(engine->open(&cfg), STORAGE_ERR_REJECTED);
+    EXPECT_EQ(logged_level, STORAGE_LOG_WARNING);
+    EXPECT_NE(strstr(logged_msg, "4096"), nullptr);
+}
+
+/* A record FlashCache has flushed out of its staging buffer is read back from
+ * disk through the cron callback path. Filling past the 1 MiB flush threshold
+ * forces the flush, and the disk counters show which path the get took. */
+TEST_F(StorageFlashCacheTest, GetAfterAFlushReadsFromDisk) {
+    openEngine();
+    sds key = sdsnew("flushed");
+    dbEntry *entry = makeEntry(key, "on-disk");
+    ASSERT_EQ(putAndWait(0, key, entry), STORAGE_OK);
+
+    const size_t filler_len = 2 * 1024 * 1024;
+    sds blob = sdsnewlen(NULL, filler_len);
+    for (size_t i = 0; i < filler_len; i++) blob[i] = (char)(i * 131 + 17);
+    sds filler_key = sdsnew("filler");
+    dbEntry *filler = objectSetKeyAndExpire(createStringObject(blob, filler_len), filler_key, EXPIRY_NONE);
+    ASSERT_EQ(putAndWait(0, filler_key, filler), STORAGE_OK);
+    ASSERT_TRUE(waitForStat("total_num_disk_writes", [](unsigned long long v) { return v >= 1; }));
+    unsigned long long reads_before = readStats()["total_num_disk_reads"];
+
+    storageCompletion comp = getAndWait(0, key);
+    ASSERT_EQ(comp.status, STORAGE_OK);
+    ASSERT_NE(comp.value, nullptr);
+    robj *want = createStringObject("on-disk", strlen("on-disk"));
+    EXPECT_TRUE(equalStringObjects((robj *)comp.value, want));
+    decrRefCount(want);
+    decrRefCount((robj *)comp.value);
+    EXPECT_TRUE(waitForStat("total_num_disk_reads", [reads_before](unsigned long long v) { return v > reads_before; }));
+
+    sdsfree(blob);
+    sdsfree(key);
+    sdsfree(filler_key);
+    decrRefCount(entry);
+    decrRefCount(filler);
 }
 
 /* A get of a key that was never put returns not found and no value. */
@@ -569,7 +642,7 @@ TEST_F(StorageFlashCacheTest, InfoReportsTheItemsHeld) {
     ASSERT_EQ(putAndWait(0, key, entry), STORAGE_OK);
     EXPECT_TRUE(waitForStat("total_num_items", [](unsigned long long v) { return v >= 1; }));
     StatMap after_put = readStats();
-    EXPECT_GE(after_put["total_num_bytes"], 1u);
+    EXPECT_GE(after_put["allocated_db_size_bytes"], 1u);
 
     ASSERT_EQ(delAndWait(0, key), STORAGE_OK);
     unsigned long long held = after_put["total_num_items"];

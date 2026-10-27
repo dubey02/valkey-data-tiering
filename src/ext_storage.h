@@ -22,7 +22,7 @@ void extStorageInit(void);
 void extStorageDeinit(void);
 
 /* Handles finished requests. */
-void extStorageCron(void);
+void extStorageBeforeSleep(void);
 
 /* Crash handler only. Stops the storage engine threads with no cleanup. */
 void extStorageKillThreads(void);

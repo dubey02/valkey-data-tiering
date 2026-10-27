@@ -1813,10 +1813,6 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     }
 #endif
 
-#ifdef USE_EXT_STORAGE
-    extStorageCron();
-#endif
-
     if (moduleCount()) {
         run_with_period(100) modulesCron();
     }
@@ -1972,6 +1968,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* We should handle pending reads clients ASAP after event loop. */
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
+
+#ifdef USE_EXT_STORAGE
+    extStorageBeforeSleep();
+#endif
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     int conn_pending = connTypeProcessPendingData();

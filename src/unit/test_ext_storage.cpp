@@ -267,6 +267,11 @@ TEST_F(StorageMockTest, PutGetDelRoundTrip) {
     EXPECT_EQ(objectGetKey(out), nullptr);
     decrRefCount(out);
 
+    /* The get consumed the record. */
+    EXPECT_EQ(readStats()["total_num_items"], 0u);
+    ASSERT_EQ(getAndWait(0, key, &out), STORAGE_NOT_FOUND);
+
+    ASSERT_EQ(putAndWait(0, key, entry, &stored), STORAGE_OK);
     ASSERT_EQ(delAndWait(0, key), STORAGE_OK);
     ASSERT_EQ(getAndWait(0, key, &out), STORAGE_NOT_FOUND);
     /* A delete of a missing record is still OK. */
@@ -412,7 +417,7 @@ TEST_F(StorageMockTest, OverwriteReplacesRatherThanAccumulates) {
 
     StatMap st = readStats();
     EXPECT_EQ(st["total_num_items"], 1u);
-    EXPECT_EQ(st["total_num_bytes"], serializedLen("bb"));
+    EXPECT_EQ(st["allocated_db_size_bytes"], serializedLen("bb"));
 
     robj *out = nullptr;
     ASSERT_EQ(getAndWait(0, key, &out), STORAGE_OK);
@@ -440,7 +445,7 @@ TEST_F(StorageMockTest, ReportsFullWhenOverCapacity) {
     /* The rejected write left nothing behind. */
     StatMap st = readStats();
     EXPECT_EQ(st["total_num_items"], 1u);
-    EXPECT_EQ(st["total_num_bytes"], serializedLen("12345"));
+    EXPECT_EQ(st["allocated_db_size_bytes"], serializedLen("12345"));
 
     sdsfree(k1);
     sdsfree(k2);
@@ -457,6 +462,7 @@ TEST_F(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     int token = 42;
 
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, &token), STORAGE_OK);
+    EXPECT_EQ(readStats()["total_num_items"], 0u);
 
     /* One poll both executes the queued put and delivers its completion. */
     storageCompletion comps[4] = {};
@@ -618,7 +624,7 @@ TEST_F(StorageMockTest, ClosingAfterPollingKeepsNothing) {
     openEngine();
     StatMap st = readStats();
     EXPECT_EQ(st["total_num_items"], 0u);
-    EXPECT_EQ(st["total_num_bytes"], 0u);
+    EXPECT_EQ(st["allocated_db_size_bytes"], 0u);
 
     robj *out = nullptr;
     EXPECT_EQ(getAndWait(0, key, &out), STORAGE_NOT_FOUND);

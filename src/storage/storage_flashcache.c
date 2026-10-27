@@ -51,6 +51,9 @@
 #define FC_EVICT_TIME_LIMIT_US 100000 /* eviction window, 100 ms. Inert until a control message arms it. */
 #define FC_OPTIMIZED_DELETE 1         /* a delete reads only the record header */
 
+/* FlashCache writes its log in pages of this size. */
+#define FC_PAGE_SIZE 4096
+
 typedef struct fcRequest {
     storageOpType op;
     uint32_t db_id;
@@ -67,10 +70,18 @@ typedef struct fcRequest {
 
 /* The counters INFO reports. */
 typedef struct fcStatsSnapshot {
-    uint64_t items;
-    uint64_t bytes;
-    uint64_t throttled;
-    uint64_t evicted;
+    /* Number of records stored on flash. */
+    uint64_t num_items;
+    /* Bytes of flash the stored records take up. */
+    uint64_t allocated_db_size_bytes;
+    /* Number of puts FlashCache turned away. Each one was retried later. */
+    uint64_t num_requests_throttled;
+    /* Number of records FlashCache deleted to make room. */
+    uint64_t num_items_evicted;
+    /* Number of reads served from the flash device. */
+    uint64_t num_disk_reads;
+    /* Number of times the write buffer was written to the flash device. */
+    uint64_t num_disk_writes;
 } fcStatsSnapshot;
 
 /* The IO thread refreshes the snapshot INFO reads at this interval. */
@@ -108,8 +119,10 @@ static struct {
 
     /* Counters the IO thread owns. Nothing else reads them. */
     struct {
-        uint64_t throttled;
-        uint64_t evicted;
+        /* Number of puts FlashCache turned away. Each one was retried later. */
+        uint64_t num_requests_throttled;
+        /* Number of records FlashCache deleted to make room. */
+        uint64_t num_items_evicted;
     } io_stats;
     /* The copy INFO reads. The IO thread rewrites it every
      * FC_STATS_REFRESH_US under snap_mutex, and fcInfo copies it out under the
@@ -162,10 +175,12 @@ static void fcRefreshStatsSnapshot(void) {
     fc_io.snap_refreshed_us = now;
 
     fcStatsSnapshot snap = {
-        .items = flashcacheGetCountBasedMetric(FC_NUM_ITEMS),
-        .bytes = flashcacheGetCountBasedMetric(FC_ALLOCATED_DB_SIZE_BYTES),
-        .throttled = fc_io.io_stats.throttled,
-        .evicted = fc_io.io_stats.evicted,
+        .num_items = flashcacheGetCountBasedMetric(FC_NUM_ITEMS),
+        .allocated_db_size_bytes = flashcacheGetCountBasedMetric(FC_ALLOCATED_DB_SIZE_BYTES),
+        .num_requests_throttled = fc_io.io_stats.num_requests_throttled,
+        .num_items_evicted = fc_io.io_stats.num_items_evicted,
+        .num_disk_reads = flashcacheGetCountBasedMetric(FC_NUM_DISK_READ),
+        .num_disk_writes = flashcacheGetCountBasedMetric(FC_NUM_DISK_WRITE),
     };
     pthread_mutex_lock(&fc_io.snap_mutex);
     fc_io.snap = snap;
@@ -262,7 +277,7 @@ static void *fcIOThreadMain(void *arg) {
                 progressed = true;
                 if (!fcSubmitToFlashCache(r)) {
                     /* Counted once per request, not once per retry. */
-                    fc_io.io_stats.throttled++;
+                    fc_io.io_stats.num_requests_throttled++;
                     held = r;
                 }
             }
@@ -298,11 +313,9 @@ static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key,
     fcRequest *r = zmalloc(sizeof(*r));
     r->op = op;
     r->db_id = db_id;
-    r->key = NULL;
-    if (key_len > 0) {
-        r->key = zmalloc(key_len);
-        memcpy(r->key, key, key_len);
-    }
+    /* Always a live pointer, even for an empty key. FlashCache asserts on NULL. */
+    r->key = zmalloc(key_len);
+    memcpy(r->key, key, key_len);
     r->key_len = key_len;
     r->entry = entry;
     r->put_bytes = NULL;
@@ -335,10 +348,12 @@ static void fcInfo(const storageInfoSink *s) {
     fcStatsSnapshot snap = fc_io.snap;
     pthread_mutex_unlock(&fc_io.snap_mutex);
 
-    s->add_ulong_long(s->ctx, "total_num_items", snap.items);
-    s->add_ulong_long(s->ctx, "total_num_bytes", snap.bytes);
-    s->add_ulong_long(s->ctx, "total_num_requests_throttled", snap.throttled);
-    s->add_ulong_long(s->ctx, "total_num_items_evicted", snap.evicted);
+    s->add_ulong_long(s->ctx, "total_num_items", snap.num_items);
+    s->add_ulong_long(s->ctx, "allocated_db_size_bytes", snap.allocated_db_size_bytes);
+    s->add_ulong_long(s->ctx, "total_num_requests_throttled", snap.num_requests_throttled);
+    s->add_ulong_long(s->ctx, "total_num_items_evicted", snap.num_items_evicted);
+    s->add_ulong_long(s->ctx, "total_num_disk_reads", snap.num_disk_reads);
+    s->add_ulong_long(s->ctx, "total_num_disk_writes", snap.num_disk_writes);
 }
 
 /* Collects finished requests. */
@@ -391,7 +406,7 @@ static uint64_t fcMonotonicClockUs(void) {
 static void fcEvictionCb(void *context, uint32_t db_id, char *key, size_t key_len) {
     (void)context;
     (void)key;
-    if (fc_io.io_stats.evicted++ == 0 && fc_io.logger != NULL) {
+    if (fc_io.io_stats.num_items_evicted++ == 0 && fc_io.logger != NULL) {
         fc_io.logger(STORAGE_LOG_WARNING,
                      "FlashCache evicted a record (db %u, key length %zu). Evicted keys stay in memory "
                      "until eviction is wired to the valkey server. Fetches of them will report not found.",
@@ -454,6 +469,11 @@ static storageStatus fcOpen(const storageConfig *cfg) {
     }
     if (cfg->capacity_bytes == 0) {
         cfg->logger(STORAGE_LOG_WARNING, "flashcache: ext-storage-capacity must be more than zero");
+        return STORAGE_ERR_REJECTED;
+    }
+    /* FlashCache asserts on a log size that is not page aligned. */
+    if (cfg->capacity_bytes % FC_PAGE_SIZE != 0) {
+        cfg->logger(STORAGE_LOG_WARNING, "flashcache: ext-storage-capacity must be a multiple of %d bytes", FC_PAGE_SIZE);
         return STORAGE_ERR_REJECTED;
     }
     /* No options are recognized yet. */

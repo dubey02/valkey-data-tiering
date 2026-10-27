@@ -234,7 +234,7 @@ void extStorageInit(void) {
 }
 
 /* Completions
- * Cron and the shutdown drain both go through here. */
+ * extStorageBeforeSleep and the shutdown drain both go through here. */
 
 /* Handles one finished request. */
 static void extStorageProcessCompletion(const storageCompletion *c) {
@@ -261,8 +261,9 @@ static int extStoragePollCompletions(void) {
     return n;
 }
 
-/* Runs from serverCron. */
-void extStorageCron(void) {
+/* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
+ * the loop at least every tick, so a completion waits at most that long. */
+void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
     extStoragePollCompletions();
 }

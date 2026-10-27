@@ -67,8 +67,10 @@ static struct {
     /* The counters INFO reports. Everything here runs on the main thread, so
      * INFO reads them as they are. */
     struct {
+        /* Number of records stored. */
         uint64_t total_num_items;
-        uint64_t total_num_bytes;
+        /* Bytes the stored records take up. */
+        uint64_t allocated_db_size_bytes;
     } stats;
 } mock;
 
@@ -125,12 +127,12 @@ static storageStatus mockPut(uint32_t db_id, const char *key, size_t klen, const
     /* On overwrite, the old value's bytes come back, so the capacity check
      * compares against the final cost. */
     size_t freed = *slot ? (*slot)->vlen : 0;
-    if (mock.cfg.capacity_bytes && mock.stats.total_num_bytes - freed + (uint64_t)vlen > mock.cfg.capacity_bytes) {
+    if (mock.cfg.capacity_bytes && mock.stats.allocated_db_size_bytes - freed + (uint64_t)vlen > mock.cfg.capacity_bytes) {
         st = STORAGE_ERR_FULL;
     } else {
         if (*slot) {
             free((*slot)->val);
-            mock.stats.total_num_bytes -= (*slot)->vlen;
+            mock.stats.allocated_db_size_bytes -= (*slot)->vlen;
         } else {
             mockRecord *r = mockAlloc(sizeof(*r));
             r->key = mockAlloc(klen);
@@ -146,7 +148,7 @@ static storageStatus mockPut(uint32_t db_id, const char *key, size_t klen, const
         (*slot)->val = mockAlloc((size_t)vlen);
         memcpy((*slot)->val, vbytes, (size_t)vlen);
         (*slot)->vlen = (size_t)vlen;
-        mock.stats.total_num_bytes += (size_t)vlen;
+        mock.stats.allocated_db_size_bytes += (size_t)vlen;
         if (stored_bytes) *stored_bytes = (size_t)vlen;
     }
 
@@ -170,6 +172,12 @@ static storageStatus mockGet(uint32_t db_id, const char *key, size_t klen, valke
             *value_out = obj;
             st = STORAGE_OK;
         }
+        /* A get consumes the record, as FlashCache does. */
+        mockRecord *victim = *slot;
+        *slot = victim->next;
+        mock.stats.allocated_db_size_bytes -= victim->vlen;
+        mock.stats.total_num_items--;
+        mockFreeRecord(victim);
     }
     return st;
 }
@@ -181,7 +189,7 @@ static storageStatus mockDel(uint32_t db_id, const char *key, size_t klen) {
     if (*slot != NULL) {
         mockRecord *victim = *slot;
         *slot = victim->next;
-        mock.stats.total_num_bytes -= victim->vlen;
+        mock.stats.allocated_db_size_bytes -= victim->vlen;
         mock.stats.total_num_items--;
         mockFreeRecord(victim);
     }
@@ -231,7 +239,7 @@ static storageStatus mockDelAsync(uint32_t db_id, const char *key, size_t key_le
 
 static void mockInfo(const storageInfoSink *s) {
     s->add_ulong_long(s->ctx, "total_num_items", mock.stats.total_num_items);
-    s->add_ulong_long(s->ctx, "total_num_bytes", mock.stats.total_num_bytes);
+    s->add_ulong_long(s->ctx, "allocated_db_size_bytes", mock.stats.allocated_db_size_bytes);
 }
 
 /* Executes up to max queued requests and enqueues a completion for each. Stops
