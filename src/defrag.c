@@ -660,6 +660,8 @@ static void defragKey(defragKeysCtx *ctx, robj **elemref) {
     ob = *elemref;
 
     if (bgIteration_isEntryInuse(ob)) return;
+    /* The storage engine may be reading the value, or it is on flash. */
+    if (ob->storage_state != STORAGE_STATE_ONLY_MEMORY) return;
 
     /* Try to defrag robj and/or string value. */
     if ((newob = activeDefragStringOb(ob))) {

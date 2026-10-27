@@ -902,6 +902,21 @@ static int createOneOfEachObject(robj **objs) {
     return n;
 }
 
+/* Adds one element to a collection, since the keyspace holds no empty ones. */
+static void addOneElement(robj *o) {
+    sds one = sdsnew("1");
+    robj *ele = createStringObject("1", 1);
+    int out_flags = 0;
+    switch (o->type) {
+    case OBJ_LIST: listTypePush(o, ele, LIST_TAIL); break;
+    case OBJ_SET: setTypeAdd(o, one); break;
+    case OBJ_HASH: hashTypeSet(o, one, one, EXPIRY_NONE, HASH_SET_COPY, NULL); break;
+    case OBJ_ZSET: zsetAdd(o, 1, one, ZADD_IN_NONE, &out_flags, NULL); break;
+    }
+    decrRefCount(ele);
+    sdsfree(one);
+}
+
 TEST(StorageStateTest, NewObjectsStartInMemory) {
     robj *objs[NUM_TEST_OBJECTS];
     int n = createOneOfEachObject(objs);
@@ -1009,6 +1024,12 @@ class SpillSelectTest : public ::testing::Test {
         return found;
     }
 
+    /* Whether spill selection would pick 'entry', the only candidate there. */
+    bool isSelected(robj *entry) {
+        int dbid;
+        return spillSelectCandidate(&dbid) == entry;
+    }
+
     /* Adds a key to 'db' in 'slot', with a TTL unless expire is -1, and returns its entry. */
     robj *addKeyTo(serverDb *db, int slot, const char *key, robj *val, long long expire) {
         sds k = sdsnew(key);
@@ -1056,6 +1077,7 @@ TEST_F(SpillSelectTest, EveryTypeIsACandidateExceptEmbeddedAndIntStrings) {
         int type = objs[i]->type;
         int encoding = objs[i]->encoding;
         bool expected = encoding != OBJ_ENCODING_EMBSTR && encoding != OBJ_ENCODING_INT;
+        addOneElement(objs[i]);
         robj *entry = addKey("key", objs[i]);
 
         int dbid = -1;
@@ -1145,6 +1167,17 @@ TEST_F(SpillSelectTest, SkipsExpiredKeys) {
 
     int dbid = -1;
     EXPECT_EQ(spillSelectCandidate(&dbid), live);
+}
+
+/* Field expiry reads and changes the hash's value, so it has to stay in DRAM. */
+TEST_F(SpillSelectTest, SkipsHashesWithFieldExpirations) {
+    robj *hash = createHashObject();
+    hashTypeSet(hash, sdsnew("field"), sdsnew("value"), EXPIRY_NONE, HASH_SET_TAKE_FIELD | HASH_SET_TAKE_VALUE, NULL);
+    robj *entry = addKey("hash", hash);
+    EXPECT_TRUE(isSelected(entry));
+    hashTypeSet(entry, sdsnew("ttl"), sdsnew("value"), mstime() + 100000, HASH_SET_TAKE_FIELD | HASH_SET_TAKE_VALUE,
+                NULL);
+    EXPECT_FALSE(isSelected(entry));
 }
 
 /* Non-candidates must not crowd the candidate out of the pool. */
@@ -1449,6 +1482,108 @@ TEST_F(SpillSelectTest, PicksKeysAcrossSlots) {
         int dbid = -1;
         EXPECT_NE(spillSelectCandidate(&dbid), nullptr) << "selection " << i;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Spill submission
+ * ---------------------------------------------------------------------------*/
+
+class SpillSubmitTest : public SpillSelectTest {
+  protected:
+    void SetUp() override {
+        SpillSelectTest::SetUp();
+        extStorageTestResetRegistry();
+        server.hz = CONFIG_DEFAULT_HZ;
+        server.logfile = zstrdup("");
+        crc64_init();
+        server.ext_storage_enabled = 1;
+        server.ext_storage_engine = zstrdup("mock");
+        server.ext_storage_path = zstrdup("");
+        extStorageInit();
+    }
+
+    void TearDown() override {
+        storageMockRunIo(1000);
+        storageCompletion done[16];
+        int n;
+        while ((n = storageMockEngine()->poll_completions(done, 16)) > 0) {
+            for (int i = 0; i < n; i++) {
+                if (done[i].op_type == STORAGE_OP_PUT) zfree(done[i].request_ctx);
+            }
+        }
+        extStorageDeinit();
+        zfree(server.ext_storage_engine);
+        zfree(server.ext_storage_path);
+        zfree(server.logfile);
+        SpillSelectTest::TearDown();
+    }
+};
+
+TEST_F(SpillSubmitTest, SubmitsTheValueAndCountsItsDram) {
+    robj *entry = addRawKey("key");
+    size_t before = spillInflightRamBytes();
+
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    EXPECT_EQ(spillInflightRamBytes() - before, sdsAllocSize((sds)objectGetVal(entry)));
+
+    /* The engine writes the borrowed value and hands back our request. */
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    storageCompletion comp = {};
+    ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
+    EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+    EXPECT_NE(comp.request_ctx, nullptr);
+    zfree(comp.request_ctx);
+}
+
+/* A collection is sized from sampled elements, so only the value's DRAM is
+ * counted, not the object that keeps the key. */
+TEST_F(SpillSubmitTest, CountsTheDramOfACollection) {
+    char element[100];
+    memset(element, 'e', sizeof(element));
+
+    size_t used_before = zmalloc_used_memory();
+    robj *list = createQuicklistObject(-2, 0);
+    for (int i = 0; i < 1000; i++) {
+        robj *ele = createStringObject(element, sizeof(element));
+        listTypePush(list, ele, LIST_TAIL);
+        decrRefCount(ele);
+    }
+    size_t value_bytes = zmalloc_used_memory() - used_before - zmalloc_size(list);
+    robj *entry = addKey("list", list);
+    size_t before = spillInflightRamBytes();
+
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    EXPECT_NEAR((double)(spillInflightRamBytes() - before), (double)value_bytes, value_bytes * 0.1);
+}
+
+TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
+    /* Fill the engine's queue. */
+    int queued = 0;
+    for (; queued < 1000; queued++) {
+        char key[32];
+        snprintf(key, sizeof(key), "queued%d", queued);
+        if (spillItem(0, addRawKey(key)) != STORAGE_OK) break;
+    }
+    ASSERT_LT(queued, 1000) << "the engine's queue never filled";
+
+    robj *entry = addRawKey("key");
+    size_t before = spillInflightRamBytes();
+
+    EXPECT_EQ(spillItem(0, entry), STORAGE_WOULDBLOCK);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(spillInflightRamBytes(), before);
+}
+
+TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
+    robj *entry = addRawKey("key");
+    size_t before = spillInflightRamBytes();
+
+    /* The engine rejects a database it wasn't opened with. */
+    EXPECT_EQ(spillItem(server.dbnum, entry), STORAGE_ERR_REJECTED);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(spillInflightRamBytes(), before);
 }
 
 #endif /* USE_EXT_STORAGE */
