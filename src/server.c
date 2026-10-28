@@ -1992,6 +1992,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Release keys from bgIteration before processing unblocked clients. */
     bgIteration_beforeSleep();
+
+    externalStorage_processCompletedRequests();
     /* Handle blocked clients.
      * must be done before flushAppendOnlyFile, in case of appendfsync=always,
      * since the unblocked clients may write data. */
@@ -5027,6 +5029,10 @@ int processCommand(client *c) {
     }
 
     if (throttle_throttleClientIfNeeded(c)) return C_OK;
+
+    // Tiered Storage Need to figure out best place to put this handler but something like
+    // if (tieredstorage_blockClientIfNeeded(c)) return C_OK;
+    if (externalStorage_blockClientIfNeeded(c)) return C_OK;
 
     /* Exec the command */
     if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&

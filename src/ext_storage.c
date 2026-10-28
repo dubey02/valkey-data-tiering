@@ -9,6 +9,7 @@
 
 #include "server.h"
 
+#define USE_EXT_STORAGE
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
@@ -480,4 +481,69 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     return STORAGE_OK;
 }
 
+#define EXT_STORAGE_POLL_MAX_BATCH_SIZE 128 // arbitrary
+
+
+static void handleGetCompletion(storageCompletion r) {
+    serverAssert(r.op_type == STORAGE_OP_GET);
+    // As far as I can tell there's no gauranteed status.
+    // If there is we should probably check status = STORAGE_OK;
+    dbEntry entry = dbFind(r.db_id, (sds)r.request_ctx.key);
+    serverAssert(entry.storage_state == STORAGE_STATE_COPYING_TO_MEMORY);
+    // todo: see if it still makes sense to do something similar to replaceDbEntryValue
+    objectSetVal(entry, r.value);
+
+}
+
+static void processCompletedRequest(storageCompletion r) {
+    switch (r.op_type) {
+    case STORAGE_OP_GET: handleGetCompletion(r);
+    case STORAGE_OP_PUT: serverPanic("Unhandled");
+    case STORAGE_OP_DEL: serverPanic("Unhandled");
+    default: serverPanic("Unhandled storage op");
+    }
+}
+
+void externalStorage_processCompletedRequests(void) {
+    if (!ext_storage.open) return;
+
+    storageCompletion requests[EXT_STORAGE_POLL_MAX_BATCH_SIZE];
+    int num_requests = ext_storage.engine->poll_completions(requests, EXT_STORAGE_POLL_MAX_BATCH_SIZE);
+
+    for (int i = 0; i < num_requests; i++) {
+        processCompletedRequest(requests[i]);
+    }
+}
+
+// Spilling
+// And then within tiered storage we need something like 
+
+/*
+bool tieredstorage_blockClientIfNeeded(c) {
+    // if any of the keys are spilled for this command, then we need to block the client for tiered storage
+    sds* spilledKeys = determineSpilledKeys(c->argv); // or whatever the argument for multiple keys is
+    fetchKeys();
+    blockClientInUseOnKeys(); // all the keys that spilled
+    return C_OK; // this prevents the command from exec
+    // otherwise we just proceed
+    return C_ERR;
+}
+
+void fetchKeys(sds*) {
+    for every key in teh sds call fcGetAsync
+}
+
+sds* determineSpilledKeys(sds* keys) {
+    // for each key, check if storage state is in memory
+    // if it is add it to the return list
+}
+
+// logic will need to be added for edge cases like multi/exec in milestone 5
+
+// logic will also be needed unblock the keys when fetching from disk
+
+*/
+
+
 #endif /* USE_EXT_STORAGE */
+

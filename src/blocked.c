@@ -242,6 +242,7 @@ void unblockClient(client *c, int queue_for_reprocessing) {
     case BLOCKED_INUSE:
         unlinkBlockInUseClient(c);
         break;
+    // case BLOCKED_TIERED_STORAGE
     default:
         serverPanic("Unknown btype in unblockClient().");
     }
@@ -449,7 +450,7 @@ void handleClientsBlockedOnKeys(void) {
  * The client will unblocked as soon as one of the keys in 'keys' value was updated.
  * the parameter unblock_on_nokey can be used to force client to be unblocked even in the case the key
  * is updated to become unavailable, either by type change (override), deletion or swapdb */
-void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, int unblock_on_nokey) {
+void blockForKeys(client *c, int btype, robj **keys, int numkeys, mstime_t timeout, int unblock_on_nokey) { // Need this for tiered storage
     dictEntry *db_blocked_entry, *db_blocked_existing_entry, *client_blocked_entry;
     list *l;
     int j;
@@ -911,10 +912,10 @@ static bool isClientBlockedInUse(client *c) {
  * in another DB is unblocked.
  *
  * The client remains blocked until ALL of its keys are unblocked via
- * unblockClientsInUseOnKey().
+ * unblockClientsInUseOnKey(). // tiered storage needs to call this
  *
  * The caller should return without executing the command after calling this. */
-void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {
+void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) { // we need to call this for any keys that are spilled tiered storage
     serverAssert(!c->flag.blocked && !c->flag.unblocked);
     serverAssert(c->flag.pending_command == 1);
     serverAssert(num_keys > 0);

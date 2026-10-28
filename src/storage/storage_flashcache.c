@@ -366,6 +366,7 @@ static int fcPollCompletions(storageCompletion *out, int max) {
     fcRequest *r;
     while (total < max && fifoPop(done, (void **)&r)) {
         out[total++] = r->completed_request;
+        // somewhere here we need to process the request to handle locking/unlocking
         fcFreeRequest(r);
     }
 
@@ -419,6 +420,35 @@ static void fcEvictionCb(void *context, uint32_t db_id, char *key, size_t key_le
 static void fcControlMsgCb(void *context) {
     (void)context;
 }
+
+// Spilling
+// And then within tiered storage we need something like 
+
+/*
+bool tieredstorage_blockClientIfNeeded(c) {
+    // if any of the keys are spilled for this command, then we need to block the client for tiered storage
+    sds* spilledKeys = determineSpilledKeys(c->argv); // or whatever the argument for multiple keys is
+    fetchKeys();
+    blockClientInUseOnKeys(); // all the keys that spilled
+    return C_OK; // this prevents the command from exec
+    // otherwise we just proceed
+    return C_ERR;
+}
+
+void fetchKeys(sds*) {
+    for every key in teh sds call fcGetAsync
+}
+
+sds* determineSpilledKeys(sds* keys) {
+    // for each key, check if storage state is in memory
+    // if it is add it to the return list
+}
+
+// logic will need to be added for edge cases like multi/exec in milestone 5
+
+// logic will also be needed unblock the keys when fetching from disk
+
+*/
 
 /* ---------------------------------------------------------------------------
  * Lifecycle
@@ -601,3 +631,5 @@ static const storageEngine flashcache_storage_engine = {
 const storageEngine *storageFlashCacheEngine(void) {
     return &flashcache_storage_engine;
 }
+
+
