@@ -1390,6 +1390,16 @@ size_t hashtableMemUsage(const hashtable *ht) {
     return sizeof(hashtable) + metasize + sizeof(bucket) * num_buckets;
 }
 
+/* Like hashtableMemUsage(), but counts the table struct at its allocated size
+ * rather than its requested size, so it is what freeing the table frees,
+ * leaving out the entries. Bucket arrays are a power of two buckets, which the
+ * allocator doesn't round. */
+size_t hashtableAllocSize(const hashtable *ht) {
+    size_t num_buckets = numBuckets(ht->bucket_exp[0]) + numBuckets(ht->bucket_exp[1]);
+    num_buckets += ht->child_buckets[0] + ht->child_buckets[1];
+    return zmalloc_size((void *)ht) + sizeof(bucket) * num_buckets;
+}
+
 /* Pauses automatic shrinking. This can be called before deleting a lot of
  * entries, to prevent automatic shrinking from being triggered multiple times.
  * Call hashtableResumeAutoShrink afterwards to restore automatic shrinking. */

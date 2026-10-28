@@ -54,8 +54,9 @@ typedef enum {
  * A storage engine calls them on its own thread, never on the main thread. */
 typedef struct storageSerializer {
     /* A keyspace entry to bytes. Returns the byte length, or -1 on failure. A
-     * storage engine reports a failure here as STORAGE_ERR_REJECTED. */
-    int (*serialize)(const char *key, size_t key_len, const valkeyObject *entry, char **out);
+     * storage engine reports a failure here as STORAGE_ERR_REJECTED.
+     * request_ctx is the token from the put_async call that lent the entry. */
+    int (*serialize)(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out);
 
     /* Bytes to a keyless value object. Returns NULL on a malformed buffer. */
     valkeyObject *(*deserialize)(const char *key, size_t key_len, const char *bytes, int len);

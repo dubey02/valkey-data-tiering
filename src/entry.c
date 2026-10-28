@@ -511,6 +511,20 @@ size_t entryMemUsage(entry *entry) {
     return mem;
 }
 
+/* Returns the DRAM freeing the entry frees: its allocation, plus its value when
+ * that is allocated on its own. Unlike entryMemUsage(), an embedded value is
+ * counted with the allocator's rounding, since it shares the entry's allocation. */
+size_t entryAllocSize(const entry *entry) {
+    size_t mem = zmalloc_size(entryGetAllocPtr(entry));
+    if (entryHasStringRef(entry)) {
+        stringRef *string_ref = entryGetStringRefRef(entry);
+        if (string_ref) mem += zmalloc_size(string_ref);
+    } else if (!entryHasEmbeddedValue(entry)) {
+        mem += sdsAllocSize(*entryGetSdsValueRef(entry));
+    }
+    return mem;
+}
+
 /* Defragments an entry (field-value pair) if needed, using the
  * provided defrag functions. The defrag functions return NULL if the allocation
  * was not moved, otherwise they return a pointer to the new memory location.

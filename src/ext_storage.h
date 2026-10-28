@@ -43,9 +43,45 @@ sds extStorageEngineInfoString(sds info);
 /* The serialization callbacks. */
 const storageSerializer *extStorageSerializer(void);
 
+/* The same callbacks, except that serializing a value also sizes it for the
+ * spill accounting below. Every put to a storage engine opened with these
+ * passes a spillSizing as its request_ctx. */
+const storageSerializer *extStorageSpillSerializer(void);
+
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
 robj *spillSelectCandidate(int *dbid);
+
+/* Spill accounting: what spills in flight will free. */
+
+/* A spill's place in the accounting, passed as its put_async request_ctx. The
+ * serializer fills it in on the storage engine's thread, before the engine
+ * posts the completion. */
+typedef struct spillSizing {
+    bool sized;       /* The serializer has measured the value. */
+    size_t ram_bytes; /* What freeing the value frees, once sized. */
+} spillSizing;
+
+/* Counts a spill as in flight. Called before put_async. */
+void spillAccountSubmit(spillSizing *s);
+
+/* Takes a spill back out, once its completion is polled or put_async refuses it. */
+void spillAccountFinish(spillSizing *s);
+
+/* What spills in flight will free: their exact sizes once sized, the mean before. */
+size_t spillAccountInflightRamBytes(void);
+
+/* Clears the accounting. Nothing may be in flight. */
+void spillAccountReset(void);
+
+typedef struct spillAccountStats {
+    unsigned long inflight_requests; /* Spills submitted and not finished. */
+    unsigned long unsized_requests;  /* Of those, the ones the serializer hasn't sized. */
+    size_t sized_ram_bytes;          /* What the sized ones will free. */
+    size_t ram_mean;                 /* Mean measured size. Each unsized spill counts as this. */
+} spillAccountStats;
+
+void spillAccountGetStats(spillAccountStats *out);
 
 #endif /* USE_EXT_STORAGE */
 

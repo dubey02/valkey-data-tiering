@@ -114,11 +114,16 @@ static void *mockAlloc(size_t n) {
  * the interface. Execution calls them when it retires a queued request.
  * ---------------------------------------------------------------------------*/
 
-static storageStatus mockPut(uint32_t db_id, const char *key, size_t klen, const valkeyObject *entry, size_t *stored_bytes) {
+static storageStatus mockPut(uint32_t db_id,
+                             const char *key,
+                             size_t klen,
+                             const valkeyObject *entry,
+                             void *request_ctx,
+                             size_t *stored_bytes) {
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
 
     char *vbytes = NULL;
-    int vlen = mock.cfg.serializer.serialize(key, klen, entry, &vbytes);
+    int vlen = mock.cfg.serializer.serialize(key, klen, entry, request_ctx, &vbytes);
     if (vlen < 0 || vbytes == NULL) return STORAGE_ERR_REJECTED;
 
     storageStatus st = STORAGE_OK;
@@ -258,7 +263,8 @@ int storageMockRunIo(int max) {
 
         switch (req->op) {
         case STORAGE_OP_PUT:
-            comp->status = mockPut(req->db_id, req->key, req->key_len, req->entry, &comp->stored_bytes);
+            comp->status =
+                mockPut(req->db_id, req->key, req->key_len, req->entry, req->request_ctx, &comp->stored_bytes);
             break;
         case STORAGE_OP_GET:
             comp->status = mockGet(req->db_id, req->key, req->key_len, &comp->value);
