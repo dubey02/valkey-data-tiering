@@ -1533,14 +1533,8 @@ TEST_F(SpillSubmitTest, SubmitsTheValue) {
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
 
-    /* The engine writes the borrowed value and hands back our request. */
-    ASSERT_EQ(storageMockRunIo(1), 1);
-    storageCompletion comp = {};
-    ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
-    EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
-    EXPECT_EQ(comp.status, STORAGE_OK);
-    EXPECT_NE(comp.request_ctx, nullptr);
-    zfree(comp.request_ctx);
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 
 /* Each type and encoding takes its own path through the serializer, which
@@ -1561,11 +1555,9 @@ TEST_F(SpillSubmitTest, SubmitsEveryTypeOfValue) {
         robj *entry = addKey(name, objs[i]);
 
         ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
-        ASSERT_EQ(storageMockRunIo(1), 1);
-        storageCompletion comp = {};
-        ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
-        EXPECT_EQ(comp.status, STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
-        zfree(comp.request_ctx);
+        ASSERT_EQ(finishSpills(), 1);
+        EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH)
+            << "type " << type << " encoding " << strEncoding(encoding);
     }
 }
 
@@ -1719,6 +1711,112 @@ TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
         ASSERT_EQ(objectGetVal(hashes[i]), nullptr);
         EXPECT_FALSE(hashTypeHasVolatileFields(hashes[i]));
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Values in flight
+ * ---------------------------------------------------------------------------*/
+
+/* A write waits for the engine to release the value, and the value stays in
+ * DRAM. Another key's completion that arrives first waits for beforeSleep(),
+ * since the running command may still use its value. */
+TEST_F(SpillSubmitTest, WritingAKeyMidSpillKeepsItsValue) {
+    robj *other = addRawKey("other");
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, other), STORAGE_OK);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    sds val = sdsdup((sds)objectGetVal(entry));
+
+    spillBeforeWrite(entry);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), val), 0);
+    EXPECT_EQ(getStorageState(other), STORAGE_STATE_COPYING_TO_FLASH);
+    EXPECT_NE(objectGetVal(other), nullptr);
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(other), STORAGE_STATE_ONLY_FLASH);
+    sdsfree(val);
+}
+
+/* A completion that was set aside while waiting for another key is found when
+ * its own key is written. */
+TEST_F(SpillSubmitTest, WritingAKeyWhoseCompletionWasSetAside) {
+    robj *first = addRawKey("first");
+    robj *second = addRawKey("second");
+    ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
+    ASSERT_EQ(extStorageSpillItem(0, second), STORAGE_OK);
+
+    spillBeforeWrite(second);
+    ASSERT_EQ(getStorageState(first), STORAGE_STATE_COPYING_TO_FLASH);
+    spillBeforeWrite(first);
+    EXPECT_EQ(getStorageState(first), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_NE(objectGetVal(first), nullptr);
+
+    /* Nothing is left to finish, so both keys stay in memory. */
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(first), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(getStorageState(second), STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* Deleting a key mid-spill must not free the value the engine is reading. */
+TEST_F(SpillSubmitTest, DeletingAKeyMidSpill) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    spillBeforeRemove(entry);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    sds key = sdsnew("key");
+    ASSERT_TRUE(kvstoreHashtableDelete(server.db[0]->keys, 0, key));
+    sdsfree(key);
+    EXPECT_EQ(finishSpills(), 0);
+}
+
+/* The key replacing a spilled key's value must not look spilled. */
+TEST_F(SpillSubmitTest, RemovingASpilledKeyResetsItsState) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+
+    spillBeforeRemove(entry);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+}
+
+/* Closing the engine discards completions it hasn't handed back, which would
+ * leak the requests and leave keys COPYING_TO_FLASH. */
+TEST_F(SpillSubmitTest, ClosingTheEngineFinishesSpillsInFlight) {
+    robj *a = addRawKey("a");
+    robj *b = addRawKey("b");
+    ASSERT_EQ(extStorageSpillItem(0, a), STORAGE_OK);
+    ASSERT_EQ(extStorageSpillItem(0, b), STORAGE_OK);
+
+    extStorageDeinit();
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_FLASH);
+}
+
+TEST_F(SpillSubmitTest, SavingAKeyOnFlashFails) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+
+    rio rdb;
+    rioInitWithBuffer(&rdb, sdsempty());
+    robj *key = createStringObject("key", 3);
+    EXPECT_EQ(rdbSaveKeyValuePair(&rdb, key, entry, -1, 0, RDB_VERSION), -1);
+    decrRefCount(key);
+    sdsfree(rdb.io.buffer.ptr);
+}
+
+/* TODO(#39): a read fetches the value instead. */
+TEST_F(SpillSubmitTest, AKeyOnFlashReadsAsMissing) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+
+    robj *key = createStringObject("key", 3);
+    EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr);
+    decrRefCount(key);
 }
 
 /* Deleting a key on flash frees only the object, so lazy free must not read

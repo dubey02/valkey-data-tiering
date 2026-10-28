@@ -237,6 +237,7 @@ void extStorageInit(void) {
  * extStorageBeforeSleep and the shutdown drain both go through here. */
 
 static void spillComplete(const storageCompletion *comp);
+static int spillProcessDeferred(void);
 
 /* Handles one finished request. */
 static void extStorageProcessCompletion(const storageCompletion *c) {
@@ -267,6 +268,7 @@ static int extStoragePollCompletions(void) {
  * the loop at least every tick, so a completion waits at most that long. */
 void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
+    spillProcessDeferred();
     extStoragePollCompletions();
 }
 
@@ -274,6 +276,8 @@ void extStorageBeforeSleep(void) {
  * Nothing new is submitted, so the drain ends when they finish. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
+    /* The engine no longer holds these, so close() doesn't wait for them. */
+    spillProcessDeferred();
     storageStatus st;
     int drained = 0;
     mstime_t drain_start = 0;
@@ -463,6 +467,9 @@ typedef struct spillRequest {
     robj *entry;
 } spillRequest;
 
+/* Number of spills submitted and not yet finished. */
+static unsigned long inflight_requests;
+
 /* Submits an item to the storage engine, which borrows it until the completion
  * is polled. On any status other than STORAGE_OK nothing changes. */
 storageStatus extStorageSpillItem(int dbid, robj *entry) {
@@ -478,6 +485,7 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     }
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
+    inflight_requests++;
     return STORAGE_OK;
 }
 
@@ -495,23 +503,99 @@ static void spillFreeValue(robj *entry) {
         decrRefCount(val);
 }
 
-/* Handles a finished write. A key is spilled only when nothing else references
- * it, and nothing may take a reference while it is COPYING_TO_FLASH. So a
- * written value is always freed, and only a failed write keeps it in memory. */
-static void spillComplete(const storageCompletion *comp) {
-    spillRequest *req = comp->request_ctx;
+/* Finishes a spill. A key is spilled only when nothing else references it, and
+ * nothing may take a reference while it is COPYING_TO_FLASH. So a written value
+ * is freed unless a write cancelled the spill. */
+static void spillFinish(spillRequest *req, storageStatus status, bool keep_in_memory) {
     robj *entry = req->entry;
     serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
     serverAssert(objectGetRefcount(entry) == 1);
 
-    if (comp->status == STORAGE_OK) {
+    if (status == STORAGE_OK && !keep_in_memory) {
         spillFreeValue(entry);
         setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
         ext_storage.stats.total_num_items_spilled++;
     } else {
+        /* TODO(#34): delete the flash copy when a cancelled write succeeded. */
         setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
     }
+    inflight_requests--;
     zfree(req);
 }
 
+static void spillComplete(const storageCompletion *comp) {
+    spillFinish(comp->request_ctx, comp->status, false);
+}
+
+/* Completions polled while waiting for one key. The running command may hold
+ * pointers to their values, so they are finished from beforeSleep() instead. */
+static list *deferred_completions;
+
+static void deferCompletion(const storageCompletion *comp) {
+    if (deferred_completions == NULL) deferred_completions = listCreate();
+    storageCompletion *copy = zmalloc(sizeof(*copy));
+    *copy = *comp;
+    listAddNodeTail(deferred_completions, copy);
+}
+
+static int spillProcessDeferred(void) {
+    if (deferred_completions == NULL) return 0;
+    int n = 0;
+    listNode *ln;
+    while ((ln = listFirst(deferred_completions)) != NULL) {
+        storageCompletion *comp = listNodeValue(ln);
+        listDelNode(deferred_completions, ln);
+        extStorageProcessCompletion(comp);
+        zfree(comp);
+        n++;
+    }
+    return n;
+}
+
+/* A write is about to change or free a key that is being spilled. Waits for
+ * the storage engine to release the value and keeps it in DRAM. The engine
+ * completes every request it accepts, so the wait ends.
+ * TODO(#39): block the client instead of waiting on the main thread. */
+void spillCancel(robj *entry) {
+    serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
+
+    if (deferred_completions) {
+        listIter li;
+        listNode *ln;
+        listRewind(deferred_completions, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            storageCompletion *comp = listNodeValue(ln);
+            if (comp->op_type != STORAGE_OP_PUT || ((spillRequest *)comp->request_ctx)->entry != entry) continue;
+            listDelNode(deferred_completions, ln);
+            spillFinish(comp->request_ctx, comp->status, true);
+            zfree(comp);
+            return;
+        }
+    }
+
+    while (getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH) {
+        storageCompletion comps[16];
+        int n = ext_storage.engine->poll_completions(comps, 16);
+        for (int i = 0; i < n; i++) {
+            if (comps[i].op_type == STORAGE_OP_PUT && ((spillRequest *)comps[i].request_ctx)->entry == entry) {
+                spillFinish(comps[i].request_ctx, comps[i].status, true);
+            } else {
+                deferCompletion(&comps[i]);
+            }
+        }
+    }
+}
+
+/* A key is about to be deleted or have its value replaced. The state is reset
+ * so that a value swapped into this object isn't taken to be on flash. */
+void spillRemove(robj *entry) {
+    if (getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH) spillCancel(entry);
+    /* TODO(#34): delete the flash copy. */
+    if (getStorageState(entry) == STORAGE_STATE_ONLY_FLASH) setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* Waits for every spill in flight to finish. */
+void spillDrain(void) {
+    while (inflight_requests > 0) extStorageBeforeSleep();
+}
 #endif /* USE_EXT_STORAGE */
