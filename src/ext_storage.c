@@ -574,8 +574,8 @@ void spillCancel(robj *entry) {
     }
 
     while (getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH) {
-        storageCompletion comps[16];
-        int n = ext_storage.engine->poll_completions(comps, 16);
+        storageCompletion comps[EXT_STORAGE_POLL_BATCH];
+        int n = ext_storage.engine->poll_completions(comps, EXT_STORAGE_POLL_BATCH);
         for (int i = 0; i < n; i++) {
             if (comps[i].op_type == STORAGE_OP_PUT && ((spillRequest *)comps[i].request_ctx)->entry == entry) {
                 spillFinish(comps[i].request_ctx, comps[i].status, true);
