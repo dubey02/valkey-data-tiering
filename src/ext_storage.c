@@ -481,69 +481,116 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     return STORAGE_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * Fetch path (pseudocode)
+ * ---------------------------------------------------------------------------*/
+
 #define EXT_STORAGE_POLL_MAX_BATCH_SIZE 128 // arbitrary
 
+/* request_ctx for a GET is the key, a refcounted string robj. */
+static void handleGetCompletion(storageCompletion *r) {
+    robj *key = r->request_ctx;
+    robj *o = dbFind(server.db[r->db_id], objectGetVal(key));
+    serverAssert(o && getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
 
-static void handleGetCompletion(storageCompletion r) {
-    serverAssert(r.op_type == STORAGE_OP_GET);
     // As far as I can tell there's no gauranteed status.
     // If there is we should probably check status = STORAGE_OK;
-    dbEntry entry = dbFind(r.db_id, (sds)r.request_ctx.key);
-    serverAssert(entry.storage_state == STORAGE_STATE_COPYING_TO_MEMORY);
-    // todo: see if it still makes sense to do something similar to replaceDbEntryValue
-    objectSetVal(entry, r.value);
+    serverAssert(r->value);
 
+    // todo: see if it still makes sense to do something similar to replaceDbEntryValue
+    // todo: handle embedded strings separately
+    serverAssert(objectGetType(o) == objectGetType(r->value));
+    objectSetVal(o, objectGetVal(r->value));
+    o->encoding = r->value->encoding;
+    objectSetVal(r->value, NULL);
+    decrRefCount(r->value); // frees only the shell
+    // todo: check if there are lrulfu implications (touching)
+    setStorageState(o, STORAGE_STATE_ONLY_MEMORY);
+
+    unblockClientsInUseOnKey(key);
+    decrRefCount(key);
 }
 
-static void processCompletedRequest(storageCompletion r) {
-    switch (r.op_type) {
-    case STORAGE_OP_GET: handleGetCompletion(r);
-    case STORAGE_OP_PUT: serverPanic("Unhandled");
+static void processCompletedRequest(storageCompletion *r) {
+    switch (r->op_type) {
+    case STORAGE_OP_GET: handleGetCompletion(r); break;
+    case STORAGE_OP_PUT: serverPanic("Unhandled"); // todo: spill path
     case STORAGE_OP_DEL: serverPanic("Unhandled");
     default: serverPanic("Unhandled storage op");
     }
 }
 
+/* Called from beforeSleep() before blockedBeforeSleep(), so unblocked clients
+ * re-run their command in the same event loop iteration. */
 void externalStorage_processCompletedRequests(void) {
     if (!ext_storage.open) return;
 
     storageCompletion requests[EXT_STORAGE_POLL_MAX_BATCH_SIZE];
-    int num_requests = ext_storage.engine->poll_completions(requests, EXT_STORAGE_POLL_MAX_BATCH_SIZE);
-
-    for (int i = 0; i < num_requests; i++) {
-        processCompletedRequest(requests[i]);
+    int num_requests;
+    while ((num_requests = ext_storage.engine->poll_completions(requests, EXT_STORAGE_POLL_MAX_BATCH_SIZE)) > 0) {
+        for (int i = 0; i < num_requests; i++) processCompletedRequest(&requests[i]);
     }
 }
 
-// Spilling
-// And then within tiered storage we need something like 
+/* Submits a fetch for one ONLY_FLASH object. Returns true if the engine took it. */
+static bool fetchKey(serverDb *db, robj *key, robj *o) {
+    // call get_async, with appropriate error handling
+    // Once we fire the async function, update the storage status to STORAGE_STATE_COPYING_TO_MEMORY
+    storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), key);
+    if (st != STORAGE_OK) {
+        // STORAGE_WOULDBLOCK: queue full. todo: retry later, or reply with an error.
+        return false;
+    }
+    incrRefCount(key); // released in handleGetCompletion
+    setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
+    // todo: arm the 1 ms timer if it is not armed
+    return true;
+}
 
-/*
-bool tieredstorage_blockClientIfNeeded(c) {
+/* Fills keys_out with the keys the client must block on and starts fetches
+ * for the ones that are only on flash. Returns the number of keys. */
+static int determineSpilledKeys(client *c, robj **keys_out) {
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+    int n = 0;
+    // for each key that was an argument, determine if it is spilled to flash by using the storage state.
+    for (int i = 0; i < numkeys; i++) {
+        robj *key = c->argv[result.keys[i].pos];
+        robj *o = dbFind(c->db, objectGetVal(key));
+        if (!o) continue;
+        switch (getStorageState(o)) {
+        case STORAGE_STATE_ONLY_FLASH:
+            if (fetchKey(c->db, key, o)) keys_out[n++] = key;
+            break;
+        case STORAGE_STATE_COPYING_TO_MEMORY:
+            keys_out[n++] = key; // a fetch is already in flight, just block
+            break;
+        default: break; // todo: COPYING_TO_FLASH should block write commands once spill exists
+        }
+    }
+    getKeysFreeResult(&result);
+    return n;
+}
+
+/* Returns true if the client was blocked and the command must not run now. */
+bool externalStorage_blockClientIfNeeded(client *c) {
+    if (!ext_storage.open) return false;
+    // logic will need to be added for edge cases like multi/exec in milestone 5
+    // todo: at EXEC, check the keys of every queued command.
+    if (c->flag.multi && c->cmd->proc != execCommand) return false;
+
     // if any of the keys are spilled for this command, then we need to block the client for tiered storage
-    sds* spilledKeys = determineSpilledKeys(c->argv); // or whatever the argument for multiple keys is
-    fetchKeys();
-    blockClientInUseOnKeys(); // all the keys that spilled
-    return C_OK; // this prevents the command from exec
-    // otherwise we just proceed
-    return C_ERR;
+    robj **keys = zmalloc(sizeof(robj *) * c->argc);
+    int n = determineSpilledKeys(c, keys);
+    // double check the order of fetching and blocking doesn't matter
+    if (n > 0) blockClientInUseOnKeys(c, n, keys); // all the keys that spilled
+    zfree(keys);
+    return n > 0; // true prevents the command from exec, otherwise we just proceed
 }
 
-void fetchKeys(sds*) {
-    for every key in teh sds call fcGetAsync
-}
-
-sds* determineSpilledKeys(sds* keys) {
-    // for each key, check if storage state is in memory
-    // if it is add it to the return list
-}
-
-// logic will need to be added for edge cases like multi/exec in milestone 5
-
-// logic will also be needed unblock the keys when fetching from disk
-
-*/
-
+// todo: commands from scripts, RM_Call and AOF loading skip processCommand(), so they skip this hook.
+// todo: decide how to handle the replication client on a replica.
 
 #endif /* USE_EXT_STORAGE */
 
