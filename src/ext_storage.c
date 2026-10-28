@@ -586,12 +586,10 @@ void spillCancel(robj *entry) {
     }
 }
 
-/* A key is about to be deleted or have its value replaced. The state is reset
- * so that a value swapped into this object isn't taken to be on flash. */
+/* A key is about to be deleted or have its value replaced. */
 void spillRemove(robj *entry) {
     if (getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH) spillCancel(entry);
     /* TODO(#34): delete the flash copy. */
-    if (getStorageState(entry) == STORAGE_STATE_ONLY_FLASH) setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
 }
 
 /* Waits for every spill in flight to finish. */
