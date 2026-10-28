@@ -16,6 +16,8 @@
 #include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
 
+#include <stdatomic.h>
+
 /* Holds a storage engine registered by a module. Built-in storage engines are
  * selected by name in extStorageInit and are not held here. */
 
@@ -76,14 +78,21 @@ static void extStorageReleaseLoadingLock(void) {
 /* Serialization and Deserialization Functions
  * The storage engine may call these from its own IO thread. */
 
-/* Serialize in the DUMP wire format, so every type and encoding is handled. */
-static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, char **out) {
+static void spillAccountSized(void *request_ctx, size_t ram_bytes);
+
+/* Serialize in the DUMP wire format, so every type and encoding is handled.
+ * When ram_bytes isn't NULL, the same walk adds the value's DRAM to it. */
+static int extStorageSerializeValue(const char *key,
+                                    size_t key_len,
+                                    const valkeyObject *entry,
+                                    size_t *ram_bytes,
+                                    char **out) {
     sds key_sds = sdsnewlen(key, key_len);
     robj key_obj;
     initStaticStringObject(key_obj, key_sds);
 
     rio payload;
-    createDumpPayload(&payload, (robj *)entry, &key_obj, -1);
+    createDumpPayload(&payload, (robj *)entry, &key_obj, -1, ram_bytes);
     sdsfree(key_sds);
 
     size_t len = sdslen(payload.io.buffer.ptr);
@@ -94,6 +103,25 @@ static int extStorageSerialize(const char *key, size_t key_len, const valkeyObje
     }
     *out = payload.io.buffer.ptr;
     return (int)len;
+}
+
+static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
+    UNUSED(request_ctx);
+    return extStorageSerializeValue(key, key_len, entry, NULL, out);
+}
+
+/* Also sizes the value for the spill accounting, in the same walk, so a spill
+ * is sized off the main thread before it completes. request_ctx is the spill's
+ * spillSizing. A value that fails to serialize isn't sized. */
+static int extStorageSerializeSpill(const char *key,
+                                    size_t key_len,
+                                    const valkeyObject *entry,
+                                    void *request_ctx,
+                                    char **out) {
+    size_t ram_bytes = 0;
+    int len = extStorageSerializeValue(key, key_len, entry, &ram_bytes, out);
+    if (len >= 0) spillAccountSized(request_ctx, ram_bytes);
+    return len;
 }
 
 static valkeyObject *extStorageDeserialize(const char *key, size_t key_len, const char *bytes, int len) {
@@ -130,6 +158,16 @@ static const storageSerializer ext_storage_serializer = {
 
 const storageSerializer *extStorageSerializer(void) {
     return &ext_storage_serializer;
+}
+
+static const storageSerializer ext_storage_spill_serializer = {
+    .serialize = extStorageSerializeSpill,
+    .deserialize = extStorageDeserialize,
+    .free_serialized = extStorageFreeSerialized,
+};
+
+const storageSerializer *extStorageSpillSerializer(void) {
+    return &ext_storage_spill_serializer;
 }
 
 /* Runs first on every storage engine thread. */
@@ -451,6 +489,90 @@ static int spillSamplingPolicy(void) {
 /* Returns the coldest spillable key, or NULL if none was sampled. */
 robj *spillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
+}
+
+/* Spill accounting
+ *
+ * What spills in flight will free. A spill frees its DRAM only when it
+ * completes, so this is a two-stage Smith predictor for that dead time:
+ * - From submit to serialize, the value isn't sized yet. Each spill counts as
+ *   the mean size of recent spills, and their number is exact.
+ * - From serialize to completion, the serializer has sized the value, so the
+ *   sum is exact.
+ * The mean is an EMA of the sizes the serializer measures, so the first stage
+ * converges on what spills really free, a little behind. It starts at the
+ * first size. Finishing a spill subtracts what sizing it added, so nothing
+ * drifts. Nothing submits spills yet. */
+static unsigned long spill_account_requests;         /* Main thread. */
+static _Atomic unsigned long spill_account_sized;    /* Serializer adds, finish subtracts. */
+static _Atomic size_t spill_account_sized_ram_bytes; /* Serializer adds, finish subtracts. */
+static _Atomic size_t spill_account_ram_mean;        /* Serializer writes, main thread reads. */
+
+/* Weight of a new size in the mean: 1/16. */
+#define SPILL_RAM_MEAN_SHIFT 4
+
+/* Moves the mean 1/16 of the way to a new size. The first size starts it. */
+static size_t spillRamMeanStep(size_t mean, size_t bytes) {
+    if (mean == 0) return bytes;
+    if (bytes >= mean) return mean + ((bytes - mean) >> SPILL_RAM_MEAN_SHIFT);
+    return mean - ((mean - bytes) >> SPILL_RAM_MEAN_SHIFT);
+}
+
+void spillAccountReset(void) {
+    serverAssert(spill_account_requests == 0);
+    atomic_store_explicit(&spill_account_sized, 0, memory_order_relaxed);
+    atomic_store_explicit(&spill_account_sized_ram_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&spill_account_ram_mean, 0, memory_order_relaxed);
+}
+
+void spillAccountSubmit(spillSizing *s) {
+    s->sized = false;
+    s->ram_bytes = 0;
+    spill_account_requests++;
+}
+
+/* Serializer side, on the storage engine's thread: the spill leaves the first
+ * stage with the size its serialization measured, which also feeds the mean.
+ * An engine may serialize a request more than once, so only the first time
+ * counts. */
+static void spillAccountSized(void *request_ctx, size_t ram_bytes) {
+    spillSizing *s = request_ctx;
+    if (s->sized) return;
+    s->ram_bytes = ram_bytes;
+    s->sized = true;
+    atomic_fetch_add_explicit(&spill_account_sized_ram_bytes, ram_bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&spill_account_sized, 1, memory_order_relaxed);
+
+    size_t mean = atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(&spill_account_ram_mean, &mean, spillRamMeanStep(mean, ram_bytes),
+                                                  memory_order_relaxed, memory_order_relaxed));
+}
+
+void spillAccountFinish(spillSizing *s) {
+    serverAssert(spill_account_requests > 0);
+    if (s->sized) {
+        atomic_fetch_sub_explicit(&spill_account_sized_ram_bytes, s->ram_bytes, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&spill_account_sized, 1, memory_order_relaxed);
+    }
+    spill_account_requests--;
+}
+
+/* Spills in flight that the serializer hasn't sized yet. */
+static unsigned long spillAccountUnsized(void) {
+    unsigned long sized = atomic_load_explicit(&spill_account_sized, memory_order_relaxed);
+    return spill_account_requests > sized ? spill_account_requests - sized : 0;
+}
+
+size_t spillAccountInflightRamBytes(void) {
+    return atomic_load_explicit(&spill_account_sized_ram_bytes, memory_order_relaxed) +
+           spillAccountUnsized() * atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
+}
+
+void spillAccountGetStats(spillAccountStats *out) {
+    out->inflight_requests = spill_account_requests;
+    out->unsized_requests = spillAccountUnsized();
+    out->sized_ram_bytes = atomic_load_explicit(&spill_account_sized_ram_bytes, memory_order_relaxed);
+    out->ram_mean = atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
 }
 
 #endif /* USE_EXT_STORAGE */

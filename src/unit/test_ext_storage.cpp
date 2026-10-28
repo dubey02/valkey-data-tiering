@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include "server.h"
@@ -179,7 +180,7 @@ class StorageMockTest : public ::testing::Test {
     size_t serializedLen(const char *s) {
         robj *o = createStringObject(s, strlen(s));
         char *bytes = nullptr;
-        int len = cfg.serializer.serialize("k", 1, o, &bytes);
+        int len = cfg.serializer.serialize("k", 1, o, nullptr, &bytes);
         cfg.serializer.free_serialized(bytes);
         decrRefCount(o);
         return (size_t)len;
@@ -735,7 +736,7 @@ TEST_F(ExtStorageSerializerTest, StringValueSurvivesTheRoundTrip) {
     dbEntry *entry = makeEntry("mykey", "some value");
 
     char *bytes = nullptr;
-    int len = s->serialize("mykey", 5, entry, &bytes);
+    int len = s->serialize("mykey", 5, entry, nullptr, &bytes);
     ASSERT_GT(len, 0);
     ASSERT_NE(bytes, nullptr);
 
@@ -761,8 +762,8 @@ TEST_F(ExtStorageSerializerTest, TheKeyIsNotPartOfTheRecord) {
 
     char *a = nullptr;
     char *b = nullptr;
-    int alen = s->serialize("short", 5, e1, &a);
-    int blen = s->serialize("a-much-longer-key", 17, e2, &b);
+    int alen = s->serialize("short", 5, e1, nullptr, &a);
+    int blen = s->serialize("a-much-longer-key", 17, e2, nullptr, &b);
     ASSERT_GT(alen, 0);
     ASSERT_EQ(alen, blen);
     EXPECT_EQ(memcmp(a, b, (size_t)alen), 0);
@@ -785,8 +786,8 @@ TEST_F(ExtStorageSerializerTest, AnExpireIsNotPartOfTheRecord) {
 
     char *a = nullptr;
     char *b = nullptr;
-    int alen = s->serialize("k", 1, with, &a);
-    int blen = s->serialize("k", 1, without, &b);
+    int alen = s->serialize("k", 1, with, nullptr, &a);
+    int blen = s->serialize("k", 1, without, nullptr, &b);
     ASSERT_GT(alen, 0);
     ASSERT_EQ(alen, blen);
     EXPECT_EQ(memcmp(a, b, (size_t)alen), 0);
@@ -807,7 +808,7 @@ TEST_F(ExtStorageSerializerTest, RejectsAMalformedBuffer) {
     // valid type but fail verification.
     dbEntry *entry = makeEntry("k", "some value");
     char *bytes = nullptr;
-    int len = s->serialize("k", 1, entry, &bytes);
+    int len = s->serialize("k", 1, entry, nullptr, &bytes);
     ASSERT_GT(len, 10);
     EXPECT_EQ(s->deserialize("k", 1, bytes, len - 4), nullptr);
     s->free_serialized(bytes);
@@ -867,7 +868,7 @@ TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndNoDbId) {
     observed_saves = 0;
 
     char *bytes = nullptr;
-    int len = s->serialize(key, sdslen(key), entry, &bytes);
+    int len = s->serialize(key, sdslen(key), entry, nullptr, &bytes);
     ASSERT_GT(len, 0);
     ASSERT_EQ(observed_saves, 1);
     EXPECT_EQ(observed_key, "mykey");
@@ -900,6 +901,21 @@ static int createOneOfEachObject(robj **objs) {
     objs[n++] = createStreamObject();
     assert(n == NUM_TEST_OBJECTS);
     return n;
+}
+
+/* Adds one element to a collection, since the keyspace holds no empty ones. */
+static void addOneElement(robj *o) {
+    sds one = sdsnew("1");
+    robj *ele = createStringObject("1", 1);
+    int out_flags = 0;
+    switch (o->type) {
+    case OBJ_LIST: listTypePush(o, ele, LIST_TAIL); break;
+    case OBJ_SET: setTypeAdd(o, one); break;
+    case OBJ_HASH: hashTypeSet(o, one, one, EXPIRY_NONE, HASH_SET_COPY, NULL); break;
+    case OBJ_ZSET: zsetAdd(o, 1, one, ZADD_IN_NONE, &out_flags, NULL); break;
+    }
+    decrRefCount(ele);
+    sdsfree(one);
 }
 
 TEST(StorageStateTest, NewObjectsStartInMemory) {
@@ -1449,6 +1465,362 @@ TEST_F(SpillSelectTest, PicksKeysAcrossSlots) {
         int dbid = -1;
         EXPECT_NE(spillSelectCandidate(&dbid), nullptr) << "selection " << i;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Spill sizing
+ *
+ * The spill serializer sizes a value in the walk that serializes it: what
+ * freeing the value frees.
+ * ---------------------------------------------------------------------------*/
+
+class SpillSizingTest : public ::testing::Test {
+  protected:
+    MockValkey mock;
+    RealValkey real;
+
+    void SetUp() override {
+        memset(&server, 0, sizeof(valkeyServer));
+        server.hz = CONFIG_DEFAULT_HZ;
+        server.logfile = zstrdup("");
+        crc64_init();
+        /* Default limits, so each listpack and intset keeps its encoding. */
+        server.list_max_listpack_size = -2;
+        server.set_max_intset_entries = 512;
+        server.set_max_listpack_entries = 128;
+        server.set_max_listpack_value = 64;
+        server.zset_max_listpack_entries = 128;
+        server.zset_max_listpack_value = 64;
+        server.hash_max_listpack_entries = 128;
+        server.hash_max_listpack_value = 64;
+        spillAccountReset();
+    }
+
+    void TearDown() override {
+        zfree(server.logfile);
+        server.logfile = NULL;
+    }
+
+    /* Serializes 'o' with the spill serializer and returns the size it measured. */
+    size_t measure(robj *o) {
+        const storageSerializer *s = extStorageSpillSerializer();
+        spillSizing sizing;
+        spillAccountSubmit(&sizing);
+        char *bytes = nullptr;
+        EXPECT_GT(s->serialize("k", 1, o, &sizing, &bytes), 0);
+        s->free_serialized(bytes);
+        EXPECT_TRUE(sizing.sized);
+        spillAccountFinish(&sizing);
+        return sizing.ram_bytes;
+    }
+
+    /* Frees 'o' and returns what that freed, leaving out 'o' itself. */
+    size_t freeValue(robj *o) {
+        size_t object_bytes = zmalloc_size(o);
+        size_t used = zmalloc_used_memory();
+        decrRefCount(o);
+        return used - zmalloc_used_memory() - object_bytes;
+    }
+
+    /* A hash in a hashtable, with 'ttl_fields' more fields that expire, each
+     * 'ttl_step' ms after the one before. */
+    robj *createHashtableHash(int ttl_fields, long long ttl_step) {
+        robj *hash = createHashObject();
+        addOneElement(hash);
+        hashTypeConvert(hash, OBJ_ENCODING_HASHTABLE);
+        for (int i = 0; i < ttl_fields; i++) {
+            sds field = sdscatprintf(sdsempty(), "field:%d", i);
+            hashTypeSet(hash, field, field, 4000000000000LL + i * ttl_step, HASH_SET_COPY, NULL);
+            sdsfree(field);
+        }
+        return hash;
+    }
+
+    /* One value of each type and encoding, each holding something. Returns the
+     * count. */
+    int createValues(robj **objs) {
+        int n = createOneOfEachObject(objs);
+        for (int i = 0; i < n; i++) addOneElement(objs[i]);
+
+        objs[n++] = createHashtableHash(0, 0);
+        objs[n++] = createHashtableHash(1, 0);
+        objs[n++] = createHashtableHash(2, 0);
+        objs[n++] = createHashtableHash(100, 0);
+        objs[n++] = createHashtableHash(100, 60000);
+
+        /* A stream with an entry, a consumer group, a consumer and a pending entry. */
+        robj *stream_obj = createStreamObject();
+        stream *s = (stream *)objectGetVal(stream_obj);
+        robj *fields[2] = {createStringObject("field", 5), createStringObject("value", 5)};
+        streamID id;
+        EXPECT_EQ(streamAppendItem(s, fields, 1, &id, NULL, 0), C_OK);
+        decrRefCount(fields[0]);
+        decrRefCount(fields[1]);
+        streamCG *cg = streamCreateCG(s, (char *)"group", 5, &id, 0);
+        sds consumer_name = sdsnew("consumer");
+        streamConsumer *consumer = streamCreateConsumer(cg, consumer_name, NULL, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+        sdsfree(consumer_name);
+        unsigned char pel_key[sizeof(streamID)];
+        streamEncodeID(pel_key, &id);
+        streamNACK *nack = streamCreateNACK(consumer);
+        raxInsert(cg->pel, pel_key, sizeof(pel_key), nack, NULL);
+        raxInsert(consumer->pel, pel_key, sizeof(pel_key), nack, NULL);
+        objs[n++] = stream_obj;
+
+        /* A path hash with a listpack payload and a hashtable payload. */
+        robj *path_hash_obj = createPathHashObject();
+        pathHashObject *path_hash = (pathHashObject *)objectGetVal(path_hash_obj);
+        const char *paths[] = {"listpack", "hashtable"};
+        for (int p = 0; p < 2; p++) {
+            robj *payload = createHashObject();
+            addOneElement(payload);
+            if (p == 1) hashTypeConvert(payload, OBJ_ENCODING_HASHTABLE);
+            raxInsert(path_hash->index, (unsigned char *)paths[p], strlen(paths[p]), payload, NULL);
+            path_hash->num_fields++;
+        }
+        objs[n++] = path_hash_obj;
+        return n;
+    }
+};
+
+#define MAX_TEST_VALUES (NUM_TEST_OBJECTS + 8)
+
+/* For each type and encoding, what serializing measures is what freeing the
+ * value frees. Embedded and INT strings have nothing to free. A btree sorted
+ * set's index is estimated, and is checked on its own below. */
+TEST_F(SpillSizingTest, SerializingMeasuresWhatFreeingFrees) {
+    robj *objs[MAX_TEST_VALUES];
+    int n = createValues(objs);
+    for (int i = 0; i < n; i++) {
+        int type = objs[i]->type, encoding = objs[i]->encoding;
+        size_t measured = measure(objs[i]);
+        size_t freed = freeValue(objs[i]);
+        if (encoding == OBJ_ENCODING_BTREE) continue;
+        EXPECT_EQ(measured, freed) << "value " << i << " type " << type << " encoding " << strEncoding(encoding);
+    }
+}
+
+/* Sizing doesn't change the bytes, and the plain serializer leaves the
+ * request_ctx alone. */
+TEST_F(SpillSizingTest, SizingLeavesTheBytesUnchanged) {
+    const storageSerializer *plain = extStorageSerializer();
+    const storageSerializer *spill = extStorageSpillSerializer();
+    robj *objs[MAX_TEST_VALUES];
+    int n = createValues(objs);
+    for (int i = 0; i < n; i++) {
+        spillSizing untouched, sizing;
+        spillAccountSubmit(&untouched);
+        spillAccountSubmit(&sizing);
+        char *a = nullptr;
+        char *b = nullptr;
+        int alen = plain->serialize("k", 1, objs[i], &untouched, &a);
+        int blen = spill->serialize("k", 1, objs[i], &sizing, &b);
+        EXPECT_FALSE(untouched.sized);
+        EXPECT_TRUE(sizing.sized);
+        spillAccountFinish(&untouched);
+        spillAccountFinish(&sizing);
+
+        ASSERT_GT(alen, 0);
+        ASSERT_EQ(alen, blen) << "value " << i;
+        EXPECT_EQ(memcmp(a, b, (size_t)alen), 0) << "value " << i;
+        plain->free_serialized(a);
+        spill->free_serialized(b);
+        decrRefCount(objs[i]);
+    }
+}
+
+/* Five sampled elements, as MEMORY USAGE uses, can be far off for a collection
+ * whose elements differ in size. Serializing counts every one. */
+TEST_F(SpillSizingTest, CountsEveryElementOfACollection) {
+    /* The first nodes hold small elements, the rest one large element each. */
+    static char small[100], large[100 * 1024];
+    memset(small, 's', sizeof(small));
+    memset(large, 'l', sizeof(large));
+    robj *list = createQuicklistObject(-2, 0);
+    for (int i = 0; i < 420; i++) {
+        robj *ele = i < 400 ? createStringObject(small, sizeof(small)) : createStringObject(large, sizeof(large));
+        listTypePush(list, ele, LIST_TAIL);
+        decrRefCount(ele);
+    }
+
+    size_t sampled = objectComputeSize(NULL, list, 5, 0) - zmalloc_size(list);
+    size_t measured = measure(list);
+    size_t freed = freeValue(list);
+    EXPECT_EQ(measured, freed);
+    EXPECT_LT(sampled, freed / 2);
+}
+
+/* Serializing doesn't walk a btree sorted set's index nodes, so they are
+ * estimated, as MEMORY USAGE does. */
+TEST_F(SpillSizingTest, EstimatesTheIndexOfABtreeSortedSet) {
+    robj *zset = createZsetObject();
+    for (int i = 0; i < 1000; i++) {
+        sds member = sdscatprintf(sdsempty(), "member:%d", i);
+        int out_flags = 0;
+        zsetAdd(zset, i, member, ZADD_IN_NONE, &out_flags, NULL);
+        sdsfree(member);
+    }
+    ASSERT_EQ(zset->encoding, OBJ_ENCODING_BTREE);
+    size_t measured = measure(zset);
+    size_t freed = freeValue(zset);
+    EXPECT_NEAR((double)measured, (double)freed, freed * 0.02);
+}
+
+/* ---------------------------------------------------------------------------
+ * Spill accounting
+ *
+ * The mock storage engine, opened with the spill serializer, sizes a spill
+ * when its IO tick serializes it.
+ * ---------------------------------------------------------------------------*/
+
+class SpillAccountTest : public StorageMockTest {
+  protected:
+    std::vector<sds> keys;
+    std::vector<dbEntry *> entries;
+
+    void SetUp() override {
+        StorageMockTest::SetUp();
+        cfg.serializer = *extStorageSpillSerializer();
+        spillAccountReset();
+        openEngine();
+    }
+
+    void TearDown() override {
+        storageMockRunIo(1000);
+        finishSpills();
+        StorageMockTest::TearDown();
+        for (sds key : keys) sdsfree(key);
+        for (dbEntry *entry : entries) decrRefCount(entry);
+    }
+
+    /* A keyspace entry with a raw value of 'len' bytes. */
+    dbEntry *rawEntry(const char *name, size_t len) {
+        std::string val(len, 'v');
+        sds key = sdsnew(name);
+        dbEntry *entry = makeEntry(key, val.c_str());
+        keys.push_back(key);
+        entries.push_back(entry);
+        EXPECT_EQ(entry->encoding, OBJ_ENCODING_RAW);
+        EXPECT_FALSE(entry->hasembval);
+        return entry;
+    }
+
+    size_t valueBytes(const dbEntry *entry) {
+        return sdsAllocSize((sds)objectGetVal(entry));
+    }
+
+    /* Counts a spill as in flight and puts it, taking it back out when the
+     * engine refuses it. */
+    storageStatus spill(dbEntry *entry, spillSizing *sizing, uint32_t db_id = 0) {
+        spillAccountSubmit(sizing);
+        sds key = objectGetKey(entry);
+        storageStatus status = engine->put_async(db_id, key, sdslen(key), entry, sizing);
+        if (status != STORAGE_OK) spillAccountFinish(sizing);
+        return status;
+    }
+
+    /* Polls what has completed and finishes each spill. Returns the count. */
+    int finishSpills() {
+        storageCompletion done[16];
+        int total = 0;
+        int n;
+        while ((n = engine->poll_completions(done, 16)) > 0) {
+            for (int i = 0; i < n; i++) spillAccountFinish((spillSizing *)done[i].request_ctx);
+            total += n;
+        }
+        return total;
+    }
+
+    spillAccountStats stats() {
+        spillAccountStats st;
+        spillAccountGetStats(&st);
+        return st;
+    }
+};
+
+/* Until the serializer sizes it, a spill counts as the mean of recent spills.
+ * Serializing swaps in its measured size, and finishing takes that back out. */
+TEST_F(SpillAccountTest, ASpillCountsAsTheMeanUntilSized) {
+    dbEntry *first = rawEntry("first", 200);
+    size_t value_bytes = valueBytes(first);
+    spillSizing a, b;
+
+    ASSERT_EQ(spill(first, &a), STORAGE_OK);
+    EXPECT_EQ(stats().inflight_requests, 1u);
+    EXPECT_EQ(stats().unsized_requests, 1u);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 0u); /* No size measured yet, so no mean. */
+
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    EXPECT_TRUE(a.sized);
+    EXPECT_EQ(a.ram_bytes, value_bytes);
+    EXPECT_EQ(stats().unsized_requests, 0u);
+    EXPECT_EQ(stats().sized_ram_bytes, value_bytes);
+    EXPECT_EQ(stats().ram_mean, value_bytes);
+    EXPECT_EQ(spillAccountInflightRamBytes(), value_bytes);
+
+    ASSERT_EQ(spill(rawEntry("second", 200), &b), STORAGE_OK);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 2 * value_bytes); /* One sized, one at the mean. */
+
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    ASSERT_EQ(finishSpills(), 2);
+    spillAccountStats st = stats();
+    EXPECT_EQ(st.inflight_requests, 0u);
+    EXPECT_EQ(st.unsized_requests, 0u);
+    EXPECT_EQ(st.sized_ram_bytes, 0u);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
+    EXPECT_EQ(st.ram_mean, value_bytes); /* The mean outlives the spills. */
+}
+
+/* The mean starts at the first measured size and moves 1/16 of the way to each
+ * later one. */
+TEST_F(SpillAccountTest, TheMeanMovesASixteenthTowardEachSize) {
+    dbEntry *small = rawEntry("small", 200);
+    dbEntry *big = rawEntry("big", 4096);
+    size_t small_bytes = valueBytes(small), big_bytes = valueBytes(big);
+    spillSizing a, b;
+
+    ASSERT_EQ(spill(small, &a), STORAGE_OK);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    EXPECT_EQ(stats().ram_mean, small_bytes);
+
+    ASSERT_EQ(spill(big, &b), STORAGE_OK);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    EXPECT_EQ(stats().ram_mean, small_bytes + (big_bytes - small_bytes) / 16);
+    ASSERT_EQ(finishSpills(), 2);
+}
+
+/* A spill the engine refuses was never sized, so finishing it only takes it out
+ * of the count. */
+TEST_F(SpillAccountTest, ARefusedSpillLeavesNoCredit) {
+    spillSizing sizing;
+    EXPECT_EQ(spill(rawEntry("key", 200), &sizing, cfg.num_databases), STORAGE_ERR_REJECTED);
+    EXPECT_FALSE(sizing.sized);
+    spillAccountStats st = stats();
+    EXPECT_EQ(st.inflight_requests, 0u);
+    EXPECT_EQ(st.unsized_requests, 0u);
+    EXPECT_EQ(st.sized_ram_bytes, 0u);
+    EXPECT_EQ(st.ram_mean, 0u);
+}
+
+/* An engine may serialize a spill more than once. Only the first time counts. */
+TEST_F(SpillAccountTest, OnlyTheFirstSerializationCounts) {
+    dbEntry *entry = rawEntry("key", 200);
+    size_t value_bytes = valueBytes(entry);
+    const storageSerializer *s = extStorageSpillSerializer();
+    spillSizing sizing;
+    spillAccountSubmit(&sizing);
+    for (int i = 0; i < 2; i++) {
+        char *bytes = nullptr;
+        ASSERT_GT(s->serialize("key", 3, entry, &sizing, &bytes), 0);
+        s->free_serialized(bytes);
+    }
+    EXPECT_EQ(sizing.ram_bytes, value_bytes);
+    EXPECT_EQ(stats().sized_ram_bytes, value_bytes);
+    EXPECT_EQ(spillAccountInflightRamBytes(), value_bytes);
+
+    spillAccountFinish(&sizing);
+    EXPECT_EQ(stats().sized_ram_bytes, 0u);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
 }
 
 #endif /* USE_EXT_STORAGE */

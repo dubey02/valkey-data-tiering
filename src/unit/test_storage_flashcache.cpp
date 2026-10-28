@@ -63,19 +63,21 @@ static const storageInfoSink stat_map_sink_template = {
 #define WAIT_STEP_US 1000
 #define WAIT_RETRIES 5000
 
-/* Records the thread that ran serialize and the key it was handed, then
- * forwards to the real one. */
+/* Records the thread that ran serialize, the key it was handed and its request
+ * context, then forwards to the real one. */
 static int serialize_calls = 0;
 static pthread_t serialize_thread;
 static const char *serialize_key_ptr;
 static char serialize_key[16];
-static int (*real_serialize)(const char *, size_t, const valkeyObject *, char **);
-static int recordingSerialize(const char *key, size_t key_len, const valkeyObject *entry, char **out) {
+static void *serialize_ctx;
+static int (*real_serialize)(const char *, size_t, const valkeyObject *, void *, char **);
+static int recordingSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
     serialize_thread = pthread_self();
     serialize_calls++;
     serialize_key_ptr = key;
     snprintf(serialize_key, sizeof(serialize_key), "%.*s", (int)key_len, key);
-    return real_serialize(key, key_len, entry, out);
+    serialize_ctx = request_ctx;
+    return real_serialize(key, key_len, entry, request_ctx, out);
 }
 
 class StorageFlashCacheTest : public ::testing::Test {
@@ -305,6 +307,83 @@ TEST_F(StorageFlashCacheTest, TheKeyIsCopiedAtSubmit) {
     EXPECT_NE(serialize_key_ptr, (const char *)key);
     EXPECT_STREQ(serialize_key, "lent");
     decrRefCount(entry);
+}
+
+TEST_F(StorageFlashCacheTest, SerializeGetsThePutsRequestContext) {
+    real_serialize = cfg.serializer.serialize;
+    cfg.serializer.serialize = recordingSerialize;
+    serialize_ctx = nullptr;
+    openEngine();
+    sds key = sdsnew("k");
+    dbEntry *entry = makeEntry(key, "v");
+    int token = 0;
+    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, &token), STORAGE_OK);
+
+    storageCompletion comp = {};
+    ASSERT_EQ(waitForCompletions(&comp), 1);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+    EXPECT_EQ(serialize_ctx, (void *)&token);
+    sdsfree(key);
+    decrRefCount(entry);
+}
+
+/* Finishes every spill that has completed. */
+static void finishCompletedSpills(const storageEngine *engine, int *finished) {
+    storageCompletion done[64];
+    int n = 0;
+    for (int retry = 0; retry < WAIT_RETRIES && n == 0; retry++) {
+        n = engine->poll_completions(done, 64);
+        if (n == 0) usleep(WAIT_STEP_US);
+    }
+    ASSERT_GT(n, 0) << "no completion arrived";
+    for (int i = 0; i < n; i++) {
+        ASSERT_EQ(done[i].status, STORAGE_OK);
+        spillAccountFinish((spillSizing *)done[i].request_ctx);
+        (*finished)++;
+    }
+}
+
+/* With the spill serializer, the IO thread sizes each spill while the main
+ * thread submits and finishes them. Once all are finished, nothing is left in
+ * either stage, and the mean is the size of the values. */
+TEST_F(StorageFlashCacheTest, SpillsSizedOnTheIoThreadBalanceOut) {
+    cfg.serializer = *extStorageSpillSerializer();
+    spillAccountReset();
+    openEngine();
+
+    const int total = 2000;
+    static spillSizing sizing[total];
+    static sds keys[total];
+    static dbEntry *entries[total];
+    char val[201];
+    memset(val, 'v', sizeof(val) - 1);
+    val[sizeof(val) - 1] = '\0';
+
+    int finished = 0;
+    for (int i = 0; i < total; i++) {
+        keys[i] = sdscatprintf(sdsempty(), "key-%d", i);
+        entries[i] = makeEntry(keys[i], val);
+        spillAccountSubmit(&sizing[i]);
+        storageStatus st;
+        while ((st = engine->put_async(0, keys[i], sdslen(keys[i]), entries[i], &sizing[i])) == STORAGE_WOULDBLOCK) {
+            ASSERT_NO_FATAL_FAILURE(finishCompletedSpills(engine, &finished));
+        }
+        ASSERT_EQ(st, STORAGE_OK);
+    }
+    while (finished < total) ASSERT_NO_FATAL_FAILURE(finishCompletedSpills(engine, &finished));
+
+    spillAccountStats st;
+    spillAccountGetStats(&st);
+    EXPECT_EQ(st.inflight_requests, 0u);
+    EXPECT_EQ(st.unsized_requests, 0u);
+    EXPECT_EQ(st.sized_ram_bytes, 0u);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
+    EXPECT_EQ(st.ram_mean, sdsAllocSize((sds)objectGetVal(entries[0])));
+
+    for (int i = 0; i < total; i++) {
+        sdsfree(keys[i]);
+        decrRefCount(entries[i]);
+    }
 }
 
 TEST_F(StorageFlashCacheTest, ReopenAfterCloseAcceptsRequests) {

@@ -63,6 +63,9 @@ entry *entryUpdate(entry *entry, sds value, mstime_t expiry);
 /* Returns the total memory used by the entry (in bytes). */
 size_t entryMemUsage(entry *entry);
 
+/* Returns what freeing the entry frees, allocator rounding included. */
+size_t entryAllocSize(const entry *entry);
+
 /* Defragments the entry and returns the new pointer (if moved). */
 entry *entryDefrag(entry *entry, void *(*defragfn)(void *), sds (*sdsdefragfn)(sds));
 

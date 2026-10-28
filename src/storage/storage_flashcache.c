@@ -199,7 +199,8 @@ static bool fcSubmitToFlashCache(fcRequest *r) {
 
     if (r->op == STORAGE_OP_PUT) {
         if (r->put_bytes == NULL) {
-            r->put_len = fc_io.serializer.serialize(r->key, r->key_len, r->entry, &r->put_bytes);
+            r->put_len = fc_io.serializer.serialize(r->key, r->key_len, r->entry, r->completed_request.request_ctx,
+                                                    &r->put_bytes);
             if (r->put_len < 0 || r->put_bytes == NULL) {
                 r->put_bytes = NULL;
                 r->completed_request.status = STORAGE_ERR_REJECTED;

@@ -811,8 +811,9 @@ int rdbLoadObjectType(rio *rdb) {
  * just the IDs: this is useful because for the global consumer group PEL
  * we serialized the NACKs as well, but when serializing the local consumer
  * PELs we just add the ID, that will be resolved inside the global PEL to
- * put a reference to the same structure. */
-ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
+ * put a reference to the same structure. When ram_bytes isn't NULL, the NACKs'
+ * DRAM is added to it. */
+ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks, size_t *ram_bytes) {
     ssize_t n, nwritten = 0;
 
     /* Number of entries in the PEL. */
@@ -834,6 +835,7 @@ ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
 
         if (nacks) {
             streamNACK *nack = ri.data;
+            if (ram_bytes) *ram_bytes += zmalloc_size(nack);
             if ((n = rdbSaveMillisecondTime(rdb, nack->delivery_time)) == -1) {
                 raxStop(&ri);
                 return -1;
@@ -855,8 +857,9 @@ ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
 
 /* Serialize the consumers of a stream consumer group into the RDB. Helper
  * function for the stream data type serialization. What we do here is to
- * persist the consumer metadata, and it's PEL, for each consumer. */
-ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
+ * persist the consumer metadata, and it's PEL, for each consumer. When ram_bytes
+ * isn't NULL, the consumers' DRAM is added to it. */
+ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg, size_t *ram_bytes) {
     ssize_t n, nwritten = 0;
 
     /* Number of consumers in this consumer group. */
@@ -869,6 +872,7 @@ ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
     raxSeek(&ri, "^", NULL, 0);
     while (raxNext(&ri)) {
         streamConsumer *consumer = ri.data;
+        if (ram_bytes) *ram_bytes += zmalloc_size(consumer) + sdsAllocSize(consumer->name) + raxAllocSize(consumer->pel);
 
         /* Consumer name. */
         if ((n = rdbSaveRawString(rdb, ri.key, ri.key_len)) == -1) {
@@ -895,7 +899,7 @@ ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
          * passed with value of 0), at loading time we'll lookup the ID
          * in the consumer group global PEL and will put a reference in the
          * consumer local PEL. */
-        if ((n = rdbSaveStreamPEL(rdb, consumer->pel, 0)) == -1) {
+        if ((n = rdbSaveStreamPEL(rdb, consumer->pel, 0, NULL)) == -1) {
             raxStop(&ri);
             return -1;
         }
@@ -906,13 +910,16 @@ ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
 }
 
 /* Save an Object.
- * Returns -1 on error, number of bytes written on success. */
-ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbtype) {
+ * Returns -1 on error, number of bytes written on success. When ram_bytes isn't
+ * NULL, the DRAM the value holds, not counting the object itself, is added to
+ * it by the same walk. Pass NULL to skip the allocator lookups that costs. */
+ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbtype, size_t *ram_bytes) {
     ssize_t n = 0, nwritten = 0;
     if (objectGetType(o) == OBJ_STRING) {
         /* Save a string value */
         if ((n = rdbSaveStringObject(rdb, o)) == -1) return -1;
         nwritten += n;
+        if (ram_bytes && objectGetEncoding(o) == OBJ_ENCODING_RAW) *ram_bytes += sdsAllocSize(objectGetVal(o));
     } else if (objectGetType(o) == OBJ_LIST) {
         /* Save a list value */
         if (objectGetEncoding(o) == OBJ_ENCODING_QUICKLIST) {
@@ -921,6 +928,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
 
             if ((n = rdbSaveLen(rdb, ql->len)) == -1) return -1;
             nwritten += n;
+            if (ram_bytes) *ram_bytes += zmalloc_size(ql);
 
             while (node) {
                 if ((n = rdbSaveLen(rdb, node->container)) == -1) return -1;
@@ -935,6 +943,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                     if ((n = rdbSaveRawString(rdb, node->entry, node->sz)) == -1) return -1;
                     nwritten += n;
                 }
+                if (ram_bytes) *ram_bytes += zmalloc_size(node) + zmalloc_size(node->entry);
                 node = node->next;
             }
         } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
@@ -947,6 +956,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             nwritten += n;
             if ((n = rdbSaveRawString(rdb, lp, lpBytes(lp))) == -1) return -1;
             nwritten += n;
+            if (ram_bytes) *ram_bytes += zmalloc_size(lp);
         } else {
             serverPanic("Unknown list encoding");
         }
@@ -959,6 +969,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 return -1;
             }
             nwritten += n;
+            if (ram_bytes) *ram_bytes += hashtableAllocSize(set);
 
             hashtableIterator iterator;
             hashtableInitIterator(&iterator, set, 0);
@@ -970,6 +981,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                     return -1;
                 }
                 nwritten += n;
+                if (ram_bytes) *ram_bytes += sdsAllocSize(ele);
             }
             hashtableCleanupIterator(&iterator);
         } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
@@ -977,10 +989,12 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
 
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
+            if (ram_bytes) *ram_bytes += zmalloc_size(objectGetVal(o));
         } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
             size_t l = lpBytes((unsigned char *)objectGetVal(o));
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
+            if (ram_bytes) *ram_bytes += zmalloc_size(objectGetVal(o));
         } else {
             serverPanic("Unknown set encoding");
         }
@@ -991,11 +1005,17 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
 
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
+            if (ram_bytes) *ram_bytes += zmalloc_size(objectGetVal(o));
         } else if (objectGetEncoding(o) == OBJ_ENCODING_BTREE) {
             zset *zs = objectGetVal(o);
 
             if ((n = rdbSaveLen(rdb, orderedIndexLength(zs->oi))) == -1) return -1;
             nwritten += n;
+            /* The index's own nodes aren't walked here, so they're estimated. */
+            if (ram_bytes) {
+                *ram_bytes +=
+                    zmalloc_size(zs) + orderedIndexEstimateStructureMemory(zs->oi) + hashtableAllocSize(zs->ht);
+            }
 
             /* We save the skiplist elements from the greatest to the smallest
              * (that's trivial since the elements are already ordered in the
@@ -1016,6 +1036,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 nwritten += n;
                 if ((n = rdbSaveBinaryDoubleValue(rdb, orderedIndexItemGetScore(item))) == -1) return -1;
                 nwritten += n;
+                if (ram_bytes) *ram_bytes += sdsAllocSize((sds)item);
             }
         } else {
             serverPanic("Unknown sorted set encoding");
@@ -1030,6 +1051,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
 
             if ((n = rdbSaveLen(rdb, hashTypeLength(o))) == -1) return -1;
             nwritten += n;
+            if (ram_bytes) *ram_bytes += zmalloc_size(zl);
 
             unsigned char *p = lpFirst(zl);
             while (p) {
@@ -1054,6 +1076,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
 
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
+            if (ram_bytes) *ram_bytes += zmalloc_size(objectGetVal(o));
         } else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
             serverAssert(rdbtype == RDB_TYPE_HASH || rdbtype == RDB_TYPE_HASH_2);
             hashtable *ht = objectGetVal(o);
@@ -1062,6 +1085,11 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 return -1;
             }
             nwritten += n;
+            if (ram_bytes) {
+                vset *volatile_fields = hashtableMetadata(ht);
+                *ram_bytes += hashtableAllocSize(ht);
+                if (vsetIsValid(volatile_fields)) *ram_bytes += vsetMemUsage(volatile_fields);
+            }
             /* check if need to add expired time for the hash fields */
             bool add_expiry = (rdbtype == RDB_TYPE_HASH_2);
             hashtableIterator iter;
@@ -1071,6 +1099,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 sds field = entryGetField(next);
                 size_t value_len;
                 unsigned char *value = (unsigned char *)entryGetValue(next, &value_len);
+                if (ram_bytes) *ram_bytes += entryAllocSize(next);
 
                 if ((n = rdbSaveRawString(rdb, (unsigned char *)field, sdslen(field))) == -1) {
                     hashtableCleanupIterator(&iter);
@@ -1102,6 +1131,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         rax *rax = s->rax;
         if ((n = rdbSaveLen(rdb, raxSize(rax))) == -1) return -1;
         nwritten += n;
+        if (ram_bytes) *ram_bytes += zmalloc_size(s) + raxAllocSize(rax);
 
         /* Serialize all the listpacks inside the radix tree as they are,
          * when loading back, we'll use the first entry of each listpack
@@ -1112,6 +1142,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         while (raxNext(&ri)) {
             unsigned char *lp = ri.data;
             size_t lp_bytes = lpBytes(lp);
+            if (ram_bytes) *ram_bytes += zmalloc_size(lp);
             if ((n = rdbSaveRawString(rdb, ri.key, ri.key_len)) == -1) {
                 raxStop(&ri);
                 return -1;
@@ -1158,11 +1189,13 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         nwritten += n;
 
         if (num_cgroups) {
+            if (ram_bytes) *ram_bytes += raxAllocSize(s->cgroups);
             /* Serialize each consumer group. */
             raxStart(&ri, s->cgroups);
             raxSeek(&ri, "^", NULL, 0);
             while (raxNext(&ri)) {
                 streamCG *cg = ri.data;
+                if (ram_bytes) *ram_bytes += zmalloc_size(cg) + raxAllocSize(cg->pel) + raxAllocSize(cg->consumers);
 
                 /* Save the group name. */
                 if ((n = rdbSaveRawString(rdb, ri.key, ri.key_len)) == -1) {
@@ -1191,14 +1224,14 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 nwritten += n;
 
                 /* Save the global PEL. */
-                if ((n = rdbSaveStreamPEL(rdb, cg->pel, 1)) == -1) {
+                if ((n = rdbSaveStreamPEL(rdb, cg->pel, 1, ram_bytes)) == -1) {
                     raxStop(&ri);
                     return -1;
                 }
                 nwritten += n;
 
                 /* Save the consumers of this group. */
-                if ((n = rdbSaveStreamConsumers(rdb, cg)) == -1) {
+                if ((n = rdbSaveStreamConsumers(rdb, cg, ram_bytes)) == -1) {
                     raxStop(&ri);
                     return -1;
                 }
@@ -1210,12 +1243,24 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         pathHashObject *path_hash = objectGetVal(o);
         if ((n = rdbSaveLen(rdb, raxSize(path_hash->index))) == -1) return -1;
         nwritten += n;
+        if (ram_bytes) *ram_bytes += zmalloc_size(path_hash) + raxAllocSize(path_hash->index);
 
         raxIterator paths;
         raxStart(&paths, path_hash->index);
         raxSeek(&paths, "^", NULL, 0);
         while (raxNext(&paths)) {
             robj *payload = paths.data;
+            if (ram_bytes) {
+                *ram_bytes += zmalloc_size(payload);
+                if (objectGetEncoding(payload) == OBJ_ENCODING_LISTPACK) {
+                    *ram_bytes += zmalloc_size(objectGetVal(payload));
+                } else {
+                    hashtable *ht = objectGetVal(payload);
+                    vset *volatile_fields = hashtableMetadata(ht);
+                    *ram_bytes += hashtableAllocSize(ht);
+                    if (vsetIsValid(volatile_fields)) *ram_bytes += vsetMemUsage(volatile_fields);
+                }
+            }
             if ((n = rdbSaveRawString(rdb, paths.key, paths.key_len)) == -1) {
                 raxStop(&paths);
                 return -1;
@@ -1230,6 +1275,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             hashTypeIterator fields;
             hashTypeInitIterator(payload, &fields);
             while (hashTypeNext(&fields) != C_ERR) {
+                if (ram_bytes && fields.encoding == OBJ_ENCODING_HASHTABLE) *ram_bytes += entryAllocSize(fields.next);
                 sds field = hashTypeCurrentObjectNewSds(&fields, OBJ_HASH_FIELD);
                 sds value = hashTypeCurrentObjectNewSds(&fields, OBJ_HASH_VALUE);
                 ssize_t field_bytes = rdbSaveRawString(rdb, (unsigned char *)field, sdslen(field));
@@ -1254,7 +1300,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         }
         raxStop(&paths);
     } else if (objectGetType(o) == OBJ_MODULE) {
-        /* Save a module-specific value. */
+        /* Save a module-specific value. Its DRAM isn't counted in ram_bytes. */
         ValkeyModuleIO io;
         moduleValue *mv = objectGetVal(o);
         moduleType *mt = mv->type;
@@ -1292,7 +1338,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
 size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
     int rdbtype = rdbGetObjectType(o, RDB_VERSION);
     serverAssert(rdbtype != -1);
-    ssize_t len = rdbSaveObject(NULL, o, key, dbid, rdbtype);
+    ssize_t len = rdbSaveObject(NULL, o, key, dbid, rdbtype, NULL);
     serverAssertWithInfo(NULL, o, len != -1);
     return len;
 }
@@ -1341,7 +1387,7 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     }
     if (rdbSaveType(rdb, rdbtype) == -1) return -1;
     if (rdbSaveStringObject(rdb, key) == -1) return -1;
-    if (rdbSaveObject(rdb, val, key, dbid, rdbtype) == -1) return -1;
+    if (rdbSaveObject(rdb, val, key, dbid, rdbtype, NULL) == -1) return -1;
 
     /* Delay return if required (for testing) */
     if (server.rdb_key_save_delay) debugDelay(server.rdb_key_save_delay);

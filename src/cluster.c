@@ -119,8 +119,9 @@ ConnectionType *connTypeOfCluster(void) {
  * -------------------------------------------------------------------------- */
 
 /* Generates a DUMP-format representation of the object 'o', adding it to the
- * io stream pointed by 'rio'. This function can't fail. */
-void createDumpPayload(rio *payload, robj *o, robj *key, int dbid) {
+ * io stream pointed by 'rio'. This function can't fail. When ram_bytes isn't
+ * NULL, the DRAM the value holds is added to it, as in rdbSaveObject(). */
+void createDumpPayload(rio *payload, robj *o, robj *key, int dbid, size_t *ram_bytes) {
     unsigned char buf[2];
     uint64_t crc;
 
@@ -130,7 +131,7 @@ void createDumpPayload(rio *payload, robj *o, robj *key, int dbid) {
     int rdbtype = rdbGetObjectType(o, RDB_VERSION);
     serverAssert(rdbtype >= 0);
     serverAssert(rdbSaveType(payload, rdbtype));
-    serverAssert(rdbSaveObject(payload, o, key, dbid, rdbtype));
+    serverAssert(rdbSaveObject(payload, o, key, dbid, rdbtype, ram_bytes));
 
     /* Write the footer, this is how it looks like:
      * ----------------+---------------------+---------------+
@@ -192,7 +193,7 @@ void dumpCommand(client *c) {
     }
 
     /* Create the DUMP encoded representation. */
-    createDumpPayload(&payload, o, c->argv[1], c->db->id);
+    createDumpPayload(&payload, o, c->argv[1], c->db->id, NULL);
 
     /* Transfer to the client */
     addReplyBulkSds(c, payload.io.buffer.ptr);
@@ -586,7 +587,7 @@ try_again:
 
         /* Emit the payload argument, that is the serialized object using
          * the DUMP format. */
-        createDumpPayload(&payload, ov[j], kv[j], dbid);
+        createDumpPayload(&payload, ov[j], kv[j], dbid, NULL);
         serverAssertWithInfo(c, NULL, rioWriteBulkString(&cmd, payload.io.buffer.ptr, sdslen(payload.io.buffer.ptr)));
         sdsfree(payload.io.buffer.ptr);
 
