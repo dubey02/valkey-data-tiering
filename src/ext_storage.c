@@ -9,7 +9,6 @@
 
 #include "server.h"
 
-#define USE_EXT_STORAGE
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
@@ -577,8 +576,6 @@ static int determineSpilledKeys(client *c, robj **keys_out) {
 bool externalStorage_blockClientIfNeeded(client *c) {
     if (!ext_storage.open) return false;
     // logic will need to be added for edge cases like multi/exec in milestone 5
-    // todo: at EXEC, check the keys of every queued command.
-    if (c->flag.multi && c->cmd->proc != execCommand) return false;
 
     // if any of the keys are spilled for this command, then we need to block the client for tiered storage
     robj **keys = zmalloc(sizeof(robj *) * c->argc);
