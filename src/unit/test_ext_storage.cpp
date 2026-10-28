@@ -1729,15 +1729,26 @@ TEST_F(SpillSubmitTest, DeletingAKeyMidSpill) {
     EXPECT_EQ(finishSpills(), 0);
 }
 
-/* The key replacing a spilled key's value must not look spilled. */
-TEST_F(SpillSubmitTest, RemovingASpilledKeyResetsItsState) {
-    robj *entry = addRawKey("key");
+/* Replacing a hash on flash keeps the object in the keyspace for the new
+ * value. The new value is in memory, and freeing the old one, which has no
+ * value left, doesn't look for field expirations in it. */
+TEST_F(SpillSubmitTest, ReplacingTheValueOfAKeyOnFlash) {
+    robj *hash = createHashObject();
+    sds field = sdsnew("field");
+    hashTypeSet(hash, field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+    robj *entry = addKey("hash", hash);
     ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
     ASSERT_EQ(finishSpills(), 1);
 
-    spillBeforeRemove(entry);
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(objectGetVal(entry), nullptr);
+    robj *val = createHashObject();
+    hashTypeSet(val, field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+    sdsfree(field);
+    robj *key = createStringObject("hash", 4);
+    dbReplaceValue(server.db[0], key, &val);
+    decrRefCount(key);
+    EXPECT_EQ(val, entry);
+    EXPECT_EQ(getStorageState(val), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_NE(objectGetVal(val), nullptr);
 }
 
 /* Closing the engine discards completions it hasn't handed back, which would
