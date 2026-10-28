@@ -902,6 +902,21 @@ static int createOneOfEachObject(robj **objs) {
     return n;
 }
 
+/* Adds one element to a collection, since the keyspace holds no empty ones. */
+static void addOneElement(robj *o) {
+    sds one = sdsnew("1");
+    robj *ele = createStringObject("1", 1);
+    int out_flags = 0;
+    switch (o->type) {
+    case OBJ_LIST: listTypePush(o, ele, LIST_TAIL); break;
+    case OBJ_SET: setTypeAdd(o, one); break;
+    case OBJ_HASH: hashTypeSet(o, one, one, EXPIRY_NONE, HASH_SET_COPY, NULL); break;
+    case OBJ_ZSET: zsetAdd(o, 1, one, ZADD_IN_NONE, &out_flags, NULL); break;
+    }
+    decrRefCount(ele);
+    sdsfree(one);
+}
+
 TEST(StorageStateTest, NewObjectsStartInMemory) {
     robj *objs[NUM_TEST_OBJECTS];
     int n = createOneOfEachObject(objs);
@@ -1009,6 +1024,12 @@ class SpillSelectTest : public ::testing::Test {
         return found;
     }
 
+    /* Whether spill selection would pick 'entry', the only candidate there. */
+    bool isSelected(robj *entry) {
+        int dbid;
+        return spillSelectCandidate(&dbid) == entry;
+    }
+
     /* Adds a key to 'db' in 'slot', with a TTL unless expire is -1, and returns its entry. */
     robj *addKeyTo(serverDb *db, int slot, const char *key, robj *val, long long expire) {
         sds k = sdsnew(key);
@@ -1056,6 +1077,7 @@ TEST_F(SpillSelectTest, EveryTypeIsACandidateExceptEmbeddedAndIntStrings) {
         int type = objs[i]->type;
         int encoding = objs[i]->encoding;
         bool expected = encoding != OBJ_ENCODING_EMBSTR && encoding != OBJ_ENCODING_INT;
+        addOneElement(objs[i]);
         robj *entry = addKey("key", objs[i]);
 
         int dbid = -1;
@@ -1145,6 +1167,17 @@ TEST_F(SpillSelectTest, SkipsExpiredKeys) {
 
     int dbid = -1;
     EXPECT_EQ(spillSelectCandidate(&dbid), live);
+}
+
+/* Field expiry reads and changes the hash's value, so it has to stay in DRAM. */
+TEST_F(SpillSelectTest, SkipsHashesWithFieldExpirations) {
+    robj *hash = createHashObject();
+    hashTypeSet(hash, sdsnew("field"), sdsnew("value"), EXPIRY_NONE, HASH_SET_TAKE_FIELD | HASH_SET_TAKE_VALUE, NULL);
+    robj *entry = addKey("hash", hash);
+    EXPECT_TRUE(isSelected(entry));
+    hashTypeSet(entry, sdsnew("ttl"), sdsnew("value"), mstime() + 100000, HASH_SET_TAKE_FIELD | HASH_SET_TAKE_VALUE,
+                NULL);
+    EXPECT_FALSE(isSelected(entry));
 }
 
 /* Non-candidates must not crowd the candidate out of the pool. */
@@ -1449,6 +1482,407 @@ TEST_F(SpillSelectTest, PicksKeysAcrossSlots) {
         int dbid = -1;
         EXPECT_NE(spillSelectCandidate(&dbid), nullptr) << "selection " << i;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Spill submission
+ * ---------------------------------------------------------------------------*/
+
+class SpillSubmitTest : public SpillSelectTest {
+  protected:
+    void SetUp() override {
+        SpillSelectTest::SetUp();
+        extStorageTestResetRegistry();
+        server.hz = CONFIG_DEFAULT_HZ;
+        server.logfile = zstrdup("");
+        crc64_init();
+        server.ext_storage_enabled = 1;
+        server.ext_storage_engine = zstrdup("mock");
+        server.ext_storage_path = zstrdup("");
+        extStorageInit();
+    }
+
+    void TearDown() override {
+        finishSpills();
+        extStorageDeinit();
+        zfree(server.ext_storage_engine);
+        zfree(server.ext_storage_path);
+        zfree(server.logfile);
+        SpillSelectTest::TearDown();
+    }
+
+    /* Runs every queued request and processes its completion. */
+    int finishSpills() {
+        storageMockRunIo(1000);
+        return extStorageBeforeSleep();
+    }
+};
+
+TEST_F(SpillSubmitTest, SubmitsTheValueAndCountsItsDram) {
+    robj *entry = addRawKey("key");
+    size_t before = spillInflightRamBytes();
+
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    EXPECT_EQ(spillInflightRamBytes() - before, sdsAllocSize((sds)objectGetVal(entry)));
+}
+
+/* A collection is sized from sampled elements, so only the value's DRAM is
+ * counted, not the object that keeps the key. */
+TEST_F(SpillSubmitTest, CountsTheDramOfACollection) {
+    char element[100];
+    memset(element, 'e', sizeof(element));
+
+    size_t used_before = zmalloc_used_memory();
+    robj *list = createQuicklistObject(-2, 0);
+    for (int i = 0; i < 1000; i++) {
+        robj *ele = createStringObject(element, sizeof(element));
+        listTypePush(list, ele, LIST_TAIL);
+        decrRefCount(ele);
+    }
+    size_t value_bytes = zmalloc_used_memory() - used_before - zmalloc_size(list);
+    robj *entry = addKey("list", list);
+    size_t before = spillInflightRamBytes();
+
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    EXPECT_NEAR((double)(spillInflightRamBytes() - before), (double)value_bytes, value_bytes * 0.1);
+}
+
+TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
+    /* Fill the engine's queue. */
+    int queued = 0;
+    for (; queued < 1000; queued++) {
+        char key[32];
+        snprintf(key, sizeof(key), "queued%d", queued);
+        if (spillItem(0, addRawKey(key)) != STORAGE_OK) break;
+    }
+    ASSERT_LT(queued, 1000) << "the engine's queue never filled";
+
+    robj *entry = addRawKey("key");
+    size_t before = spillInflightRamBytes();
+
+    EXPECT_EQ(spillItem(0, entry), STORAGE_WOULDBLOCK);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(spillInflightRamBytes(), before);
+}
+
+TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
+    robj *entry = addRawKey("key");
+    size_t before = spillInflightRamBytes();
+
+    /* The engine rejects a database it wasn't opened with. */
+    EXPECT_EQ(spillItem(server.dbnum, entry), STORAGE_ERR_REJECTED);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(spillInflightRamBytes(), before);
+}
+
+/* ---------------------------------------------------------------------------
+ * Spill completion
+ * ---------------------------------------------------------------------------*/
+
+TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_STREQ(objectGetKey(entry), "key");
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+    EXPECT_FALSE(isSelected(entry));
+}
+
+/* A failed write leaves the value in DRAM, so the key can be picked again. */
+TEST_F(SpillSubmitTest, AFailedSpillKeepsTheValueInMemory) {
+    extStorageDeinit();
+    server.ext_storage_capacity = 1;
+    extStorageInit();
+
+    robj *entry = addRawKey("key");
+    sds val = sdsdup((sds)objectGetVal(entry));
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), val), 0);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+    EXPECT_TRUE(isSelected(entry));
+    sdsfree(val);
+}
+
+/* Each type's value is freed by its own free function. */
+TEST_F(SpillSubmitTest, EverySpillableTypeCompletes) {
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    robj *spilled[NUM_TEST_OBJECTS];
+    int num_spilled = 0;
+    for (int i = 0; i < n; i++) {
+        addOneElement(objs[i]);
+
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addKey(key, objs[i]);
+        /* Embedded and INT strings have no separate value to spill. */
+        if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
+        ASSERT_EQ(spillItem(0, entry), STORAGE_OK) << "type " << entry->type;
+        spilled[num_spilled++] = entry;
+    }
+    /* All but the embedded and INT strings. */
+    ASSERT_EQ(num_spilled, n - 2);
+    ASSERT_GT(spillInflightRamBytes(), 0u);
+
+    EXPECT_EQ(finishSpills(), num_spilled);
+    for (int i = 0; i < num_spilled; i++) {
+        EXPECT_EQ(getStorageState(spilled[i]), STORAGE_STATE_ONLY_FLASH)
+            << "type " << spilled[i]->type << " encoding " << strEncoding(spilled[i]->encoding);
+        EXPECT_EQ(objectGetVal(spilled[i]), nullptr);
+    }
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+}
+
+/* Freeing a value something else references would leave it dangling. */
+TEST_F(SpillSubmitTest, AReferencedValueStaysInMemory) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    incrRefCount(entry);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_NE(objectGetVal(entry), nullptr);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+    decrRefCount(entry);
+}
+
+/* Deleting or overwriting a hash checks it for field expirations. */
+TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
+    robj *listpack = createHashObject();
+    robj *hashtable = createHashObject();
+    hashTypeConvert(hashtable, OBJ_ENCODING_HASHTABLE);
+    robj *hashes[] = {addKey("listpack", listpack), addKey("hashtable", hashtable)};
+    for (int i = 0; i < 2; i++) {
+        sds field = sdsnew("field");
+        hashTypeSet(hashes[i], field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+        sdsfree(field);
+        ASSERT_EQ(spillItem(0, hashes[i]), STORAGE_OK);
+    }
+    ASSERT_EQ(finishSpills(), 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(objectGetVal(hashes[i]), nullptr);
+        EXPECT_FALSE(hashTypeHasVolatileFields(hashes[i]));
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Values in flight
+ * ---------------------------------------------------------------------------*/
+
+/* A write waits for the engine to release the value, and the value stays in
+ * DRAM. Another key's completion that arrives first waits for beforeSleep(),
+ * since the running command may still use its value. */
+TEST_F(SpillSubmitTest, WritingAKeyMidSpillKeepsItsValue) {
+    robj *other = addRawKey("other");
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, other), STORAGE_OK);
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    sds val = sdsdup((sds)objectGetVal(entry));
+
+    spillBeforeWrite(entry);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), val), 0);
+    EXPECT_EQ(getStorageState(other), STORAGE_STATE_COPYING_TO_FLASH);
+    EXPECT_NE(objectGetVal(other), nullptr);
+
+    EXPECT_EQ(extStorageBeforeSleep(), 1);
+    EXPECT_EQ(getStorageState(other), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+    sdsfree(val);
+}
+
+/* A completion that was set aside while waiting for another key is found when
+ * its own key is written. */
+TEST_F(SpillSubmitTest, WritingAKeyWhoseCompletionWasSetAside) {
+    robj *first = addRawKey("first");
+    robj *second = addRawKey("second");
+    ASSERT_EQ(spillItem(0, first), STORAGE_OK);
+    ASSERT_EQ(spillItem(0, second), STORAGE_OK);
+
+    spillBeforeWrite(second);
+    ASSERT_EQ(getStorageState(first), STORAGE_STATE_COPYING_TO_FLASH);
+    spillBeforeWrite(first);
+    EXPECT_EQ(getStorageState(first), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_NE(objectGetVal(first), nullptr);
+    EXPECT_EQ(extStorageBeforeSleep(), 0);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+}
+
+/* Deleting a key mid-spill must not free the value the engine is reading. */
+TEST_F(SpillSubmitTest, DeletingAKeyMidSpill) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+
+    spillBeforeRemove(entry);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    sds key = sdsnew("key");
+    ASSERT_TRUE(kvstoreHashtableDelete(server.db[0]->keys, 0, key));
+    sdsfree(key);
+    EXPECT_EQ(finishSpills(), 0);
+}
+
+/* Replacing a hash on flash keeps the object in the keyspace for the new
+ * value. The new value is in memory, and freeing the old one, which has no
+ * value left, doesn't look for field expirations in it. */
+TEST_F(SpillSubmitTest, ReplacingTheValueOfAKeyOnFlash) {
+    robj *hash = createHashObject();
+    sds field = sdsnew("field");
+    hashTypeSet(hash, field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+    robj *entry = addKey("hash", hash);
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+
+    robj *val = createHashObject();
+    hashTypeSet(val, field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+    sdsfree(field);
+    robj *key = createStringObject("hash", 4);
+    dbReplaceValue(server.db[0], key, &val);
+    decrRefCount(key);
+    EXPECT_EQ(val, entry);
+    EXPECT_EQ(getStorageState(val), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_NE(objectGetVal(val), nullptr);
+}
+
+/* Closing the engine discards completions it hasn't handed back, which would
+ * leak the requests and leave keys COPYING_TO_FLASH. */
+TEST_F(SpillSubmitTest, ClosingTheEngineFinishesSpillsInFlight) {
+    robj *a = addRawKey("a");
+    robj *b = addRawKey("b");
+    ASSERT_EQ(spillItem(0, a), STORAGE_OK);
+    ASSERT_EQ(spillItem(0, b), STORAGE_OK);
+
+    extStorageDeinit();
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+}
+
+TEST_F(SpillSubmitTest, SavingAKeyOnFlashFails) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+
+    rio rdb;
+    rioInitWithBuffer(&rdb, sdsempty());
+    robj *key = createStringObject("key", 3);
+    EXPECT_EQ(rdbSaveKeyValuePair(&rdb, key, entry, -1, 0, RDB_VERSION), -1);
+    decrRefCount(key);
+    sdsfree(rdb.io.buffer.ptr);
+}
+
+/* TODO(#39): a read fetches the value instead. */
+TEST_F(SpillSubmitTest, AKeyOnFlashReadsAsMissing) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+
+    robj *key = createStringObject("key", 3);
+    EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr);
+    decrRefCount(key);
+}
+
+/* Deleting a key on flash frees only the object, so lazy free must not read
+ * the quicklist it no longer has. */
+TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    ASSERT_EQ(objectGetVal(entry), nullptr);
+
+    /* As a lazy delete does, after taking the key out of the keyspace. */
+    void *popped;
+    ASSERT_TRUE(kvstoreHashtablePop(server.db[0]->keys, 0, objectGetKey(entry), &popped));
+    robj *key = createStringObject("list", 4);
+    freeObjAsync(key, entry, 0);
+    decrRefCount(key);
+}
+
+/* ---------------------------------------------------------------------------
+ * Spilling over maxmemory
+ * ---------------------------------------------------------------------------*/
+
+TEST_F(SpillSubmitTest, EvictionOnlyTakesKeysInMemory) {
+    robj *entry = addRawKey("key");
+    EXPECT_TRUE(spillCanEvict(entry));
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    EXPECT_FALSE(spillCanEvict(entry));
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_FALSE(spillCanEvict(entry));
+}
+
+TEST_F(SpillSubmitTest, SpillsOnlyEnoughToCoverWhatMustBeFreed) {
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, -1, 1000);
+    objectSetLRUOrLFU(addRawKey("warm"), -1, 100);
+    objectSetLRUOrLFU(addRawKey("hot"), -1, 10);
+
+    EXPECT_EQ(spillToFree(1), 0u);
+    EXPECT_EQ(getStorageState(coldest), STORAGE_STATE_COPYING_TO_FLASH);
+    size_t one_value = spillInflightRamBytes();
+
+    /* What is in flight already counts. */
+    EXPECT_EQ(spillToFree(one_value), 0u);
+    EXPECT_EQ(spillInflightRamBytes(), one_value);
+}
+
+/* Eviction frees what spilling can't. */
+TEST_F(SpillSubmitTest, ReturnsWhatSpillingCannotCover) {
+    addRawKey("a");
+    addRawKey("b");
+    addKey("embedded", createStringObject("short", 5));
+
+    size_t left = spillToFree(1000000);
+    EXPECT_EQ(left, 1000000 - spillInflightRamBytes());
+    ASSERT_EQ(finishSpills(), 2);
+}
+
+/* A call stops after a fixed number of keys without handing the rest to
+ * eviction, because spillable keys are left for the next call. */
+TEST_F(SpillSubmitTest, StopsAfterTheLimitWithoutEvicting) {
+    server.maxmemory_samples = 64; /* sample every key, so only the limit stops the loop */
+    for (int i = 0; i < 20; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        addRawKey(key);
+    }
+    EXPECT_EQ(spillToFree(1000000), 0u);
+    EXPECT_EQ(finishSpills(), 16);
+}
+
+TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
+    addRawKey("key");
+    extStorageDeinit();
+    EXPECT_EQ(spillToFree(100), 100u);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+}
+
+/* beforeSleep() spills without a command, and on a replica, which never evicts. */
+TEST_F(SpillSubmitTest, CronSpillsOverMaxmemoryOnPrimariesAndReplicas) {
+    robj *primary_key = addRawKey("primary");
+    spillCron();
+    EXPECT_EQ(getStorageState(primary_key), STORAGE_STATE_ONLY_MEMORY); /* No maxmemory. */
+
+    server.maxmemory = zmalloc_used_memory() - 1;
+    spillCron();
+    EXPECT_EQ(getStorageState(primary_key), STORAGE_STATE_COPYING_TO_FLASH);
+
+    robj *replica_key = addRawKey("replica");
+    server.primary_host = (char *)"127.0.0.1";
+    server.maxmemory = zmalloc_used_memory() - spillInflightRamBytes() - 1;
+    spillCron();
+    EXPECT_EQ(getStorageState(replica_key), STORAGE_STATE_COPYING_TO_FLASH);
+    server.primary_host = nullptr;
+    server.maxmemory = 0;
 }
 
 #endif /* USE_EXT_STORAGE */

@@ -3340,6 +3340,7 @@ int execGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult 
 void decrRefCount(robj *o);
 void incrRefCount(robj *o);
 robj *makeObjectShared(robj *o);
+void freeObjectVal(robj *o);
 void freeStringObject(robj *o);
 void freeListObject(robj *o);
 void freeSetObject(robj *o);
@@ -3401,6 +3402,7 @@ robj *objectSetExpire(robj *o, long long expire);
 void objectSetVal(robj *o, void *val);
 void objectUnembedVal(robj *o);
 void *objectGetVal(const robj *o);
+bool isValueInMemory(const robj *o);
 sds objectGetKey(const robj *o);
 mstime_t objectGetExpire(const robj *o);
 uint8_t objectGetLFUFrequency(robj *o);

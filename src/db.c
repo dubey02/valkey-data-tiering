@@ -44,6 +44,7 @@
 #include "forkless.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
+#include "ext_storage.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -106,6 +107,17 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         }
     }
 
+    /* TODO(#39): fetch the value. Until then a key on flash reads as missing,
+     * and a write deletes it first so the command starts from an empty key. */
+    if (val && spillIsOnFlash(val)) {
+        if (flags & LOOKUP_WRITE) {
+            dbDelete(db, key);
+            signalModifiedKey(NULL, db, key);
+            propagateDeletion(db, key, server.lazyfree_lazy_server_del, dict_index);
+        }
+        val = NULL;
+    }
+
     if (val) {
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
@@ -122,6 +134,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
 
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
         /* TODO: Use separate hits stats for WRITE */
+        if (flags & LOOKUP_WRITE) spillBeforeWrite(val);
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE))) notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_misses++;
@@ -341,6 +354,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
     robj *new;
+    spillBeforeRemove(old);
 
     if (overwrite) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
@@ -363,12 +377,15 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
          * encoding with the content of val. */
         int tmp_type = old->type;
         int tmp_encoding = old->encoding;
+        int tmp_storage_state = old->storage_state;
         void *tmp_ptr = objectGetVal(old);
         old->type = val->type;
         old->encoding = val->encoding;
+        old->storage_state = val->storage_state;
         objectSetVal(old, objectGetVal(val));
         val->type = tmp_type;
         val->encoding = tmp_encoding;
+        val->storage_state = tmp_storage_state;
         objectSetVal(val, tmp_ptr);
         /* Set new to old to keep the old object. Set old to val to be freed below. */
         new = old;
@@ -498,6 +515,7 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         hotkeysRecordDelete(key, db->id, flags);
 
         robj *val = *ref;
+        spillBeforeRemove(val);
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
         incrRefCount(val);
@@ -688,6 +706,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
 
     /* bgIteration must be notified for flushall. */
     if (dbnum == -1) bgIteration_flushall();
+
+    /* The storage engine may still be reading values that are about to be freed. */
+    spillDrain();
 
     /* Fire the flushdb modules event. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_FLUSHDB, VALKEYMODULE_SUBEVENT_FLUSHDB_START, &fi);

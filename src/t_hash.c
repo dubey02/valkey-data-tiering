@@ -119,7 +119,8 @@ long long hashTypeVolatileCount(robj *o) {
 }
 
 bool hashTypeHasVolatileFields(robj *o) {
-    if (o == NULL) return false;
+    /* Hashes with field expirations aren't spilled. */
+    if (o == NULL || !isValueInMemory(o)) return false;
     serverAssert(objectGetType(o) == OBJ_HASH);
 
     if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {

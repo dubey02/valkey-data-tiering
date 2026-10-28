@@ -420,6 +420,11 @@ void *objectGetVal(const robj *o) {
     }
 }
 
+/* False when the value is on flash and only the key is in memory. */
+bool isValueInMemory(const robj *o) {
+    return o->storage_state == STORAGE_STATE_ONLY_MEMORY || o->storage_state == STORAGE_STATE_COPYING_TO_FLASH;
+}
+
 sds objectGetKey(const robj *o) {
     const unsigned char *data = objectEmbeddedData((robj *)o);
     if (o->hasexpire) {
@@ -773,21 +778,24 @@ void incrRefCount(robj *o) {
     }
 }
 
+/* Frees the object's value but not the object itself. */
+void freeObjectVal(robj *o) {
+    switch (objectGetType(o)) {
+    case OBJ_STRING: freeStringObject(o); break;
+    case OBJ_LIST: freeListObject(o); break;
+    case OBJ_SET: freeSetObject(o); break;
+    case OBJ_ZSET: freeZsetObject(o); break;
+    case OBJ_HASH: freeHashObject(o); break;
+    case OBJ_MODULE: freeModuleObject(o); break;
+    case OBJ_STREAM: freeStreamObject(o); break;
+    case OBJ_PATH_HASH: freePathHashObject(o); break;
+    default: serverPanic("Unknown object type"); break;
+    }
+}
+
 void decrRefCount(robj *o) {
     if (objectGetRefcount(o) == 1) {
-        if (objectGetVal(o) != NULL) {
-            switch (objectGetType(o)) {
-            case OBJ_STRING: freeStringObject(o); break;
-            case OBJ_LIST: freeListObject(o); break;
-            case OBJ_SET: freeSetObject(o); break;
-            case OBJ_ZSET: freeZsetObject(o); break;
-            case OBJ_HASH: freeHashObject(o); break;
-            case OBJ_MODULE: freeModuleObject(o); break;
-            case OBJ_STREAM: freeStreamObject(o); break;
-            case OBJ_PATH_HASH: freePathHashObject(o); break;
-            default: serverPanic("Unknown object type"); break;
-            }
-        }
+        if (objectGetVal(o) != NULL) freeObjectVal(o);
         zfree(o);
     } else {
         if (objectGetRefcount(o) <= 0) serverPanic("decrRefCount against refcount <= 0");

@@ -1970,7 +1970,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (io_responses > 0) server.el_iteration_active = true;
 
 #ifdef USE_EXT_STORAGE
-    extStorageBeforeSleep();
+    if (extStorageBeforeSleep() > 0) server.el_iteration_active = true;
 #endif
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
@@ -1992,6 +1992,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Release keys from bgIteration before processing unblocked clients. */
     bgIteration_beforeSleep();
+    spillCron();
     /* Handle blocked clients.
      * must be done before flushAppendOnlyFile, in case of appendfsync=always,
      * since the unblocked clients may write data. */

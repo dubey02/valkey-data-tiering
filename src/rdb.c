@@ -1304,6 +1304,13 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
+    /* TODO(#64): save values that are on flash. */
+    if (val->storage_state == STORAGE_STATE_ONLY_FLASH) {
+        serverLog(LL_WARNING, "Can't save a key whose value is on flash.");
+        errno = ENOTSUP;
+        return -1;
+    }
+
     /* Save the expire time */
     if (expiretime != -1) {
         if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) return -1;

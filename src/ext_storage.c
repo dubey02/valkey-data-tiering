@@ -12,6 +12,7 @@
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
+#include "bgiteration.h"
 #include "rdb.h"
 #include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
@@ -236,11 +237,15 @@ void extStorageInit(void) {
 /* Completions
  * extStorageBeforeSleep and the shutdown drain both go through here. */
 
+static void spillComplete(const storageCompletion *comp);
+static int spillProcessDeferred(void);
+
 /* Handles one finished request. */
 static void extStorageProcessCompletion(const storageCompletion *c) {
     switch (c->op_type) {
     case STORAGE_OP_PUT:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
+        spillComplete(c);
         break;
     case STORAGE_OP_GET:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
@@ -262,16 +267,19 @@ static int extStoragePollCompletions(void) {
 }
 
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
- * the loop at least every tick, so a completion waits at most that long. */
-void extStorageBeforeSleep(void) {
-    if (!ext_storage.open) return;
-    extStoragePollCompletions();
+ * the loop at least every tick, so a completion waits at most that long.
+ * Returns how many completions were handled. */
+int extStorageBeforeSleep(void) {
+    if (!ext_storage.open) return 0;
+    return spillProcessDeferred() + extStoragePollCompletions();
 }
 
 /* Closes the storage engine. Outstanding requests are polled and handled first.
  * Nothing new is submitted, so the drain ends when they finish. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
+    /* The engine no longer holds these, so close() doesn't wait for them. */
+    spillProcessDeferred();
     storageStatus st;
     int drained = 0;
     mstime_t drain_start = 0;
@@ -428,15 +436,28 @@ void setStorageState(robj *o, storageState state) {
     o->storage_state = state;
 }
 
+/* Elements sampled to size a collection, the same default as MEMORY USAGE. */
+#define SPILL_SIZE_SAMPLES 5
+
+/* Returns the memory freed by spilling the value of 'o'. The object, which
+ * holds the key, stays. Collections are sampled, as in MEMORY USAGE. The key
+ * and dbid are only read for module values, which aren't spilled. */
+static size_t spillValueRamBytes(const robj *o) {
+    return objectComputeSize(NULL, (robj *)o, SPILL_SIZE_SAMPLES, 0) - zmalloc_size((void *)o);
+}
+
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
  * Module values have no serializer yet (#81). Expired keys are left for
- * expiry to delete. */
+ * expiry to delete. A hash with field expirations stays in DRAM because active
+ * field expiry reads and changes its value.
+ * TODO(#57): spill it once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
-    return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY && !o->hasembval &&
-           objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE &&
-           !timestampIsExpired(objectGetExpire(o));
+    if (getStorageState(o) != STORAGE_STATE_ONLY_MEMORY || o->hasembval || objectGetRefcount(o) != 1) return false;
+    if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
+    if (timestampIsExpired(objectGetExpire(o))) return false;
+    return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }
 
 /* Picks the eviction policy used to sample and rank keys for spilling.
@@ -451,6 +472,175 @@ static int spillSamplingPolicy(void) {
 /* Returns the coldest spillable key, or NULL if none was sampled. */
 robj *spillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
+}
+
+/* A put in flight, passed to the engine as its request_ctx. */
+typedef struct spillRequest {
+    robj *entry;
+    size_t ram_bytes;
+} spillRequest;
+
+/* DRAM held by values that are being written to the storage engine. */
+static size_t inflight_ram_bytes;
+static unsigned long inflight_requests;
+
+size_t spillInflightRamBytes(void) {
+    return inflight_ram_bytes;
+}
+
+/* Submits an item to the storage engine, which borrows it until the completion
+ * is polled. On any status other than STORAGE_OK nothing changes. */
+storageStatus spillItem(int dbid, robj *entry) {
+    serverAssert(ext_storage.open && isSpillCandidate(entry));
+
+    size_t ram_bytes = spillValueRamBytes(entry);
+
+    spillRequest *req = zmalloc(sizeof(*req));
+    req->entry = entry;
+    req->ram_bytes = ram_bytes;
+    sds key = objectGetKey(entry);
+    storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
+    if (status != STORAGE_OK) {
+        zfree(req);
+        return status;
+    }
+
+    setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
+    inflight_ram_bytes += ram_bytes;
+    inflight_requests++;
+    return STORAGE_OK;
+}
+
+/* Finishes a spill. On success the value is freed and only the key stays in
+ * DRAM. On failure, or when the value must stay, the key is back in memory and
+ * can be picked again. */
+static void spillFinish(spillRequest *req, storageStatus status, bool keep_in_memory) {
+    robj *entry = req->entry;
+    serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
+
+    /* Keep a value that something else still references. */
+    if (objectGetRefcount(entry) != 1 || bgIteration_isEntryInuse(entry)) keep_in_memory = true;
+    if (status == STORAGE_OK && !keep_in_memory) {
+        freeObjectVal(entry);
+        objectSetVal(entry, NULL);
+        setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    } else {
+        /* TODO(#34): delete the flash copy when the write succeeded. */
+        setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
+    }
+    inflight_ram_bytes -= req->ram_bytes;
+    inflight_requests--;
+    zfree(req);
+}
+
+static void spillComplete(const storageCompletion *comp) {
+    spillFinish(comp->request_ctx, comp->status, false);
+}
+
+/* Completions polled while waiting for one key. The running command may hold
+ * pointers to their values, so they are finished from beforeSleep() instead. */
+static list *deferred_completions;
+
+static void deferCompletion(const storageCompletion *comp) {
+    if (deferred_completions == NULL) deferred_completions = listCreate();
+    storageCompletion *copy = zmalloc(sizeof(*copy));
+    *copy = *comp;
+    listAddNodeTail(deferred_completions, copy);
+}
+
+static int spillProcessDeferred(void) {
+    if (deferred_completions == NULL) return 0;
+    int n = 0;
+    listNode *ln;
+    while ((ln = listFirst(deferred_completions)) != NULL) {
+        storageCompletion *comp = listNodeValue(ln);
+        listDelNode(deferred_completions, ln);
+        extStorageProcessCompletion(comp);
+        zfree(comp);
+        n++;
+    }
+    return n;
+}
+
+/* A write is about to change or free a key that is being spilled. Waits for
+ * the storage engine to release the value and keeps it in DRAM. The engine
+ * completes every request it accepts, so the wait ends.
+ * TODO(#39): block the client instead of waiting on the main thread. */
+void spillCancel(robj *entry) {
+    serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
+
+    if (deferred_completions) {
+        listIter li;
+        listNode *ln;
+        listRewind(deferred_completions, &li);
+        while ((ln = listNext(&li)) != NULL) {
+            storageCompletion *comp = listNodeValue(ln);
+            if (comp->op_type != STORAGE_OP_PUT || ((spillRequest *)comp->request_ctx)->entry != entry) continue;
+            listDelNode(deferred_completions, ln);
+            if (comp->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
+            spillFinish(comp->request_ctx, comp->status, true);
+            zfree(comp);
+            return;
+        }
+    }
+
+    while (getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH) {
+        storageCompletion comps[16];
+        int n = ext_storage.engine->poll_completions(comps, 16);
+        for (int i = 0; i < n; i++) {
+            if (comps[i].op_type == STORAGE_OP_PUT && ((spillRequest *)comps[i].request_ctx)->entry == entry) {
+                if (comps[i].status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
+                spillFinish(comps[i].request_ctx, comps[i].status, true);
+            } else {
+                deferCompletion(&comps[i]);
+            }
+        }
+    }
+}
+
+/* A key is about to be deleted or have its value replaced. */
+void spillRemove(robj *entry) {
+    if (getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH) spillCancel(entry);
+    /* TODO(#34): delete the flash copy. */
+}
+
+/* Waits for every spill in flight to finish. */
+void spillDrain(void) {
+    while (inflight_requests > 0) extStorageBeforeSleep();
+}
+
+/* Eviction leaves keys alone unless their value is only in DRAM. */
+bool spillCanEvict(const robj *o) {
+    return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY;
+}
+
+/* Spills at most this many keys per call, to bound the time spent selecting. */
+#define SPILL_MAX_PER_CALL 16
+
+/* Spills cold keys until the DRAM held by spills in flight covers mem_tofree,
+ * since that DRAM is freed once they complete. Returns what is still to free,
+ * which eviction frees instead: zero when covered, or when the per-call limit
+ * was reached and the next call carries on. DRAM in flight is bounded by the
+ * engine's queue: once it returns WOULDBLOCK, eviction frees the rest. */
+size_t spillToFree(size_t mem_tofree) {
+    /* TODO(#64): spill during a background snapshot. */
+    if (!extStorageIsActive() || bgIteration_iterationActive()) return mem_tofree;
+
+    for (int i = 0; inflight_ram_bytes < mem_tofree; i++) {
+        if (i == SPILL_MAX_PER_CALL) return 0;
+        int dbid;
+        robj *entry = spillSelectCandidate(&dbid);
+        if (entry == NULL || spillItem(dbid, entry) != STORAGE_OK) break;
+    }
+    return inflight_ram_bytes >= mem_tofree ? 0 : mem_tofree - inflight_ram_bytes;
+}
+
+/* Called from beforeSleep(). Spills over maxmemory without waiting for a
+ * command, and on replicas, which never evict. */
+void spillCron(void) {
+    size_t mem_tofree;
+    if (server.loading || getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
+    spillToFree(mem_tofree);
 }
 
 #endif /* USE_EXT_STORAGE */

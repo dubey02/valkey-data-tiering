@@ -34,6 +34,7 @@
 #include "bio.h"
 #include "script.h"
 #include "cluster_migrateslots.h"
+#include "ext_storage.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -52,6 +53,9 @@
  *
  * Empty entries have the key pointer set to NULL. */
 #define EVPOOL_SIZE 16
+/* Keys in a row the filter may reject before eviction gives up, so a keyspace
+ * that is mostly on flash still finds the keys in memory. */
+#define EVICTION_MAX_REJECTED_KEYS 64
 #define EVPOOL_CACHED_SDS_SIZE 255
 struct evictionPoolEntry {
     unsigned long long idle; /* Object idle time (inverse frequency for LFU) */
@@ -565,6 +569,13 @@ int performEvictions(void) {
         goto update_metrics;
     }
 
+    /* Spilled values free their DRAM once written, so eviction only frees the rest. */
+    mem_tofree = spillToFree(mem_tofree);
+    if (mem_tofree == 0) {
+        result = EVICT_OK;
+        goto update_metrics;
+    }
+
     if (server.maxmemory_policy == MAXMEMORY_NO_EVICTION || (iAmPrimary() && server.import_mode)) {
         result = EVICT_FAIL; /* We need to free memory, but policy forbids or we are in import mode. */
         goto update_metrics;
@@ -592,14 +603,20 @@ int performEvictions(void) {
         if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU) ||
             server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
             evictionPoolSetPolicy(server.maxmemory_policy);
+            int rejected = 0;
             while (bestkey == NULL) {
                 /* We don't want to make local-db choices when expiring keys,
                  * so to start populate the eviction pool sampling keys from
                  * every DB. */
-                unsigned long total_keys = evictionPoolSample(server.maxmemory_policy, NULL);
+                unsigned long total_keys = evictionPoolSample(server.maxmemory_policy, spillCanEvict);
                 if (!total_keys) break; /* No keys to evict. */
+                /* The filter rejected every sampled key, too many times in a row. */
+                if (EvictionPoolLRU[0].key == NULL) {
+                    rejected += server.maxmemory_samples;
+                    if (rejected >= EVICTION_MAX_REJECTED_KEYS) break;
+                }
 
-                robj *valkey = evictionPoolPop(server.maxmemory_policy, NULL, &bestdbid, &bestslot);
+                robj *valkey = evictionPoolPop(server.maxmemory_policy, spillCanEvict, &bestdbid, &bestslot);
                 if (valkey) bestkey = objectGetKey(valkey);
             }
         }
@@ -623,12 +640,14 @@ int performEvictions(void) {
                 int slot = kvstoreGetFairRandomHashtableIndex(kvs);
                 if (slot == KVSTORE_INDEX_NOT_FOUND) continue; /* No keys in this DB. */
                 void *entry;
-                if (kvstoreHashtableRandomEntry(kvs, slot, &entry)) {
+                for (int tries = 0; tries < EVICTION_MAX_REJECTED_KEYS && !bestkey; tries++) {
+                    if (!kvstoreHashtableRandomEntry(kvs, slot, &entry)) break;
+                    if (!spillCanEvict(entry)) continue;
                     bestkey = objectGetKey((robj *)entry);
                     bestdbid = j;
                     bestslot = slot;
-                    break;
                 }
+                if (bestkey) break;
             }
         }
 
