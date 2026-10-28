@@ -516,6 +516,10 @@ void debugCommand(client *c) {
             "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
+#ifdef USE_EXT_STORAGE
+            "SPILL <key> [<key> ...]",
+            "    Submit each key's value to the storage engine. Stops at the first key that fails.",
+#endif
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -713,7 +717,9 @@ void debugCommand(client *c) {
         strenc = strEncoding(val->encoding);
 
         char extra[138] = {0};
-        if (val->encoding == OBJ_ENCODING_QUICKLIST) {
+        /* A value being spilled or on flash isn't read. */
+        bool in_memory = extStorageIsMemoryOnly(val);
+        if (val->encoding == OBJ_ENCODING_QUICKLIST && in_memory) {
             char *nextra = extra;
             int remaining = sizeof(extra);
             quicklist *ql = objectGetVal(val);
@@ -752,7 +758,8 @@ void debugCommand(client *c) {
 #ifdef USE_EXT_STORAGE
         s = sdscatprintf(s, " storage_state:%d", (int)val->storage_state);
 #endif
-        if (!fast) s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
+        if (!fast && in_memory)
+            s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
         /* Either lru or lfu field could work correctly which depends on server.maxmemory_policy. */
         if (lrulfu_isUsingLFU()) {
             s = sdscatprintf(s, " lfu_freq:%u lfu_access_time_minutes:%u", objectGetLFUFrequency(val), val->lru >> 8);
@@ -946,6 +953,10 @@ void debugCommand(client *c) {
         tv.tv_nsec = (utime % 1000000) * 1000;
         nanosleep(&tv, NULL);
         addReply(c, shared.ok);
+#ifdef USE_EXT_STORAGE
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc >= 3) {
+        debugSpillCommand(c);
+#endif
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-active-expire") && c->argc == 3) {
         server.active_expire_enabled = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);

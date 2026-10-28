@@ -485,6 +485,35 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     return STORAGE_OK;
 }
 
+/* DEBUG SPILL <key> [<key> ...]: submits each key's value to the storage engine. */
+void debugSpillCommand(client *c) {
+    if (!extStorageIsActive()) {
+        addReplyError(c, "Data tiering is not enabled");
+        return;
+    }
+    /* Stops at the first key that fails. The keys before it stay submitted. */
+    for (int j = 2; j < c->argc; j++) {
+        robj *entry = dbFind(c->db, objectGetVal(c->argv[j]));
+        if (entry == NULL) {
+            addReplyErrorObject(c, shared.nokeyerr);
+            return;
+        }
+        if (!isSpillCandidate(entry)) {
+            addReplyError(c, "The key can't be spilled");
+            return;
+        }
+        storageStatus status = extStorageSpillItem(c->db->id, entry);
+        if (status == STORAGE_WOULDBLOCK) {
+            addReplyError(c, "The storage engine is busy");
+            return;
+        } else if (status != STORAGE_OK) {
+            addReplyError(c, "The storage engine rejected the item");
+            return;
+        }
+    }
+    addReply(c, shared.ok);
+}
+
 /* Frees the value the way dbSetValue() frees an overwritten one. The object,
  * which holds the key, stays.
  * TODO(#81): pass the key and dbid once module values spill, since a module's
