@@ -60,6 +60,9 @@ target_link_libraries(valkeylib-gtest PRIVATE ffc)
 if (USE_ZSTD)
     target_link_libraries(valkeylib-gtest PRIVATE valkey_zstd)
 endif ()
+if (USE_EXT_STORAGE EQUAL 1)
+    target_link_libraries(valkeylib-gtest PRIVATE flashcache)
+endif ()
 
 # Generate wrapper files from wrappers.h
 set(GENERATED_WRAPPERS_DIR ${CMAKE_BINARY_DIR}/gtest_generated)

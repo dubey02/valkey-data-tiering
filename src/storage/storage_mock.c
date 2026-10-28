@@ -11,6 +11,7 @@
 
 #include "storage.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,7 +64,14 @@ static struct {
     int completions_head;
     int completions_len;
 
-    storageStats stats;
+    /* The counters INFO reports. Everything here runs on the main thread, so
+     * INFO reads them as they are. */
+    struct {
+        /* Number of records stored. */
+        uint64_t total_num_items;
+        /* Bytes the stored records take up. */
+        uint64_t allocated_db_size_bytes;
+    } stats;
 } mock;
 
 /* FNV-1a hash. */
@@ -119,12 +127,12 @@ static storageStatus mockPut(uint32_t db_id, const char *key, size_t klen, const
     /* On overwrite, the old value's bytes come back, so the capacity check
      * compares against the final cost. */
     size_t freed = *slot ? (*slot)->vlen : 0;
-    if (mock.cfg.capacity_bytes && mock.stats.total_num_bytes - freed + (uint64_t)vlen > mock.cfg.capacity_bytes) {
+    if (mock.cfg.capacity_bytes && mock.stats.allocated_db_size_bytes - freed + (uint64_t)vlen > mock.cfg.capacity_bytes) {
         st = STORAGE_ERR_FULL;
     } else {
         if (*slot) {
             free((*slot)->val);
-            mock.stats.total_num_bytes -= (*slot)->vlen;
+            mock.stats.allocated_db_size_bytes -= (*slot)->vlen;
         } else {
             mockRecord *r = mockAlloc(sizeof(*r));
             r->key = mockAlloc(klen);
@@ -140,8 +148,7 @@ static storageStatus mockPut(uint32_t db_id, const char *key, size_t klen, const
         (*slot)->val = mockAlloc((size_t)vlen);
         memcpy((*slot)->val, vbytes, (size_t)vlen);
         (*slot)->vlen = (size_t)vlen;
-        mock.stats.total_num_bytes += (size_t)vlen;
-        mock.stats.total_num_items_spilled_to_storage++;
+        mock.stats.allocated_db_size_bytes += (size_t)vlen;
         if (stored_bytes) *stored_bytes = (size_t)vlen;
     }
 
@@ -163,9 +170,14 @@ static storageStatus mockGet(uint32_t db_id, const char *key, size_t klen, valke
             st = STORAGE_ERR_IO;
         } else {
             *value_out = obj;
-            mock.stats.total_num_items_fetched_from_storage++;
             st = STORAGE_OK;
         }
+        /* A get consumes the record, as FlashCache does. */
+        mockRecord *victim = *slot;
+        *slot = victim->next;
+        mock.stats.allocated_db_size_bytes -= victim->vlen;
+        mock.stats.total_num_items--;
+        mockFreeRecord(victim);
     }
     return st;
 }
@@ -173,20 +185,15 @@ static storageStatus mockGet(uint32_t db_id, const char *key, size_t klen, valke
 static storageStatus mockDel(uint32_t db_id, const char *key, size_t klen) {
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
 
-    storageStatus st;
     mockRecord **slot = mockFindSlot(db_id, key, klen);
-    if (*slot == NULL) {
-        st = STORAGE_NOT_FOUND;
-    } else {
+    if (*slot != NULL) {
         mockRecord *victim = *slot;
         *slot = victim->next;
-        mock.stats.total_num_bytes -= victim->vlen;
+        mock.stats.allocated_db_size_bytes -= victim->vlen;
         mock.stats.total_num_items--;
-        mock.stats.total_num_items_deleted_from_storage++;
         mockFreeRecord(victim);
-        st = STORAGE_OK;
     }
-    return st;
+    return STORAGE_OK;
 }
 
 /* ---------------------------------------------------------------------------
@@ -202,8 +209,11 @@ static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *ke
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
     if (mock.requests_len == MOCK_MAX_INFLIGHT) return STORAGE_WOULDBLOCK;
     int tail = (mock.requests_head + mock.requests_len) % MOCK_MAX_INFLIGHT;
-    char *key_copy = mockAlloc(key_len);
-    memcpy(key_copy, key, key_len);
+    char *key_copy = NULL;
+    if (key_len > 0) {
+        key_copy = mockAlloc(key_len);
+        memcpy(key_copy, key, key_len);
+    }
     mock.requests[tail] = (mockRequest){
         .op = op,
         .db_id = db_id,
@@ -225,6 +235,11 @@ static storageStatus mockGetAsync(uint32_t db_id, const char *key, size_t key_le
 
 static storageStatus mockDelAsync(uint32_t db_id, const char *key, size_t key_len, void *request_ctx) {
     return mockSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request_ctx);
+}
+
+static void mockInfo(const storageInfoSink *s) {
+    s->add_ulong_long(s->ctx, "total_num_items", mock.stats.total_num_items);
+    s->add_ulong_long(s->ctx, "allocated_db_size_bytes", mock.stats.allocated_db_size_bytes);
 }
 
 /* Executes up to max queued requests and enqueues a completion for each. Stops
@@ -278,7 +293,7 @@ static int mockPollCompletions(storageCompletion *out, int max) {
  * Lifecycle
  * ---------------------------------------------------------------------------*/
 
-static void mockClose(void);
+static storageStatus mockClose(void);
 
 static storageStatus mockOpen(const storageConfig *cfg) {
     if (cfg == NULL || cfg->num_databases == 0) return STORAGE_ERR_REJECTED;
@@ -293,8 +308,8 @@ static storageStatus mockOpen(const storageConfig *cfg) {
      * names it knows here. */
     if (cfg->num_options > 0) return STORAGE_ERR_REJECTED;
 
-    /* Start from a clean slate in case a prior instance was not closed. */
-    mockClose();
+    /* Reopen is refused while a prior instance has unpolled requests. */
+    if (mockClose() != STORAGE_OK) return STORAGE_WOULDBLOCK;
 
     mock.dbs = mockAlloc(cfg->num_databases * sizeof(mockDb));
     memset(mock.dbs, 0, cfg->num_databases * sizeof(mockDb));
@@ -303,10 +318,10 @@ static storageStatus mockOpen(const storageConfig *cfg) {
     return STORAGE_OK;
 }
 
-static void mockClose(void) {
-    for (int i = 0; i < mock.requests_len; i++) {
-        free(mock.requests[(mock.requests_head + i) % MOCK_MAX_INFLIGHT].key);
-    }
+static storageStatus mockClose(void) {
+    /* An unpolled request may be a fetched value nobody else holds, so the
+     * storage engine stays open until the caller has polled it. */
+    if (mock.requests_len > 0 || mock.completions_len > 0) return STORAGE_WOULDBLOCK;
     if (mock.dbs) {
         for (uint32_t d = 0; d < mock.num_databases; d++) {
             for (int b = 0; b < MOCK_BUCKETS; b++) {
@@ -321,11 +336,7 @@ static void mockClose(void) {
         free(mock.dbs);
     }
     memset(&mock, 0, sizeof(mock));
-}
-
-static void mockGetStats(storageStats *out) {
-    *out = mock.stats;
-    out->num_completions_pending = (uint64_t)mock.completions_len;
+    return STORAGE_OK;
 }
 
 static const storageEngine mock_storage_engine = {
@@ -337,7 +348,7 @@ static const storageEngine mock_storage_engine = {
     .get_async = mockGetAsync,
     .del_async = mockDelAsync,
     .poll_completions = mockPollCompletions,
-    .get_stats = mockGetStats,
+    .info = mockInfo,
 };
 
 const storageEngine *storageMockEngine(void) {

@@ -7,6 +7,7 @@
 #include "generated_wrappers.hpp"
 
 #include <cstring>
+#include <map>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string>
@@ -37,6 +38,25 @@ static void testLog(storageLogLevel level, const char *fmt, ...) {
 }
 
 static const storageThreadConfig test_thread_config = {};
+
+/* A sink that keeps the reported fields by name. The mock reports only
+ * unsigned counters, so the other field kinds are not kept. */
+typedef std::map<std::string, unsigned long long> StatMap;
+static void sinkAddULongLong(void *c, const char *name, unsigned long long v) {
+    (*(StatMap *)c)[name] = v;
+}
+static void sinkAddLongLong(void *, const char *, long long) {
+}
+static void sinkAddDouble(void *, const char *, double) {
+}
+static void sinkAddCString(void *, const char *, const char *) {
+}
+static void sinkBeginDict(void *, const char *) {
+}
+static void sinkEndDict(void *) {
+}
+static const storageInfoSink stat_map_sink_template = {
+    nullptr, sinkAddLongLong, sinkAddULongLong, sinkAddDouble, sinkAddCString, sinkBeginDict, sinkEndDict};
 
 /* ---------------------------------------------------------------------------
  * Mock storage engine
@@ -126,6 +146,16 @@ class StorageMockTest : public ::testing::Test {
         return comp.status;
     }
 
+    /* Reads what the storage engine reports to INFO. The mock runs on this
+     * thread, so the counters are current. */
+    StatMap readStats() {
+        StatMap m;
+        storageInfoSink sink = stat_map_sink_template;
+        sink.ctx = &m;
+        engine->info(&sink);
+        return m;
+    }
+
     /* Drains the inflight request. */
     void drainCompletions() {
         storageCompletion done[16];
@@ -139,7 +169,7 @@ class StorageMockTest : public ::testing::Test {
 
     void TearDown() override {
         drainCompletions();
-        engine->close();
+        EXPECT_EQ(engine->close(), STORAGE_OK);
         extStorageTestResetRegistry();
         zfree(server.logfile);
         server.logfile = NULL;
@@ -237,9 +267,15 @@ TEST_F(StorageMockTest, PutGetDelRoundTrip) {
     EXPECT_EQ(objectGetKey(out), nullptr);
     decrRefCount(out);
 
+    /* The get consumed the record. */
+    EXPECT_EQ(readStats()["total_num_items"], 0u);
+    ASSERT_EQ(getAndWait(0, key, &out), STORAGE_NOT_FOUND);
+
+    ASSERT_EQ(putAndWait(0, key, entry, &stored), STORAGE_OK);
     ASSERT_EQ(delAndWait(0, key), STORAGE_OK);
     ASSERT_EQ(getAndWait(0, key, &out), STORAGE_NOT_FOUND);
-    EXPECT_EQ(delAndWait(0, key), STORAGE_NOT_FOUND);
+    /* A delete of a missing record is still OK. */
+    EXPECT_EQ(delAndWait(0, key), STORAGE_OK);
 
     sdsfree(key);
     decrRefCount(entry);
@@ -379,10 +415,9 @@ TEST_F(StorageMockTest, OverwriteReplacesRatherThanAccumulates) {
     ASSERT_EQ(putAndWait(0, key, first, nullptr), STORAGE_OK);
     ASSERT_EQ(putAndWait(0, key, second, nullptr), STORAGE_OK);
 
-    storageStats st = {};
-    engine->get_stats(&st);
-    EXPECT_EQ(st.total_num_items, 1u);
-    EXPECT_EQ(st.total_num_bytes, serializedLen("bb"));
+    StatMap st = readStats();
+    EXPECT_EQ(st["total_num_items"], 1u);
+    EXPECT_EQ(st["allocated_db_size_bytes"], serializedLen("bb"));
 
     robj *out = nullptr;
     ASSERT_EQ(getAndWait(0, key, &out), STORAGE_OK);
@@ -408,10 +443,9 @@ TEST_F(StorageMockTest, ReportsFullWhenOverCapacity) {
     EXPECT_EQ(putAndWait(0, k2, e2, nullptr), STORAGE_ERR_FULL);
 
     /* The rejected write left nothing behind. */
-    storageStats st = {};
-    engine->get_stats(&st);
-    EXPECT_EQ(st.total_num_items, 1u);
-    EXPECT_EQ(st.total_num_bytes, serializedLen("12345"));
+    StatMap st = readStats();
+    EXPECT_EQ(st["total_num_items"], 1u);
+    EXPECT_EQ(st["allocated_db_size_bytes"], serializedLen("12345"));
 
     sdsfree(k1);
     sdsfree(k2);
@@ -428,11 +462,7 @@ TEST_F(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     int token = 42;
 
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, &token), STORAGE_OK);
-
-    /* Submitted but not executed. The store still holds nothing. */
-    storageStats st = {};
-    engine->get_stats(&st);
-    EXPECT_EQ(st.total_num_items, 0u);
+    EXPECT_EQ(readStats()["total_num_items"], 0u);
 
     /* One poll both executes the queued put and delivers its completion. */
     storageCompletion comps[4] = {};
@@ -442,8 +472,7 @@ TEST_F(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     EXPECT_EQ(comps[0].status, STORAGE_OK);
     EXPECT_EQ(comps[0].stored_bytes, serializedLen("v"));
 
-    engine->get_stats(&st);
-    EXPECT_EQ(st.total_num_items, 1u);
+    EXPECT_EQ(readStats()["total_num_items"], 1u);
 
     robj *out = nullptr;
     ASSERT_EQ(getAndWait(0, key, &out), STORAGE_OK);
@@ -582,24 +611,42 @@ TEST_F(StorageMockTest, TheKeyIsOnlyLentForTheCall) {
     decrRefCount(entry);
 }
 
-/* Closing with requests still queued drops them and leaves nothing behind. */
-TEST_F(StorageMockTest, ClosingWithQueuedRequestsKeepsNothing) {
+/* A close after everything was polled leaves no record behind on reopen. */
+TEST_F(StorageMockTest, ClosingAfterPollingKeepsNothing) {
+    openEngine();
+    sds key = sdsnew("k");
+    dbEntry *entry = makeEntry(key, "v");
+
+    ASSERT_EQ(putAndWait(0, key, entry, nullptr), STORAGE_OK);
+    ASSERT_EQ(putAndWait(0, key, entry, nullptr), STORAGE_OK);
+    ASSERT_EQ(engine->close(), STORAGE_OK);
+
+    openEngine();
+    StatMap st = readStats();
+    EXPECT_EQ(st["total_num_items"], 0u);
+    EXPECT_EQ(st["allocated_db_size_bytes"], 0u);
+
+    robj *out = nullptr;
+    EXPECT_EQ(getAndWait(0, key, &out), STORAGE_NOT_FOUND);
+
+    sdsfree(key);
+    decrRefCount(entry);
+}
+
+/* Close is refused while a request is unpolled and the storage engine stays
+ * open. Once the request is polled, close goes through. */
+TEST_F(StorageMockTest, CloseIsRefusedWhileARequestIsUnpolled) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
 
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
-    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
-    engine->close();
+    EXPECT_EQ(engine->close(), STORAGE_WOULDBLOCK);
 
-    openEngine();
-    storageStats st = {};
-    engine->get_stats(&st);
-    EXPECT_EQ(st.total_num_items, 0u);
-    EXPECT_EQ(st.total_num_bytes, 0u);
-
-    robj *out = nullptr;
-    EXPECT_EQ(getAndWait(0, key, &out), STORAGE_NOT_FOUND);
+    storageCompletion comp = {};
+    ASSERT_EQ(waitForCompletedRequest(&comp), 1);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+    EXPECT_EQ(engine->close(), STORAGE_OK);
 
     sdsfree(key);
     decrRefCount(entry);
@@ -623,14 +670,9 @@ TEST_F(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
 
     /* A tick with a budget of two executes two. The third stays queued. */
     ASSERT_EQ(storageMockRunIo(2), 2);
-    storageStats st = {};
-    engine->get_stats(&st);
-    EXPECT_EQ(st.total_num_items, 2u);
 
     /* A second tick executes the remainder. */
     ASSERT_EQ(storageMockRunIo(8), 1);
-    engine->get_stats(&st);
-    EXPECT_EQ(st.total_num_items, 3u);
 
     /* All three completions drain in submission order. */
     storageCompletion comps[8] = {};
@@ -638,6 +680,8 @@ TEST_F(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
     EXPECT_EQ(comps[0].request_ctx, &t1);
     EXPECT_EQ(comps[1].request_ctx, &t2);
     EXPECT_EQ(comps[2].request_ctx, &t3);
+
+    EXPECT_EQ(readStats()["total_num_items"], 3u);
 
     sdsfree(k1);
     sdsfree(k2);

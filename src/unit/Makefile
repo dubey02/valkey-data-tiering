@@ -90,9 +90,12 @@ endif
 
 # BUILD_EXT_STORAGE arrives from ../.make-settings. The tiering objects are only
 # in the server library when it is set, so the tests that use them have to
-# compile out in lockstep.
+# compile out in lockstep. The FlashCache storage engine in that library needs
+# its archive and libaio at link time, same as the server.
+EXT_STORAGE_LIBS :=
 ifeq ($(BUILD_EXT_STORAGE),yes)
 	TEST_CFLAGS+=-DUSE_EXT_STORAGE=1
+	EXT_STORAGE_LIBS := ../../deps/flashcache/build/libflashcache.a -laio
 endif
 
 # Track compilation flags to force rebuild when they change
@@ -211,7 +214,8 @@ LD_LIBS := $(HIREDIS_LIB) \
 	$(HDR_HISTOGRAM_LIB) \
 	$(FPCONV_LIB) \
 	$(LZ4_LIB) \
-	$(ZSTD_LD_LIBS)
+	$(ZSTD_LD_LIBS) \
+	$(EXT_STORAGE_LIBS)
 
 # Add libbacktrace support if enabled
 ifeq ($(USE_LIBBACKTRACE),yes)

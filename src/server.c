@@ -1969,6 +1969,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
+#ifdef USE_EXT_STORAGE
+    extStorageBeforeSleep();
+#endif
+
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     int conn_pending = connTypeProcessPendingData();
     if (conn_pending > 0) server.el_iteration_active = true;
@@ -7210,12 +7214,17 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     }
 
 #ifdef USE_EXT_STORAGE
-    /* Ext_storage section. Not in the default set. A plain INFO stays
-     * byte-identical to a build without tiering. */
+    /* Ext_storage and Storage_engine sections. Not in the default set. A plain
+     * INFO stays byte-identical to a build without tiering. */
     if (all_sections || (dictFind(section_dict, "ext_storage") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscat(info, "# Ext_storage\r\n");
         info = extStorageInfoString(info);
+    }
+    if (extStorageEngineHasInfo() && (all_sections || (dictFind(section_dict, "storage_engine") != NULL))) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscat(info, "# Storage_engine\r\n");
+        info = extStorageEngineInfoString(info);
     }
 #endif
 

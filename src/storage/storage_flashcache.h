@@ -9,6 +9,8 @@
 
 #include "storage.h"
 
+#define STORAGE_FLASHCACHE_DB_FILE "flashcache.db"
+
 /* The FlashCache storage engine, selected by the name "flashcache". */
 const storageEngine *storageFlashCacheEngine(void);
 

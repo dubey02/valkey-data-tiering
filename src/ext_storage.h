@@ -18,17 +18,27 @@
 /* Opens the configured storage engine. */
 void extStorageInit(void);
 
-/* Closes the storage engine. */
+/* Closes the storage engine. Outstanding requests are handled first. */
 void extStorageDeinit(void);
+
+/* Handles finished requests. */
+void extStorageBeforeSleep(void);
 
 /* Crash handler only. Stops the storage engine threads with no cleanup. */
 void extStorageKillThreads(void);
 
-/* Whether a storage engine is open and ready. */
+/* Returns 1 while a storage engine is open and ready. */
 int extStorageIsActive(void);
 
-/* Appends the ext_storage INFO section to the given sds. */
+/* Appends the Ext_storage INFO fields, the ones the valkey server counts. */
 sds extStorageInfoString(sds info);
+
+/* Returns 1 while an open storage engine has INFO fields to report. The
+ * Storage_engine section is printed only then. */
+int extStorageEngineHasInfo(void);
+
+/* Appends the Storage_engine INFO fields, the ones the storage engine reports. */
+sds extStorageEngineInfoString(sds info);
 
 /* The serialization callbacks. */
 const storageSerializer *extStorageSerializer(void);
