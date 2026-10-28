@@ -5033,8 +5033,8 @@ int processCommand(client *c) {
 
     if (throttle_throttleClientIfNeeded(c)) return C_OK;
 
-    // Tiered Storage Need to figure out best place to put this handler
 #ifdef USE_EXT_STORAGE
+    // Tiered Storage Need to figure out best place to put this handler
     if (externalStorage_blockClientIfNeeded(c)) return C_OK;
 #endif
 

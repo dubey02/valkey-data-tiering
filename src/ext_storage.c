@@ -492,7 +492,7 @@ static void handleGetCompletion(storageCompletion *r) {
     robj *o = dbFind(server.db[r->db_id], objectGetVal(key));
     serverAssert(o && getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
 
-    // As far as I can tell there's no gauranteed status.
+    // As far as I can tell there's no guaranteed status.
     // If there is we should probably check status = STORAGE_OK;
     serverAssert(r->value);
 
@@ -590,4 +590,3 @@ bool externalStorage_blockClientIfNeeded(client *c) {
 // todo: decide how to handle the replication client on a replica.
 
 #endif /* USE_EXT_STORAGE */
-
