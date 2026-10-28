@@ -53,6 +53,9 @@ size_t spillInflightRamBytes(void);
 void spillCancel(robj *entry);
 void spillRemove(robj *entry);
 void spillDrain(void);
+bool spillCanEvict(const robj *o);
+size_t spillToFree(size_t mem_tofree);
+void spillCron(void);
 
 /* Call before a write changes a key's value in place. */
 static inline void spillBeforeWrite(robj *o) {
@@ -79,9 +82,18 @@ static inline void spillBeforeRemove(robj *o) {
 }
 static inline void spillDrain(void) {
 }
+static inline bool spillCanEvict(const robj *o) {
+    UNUSED(o);
+    return true;
+}
+static inline size_t spillToFree(size_t mem_tofree) {
+    return mem_tofree;
+}
 static inline bool spillIsOnFlash(const robj *o) {
     UNUSED(o);
     return false;
+}
+static inline void spillCron(void) {
 }
 
 #endif /* USE_EXT_STORAGE */

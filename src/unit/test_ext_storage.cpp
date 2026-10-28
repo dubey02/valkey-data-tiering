@@ -1807,4 +1807,82 @@ TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
     decrRefCount(key);
 }
 
+/* ---------------------------------------------------------------------------
+ * Spilling over maxmemory
+ * ---------------------------------------------------------------------------*/
+
+TEST_F(SpillSubmitTest, EvictionOnlyTakesKeysInMemory) {
+    robj *entry = addRawKey("key");
+    EXPECT_TRUE(spillCanEvict(entry));
+    ASSERT_EQ(spillItem(0, entry), STORAGE_OK);
+    EXPECT_FALSE(spillCanEvict(entry));
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_FALSE(spillCanEvict(entry));
+}
+
+TEST_F(SpillSubmitTest, SpillsOnlyEnoughToCoverWhatMustBeFreed) {
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, -1, 1000);
+    objectSetLRUOrLFU(addRawKey("warm"), -1, 100);
+    objectSetLRUOrLFU(addRawKey("hot"), -1, 10);
+
+    EXPECT_EQ(spillToFree(1), 0u);
+    EXPECT_EQ(getStorageState(coldest), STORAGE_STATE_COPYING_TO_FLASH);
+    size_t one_value = spillInflightRamBytes();
+
+    /* What is in flight already counts. */
+    EXPECT_EQ(spillToFree(one_value), 0u);
+    EXPECT_EQ(spillInflightRamBytes(), one_value);
+}
+
+/* Eviction frees what spilling can't. */
+TEST_F(SpillSubmitTest, ReturnsWhatSpillingCannotCover) {
+    addRawKey("a");
+    addRawKey("b");
+    addKey("embedded", createStringObject("short", 5));
+
+    size_t left = spillToFree(1000000);
+    EXPECT_EQ(left, 1000000 - spillInflightRamBytes());
+    ASSERT_EQ(finishSpills(), 2);
+}
+
+/* A call stops after a fixed number of keys without handing the rest to
+ * eviction, because spillable keys are left for the next call. */
+TEST_F(SpillSubmitTest, StopsAfterTheLimitWithoutEvicting) {
+    server.maxmemory_samples = 64; /* sample every key, so only the limit stops the loop */
+    for (int i = 0; i < 20; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        addRawKey(key);
+    }
+    EXPECT_EQ(spillToFree(1000000), 0u);
+    EXPECT_EQ(finishSpills(), 16);
+}
+
+TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
+    addRawKey("key");
+    extStorageDeinit();
+    EXPECT_EQ(spillToFree(100), 100u);
+    EXPECT_EQ(spillInflightRamBytes(), 0u);
+}
+
+/* beforeSleep() spills without a command, and on a replica, which never evicts. */
+TEST_F(SpillSubmitTest, CronSpillsOverMaxmemoryOnPrimariesAndReplicas) {
+    robj *primary_key = addRawKey("primary");
+    spillCron();
+    EXPECT_EQ(getStorageState(primary_key), STORAGE_STATE_ONLY_MEMORY); /* No maxmemory. */
+
+    server.maxmemory = zmalloc_used_memory() - 1;
+    spillCron();
+    EXPECT_EQ(getStorageState(primary_key), STORAGE_STATE_COPYING_TO_FLASH);
+
+    robj *replica_key = addRawKey("replica");
+    server.primary_host = (char *)"127.0.0.1";
+    server.maxmemory = zmalloc_used_memory() - spillInflightRamBytes() - 1;
+    spillCron();
+    EXPECT_EQ(getStorageState(replica_key), STORAGE_STATE_COPYING_TO_FLASH);
+    server.primary_host = nullptr;
+    server.maxmemory = 0;
+}
+
 #endif /* USE_EXT_STORAGE */

@@ -608,4 +608,39 @@ void spillRemove(robj *entry) {
 void spillDrain(void) {
     while (inflight_requests > 0) extStorageBeforeSleep();
 }
+
+/* Eviction leaves keys alone unless their value is only in DRAM. */
+bool spillCanEvict(const robj *o) {
+    return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY;
+}
+
+/* Spills at most this many keys per call, to bound the time spent selecting. */
+#define SPILL_MAX_PER_CALL 16
+
+/* Spills cold keys until the DRAM held by spills in flight covers mem_tofree,
+ * since that DRAM is freed once they complete. Returns what is still to free,
+ * which eviction frees instead: zero when covered, or when the per-call limit
+ * was reached and the next call carries on. DRAM in flight is bounded by the
+ * engine's queue: once it returns WOULDBLOCK, eviction frees the rest. */
+size_t spillToFree(size_t mem_tofree) {
+    /* TODO(#64): spill during a background snapshot. */
+    if (!extStorageIsActive() || bgIteration_iterationActive()) return mem_tofree;
+
+    for (int i = 0; inflight_ram_bytes < mem_tofree; i++) {
+        if (i == SPILL_MAX_PER_CALL) return 0;
+        int dbid;
+        robj *entry = spillSelectCandidate(&dbid);
+        if (entry == NULL || spillItem(dbid, entry) != STORAGE_OK) break;
+    }
+    return inflight_ram_bytes >= mem_tofree ? 0 : mem_tofree - inflight_ram_bytes;
+}
+
+/* Called from beforeSleep(). Spills over maxmemory without waiting for a
+ * command, and on replicas, which never evict. */
+void spillCron(void) {
+    size_t mem_tofree;
+    if (server.loading || getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
+    spillToFree(mem_tofree);
+}
+
 #endif /* USE_EXT_STORAGE */
