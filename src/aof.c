@@ -2503,6 +2503,13 @@ int rewriteAppendOnlyFileRio(rio *aof) {
         while (kvstoreIteratorNext(kvs_it, &next)) {
             robj *o = next;
 
+            /* TODO(#64): rewrite values that are on flash. */
+            if (o->storage_state == STORAGE_STATE_ONLY_FLASH) {
+                serverLog(LL_WARNING, "Can't rewrite a key whose value is on flash.");
+                errno = ENOTSUP;
+                goto werr;
+            }
+
             /* Update info every 1 second (approximately).
              * in order to avoid calling mstime() on each iteration, we will
              * check the diff every 1024 keys */
