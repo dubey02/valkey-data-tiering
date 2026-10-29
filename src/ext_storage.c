@@ -8,7 +8,7 @@
  * Connects the valkey server to a storage engine. */
 
 #include "server.h"
-
+#define USE_EXT_STORAGE
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
@@ -242,10 +242,8 @@ static void extStorageProcessCompletion(const storageCompletion *c) {
     case STORAGE_OP_PUT:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
         break;
-    case STORAGE_OP_GET:
-        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
-        /* No command path reads a fetched value yet, so it has no owner. */
-        if (c->value) decrRefCount((robj *)c->value);
+    case STORAGE_OP_GET: 
+        handleGetCompletion(c); 
         break;
     case STORAGE_OP_DEL:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_deleted++;
@@ -484,60 +482,14 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
  * Fetch path (pseudocode)
  * ---------------------------------------------------------------------------*/
 
-#define EXT_STORAGE_POLL_MAX_BATCH_SIZE 128 // arbitrary
 
-/* request_ctx for a GET is the key, a refcounted string robj. */
-static void handleGetCompletion(storageCompletion *r) {
-    robj *key = r->request_ctx;
-    robj *o = dbFind(server.db[r->db_id], objectGetVal(key));
-    serverAssert(o && getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
-
-    // As far as I can tell there's no guaranteed status.
-    // If there is we should probably check status = STORAGE_OK;
-    serverAssert(r->value);
-
-    // todo: see if it still makes sense to do something similar to replaceDbEntryValue
-    // todo: handle embedded strings separately
-    serverAssert(objectGetType(o) == objectGetType(r->value));
-    objectSetVal(o, objectGetVal(r->value));
-    o->encoding = r->value->encoding;
-    objectSetVal(r->value, NULL);
-    decrRefCount(r->value); // frees only the shell
-    // todo: check if there are lrulfu implications (touching)
-    setStorageState(o, STORAGE_STATE_ONLY_MEMORY);
-
-    unblockClientsInUseOnKey(key);
-    decrRefCount(key);
-}
-
-static void processCompletedRequest(storageCompletion *r) {
-    switch (r->op_type) {
-    case STORAGE_OP_GET: handleGetCompletion(r); break;
-    case STORAGE_OP_PUT: serverPanic("Unhandled"); // todo: spill path
-    case STORAGE_OP_DEL: serverPanic("Unhandled");
-    default: serverPanic("Unhandled storage op");
-    }
-}
-
-/* Called from beforeSleep() before blockedBeforeSleep(), so unblocked clients
- * re-run their command in the same event loop iteration. */
-void externalStorage_processCompletedRequests(void) {
-    if (!ext_storage.open) return;
-
-    storageCompletion requests[EXT_STORAGE_POLL_MAX_BATCH_SIZE];
-    int num_requests;
-    while ((num_requests = ext_storage.engine->poll_completions(requests, EXT_STORAGE_POLL_MAX_BATCH_SIZE)) > 0) {
-        for (int i = 0; i < num_requests; i++) processCompletedRequest(&requests[i]);
-    }
-}
-
-/* Submits a fetch for one ONLY_FLASH object. Returns true if the engine took it. */
+/* Submits a fetch for one ONLY_FLASH object. Returns true if the engine accepted it. */
 static bool fetchKey(serverDb *db, robj *key, robj *o) {
     // call get_async, with appropriate error handling
     // Once we fire the async function, update the storage status to STORAGE_STATE_COPYING_TO_MEMORY
     storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), key);
     if (st != STORAGE_OK) {
-        // STORAGE_WOULDBLOCK: queue full. todo: retry later, or reply with an error.
+        // STORAGE_WOULDBLOCK: queue full. TODO: retry later, or reply with an error.
         return false;
     }
     incrRefCount(key); // released in handleGetCompletion
@@ -545,6 +497,39 @@ static bool fetchKey(serverDb *db, robj *key, robj *o) {
     // todo: arm the 1 ms timer if it is not armed
     return true;
 }
+
+/* request_ctx for a GET is the key, a refcounted string robj. */
+static void handleGetCompletion(storageCompletion *c) {
+    if (c->status == STORAGE_OK) {
+        ext_storage.stats.total_num_items_fetched++;
+    } else {
+        // TODO: think about retry paths / failure cases
+    }
+
+    robj *key = c->request_ctx;
+    robj *o = dbFind(server.db[c->db_id], objectGetVal(key));
+    serverAssert(o && getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
+
+    // As far as I can tell there's no guaranteed status.
+    // If there is we should probably check status = STORAGE_OK;
+    serverAssert(c->value);
+
+    // todo: see if it still makes sense to do something similar to replaceDbEntryValue
+    // todo: handle embedded strings separately
+    serverAssert(objectGetType(o) == objectGetType(c->value));
+    objectSetVal(o, objectGetVal(c->value));
+    o->encoding = c->value->encoding;
+    objectSetVal(c->value, NULL);
+    decrRefCount(c->value); // frees only the shell
+    // todo: check if there are lrulfu implications (touching)
+    setStorageState(o, STORAGE_STATE_ONLY_MEMORY);
+
+    unblockClientsInUseOnKey(key);
+    decrRefCount(key);
+}
+
+
+
 
 /* Fills keys_out with the keys the client must block on and starts fetches
  * for the ones that are only on flash. Returns the number of keys. */

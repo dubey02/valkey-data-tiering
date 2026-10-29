@@ -1993,10 +1993,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Release keys from bgIteration before processing unblocked clients. */
     bgIteration_beforeSleep();
 
-#ifdef USE_EXT_STORAGE
-    /* Must run before blockedBeforeSleep so clients unblocked by a finished fetch run this iteration. */
-    externalStorage_processCompletedRequests();
-#endif
     /* Handle blocked clients.
      * must be done before flushAppendOnlyFile, in case of appendfsync=always,
      * since the unblocked clients may write data. */
