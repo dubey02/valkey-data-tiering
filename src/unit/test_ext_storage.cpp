@@ -1587,4 +1587,35 @@ TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
 }
 
+/* ---------------------------------------------------------------------------
+ * Active defrag
+ * ---------------------------------------------------------------------------*/
+
+#ifdef HAVE_DEFRAG
+
+extern "C" int defragLaterItem(robj *ob, unsigned long *cursor, monotime endtime, int dbid);
+
+/* A big list deferred by defrag can be spilled before defrag gets back to it.
+ * Defrag must then drop it without walking the value the engine is reading. */
+TEST(DefragLaterTest, SkipsAValueThatIsNotOnlyInMemory) {
+    robj *list = createQuicklistObject(0, 0);
+    robj *ele = createStringObject("v", 1);
+    for (int i = 0; i < 10; i++) listTypePush(list, ele, LIST_TAIL);
+    decrRefCount(ele);
+
+    for (int state = STORAGE_STATE_COPYING_TO_FLASH; state < STORAGE_STATE_NUM_STATES; state++) {
+        setStorageState(list, (storageState)state);
+        long long scanned = server.stat_active_defrag_scanned;
+        unsigned long cursor = 0;
+
+        EXPECT_EQ(defragLaterItem(list, &cursor, (monotime)-1, 0), 0) << "state " << state;
+        EXPECT_EQ(server.stat_active_defrag_scanned, scanned) << "state " << state;
+    }
+
+    setStorageState(list, STORAGE_STATE_ONLY_MEMORY);
+    decrRefCount(list);
+}
+
+#endif /* HAVE_DEFRAG */
+
 #endif /* USE_EXT_STORAGE */

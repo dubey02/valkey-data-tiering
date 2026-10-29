@@ -771,8 +771,9 @@ static void defragPubsubScanCallback(void *privdata, void *elemref) {
 }
 
 /* returns 0 more work may or may not be needed (see non-zero cursor),
- * and 1 if time is up and more work is needed. */
-static int defragLaterItem(robj *ob, unsigned long *cursor, monotime endtime, int dbid) {
+ * and 1 if time is up and more work is needed. Not static so unit tests can
+ * call it. */
+int defragLaterItem(robj *ob, unsigned long *cursor, monotime endtime, int dbid) {
     if (ob) {
         /* The storage engine may be reading the value, or it is on flash. */
         if (bgIteration_isEntryInuse(ob) || !extStorageIsMemoryOnly(ob)) {
