@@ -462,7 +462,7 @@ static int spillSamplingPolicy(void) {
 }
 
 /* Returns the coldest spillable key, or NULL if none was sampled. */
-robj *spillSelectCandidate(int *dbid) {
+robj *extStorageSpillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
 }
 
@@ -473,16 +473,17 @@ typedef struct spillRequest {
     size_t ram_bytes;
 } spillRequest;
 
-/* DRAM held by values that are being written to the storage engine. */
-static size_t inflight_ram_bytes;
+/* Estimated DRAM that spills in flight free on completion. spillToFree()
+ * counts it so it doesn't spill the same deficit twice. */
+static size_t inflight_estimated_ram_bytes;
 
-size_t spillInflightRamBytes(void) {
-    return inflight_ram_bytes;
+size_t extStorageSpillInflightEstimatedRamBytes(void) {
+    return inflight_estimated_ram_bytes;
 }
 
 /* Submits an item to the storage engine, which borrows it until the completion
  * is polled. On any status other than STORAGE_OK nothing changes. */
-storageStatus spillItem(int dbid, robj *entry) {
+storageStatus extStorageSpillItem(int dbid, robj *entry) {
     serverAssert(ext_storage.open && isSpillCandidate(entry));
 
     size_t ram_bytes = spillValueRamBytes(entry);
@@ -498,7 +499,7 @@ storageStatus spillItem(int dbid, robj *entry) {
     }
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
-    inflight_ram_bytes += ram_bytes;
+    inflight_estimated_ram_bytes += ram_bytes;
     return STORAGE_OK;
 }
 

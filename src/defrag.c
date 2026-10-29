@@ -45,6 +45,7 @@
 #include "script.h"
 #include "module.h"
 #include "bgiteration.h"
+#include "ext_storage.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -661,7 +662,7 @@ static void defragKey(defragKeysCtx *ctx, robj **elemref) {
 
     if (bgIteration_isEntryInuse(ob)) return;
     /* The storage engine may be reading the value, or it is on flash. */
-    if (ob->storage_state != STORAGE_STATE_ONLY_MEMORY) return;
+    if (!extStorageValueOnlyInMemory(ob)) return;
 
     /* Try to defrag robj and/or string value. */
     if ((newob = activeDefragStringOb(ob))) {
