@@ -662,7 +662,7 @@ static void defragKey(defragKeysCtx *ctx, robj **elemref) {
 
     if (bgIteration_isEntryInuse(ob)) return;
     /* The storage engine may be reading the value, or it is on flash. */
-    if (!extStorageValueOnlyInMemory(ob)) return;
+    if (!extStorageIsMemoryOnly(ob)) return;
 
     /* Try to defrag robj and/or string value. */
     if ((newob = activeDefragStringOb(ob))) {
@@ -774,7 +774,8 @@ static void defragPubsubScanCallback(void *privdata, void *elemref) {
  * and 1 if time is up and more work is needed. */
 static int defragLaterItem(robj *ob, unsigned long *cursor, monotime endtime, int dbid) {
     if (ob) {
-        if (bgIteration_isEntryInuse(ob)) {
+        /* The storage engine may be reading the value, or it is on flash. */
+        if (bgIteration_isEntryInuse(ob) || !extStorageIsMemoryOnly(ob)) {
             *cursor = 0;
             return 0;
         }

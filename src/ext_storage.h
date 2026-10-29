@@ -53,13 +53,13 @@ robj *extStorageSpillSelectCandidate(int *dbid);
 storageStatus extStorageSpillItem(int dbid, robj *entry);
 
 /* Whether the value is only in DRAM, so it can be moved or freed. */
-static inline bool extStorageValueOnlyInMemory(const robj *o) {
+static inline bool extStorageIsMemoryOnly(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_MEMORY;
 }
 
 #else
 
-static inline bool extStorageValueOnlyInMemory(const robj *o) {
+static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;
 }

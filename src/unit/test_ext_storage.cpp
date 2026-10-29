@@ -1537,6 +1537,32 @@ TEST_F(SpillSubmitTest, SubmitsTheValue) {
     zfree(comp.request_ctx);
 }
 
+/* Each type and encoding takes its own path through the serializer, which
+ * fails the put if it can't serialize the value. */
+TEST_F(SpillSubmitTest, SubmitsEveryTypeOfValue) {
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    for (int i = 0; i < n; i++) {
+        int type = objs[i]->type;
+        int encoding = objs[i]->encoding;
+        if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_INT) {
+            decrRefCount(objs[i]); /* not spill candidates */
+            continue;
+        }
+        addOneElement(objs[i]);
+        char name[32];
+        snprintf(name, sizeof(name), "key:%d", i);
+        robj *entry = addKey(name, objs[i]);
+
+        ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
+        ASSERT_EQ(storageMockRunIo(1), 1);
+        storageCompletion comp = {};
+        ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
+        EXPECT_EQ(comp.status, STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
+        zfree(comp.request_ctx);
+    }
+}
+
 TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
     /* Fill the engine's queue. */
     int queued = 0;
