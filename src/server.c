@@ -1970,7 +1970,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (io_responses > 0) server.el_iteration_active = true;
 
 #ifdef USE_EXT_STORAGE
-    if (extStorageBeforeSleep() > 0) server.el_iteration_active = true;
+    extStorageBeforeSleep();
 #endif
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
