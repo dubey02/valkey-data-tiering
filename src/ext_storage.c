@@ -529,44 +529,41 @@ static void handleGetCompletion(const storageCompletion *c) {
     decrRefCount(key);
 }
 
-/* Fills keys_out with the keys the client must block on and starts fetches
- * for the ones that are only on flash. Returns the number of keys. */
-static int determineSpilledKeys(client *c, robj **keys_out) {
-    getKeysResult result;
-    initGetKeysResult(&result);
-    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
-    int n = 0;
-    // for each key that was an argument, determine if it is spilled to flash by using the storage state.
-    for (int i = 0; i < numkeys; i++) {
-        robj *key = c->argv[result.keys[i].pos];
-        robj *o = dbFind(c->db, objectGetVal(key));
-        if (!o) continue;
-        switch (getStorageState(o)) {
-        case STORAGE_STATE_ONLY_FLASH:
-            if (fetchKey(c->db, key, o)) keys_out[n++] = key;
-            break;
-        case STORAGE_STATE_COPYING_TO_MEMORY:
-            keys_out[n++] = key; // a fetch is already in flight, just block
-            break;
-        default: break; // todo: COPYING_TO_FLASH should block write commands once spill exists
-        }
+/* Starts a fetch if the key is only on flash. Returns true if the client must wait for it. */
+static bool fetchKeyIfNeeded(serverDb *db, robj *key) {
+    robj *o = dbFind(db, objectGetVal(key));
+    if (!o) return false;
+    switch (getStorageState(o)) {
+    case STORAGE_STATE_ONLY_FLASH: return fetchKey(db, key, o);
+    case STORAGE_STATE_COPYING_TO_MEMORY: return true; // a fetch is already in flight, just block
+    default: return false; // todo: COPYING_TO_FLASH should block write commands once spill exists
     }
-    getKeysFreeResult(&result);
-    return n;
 }
 
 /* Returns true if the client was blocked and the command must not run now. */
 bool externalStorage_blockClientIfNeeded(client *c) {
     if (!ext_storage.open) return false;
+    if (!doesCommandHaveKeys(c->cmd)) return false;
     // logic will need to be added for edge cases like multi/exec in milestone 5
 
     // if any of the keys are spilled for this command, then we need to block the client for tiered storage
-    robj **keys = zmalloc(sizeof(robj *) * c->argc);
-    int n = determineSpilledKeys(c, keys);
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+
+    robj *stackbuf[16];
+    robj **keys = numkeys <= 16 ? stackbuf : zmalloc(sizeof(robj *) * numkeys);
+    int n = 0;
+    for (int i = 0; i < numkeys; i++) {
+        robj *key = c->argv[result.keys[i].pos];
+        if (fetchKeyIfNeeded(c->db, key)) keys[n++] = key;
+    }
     // double check the order of fetching and blocking doesn't matter
     if (n > 0) blockClientInUseOnKeys(c, n, keys); // all the keys that spilled
-    zfree(keys);
-    return n > 0; 
+
+    if (keys != stackbuf) zfree(keys);
+    getKeysFreeResult(&result);
+    return n > 0;
 }
 
 #endif /* USE_EXT_STORAGE */

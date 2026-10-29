@@ -1797,6 +1797,13 @@ TEST_F(BlockClientTest, NoKeysOnFlashDoesNotBlock) {
     EXPECT_FALSE(c->flag.blocked);
 }
 
+TEST_F(BlockClientTest, AKeylessCommandDoesNotBlock) {
+    client *c = makeClient("ping");
+
+    EXPECT_FALSE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_FALSE(c->flag.blocked);
+}
+
 TEST_F(BlockClientTest, AKeyOnFlashBlocksUntilFetched) {
     robj *a = addFlashKey("a");
     client *c = makeClient("get a");
