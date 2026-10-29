@@ -233,6 +233,7 @@ void extStorageInit(void) {
               (unsigned long long)server.ext_storage_capacity);
 }
 
+static void handleGetCompletion(const storageCompletion *c); 
 /* Completions
  * extStorageBeforeSleep and the shutdown drain both go through here. */
 
@@ -479,7 +480,7 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
 }
 
 /* ---------------------------------------------------------------------------
- * Fetch path (pseudocode)
+ * Fetching Paths
  * ---------------------------------------------------------------------------*/
 
 
@@ -499,7 +500,7 @@ static bool fetchKey(serverDb *db, robj *key, robj *o) {
 }
 
 /* request_ctx for a GET is the key, a refcounted string robj. */
-static void handleGetCompletion(storageCompletion *c) {
+static void handleGetCompletion(const storageCompletion *c) {
     if (c->status == STORAGE_OK) {
         ext_storage.stats.total_num_items_fetched++;
     } else {
@@ -527,9 +528,6 @@ static void handleGetCompletion(storageCompletion *c) {
     unblockClientsInUseOnKey(key);
     decrRefCount(key);
 }
-
-
-
 
 /* Fills keys_out with the keys the client must block on and starts fetches
  * for the ones that are only on flash. Returns the number of keys. */
@@ -568,10 +566,7 @@ bool externalStorage_blockClientIfNeeded(client *c) {
     // double check the order of fetching and blocking doesn't matter
     if (n > 0) blockClientInUseOnKeys(c, n, keys); // all the keys that spilled
     zfree(keys);
-    return n > 0; // true prevents the command from exec, otherwise we just proceed
+    return n > 0; 
 }
-
-// todo: commands from scripts, RM_Call and AOF loading skip processCommand(), so they skip this hook.
-// todo: decide how to handle the replication client on a replica.
 
 #endif /* USE_EXT_STORAGE */

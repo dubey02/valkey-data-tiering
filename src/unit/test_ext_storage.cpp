@@ -1665,6 +1665,16 @@ class FetchCompletionTest : public SpillSelectTest {
         ASSERT_EQ(engine->get_async(0, key, sdslen(key), ctx), STORAGE_OK);
         setStorageState(entry, STORAGE_STATE_COPYING_TO_MEMORY);
     }
+
+    /* Discards completions left unhandled in the parent of a death test, so
+     * extStorageDeinit does not process them. */
+    void discardCompletions() {
+        storageCompletion comp;
+        while (engine->poll_completions(&comp, 1) == 1) {
+            if (comp.value) decrRefCount((robj *)comp.value);
+            decrRefCount((robj *)comp.request_ctx);
+        }
+    }
 };
 
 TEST_F(FetchCompletionTest, AFetchedValueIsBackInMemory) {
@@ -1672,7 +1682,7 @@ TEST_F(FetchCompletionTest, AFetchedValueIsBackInMemory) {
     spill(entry);
     startFetch(entry);
 
-    externalStorage_processCompletedRequests();
+    extStorageBeforeSleep();
 
     robj *expected = rawValue();
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
@@ -1683,7 +1693,8 @@ TEST_F(FetchCompletionTest, AFetchedValueIsBackInMemory) {
 TEST_F(FetchCompletionTest, AFailedFetchPanics) {
     startFetch(addRawKey("key")); /* never spilled, so the engine returns NOT_FOUND */
     // todo: match on the assert message instead of passing on any crash
-    EXPECT_DEATH(externalStorage_processCompletedRequests(), "");
+    EXPECT_DEATH(extStorageBeforeSleep(), "");
+    discardCompletions();
 }
 
 TEST_F(FetchCompletionTest, AFetchForADeletedKeyPanics) {
@@ -1692,7 +1703,8 @@ TEST_F(FetchCompletionTest, AFetchForADeletedKeyPanics) {
     startFetch(entry);
     kvstoreHashtableDelete(server.db[0]->keys, 0, objectGetKey(entry));
     // todo: match on the assert message instead of passing on any crash
-    EXPECT_DEATH(externalStorage_processCompletedRequests(), "");
+    EXPECT_DEATH(extStorageBeforeSleep(), "");
+    discardCompletions();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1767,9 +1779,12 @@ class BlockClientTest : public FetchCompletionTest {
     }
 
     uint64_t numFetched() {
-        storageStats st;
-        engine->get_stats(&st);
-        return st.total_num_items_fetched_from_storage;
+        const char *field = "ext_storage_total_num_items_fetched_from_storage:";
+        sds info = extStorageInfoString(sdsempty());
+        const char *p = strstr(info, field);
+        uint64_t n = p ? strtoull(p + strlen(field), nullptr, 10) : 0;
+        sdsfree(info);
+        return n;
     }
 };
 
@@ -1790,7 +1805,7 @@ TEST_F(BlockClientTest, AKeyOnFlashBlocksUntilFetched) {
     EXPECT_TRUE(isBlocked(c));
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_MEMORY);
 
-    externalStorage_processCompletedRequests();
+    extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
     EXPECT_TRUE(c->flag.unblocked);
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
@@ -1804,7 +1819,7 @@ TEST_F(BlockClientTest, MultipleKeysOnFlashBlockUntilAllAreFetched) {
     EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
     EXPECT_TRUE(isBlocked(c));
 
-    externalStorage_processCompletedRequests();
+    extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
     EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_MEMORY);
@@ -1818,7 +1833,7 @@ TEST_F(BlockClientTest, OnlyTheKeysOnFlashBlock) {
     EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
     EXPECT_EQ(dictSize(c->bstate->keys), 1u);
 
-    externalStorage_processCompletedRequests();
+    extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
 }
 
@@ -1829,25 +1844,26 @@ TEST_F(BlockClientTest, StaysBlockedUntilTheLastKeyIsFetched) {
     client *c = makeClient("mget a b");
 
     EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
-    externalStorage_processCompletedRequests();
+    extStorageBeforeSleep();
     EXPECT_TRUE(isBlocked(c)); /* a is back, b is not */
 
     startFetch(b);
-    externalStorage_processCompletedRequests();
+    extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
 }
 
 TEST_F(BlockClientTest, AKeyBeingCopiedToMemoryBlocksWithoutASecondFetch) {
     robj *a = addFlashKey("a");
+    uint64_t fetched_before = numFetched();
     startFetch(a);
     client *c = makeClient("get a");
 
     EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
     EXPECT_TRUE(isBlocked(c));
 
-    externalStorage_processCompletedRequests();
+    extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
-    EXPECT_EQ(numFetched(), 1u);
+    EXPECT_EQ(numFetched() - fetched_before, 1u);
 }
 
 TEST_F(BlockClientTest, AKeyBeingCopiedToFlashDoesNotBlockARead) {
