@@ -52,9 +52,6 @@ robj *extStorageSpillSelectCandidate(int *dbid);
  * returns STORAGE_OK. */
 storageStatus extStorageSpillItem(int dbid, robj *entry);
 
-/* Estimated DRAM that spills in flight will free once they complete. */
-size_t extStorageSpillInflightEstimatedRamBytes(void);
-
 /* Whether the value is only in DRAM, so it can be moved or freed. */
 static inline bool extStorageValueOnlyInMemory(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_MEMORY;

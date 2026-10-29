@@ -1521,13 +1521,11 @@ class SpillSubmitTest : public SpillSelectTest {
     }
 };
 
-TEST_F(SpillSubmitTest, SubmitsTheValueAndCountsItsDram) {
+TEST_F(SpillSubmitTest, SubmitsTheValue) {
     robj *entry = addRawKey("key");
-    size_t before = extStorageSpillInflightEstimatedRamBytes();
 
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
-    EXPECT_EQ(extStorageSpillInflightEstimatedRamBytes() - before, sdsAllocSize((sds)objectGetVal(entry)));
 
     /* The engine writes the borrowed value and hands back our request. */
     ASSERT_EQ(storageMockRunIo(1), 1);
@@ -1537,27 +1535,6 @@ TEST_F(SpillSubmitTest, SubmitsTheValueAndCountsItsDram) {
     EXPECT_EQ(comp.status, STORAGE_OK);
     EXPECT_NE(comp.request_ctx, nullptr);
     zfree(comp.request_ctx);
-}
-
-/* A collection is sized from sampled elements, so only the value's DRAM is
- * counted, not the object that keeps the key. */
-TEST_F(SpillSubmitTest, CountsTheDramOfACollection) {
-    char element[100];
-    memset(element, 'e', sizeof(element));
-
-    size_t used_before = zmalloc_used_memory();
-    robj *list = createQuicklistObject(-2, 0);
-    for (int i = 0; i < 1000; i++) {
-        robj *ele = createStringObject(element, sizeof(element));
-        listTypePush(list, ele, LIST_TAIL);
-        decrRefCount(ele);
-    }
-    size_t value_bytes = zmalloc_used_memory() - used_before - zmalloc_size(list);
-    robj *entry = addKey("list", list);
-    size_t before = extStorageSpillInflightEstimatedRamBytes();
-
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    EXPECT_NEAR((double)(extStorageSpillInflightEstimatedRamBytes() - before), (double)value_bytes, value_bytes * 0.1);
 }
 
 TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
@@ -1571,21 +1548,17 @@ TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
     ASSERT_LT(queued, 1000) << "the engine's queue never filled";
 
     robj *entry = addRawKey("key");
-    size_t before = extStorageSpillInflightEstimatedRamBytes();
 
     EXPECT_EQ(extStorageSpillItem(0, entry), STORAGE_WOULDBLOCK);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(extStorageSpillInflightEstimatedRamBytes(), before);
 }
 
 TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
     robj *entry = addRawKey("key");
-    size_t before = extStorageSpillInflightEstimatedRamBytes();
 
     /* The engine rejects a database it wasn't opened with. */
     EXPECT_EQ(extStorageSpillItem(server.dbnum, entry), STORAGE_ERR_REJECTED);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(extStorageSpillInflightEstimatedRamBytes(), before);
 }
 
 #endif /* USE_EXT_STORAGE */

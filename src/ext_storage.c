@@ -428,16 +428,6 @@ void setStorageState(robj *o, storageState state) {
     o->storage_state = state;
 }
 
-/* Elements sampled to size a collection, the same default as MEMORY USAGE. */
-#define SPILL_SIZE_SAMPLES 5
-
-/* Returns the memory freed by spilling the value of 'o'. The object, which
- * holds the key, stays. Collections are sampled, as in MEMORY USAGE. The key
- * and dbid are only read for module values, which aren't spilled. */
-static size_t spillValueRamBytes(const robj *o) {
-    return objectComputeSize(NULL, (robj *)o, SPILL_SIZE_SAMPLES, 0) - zmalloc_size((void *)o);
-}
-
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
@@ -470,27 +460,15 @@ robj *extStorageSpillSelectCandidate(int *dbid) {
  * TODO(#109): free it when the completion is polled. */
 typedef struct spillRequest {
     robj *entry;
-    size_t ram_bytes;
 } spillRequest;
-
-/* Estimated DRAM that spills in flight free on completion. spillToFree()
- * counts it so it doesn't spill the same deficit twice. */
-static size_t inflight_estimated_ram_bytes;
-
-size_t extStorageSpillInflightEstimatedRamBytes(void) {
-    return inflight_estimated_ram_bytes;
-}
 
 /* Submits an item to the storage engine, which borrows it until the completion
  * is polled. On any status other than STORAGE_OK nothing changes. */
 storageStatus extStorageSpillItem(int dbid, robj *entry) {
     serverAssert(ext_storage.open && isSpillCandidate(entry));
 
-    size_t ram_bytes = spillValueRamBytes(entry);
-
     spillRequest *req = zmalloc(sizeof(*req));
     req->entry = entry;
-    req->ram_bytes = ram_bytes;
     sds key = objectGetKey(entry);
     storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
     if (status != STORAGE_OK) {
@@ -499,7 +477,6 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     }
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
-    inflight_estimated_ram_bytes += ram_bytes;
     return STORAGE_OK;
 }
 
