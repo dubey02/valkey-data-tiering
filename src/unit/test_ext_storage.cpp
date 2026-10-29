@@ -25,6 +25,8 @@ extern "C" {
 #include "storage/storage_mock.h"
 void extStorageTestResetRegistry(void);
 void createSharedObjects(void);
+storageState getStorageState(const robj *o);
+void setStorageState(robj *o, storageState state);
 }
 
 /* The log and the thread setup. */
@@ -902,6 +904,21 @@ static int createOneOfEachObject(robj **objs) {
     return n;
 }
 
+/* Adds one element to a collection, since the keyspace holds no empty ones. */
+static void addOneElement(robj *o) {
+    sds one = sdsnew("1");
+    robj *ele = createStringObject("1", 1);
+    int out_flags = 0;
+    switch (o->type) {
+    case OBJ_LIST: listTypePush(o, ele, LIST_TAIL); break;
+    case OBJ_SET: setTypeAdd(o, one); break;
+    case OBJ_HASH: hashTypeSet(o, one, one, EXPIRY_NONE, HASH_SET_COPY, NULL); break;
+    case OBJ_ZSET: zsetAdd(o, 1, one, ZADD_IN_NONE, &out_flags, NULL); break;
+    }
+    decrRefCount(ele);
+    sdsfree(one);
+}
+
 TEST(StorageStateTest, NewObjectsStartInMemory) {
     robj *objs[NUM_TEST_OBJECTS];
     int n = createOneOfEachObject(objs);
@@ -969,7 +986,7 @@ class SpillSelectTest : public ::testing::Test {
         }
         int dbid;
         usePolicy(MAXMEMORY_ALLKEYS_LRU);
-        spillSelectCandidate(&dbid);
+        extStorageSpillSelectCandidate(&dbid);
     }
 
     void usePolicy(int policy) {
@@ -1007,6 +1024,12 @@ class SpillSelectTest : public ::testing::Test {
         bool found = kvstoreHashtableFind(server.db[0]->keys, 0, k, &entry);
         sdsfree(k);
         return found;
+    }
+
+    /* Whether spill selection would pick 'entry', the only candidate there. */
+    bool isSelected(robj *entry) {
+        int dbid;
+        return extStorageSpillSelectCandidate(&dbid) == entry;
     }
 
     /* Adds a key to 'db' in 'slot', with a TTL unless expire is -1, and returns its entry. */
@@ -1056,10 +1079,11 @@ TEST_F(SpillSelectTest, EveryTypeIsACandidateExceptEmbeddedAndIntStrings) {
         int type = objs[i]->type;
         int encoding = objs[i]->encoding;
         bool expected = encoding != OBJ_ENCODING_EMBSTR && encoding != OBJ_ENCODING_INT;
+        addOneElement(objs[i]);
         robj *entry = addKey("key", objs[i]);
 
         int dbid = -1;
-        EXPECT_EQ(spillSelectCandidate(&dbid), expected ? entry : nullptr)
+        EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), expected ? entry : nullptr)
             << "type " << type << " encoding " << strEncoding(encoding);
         kvstoreEmpty(server.db[0]->keys, NULL);
     }
@@ -1073,7 +1097,7 @@ TEST_F(SpillSelectTest, PicksTheLeastRecentlyUsedKeyUnderAllkeysLru) {
     objectSetLRUOrLFU(addRawKey("middle"), -1, 100);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), oldest);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), oldest);
     EXPECT_EQ(dbid, 0);
 }
 
@@ -1085,7 +1109,7 @@ TEST_F(SpillSelectTest, PicksTheLeastFrequentlyUsedKeyUnderAllkeysLfu) {
     objectSetLRUOrLFU(addRawKey("warm"), 50, -1);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
 }
 
 /* Colder keys that can't be spilled are passed over. */
@@ -1111,7 +1135,7 @@ TEST_F(SpillSelectTest, SkipsKeysThatCannotBeSpilled) {
     objectSetLRUOrLFU(candidate, -1, 10);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
     decrRefCount(referenced);
 }
 
@@ -1131,7 +1155,7 @@ TEST_F(SpillSelectTest, SkipsModuleKeys) {
     objectSetLRUOrLFU(candidate, -1, 10);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
 }
 
 /* An expired key that expiry hasn't deleted yet would be written to flash for
@@ -1144,7 +1168,18 @@ TEST_F(SpillSelectTest, SkipsExpiredKeys) {
     objectSetLRUOrLFU(live, -1, 10);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), live);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), live);
+}
+
+/* Field expiry reads and changes the hash's value, so it has to stay in DRAM. */
+TEST_F(SpillSelectTest, SkipsHashesWithFieldExpirations) {
+    robj *hash = createHashObject();
+    hashTypeSet(hash, sdsnew("field"), sdsnew("value"), EXPIRY_NONE, HASH_SET_TAKE_FIELD | HASH_SET_TAKE_VALUE, NULL);
+    robj *entry = addKey("hash", hash);
+    EXPECT_TRUE(isSelected(entry));
+    hashTypeSet(entry, sdsnew("ttl"), sdsnew("value"), mstime() + 100000, HASH_SET_TAKE_FIELD | HASH_SET_TAKE_VALUE,
+                NULL);
+    EXPECT_FALSE(isSelected(entry));
 }
 
 /* Non-candidates must not crowd the candidate out of the pool. */
@@ -1160,7 +1195,7 @@ TEST_F(SpillSelectTest, KeysThatCannotBeSpilledDoNotFillThePool) {
     objectSetLRUOrLFU(candidate, -1, 10);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
 }
 
 /* Deleted keys left in the pool must not hide a live one. */
@@ -1173,7 +1208,7 @@ TEST_F(SpillSelectTest, DeletedPooledKeysDoNotHideACandidate) {
         objectSetLRUOrLFU(addRawKey(name), -1, 1000 + i);
     }
     int dbid = -1;
-    ASSERT_NE(spillSelectCandidate(&dbid), nullptr);
+    ASSERT_NE(extStorageSpillSelectCandidate(&dbid), nullptr);
 
     /* Leave the pool holding only deleted keys. */
     for (int i = 0; i < 20; i++) {
@@ -1185,7 +1220,7 @@ TEST_F(SpillSelectTest, DeletedPooledKeysDoNotHideACandidate) {
     robj *candidate = addRawKey("candidate");
     objectSetLRUOrLFU(candidate, -1, 10);
 
-    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
 }
 
 /* A pooled key that has since been overwritten with a short value is skipped. */
@@ -1199,7 +1234,7 @@ TEST_F(SpillSelectTest, SkipsPooledKeysOverwrittenWithEmbeddedValues) {
     objectSetLRUOrLFU(candidate, -1, 10);
 
     int dbid = -1;
-    ASSERT_EQ(spillSelectCandidate(&dbid), coldest);
+    ASSERT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
     setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH); /* submitted */
 
     /* As dbSetValue() does for a short value: a new embedded object under the
@@ -1211,7 +1246,7 @@ TEST_F(SpillSelectTest, SkipsPooledKeysOverwrittenWithEmbeddedValues) {
     ASSERT_TRUE(embedded->hasembval);
     objectSetLRUOrLFU(embedded, -1, 2000);
 
-    EXPECT_EQ(spillSelectCandidate(&dbid), candidate);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
 }
 
 TEST_F(SpillSelectTest, ReturnsNullWhenNoKeyCanBeSpilled) {
@@ -1220,7 +1255,7 @@ TEST_F(SpillSelectTest, ReturnsNullWhenNoKeyCanBeSpilled) {
     setStorageState(addRawKey("on_flash"), STORAGE_STATE_ONLY_FLASH);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), nullptr);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), nullptr);
 }
 
 /* Spill ranks every key by LRU or LFU whatever the maxmemory-policy: keys
@@ -1242,7 +1277,7 @@ TEST_F(SpillSelectTest, PicksTheColdestKeyUnderEveryPolicy) {
         objectSetLRUOrLFU(expires_soonest, lfu ? 200 : -1, lfu ? -1 : 10);
 
         int dbid = -1;
-        EXPECT_EQ(spillSelectCandidate(&dbid), coldest) << "policy " << policies[i];
+        EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), coldest) << "policy " << policies[i];
 
         drainPool();
     }
@@ -1268,7 +1303,7 @@ TEST_F(SpillSelectTest, IgnoresTtlScoresEvictionLeftInThePool) {
 
         usePolicy(policies[i]);
         int dbid = -1;
-        EXPECT_EQ(spillSelectCandidate(&dbid), coldest) << "policy " << policies[i];
+        EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), coldest) << "policy " << policies[i];
         drainPool();
     }
 }
@@ -1315,7 +1350,7 @@ TEST_F(SpillSelectTest, ReportsTheDbOfTheChosenKey) {
     objectSetLRUOrLFU(coldest, -1, 5000);
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
     EXPECT_EQ(dbid, 2);
 
     drainPool();
@@ -1342,13 +1377,13 @@ TEST_F(SpillSelectTest, FreesPoolCopiesOfLongKeyNames) {
 
     size_t used = zmalloc_used_memory();
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), coldest);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
 
     /* With neither key spillable, the next selection pops the long name
      * without pooling it again. */
     setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH);
     setStorageState(long_key, STORAGE_STATE_COPYING_TO_FLASH);
-    EXPECT_EQ(spillSelectCandidate(&dbid), nullptr);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), nullptr);
     EXPECT_EQ(zmalloc_used_memory(), used);
 }
 
@@ -1363,7 +1398,7 @@ TEST_F(SpillSelectTest, KeepsCandidatesFromEarlierSelections) {
     objectSetLRUOrLFU(second, -1, 4000);
 
     int dbid = -1;
-    ASSERT_EQ(spillSelectCandidate(&dbid), coldest);
+    ASSERT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
     setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH); /* submitted */
 
     /* One sample out of a thousand recent keys is unlikely to hit second. */
@@ -1374,7 +1409,7 @@ TEST_F(SpillSelectTest, KeepsCandidatesFromEarlierSelections) {
     }
     server.maxmemory_samples = 1;
 
-    EXPECT_EQ(spillSelectCandidate(&dbid), second);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), second);
 }
 
 /* Eviction under volatile-lru and spill under allkeys-lru both score by idle
@@ -1402,7 +1437,7 @@ TEST_F(SpillSelectTest, KeepsEvictionCandidatesScoredOnTheSameScale) {
     server.maxmemory_samples = 1;
 
     int dbid = -1;
-    EXPECT_EQ(spillSelectCandidate(&dbid), second);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), second);
 }
 
 /* LRU scores are idle times and LFU scores are at most 255, so entries scored
@@ -1416,7 +1451,7 @@ TEST_F(SpillSelectTest, IgnoresLruScoresAfterSwitchingToLfu) {
     objectSetLRUOrLFU(frequent, -1, 4000);
 
     int dbid = -1;
-    ASSERT_EQ(spillSelectCandidate(&dbid), coldest);
+    ASSERT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
     setStorageState(coldest, STORAGE_STATE_COPYING_TO_FLASH); /* submitted */
 
     usePolicy(MAXMEMORY_ALLKEYS_LFU);
@@ -1424,7 +1459,7 @@ TEST_F(SpillSelectTest, IgnoresLruScoresAfterSwitchingToLfu) {
     robj *rare = addRawKey("rare");
     objectSetLRUOrLFU(rare, 1, -1);
 
-    EXPECT_EQ(spillSelectCandidate(&dbid), rare);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), rare);
 }
 
 /* In cluster mode keys live in per-slot tables. With one key per slot and a
@@ -1447,8 +1482,140 @@ TEST_F(SpillSelectTest, PicksKeysAcrossSlots) {
 
     for (int i = 0; i < 10; i++) {
         int dbid = -1;
-        EXPECT_NE(spillSelectCandidate(&dbid), nullptr) << "selection " << i;
+        EXPECT_NE(extStorageSpillSelectCandidate(&dbid), nullptr) << "selection " << i;
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Spill submission
+ * ---------------------------------------------------------------------------*/
+
+class SpillSubmitTest : public SpillSelectTest {
+  protected:
+    void SetUp() override {
+        SpillSelectTest::SetUp();
+        extStorageTestResetRegistry();
+        server.hz = CONFIG_DEFAULT_HZ;
+        server.logfile = zstrdup("");
+        crc64_init();
+        server.ext_storage_enabled = 1;
+        server.ext_storage_engine = zstrdup("mock");
+        server.ext_storage_path = zstrdup("");
+        extStorageInit();
+    }
+
+    void TearDown() override {
+        storageMockRunIo(1000);
+        storageCompletion done[16];
+        int n;
+        while ((n = storageMockEngine()->poll_completions(done, 16)) > 0) {
+            for (int i = 0; i < n; i++) {
+                if (done[i].op_type == STORAGE_OP_PUT) zfree(done[i].request_ctx);
+            }
+        }
+        extStorageDeinit();
+        zfree(server.ext_storage_engine);
+        zfree(server.ext_storage_path);
+        zfree(server.logfile);
+        SpillSelectTest::TearDown();
+    }
+};
+
+TEST_F(SpillSubmitTest, SubmitsTheValue) {
+    robj *entry = addRawKey("key");
+
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+
+    /* The engine writes the borrowed value and hands back our request. */
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    storageCompletion comp = {};
+    ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
+    EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+    EXPECT_NE(comp.request_ctx, nullptr);
+    zfree(comp.request_ctx);
+}
+
+/* Each type and encoding takes its own path through the serializer, which
+ * fails the put if it can't serialize the value. */
+TEST_F(SpillSubmitTest, SubmitsEveryTypeOfValue) {
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    for (int i = 0; i < n; i++) {
+        int type = objs[i]->type;
+        int encoding = objs[i]->encoding;
+        if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_INT) {
+            decrRefCount(objs[i]); /* not spill candidates */
+            continue;
+        }
+        addOneElement(objs[i]);
+        char name[32];
+        snprintf(name, sizeof(name), "key:%d", i);
+        robj *entry = addKey(name, objs[i]);
+
+        ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
+        ASSERT_EQ(storageMockRunIo(1), 1);
+        storageCompletion comp = {};
+        ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
+        EXPECT_EQ(comp.status, STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
+        zfree(comp.request_ctx);
+    }
+}
+
+TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
+    /* Fill the engine's queue. */
+    int queued = 0;
+    for (; queued < 1000; queued++) {
+        char key[32];
+        snprintf(key, sizeof(key), "queued%d", queued);
+        if (extStorageSpillItem(0, addRawKey(key)) != STORAGE_OK) break;
+    }
+    ASSERT_LT(queued, 1000) << "the engine's queue never filled";
+
+    robj *entry = addRawKey("key");
+
+    EXPECT_EQ(extStorageSpillItem(0, entry), STORAGE_WOULDBLOCK);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
+    robj *entry = addRawKey("key");
+
+    /* The engine rejects a database it wasn't opened with. */
+    EXPECT_EQ(extStorageSpillItem(server.dbnum, entry), STORAGE_ERR_REJECTED);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* ---------------------------------------------------------------------------
+ * Active defrag
+ * ---------------------------------------------------------------------------*/
+
+#ifdef HAVE_DEFRAG
+
+extern "C" int defragLaterItem(robj *ob, unsigned long *cursor, monotime endtime, int dbid);
+
+/* A big list deferred by defrag can be spilled before defrag gets back to it.
+ * Defrag must then drop it without walking the value the engine is reading. */
+TEST(DefragLaterTest, SkipsAValueThatIsNotOnlyInMemory) {
+    robj *list = createQuicklistObject(0, 0);
+    robj *ele = createStringObject("v", 1);
+    for (int i = 0; i < 10; i++) listTypePush(list, ele, LIST_TAIL);
+    decrRefCount(ele);
+
+    for (int state = STORAGE_STATE_COPYING_TO_FLASH; state < STORAGE_STATE_NUM_STATES; state++) {
+        setStorageState(list, (storageState)state);
+        long long scanned = server.stat_active_defrag_scanned;
+        unsigned long cursor = 0;
+
+        EXPECT_EQ(defragLaterItem(list, &cursor, (monotime)-1, 0), 0) << "state " << state;
+        EXPECT_EQ(server.stat_active_defrag_scanned, scanned) << "state " << state;
+    }
+
+    setStorageState(list, STORAGE_STATE_ONLY_MEMORY);
+    decrRefCount(list);
+}
+
+#endif /* HAVE_DEFRAG */
 
 #endif /* USE_EXT_STORAGE */

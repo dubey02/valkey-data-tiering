@@ -5,14 +5,16 @@
  */
 
 /* Data tiering storage-engine-side entry points. Present only in a build with
- * BUILD_EXT_STORAGE, which defines USE_EXT_STORAGE. */
+ * BUILD_EXT_STORAGE, which defines USE_EXT_STORAGE. Without it, the hooks the
+ * rest of the server calls are stubs. */
 
 #ifndef VALKEY_EXT_STORAGE_H
 #define VALKEY_EXT_STORAGE_H
 
+#include "server.h"
+
 #ifdef USE_EXT_STORAGE
 
-#include "server.h"
 #include "storage/storage.h"
 
 /* Opens the configured storage engine. */
@@ -43,9 +45,24 @@ sds extStorageEngineInfoString(sds info);
 /* The serialization callbacks. */
 const storageSerializer *extStorageSerializer(void);
 
-storageState getStorageState(const robj *o);
-void setStorageState(robj *o, storageState state);
-robj *spillSelectCandidate(int *dbid);
+/* Returns the coldest key that can be spilled and sets *dbid, or NULL. */
+robj *extStorageSpillSelectCandidate(int *dbid);
+
+/* Submits a key's value to the storage engine. Nothing changes unless it
+ * returns STORAGE_OK. */
+storageStatus extStorageSpillItem(int dbid, robj *entry);
+
+/* Whether the value is only in DRAM, so it can be moved or freed. */
+static inline bool extStorageIsMemoryOnly(const robj *o) {
+    return o->storage_state == STORAGE_STATE_ONLY_MEMORY;
+}
+
+#else
+
+static inline bool extStorageIsMemoryOnly(const robj *o) {
+    UNUSED(o);
+    return true;
+}
 
 #endif /* USE_EXT_STORAGE */
 

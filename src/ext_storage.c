@@ -432,11 +432,14 @@ void setStorageState(robj *o, storageState state) {
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
  * Module values have no serializer yet (#81). Expired keys are left for
- * expiry to delete. */
+ * expiry to delete. A hash with field expirations stays in DRAM because active
+ * field expiry reads and changes its value.
+ * TODO(#57): spill it once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
-    return getStorageState(o) == STORAGE_STATE_ONLY_MEMORY && !o->hasembval &&
-           objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetRefcount(o) == 1 && objectGetType(o) != OBJ_MODULE &&
-           !timestampIsExpired(objectGetExpire(o));
+    if (getStorageState(o) != STORAGE_STATE_ONLY_MEMORY || o->hasembval || objectGetRefcount(o) != 1) return false;
+    if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
+    if (timestampIsExpired(objectGetExpire(o))) return false;
+    return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }
 
 /* Picks the eviction policy used to sample and rank keys for spilling.
@@ -449,8 +452,32 @@ static int spillSamplingPolicy(void) {
 }
 
 /* Returns the coldest spillable key, or NULL if none was sampled. */
-robj *spillSelectCandidate(int *dbid) {
+robj *extStorageSpillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
+}
+
+/* A put in flight, passed to the engine as its request_ctx.
+ * TODO(#109): free it when the completion is polled. */
+typedef struct spillRequest {
+    robj *entry;
+} spillRequest;
+
+/* Submits an item to the storage engine, which borrows it until the completion
+ * is polled. On any status other than STORAGE_OK nothing changes. */
+storageStatus extStorageSpillItem(int dbid, robj *entry) {
+    serverAssert(ext_storage.open && isSpillCandidate(entry));
+
+    spillRequest *req = zmalloc(sizeof(*req));
+    req->entry = entry;
+    sds key = objectGetKey(entry);
+    storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
+    if (status != STORAGE_OK) {
+        zfree(req);
+        return status;
+    }
+
+    setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
+    return STORAGE_OK;
 }
 
 #endif /* USE_EXT_STORAGE */

@@ -45,6 +45,7 @@
 #include "script.h"
 #include "module.h"
 #include "bgiteration.h"
+#include "ext_storage.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -660,6 +661,8 @@ static void defragKey(defragKeysCtx *ctx, robj **elemref) {
     ob = *elemref;
 
     if (bgIteration_isEntryInuse(ob)) return;
+    /* The storage engine may be reading the value, or it is on flash. */
+    if (!extStorageIsMemoryOnly(ob)) return;
 
     /* Try to defrag robj and/or string value. */
     if ((newob = activeDefragStringOb(ob))) {
@@ -768,10 +771,12 @@ static void defragPubsubScanCallback(void *privdata, void *elemref) {
 }
 
 /* returns 0 more work may or may not be needed (see non-zero cursor),
- * and 1 if time is up and more work is needed. */
-static int defragLaterItem(robj *ob, unsigned long *cursor, monotime endtime, int dbid) {
+ * and 1 if time is up and more work is needed. Not static so unit tests can
+ * call it. */
+int defragLaterItem(robj *ob, unsigned long *cursor, monotime endtime, int dbid) {
     if (ob) {
-        if (bgIteration_isEntryInuse(ob)) {
+        /* The storage engine may be reading the value, or it is on flash. */
+        if (bgIteration_isEntryInuse(ob) || !extStorageIsMemoryOnly(ob)) {
             *cursor = 0;
             return 0;
         }
