@@ -8,7 +8,7 @@
  * Connects the valkey server to a storage engine. */
 
 #include "server.h"
-#define USE_EXT_STORAGE
+
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
