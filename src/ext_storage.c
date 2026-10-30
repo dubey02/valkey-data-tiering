@@ -440,7 +440,7 @@ void setStorageState(robj *o, storageState state) {
  * field expiry reads and changes its value.
  * TODO(#57): spill it once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
-    if (getStorageState(o) != STORAGE_STATE_ONLY_MEMORY || o->hasembval || objectGetRefcount(o) != 1) return false;
+    if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
     if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
     if (timestampIsExpired(objectGetExpire(o))) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));

@@ -420,11 +420,6 @@ void *objectGetVal(const robj *o) {
     }
 }
 
-/* False when the value is on flash and only the key is in memory. */
-bool isValueInMemory(const robj *o) {
-    return o->storage_state == STORAGE_STATE_ONLY_MEMORY || o->storage_state == STORAGE_STATE_COPYING_TO_FLASH;
-}
-
 sds objectGetKey(const robj *o) {
     const unsigned char *data = objectEmbeddedData((robj *)o);
     if (o->hasexpire) {

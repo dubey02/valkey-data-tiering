@@ -40,6 +40,7 @@
 #include "util.h"
 #include "vset.h"
 #include "server.h"
+#include "ext_storage.h"
 #include "zmalloc.h"
 #include <math.h>
 #include <string.h>
@@ -120,7 +121,7 @@ long long hashTypeVolatileCount(robj *o) {
 
 bool hashTypeHasVolatileFields(robj *o) {
     /* Hashes with field expirations aren't spilled. */
-    if (o == NULL || !isValueInMemory(o)) return false;
+    if (o == NULL || !extStorageIsMemoryOnly(o)) return false;
     serverAssert(objectGetType(o) == OBJ_HASH);
 
     if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {

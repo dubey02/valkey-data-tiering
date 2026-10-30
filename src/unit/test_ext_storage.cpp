@@ -996,8 +996,8 @@ class SpillSelectTest : public ::testing::Test {
 
     /* Runs performEvictions() one byte over maxmemory, so it evicts one key and
      * leaves the rest of its sample in the pool. */
-    void evictOneKey(void) {
-        /* Evicting a key notifies modules, touches watched keys and propagates a DEL. */
+    /* Deleting a key notifies modules and uses the shared objects. */
+    static void initServerForDeletes(void) {
         static bool server_initialized = false;
         if (!server_initialized) {
             monotonicInit();
@@ -1005,6 +1005,11 @@ class SpillSelectTest : public ::testing::Test {
             moduleInitModulesSystem();
             server_initialized = true;
         }
+    }
+
+    void evictOneKey(void) {
+        /* Evicting a key also touches watched keys and propagates a DEL. */
+        initServerForDeletes();
         server.replicas = listCreate();
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
 
@@ -1719,11 +1724,9 @@ TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
     ASSERT_EQ(finishSpills(), 1);
     ASSERT_EQ(objectGetVal(entry), nullptr);
 
-    /* As a lazy delete does, after taking the key out of the keyspace. */
-    void *popped;
-    ASSERT_TRUE(kvstoreHashtablePop(server.db[0]->keys, 0, objectGetKey(entry), &popped));
+    initServerForDeletes();
     robj *key = createStringObject("list", 4);
-    freeObjAsync(key, entry, 0);
+    EXPECT_EQ(dbAsyncDelete(server.db[0], key), 1);
     decrRefCount(key);
 }
 

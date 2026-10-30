@@ -3401,7 +3401,6 @@ robj *objectSetExpire(robj *o, long long expire);
 void objectSetVal(robj *o, void *val);
 void objectUnembedVal(robj *o);
 void *objectGetVal(const robj *o);
-bool isValueInMemory(const robj *o);
 sds objectGetKey(const robj *o);
 mstime_t objectGetExpire(const robj *o);
 uint8_t objectGetLFUFrequency(robj *o);
