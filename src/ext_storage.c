@@ -265,11 +265,10 @@ static int extStoragePollCompletions(void) {
 }
 
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
- * the loop at least every tick, so a completion waits at most that long.
- * Returns how many completions were handled. */
-int extStorageBeforeSleep(void) {
-    if (!ext_storage.open) return 0;
-    return extStoragePollCompletions();
+ * the loop at least every tick, so a completion waits at most that long. */
+void extStorageBeforeSleep(void) {
+    if (!ext_storage.open) return;
+    extStoragePollCompletions();
 }
 
 /* Closes the storage engine. Outstanding requests are polled and handled first.

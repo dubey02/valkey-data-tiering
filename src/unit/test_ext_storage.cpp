@@ -1518,10 +1518,12 @@ class SpillSubmitTest : public SpillSelectTest {
         SpillSelectTest::TearDown();
     }
 
-    /* Runs every queued request and processes its completion. */
+    /* Runs every queued request and processes its completion. Returns how
+     * many ran. */
     int finishSpills() {
-        storageMockRunIo(1000);
-        return extStorageBeforeSleep();
+        int n = storageMockRunIo(1000);
+        extStorageBeforeSleep();
+        return n;
     }
 };
 
