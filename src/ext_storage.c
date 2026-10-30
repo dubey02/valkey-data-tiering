@@ -40,11 +40,14 @@ void extStorageTestResetRegistry(void) {
     registered_engine = NULL;
 }
 
-/* Counted on the main thread as completions are handled. */
+/* Counted on the main thread. */
 typedef struct extStorageStats {
     uint64_t total_num_items_spilled;
     uint64_t total_num_items_fetched;
     uint64_t total_num_items_deleted;
+    /* Fetches the storage engine accepted whose completion is not handled yet. */
+    uint64_t num_items_fetching;
+    uint64_t total_num_fetch_errors;
 } extStorageStats;
 
 /* Storage Context. */
@@ -324,12 +327,16 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_capacity_bytes:%llu\r\n"
                         "ext_storage_total_num_items_spilled_to_storage:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
-                        "ext_storage_total_num_items_deleted_from_storage:%llu\r\n",
+                        "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
+                        "ext_storage_num_items_fetching_from_storage:%llu\r\n"
+                        "ext_storage_total_num_fetch_errors:%llu\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
                         (unsigned long long)st->total_num_items_spilled,
                         (unsigned long long)st->total_num_items_fetched,
-                        (unsigned long long)st->total_num_items_deleted);
+                        (unsigned long long)st->total_num_items_deleted,
+                        (unsigned long long)st->num_items_fetching,
+                        (unsigned long long)st->total_num_fetch_errors);
 }
 
 /* The INFO buffer under construction, handed to the storage engine as the
@@ -497,14 +504,23 @@ static void fetchKey(serverDb *db, robj *key) {
     } 
     incrRefCount(key); // released in handleGetCompletion
     setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
-    // todo metric fetching from flash?
+    ext_storage.stats.num_items_fetching++;
+}
+
+/* Test-only. Submits a fetch through the same path as a blocked command. */
+void extStorageTestFetchKey(serverDb *db, robj *key) {
+    fetchKey(db, key);
 }
 
 /* request_ctx for a GET is the key, a refcounted string robj. */
 static void handleGetCompletion(const storageCompletion *c) {
+    serverAssert(ext_storage.stats.num_items_fetching > 0);
+    ext_storage.stats.num_items_fetching--;
     if (c->status == STORAGE_OK) {
         ext_storage.stats.total_num_items_fetched++;
     } else {
+        /* Counted before the panic so it shows in the crash report's INFO. */
+        ext_storage.stats.total_num_fetch_errors++;
         serverPanic("Fetch from flash failed"); // TODO: Proper error handling
     }
 
@@ -520,7 +536,10 @@ static void handleGetCompletion(const storageCompletion *c) {
     o->encoding = c->value->encoding;
     objectSetVal(c->value, NULL);
     decrRefCount(c->value); // frees only the shell
-    // todo: check if there are lrulfu implications (touching)
+    /* A fetched key was just accessed, so it shouldn't be the next spill
+     * candidate. Unlike lookupKey, no copy-on-write guard: the header was
+     * already written above. */
+    o->lru = lrulfu_touch(o->lru);
     setStorageState(o, STORAGE_STATE_ONLY_MEMORY);
 
     unblockClientsInUseOnKey(key);

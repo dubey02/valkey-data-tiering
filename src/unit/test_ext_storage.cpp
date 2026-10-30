@@ -24,6 +24,7 @@ extern "C" {
 #include "storage/storage.h"
 #include "storage/storage_mock.h"
 void extStorageTestResetRegistry(void);
+void extStorageTestFetchKey(serverDb *db, robj *key);
 extern hashtableType commandSetType;
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
@@ -1658,12 +1659,12 @@ class FetchCompletionTest : public SpillSelectTest {
         setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
     }
 
-    /* Submits a fetch the way fetchKeyAsync does. */
+    /* Submits a fetch the way a blocked command does. */
     void startFetch(robj *entry) {
         sds key = objectGetKey(entry);
-        robj *ctx = createStringObject(key, sdslen(key));
-        ASSERT_EQ(engine->get_async(0, key, sdslen(key), ctx), STORAGE_OK);
-        setStorageState(entry, STORAGE_STATE_COPYING_TO_MEMORY);
+        robj *k = createStringObject(key, sdslen(key));
+        extStorageTestFetchKey(server.db[0], k);
+        decrRefCount(k); /* the fetch holds its own reference */
     }
 
     /* Queues deletes until the engine refuses one, so the next request gets
@@ -1699,7 +1700,9 @@ TEST_F(FetchCompletionTest, AFetchedValueIsBackInMemory) {
 }
 
 TEST_F(FetchCompletionTest, AFailedFetchPanics) {
-    startFetch(addRawKey("key")); /* never spilled, so the engine returns NOT_FOUND */
+    robj *entry = addRawKey("key");
+    setStorageState(entry, STORAGE_STATE_ONLY_FLASH); /* never spilled, so the engine returns NOT_FOUND */
+    startFetch(entry);
     // todo: match on the assert message instead of passing on any crash
     EXPECT_DEATH(extStorageBeforeSleep(), "");
     discardCompletions();
@@ -1786,13 +1789,20 @@ class BlockClientTest : public FetchCompletionTest {
         return c->flag.blocked && c->bstate->btype == BLOCKED_INUSE;
     }
 
-    uint64_t numFetched() {
-        const char *field = "ext_storage_total_num_items_fetched_from_storage:";
+    uint64_t infoField(const char *field) {
         sds info = extStorageInfoString(sdsempty());
         const char *p = strstr(info, field);
         uint64_t n = p ? strtoull(p + strlen(field), nullptr, 10) : 0;
         sdsfree(info);
         return n;
+    }
+
+    uint64_t numFetched() {
+        return infoField("ext_storage_total_num_items_fetched_from_storage:");
+    }
+
+    uint64_t numFetching() {
+        return infoField("ext_storage_num_items_fetching_from_storage:");
     }
 };
 
@@ -1862,6 +1872,7 @@ TEST_F(BlockClientTest, StaysBlockedUntilTheLastKeyIsFetched) {
     extStorageBeforeSleep();
     EXPECT_TRUE(isBlocked(c)); /* a is back, b is not */
 
+    setStorageState(b, STORAGE_STATE_ONLY_FLASH); /* now submit its fetch */
     startFetch(b);
     extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
@@ -1878,6 +1889,20 @@ TEST_F(BlockClientTest, AKeyBeingCopiedToMemoryBlocksWithoutASecondFetch) {
 
     extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(numFetched() - fetched_before, 1u);
+}
+
+TEST_F(BlockClientTest, AFetchInFlightIsCounted) {
+    addFlashKey("a");
+    client *c = makeClient("get a");
+    uint64_t fetching_before = numFetching();
+    uint64_t fetched_before = numFetched();
+
+    EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_EQ(numFetching() - fetching_before, 1u);
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(numFetching(), fetching_before);
     EXPECT_EQ(numFetched() - fetched_before, 1u);
 }
 
