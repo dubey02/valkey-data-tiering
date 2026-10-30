@@ -756,10 +756,6 @@ static void resumeRehashing(dbEntry *de) {
 
 // Maintain a list of entries which are currently in-use.  These items should not be modified.
 static void incrementEntryInuse(dbEntry *de) {
-    /* No spill runs during an iteration, so this is a key on flash.
-     * TODO(#64): iterate keys on flash. */
-    if (!extStorageIsMemoryOnly(de))
-        serverLog(LL_WARNING, "Background iteration used a key whose value isn't only in memory.");
     dictEntry *existingEntry;
     dictEntry *newEntry = dictAddRaw(inUseEntries, de, &existingEntry);
     if (newEntry) {
@@ -1031,6 +1027,10 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
                 continue;
             }
 
+            /* A value being spilled or on flash isn't read.
+             * TODO(#64): iterate keys whose value isn't only in memory. */
+            if (!extStorageIsMemoryOnly(de)) continue;
+
             // Remove any items which have been processed early
             if (hashtableDelete(it->early_iterate_entries, de)) {
                 if (BGITERATION_DEBUG) {
@@ -1073,6 +1073,9 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
 
 
 static bool addEarlyIterationKey(bgIterator *it, dbEntry *earlyEntry, int cur_dbid) {
+    /* A value being spilled or on flash isn't read, as in the main scan. */
+    if (!extStorageIsMemoryOnly(earlyEntry)) return false;
+
     bool wasAdded = hashtableAdd(it->early_iterate_entries, earlyEntry);
     serverAssert(wasAdded);
 
@@ -1989,10 +1992,6 @@ static bgIterator *bgIteratorCreate(const char *name,
     serverAssert(server.forkless_infrastructure_enabled);
     serverAssert(hasMainThreadExclusivity());
     serverAssert(server.cluster_enabled || iter_type == BGITERATION_TYPE_FULLSCAN);
-
-    /* The iterator takes a reference to each entry, which a spill doesn't allow.
-     * Spills in flight finish first, and none start while it runs. */
-    extStorageSpillDrain();
 
     int flags;
     switch (consistency) {

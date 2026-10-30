@@ -12,7 +12,6 @@
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
-#include "bgiteration.h"
 #include "rdb.h"
 #include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
@@ -439,8 +438,6 @@ void setStorageState(robj *o, storageState state) {
  * field expiry reads and changes its value.
  * TODO(#57): spill it once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
-    /* A background iteration may take a reference to any key. */
-    if (bgIteration_iterationActive()) return false;
     if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
     if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
     if (timestampIsExpired(objectGetExpire(o))) return false;
