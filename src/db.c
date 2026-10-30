@@ -42,6 +42,7 @@
 #include "expire.h"
 #include "bgiteration.h"
 #include "forkless.h"
+#include "ext_storage.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
 
@@ -104,6 +105,15 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
             /* The key is no longer valid. */
             val = NULL;
         }
+    }
+
+    /* Commands are rejected on their keys before they run, but not on keys
+     * they don't declare, like those a script reads. A read of such a key
+     * misses, and a write can't happen.
+     * TODO(#129): block on undeclared keys too. */
+    if (val && !extStorageIsMemoryOnly(val)) {
+        serverAssert(!(flags & LOOKUP_WRITE));
+        val = NULL;
     }
 
     if (val) {
@@ -341,6 +351,9 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
     robj *new;
+    /* A value being spilled or on flash can't be replaced. Commands on it are
+     * rejected before they run. */
+    serverAssertWithInfo(NULL, key, extStorageIsMemoryOnly(old));
 
     if (overwrite) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
@@ -402,7 +415,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
     if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
         /* OK */
-    } else if (server.lazyfree_lazy_server_del) {
+    } else if (server.lazyfree_lazy_server_del && extStorageIsMemoryOnly(old)) {
         freeObjAsync(key, old, db->id);
     } else {
         decrRefCount(old);
@@ -498,6 +511,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         hotkeysRecordDelete(key, db->id, flags);
 
         robj *val = *ref;
+        /* A value being spilled or on flash can't be deleted. Commands on it
+         * are rejected before they run, and expiry skips it. */
+        serverAssertWithInfo(NULL, key, extStorageIsMemoryOnly(val));
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
         incrRefCount(val);
@@ -525,7 +541,8 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        if (async) {
+        /* A value on flash is already freed, so only the object is left. */
+        if (async && extStorageIsMemoryOnly(val)) {
             freeObjAsync(key, val, db->id);
         } else {
             decrRefCount(val);
@@ -688,6 +705,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
 
     /* bgIteration must be notified for flushall. */
     if (dbnum == -1) bgIteration_flushall();
+
+    /* The storage engine may still be reading values that are about to be freed. */
+    extStorageSpillDrain();
 
     /* Fire the flushdb modules event. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_FLUSHDB, VALKEYMODULE_SUBEVENT_FLUSHDB_START, &fi);
@@ -2220,6 +2240,8 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
         return KEY_VALID;
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
+    /* TODO(#56): delete an expired key whose value isn't only in memory. */
+    if (val && !extStorageIsMemoryOnly(val)) return KEY_EXPIRED;
 
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;

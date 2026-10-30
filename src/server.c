@@ -5028,6 +5028,24 @@ int processCommand(client *c) {
 
     if (throttle_throttleClientIfNeeded(c)) return C_OK;
 
+#ifdef USE_EXT_STORAGE
+    /* TODO(#129): block the client instead, and fetch a value on flash. */
+    if (server.ext_storage_enabled) {
+        getKeysResult keys_result;
+        initGetKeysResult(&keys_result);
+        int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &keys_result);
+        for (int i = 0; i < numkeys; i++) {
+            robj *val = dbFind(c->db, objectGetVal(c->argv[keys_result.keys[i].pos]));
+            if (val && !extStorageIsMemoryOnly(val)) {
+                getKeysFreeResult(&keys_result);
+                rejectCommandFormat(c, 1, "-TRYAGAIN Value not available in memory");
+                return C_OK;
+            }
+        }
+        getKeysFreeResult(&keys_result);
+    }
+#endif
+
     /* Exec the command */
     if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
         c->cmd->proc != quitCommand &&

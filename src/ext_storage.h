@@ -57,11 +57,16 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_MEMORY;
 }
 
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void);
+
 #else
 
 static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;
+}
+static inline void extStorageSpillDrain(void) {
 }
 
 #endif /* USE_EXT_STORAGE */

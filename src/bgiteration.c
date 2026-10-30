@@ -7,6 +7,7 @@
 #include "fmacros.h"
 #include "bgiteration.h"
 #include "dict.h"
+#include "ext_storage.h"
 #include "fifo.h"
 #include "kvstore.h"
 #include "monotonic.h"
@@ -1026,6 +1027,10 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
                 continue;
             }
 
+            /* A value being spilled or on flash isn't read.
+             * TODO(#64): iterate keys whose value isn't only in memory. */
+            if (!extStorageIsMemoryOnly(de)) continue;
+
             // Remove any items which have been processed early
             if (hashtableDelete(it->early_iterate_entries, de)) {
                 if (BGITERATION_DEBUG) {
@@ -1068,6 +1073,9 @@ static void feedIterator(bgIterator *it, monotime end_time_us) {
 
 
 static bool addEarlyIterationKey(bgIterator *it, dbEntry *earlyEntry, int cur_dbid) {
+    /* A value being spilled or on flash isn't read, as in the main scan. */
+    if (!extStorageIsMemoryOnly(earlyEntry)) return false;
+
     bool wasAdded = hashtableAdd(it->early_iterate_entries, earlyEntry);
     serverAssert(wasAdded);
 

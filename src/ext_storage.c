@@ -236,11 +236,13 @@ void extStorageInit(void) {
 /* Completions
  * extStorageBeforeSleep and the shutdown drain both go through here. */
 
+static void spillComplete(const storageCompletion *comp);
+
 /* Handles one finished request. */
 static void extStorageProcessCompletion(const storageCompletion *c) {
     switch (c->op_type) {
     case STORAGE_OP_PUT:
-        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
+        spillComplete(c);
         break;
     case STORAGE_OP_GET:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
@@ -436,7 +438,7 @@ void setStorageState(robj *o, storageState state) {
  * field expiry reads and changes its value.
  * TODO(#57): spill it once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
-    if (getStorageState(o) != STORAGE_STATE_ONLY_MEMORY || o->hasembval || objectGetRefcount(o) != 1) return false;
+    if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
     if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
     if (timestampIsExpired(objectGetExpire(o))) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
@@ -456,11 +458,13 @@ robj *extStorageSpillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
 }
 
-/* A put in flight, passed to the engine as its request_ctx.
- * TODO(#109): free it when the completion is polled. */
+/* A put in flight, passed to the engine as its request_ctx. */
 typedef struct spillRequest {
     robj *entry;
 } spillRequest;
+
+/* Number of spills submitted and not yet finished. */
+static unsigned long inflight_requests;
 
 /* Submits an item to the storage engine, which borrows it until the completion
  * is polled. On any status other than STORAGE_OK nothing changes. */
@@ -477,7 +481,46 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     }
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
+    inflight_requests++;
     return STORAGE_OK;
 }
 
+/* Frees the value the way dbSetValue() frees an overwritten one. The object,
+ * which holds the key, stays.
+ * TODO(#81): pass the key and dbid once module values spill, since a module's
+ * free_effort callback may read them. */
+static void spillFreeValue(robj *entry) {
+    robj *val = createObject(objectGetType(entry), objectGetVal(entry));
+    val->encoding = objectGetEncoding(entry);
+    objectSetVal(entry, NULL);
+    if (server.lazyfree_lazy_server_del)
+        freeObjAsync(NULL, val, -1);
+    else
+        decrRefCount(val);
+}
+
+/* Handles a finished write. A key is spilled only when nothing else references
+ * it, and nothing may take a reference while it is COPYING_TO_FLASH. So a
+ * written value is always freed, and only a failed write keeps it in memory. */
+static void spillComplete(const storageCompletion *comp) {
+    spillRequest *req = comp->request_ctx;
+    robj *entry = req->entry;
+    serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
+    serverAssert(objectGetRefcount(entry) == 1);
+
+    if (comp->status == STORAGE_OK) {
+        spillFreeValue(entry);
+        setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+        ext_storage.stats.total_num_items_spilled++;
+    } else {
+        setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
+    }
+    inflight_requests--;
+    zfree(req);
+}
+
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void) {
+    while (inflight_requests > 0) extStorageBeforeSleep();
+}
 #endif /* USE_EXT_STORAGE */
