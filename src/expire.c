@@ -40,6 +40,7 @@
 #include "cluster_migrateslots.h"
 #include "util.h"
 #include "bgiteration.h"
+#include "ext_storage.h"
 
 /*-----------------------------------------------------------------------------
  * Incremental collection of expired keys.
@@ -67,8 +68,8 @@ static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 
 int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx) {
     mstime_t t = objectGetExpire(val);
     serverAssert(t >= 0);
-    /* A key being spilled is expired on a later cycle. */
-    if (now > t && val->storage_state != STORAGE_STATE_COPYING_TO_FLASH) {
+    /* TODO(#57): expire a key whose value isn't only in memory. */
+    if (now > t && extStorageIsMemoryOnly(val)) {
         enterExecutionUnit(1, 0);
         sds key = objectGetKey(val);
         robj *keyobj = createStringObject(key, sdslen(key));

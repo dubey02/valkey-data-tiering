@@ -348,7 +348,9 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
     robj *new;
-    serverAssert(old->storage_state != STORAGE_STATE_COPYING_TO_FLASH);
+    /* A value being spilled or on flash can't be replaced. Commands on it are
+     * rejected before they run. */
+    serverAssertWithInfo(NULL, key, extStorageIsMemoryOnly(old));
 
     if (overwrite) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
@@ -371,15 +373,12 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
          * encoding with the content of val. */
         int tmp_type = old->type;
         int tmp_encoding = old->encoding;
-        int tmp_storage_state = old->storage_state;
         void *tmp_ptr = objectGetVal(old);
         old->type = val->type;
         old->encoding = val->encoding;
-        old->storage_state = val->storage_state;
         objectSetVal(old, objectGetVal(val));
         val->type = tmp_type;
         val->encoding = tmp_encoding;
-        val->storage_state = tmp_storage_state;
         objectSetVal(val, tmp_ptr);
         /* Set new to old to keep the old object. Set old to val to be freed below. */
         new = old;
@@ -509,7 +508,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         hotkeysRecordDelete(key, db->id, flags);
 
         robj *val = *ref;
-        serverAssert(val->storage_state != STORAGE_STATE_COPYING_TO_FLASH);
+        /* TODO(#129): block commands on a key being spilled.
+         * TODO(#34): delete the flash copy of a key on flash. */
+        if (!extStorageIsMemoryOnly(val)) serverLog(LL_WARNING, "Deleted a key whose value isn't only in memory.");
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
         incrRefCount(val);
@@ -2236,8 +2237,8 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
         return KEY_VALID;
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
-    /* A key being spilled is deleted on a later access, once the spill finishes. */
-    if (val && val->storage_state == STORAGE_STATE_COPYING_TO_FLASH) return KEY_EXPIRED;
+    /* TODO(#56): delete an expired key whose value isn't only in memory. */
+    if (val && !extStorageIsMemoryOnly(val)) return KEY_EXPIRED;
 
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;

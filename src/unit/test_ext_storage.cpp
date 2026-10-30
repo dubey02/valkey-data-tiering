@@ -27,8 +27,8 @@ void extStorageTestResetRegistry(void);
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
-int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx);
 void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o);
+int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx);
 }
 
 /* The log and the thread setup. */
@@ -1719,64 +1719,43 @@ TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
  * Values in flight
  * ---------------------------------------------------------------------------*/
 
-/* Freeing a value the engine is reading is a bug, so a delete of a key being
- * spilled crashes. TODO(#129): commands block on the key before they run. */
-TEST_F(SpillSubmitTest, DeletingAKeyMidSpillCrashes) {
+/* An expired key isn't deleted while its value is being spilled or on flash.
+ * A lookup reports it missing. TODO(#56), TODO(#57): delete it. */
+TEST_F(SpillSubmitTest, AnExpiredKeyNotInMemoryIsNotDeleted) {
+    mstime_t now = mstime();
+    robj *entry = addKeyWithExpire("key", rawValue(), now + 1000);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+    server.cmd_time_snapshot = now + 2000;
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_EQ(activeExpireCycleTryExpire(server.db[0], entry, now + 2000, 0), 0) << "on flash " << on_flash;
+        EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr) << "on flash " << on_flash;
+        EXPECT_TRUE(keyExists("key")) << "on flash " << on_flash;
+    }
+    server.cmd_time_snapshot = 0;
+    decrRefCount(key);
+}
+
+/* Commands on a value being spilled or on flash are rejected before they run,
+ * so a replace reaching one is a bug. */
+TEST_F(SpillSubmitTest, ReplacingAKeyNotInMemoryCrashes) {
     robj *entry = addRawKey("key");
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-
-    initServerForDeletes();
     robj *key = createStringObject("key", 3);
-    EXPECT_DEATH(dbAsyncDelete(server.db[0], key), "");
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        robj *val = rawValue();
+        EXPECT_DEATH(dbReplaceValue(server.db[0], key, &val), "") << "on flash " << on_flash;
+        decrRefCount(val);
+    }
     decrRefCount(key);
-}
-
-/* Active expire leaves a key being spilled for a later cycle. */
-TEST_F(SpillSubmitTest, ActiveExpireSkipsAKeyMidSpill) {
-    mstime_t now = mstime();
-    robj *entry = addKeyWithExpire("key", rawValue(), now + 1000);
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-
-    EXPECT_EQ(activeExpireCycleTryExpire(server.db[0], entry, now + 2000, 0), 0);
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
-}
-
-/* A lookup of an expired key being spilled reports it missing without
- * deleting it. */
-TEST_F(SpillSubmitTest, AnExpiredKeyMidSpillIsMissingButNotDeleted) {
-    mstime_t now = mstime();
-    robj *entry = addKeyWithExpire("key", rawValue(), now + 1000);
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-
-    server.cmd_time_snapshot = now + 2000;
-    robj *key = createStringObject("key", 3);
-    EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr);
-    decrRefCount(key);
-    EXPECT_TRUE(keyExists("key"));
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
-    server.cmd_time_snapshot = 0;
-}
-
-/* Replacing a hash on flash keeps the object in the keyspace for the new
- * value. The new value is in memory, and freeing the old one, which has no
- * value left, doesn't look for field expirations in it. */
-TEST_F(SpillSubmitTest, ReplacingTheValueOfAKeyOnFlash) {
-    robj *hash = createHashObject();
-    sds field = sdsnew("field");
-    hashTypeSet(hash, field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
-    robj *entry = addKey("hash", hash);
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    ASSERT_EQ(finishSpills(), 1);
-
-    robj *val = createHashObject();
-    hashTypeSet(val, field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
-    sdsfree(field);
-    robj *key = createStringObject("hash", 4);
-    dbReplaceValue(server.db[0], key, &val);
-    decrRefCount(key);
-    EXPECT_EQ(val, entry);
-    EXPECT_EQ(getStorageState(val), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_NE(objectGetVal(val), nullptr);
 }
 
 /* Closing the engine discards completions it hasn't handed back, which would
