@@ -7,6 +7,7 @@
 #include "fmacros.h"
 #include "bgiteration.h"
 #include "dict.h"
+#include "ext_storage.h"
 #include "fifo.h"
 #include "kvstore.h"
 #include "monotonic.h"
@@ -755,6 +756,10 @@ static void resumeRehashing(dbEntry *de) {
 
 // Maintain a list of entries which are currently in-use.  These items should not be modified.
 static void incrementEntryInuse(dbEntry *de) {
+    /* TODO(#64): handle keys whose value isn't only in memory. Until then the
+     * iterator can read a value being spilled, or one already on flash. */
+    if (!extStorageIsMemoryOnly(de))
+        serverLog(LL_WARNING, "Background iteration used a key whose value isn't only in memory.");
     dictEntry *existingEntry;
     dictEntry *newEntry = dictAddRaw(inUseEntries, de, &existingEntry);
     if (newEntry) {

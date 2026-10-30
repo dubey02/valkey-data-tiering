@@ -27,6 +27,7 @@ void extStorageTestResetRegistry(void);
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
+int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx);
 }
 
 /* The log and the thread setup. */
@@ -1717,58 +1718,42 @@ TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
  * Values in flight
  * ---------------------------------------------------------------------------*/
 
-/* A write waits for the engine to release the value, and the value stays in
- * DRAM. Another key's completion that arrives first waits for beforeSleep(),
- * since the running command may still use its value. */
-TEST_F(SpillSubmitTest, WritingAKeyMidSpillKeepsItsValue) {
-    robj *other = addRawKey("other");
-    robj *entry = addRawKey("key");
-    ASSERT_EQ(extStorageSpillItem(0, other), STORAGE_OK);
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    sds val = sdsdup((sds)objectGetVal(entry));
-
-    spillBeforeWrite(entry);
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), val), 0);
-    EXPECT_EQ(getStorageState(other), STORAGE_STATE_COPYING_TO_FLASH);
-    EXPECT_NE(objectGetVal(other), nullptr);
-
-    extStorageBeforeSleep();
-    EXPECT_EQ(getStorageState(other), STORAGE_STATE_ONLY_FLASH);
-    sdsfree(val);
-}
-
-/* A completion that was set aside while waiting for another key is found when
- * its own key is written. */
-TEST_F(SpillSubmitTest, WritingAKeyWhoseCompletionWasSetAside) {
-    robj *first = addRawKey("first");
-    robj *second = addRawKey("second");
-    ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
-    ASSERT_EQ(extStorageSpillItem(0, second), STORAGE_OK);
-
-    spillBeforeWrite(second);
-    ASSERT_EQ(getStorageState(first), STORAGE_STATE_COPYING_TO_FLASH);
-    spillBeforeWrite(first);
-    EXPECT_EQ(getStorageState(first), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_NE(objectGetVal(first), nullptr);
-
-    /* Nothing is left to finish, so both keys stay in memory. */
-    extStorageBeforeSleep();
-    EXPECT_EQ(getStorageState(first), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(getStorageState(second), STORAGE_STATE_ONLY_MEMORY);
-}
-
-/* Deleting a key mid-spill must not free the value the engine is reading. */
-TEST_F(SpillSubmitTest, DeletingAKeyMidSpill) {
+/* Freeing a value the engine is reading is a bug, so a delete of a key being
+ * spilled crashes. TODO(#129): commands block on the key before they run. */
+TEST_F(SpillSubmitTest, DeletingAKeyMidSpillCrashes) {
     robj *entry = addRawKey("key");
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
 
-    spillBeforeRemove(entry);
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
-    sds key = sdsnew("key");
-    ASSERT_TRUE(kvstoreHashtableDelete(server.db[0]->keys, 0, key));
-    sdsfree(key);
-    EXPECT_EQ(finishSpills(), 0);
+    initServerForDeletes();
+    robj *key = createStringObject("key", 3);
+    EXPECT_DEATH(dbAsyncDelete(server.db[0], key), "");
+    decrRefCount(key);
+}
+
+/* Active expire leaves a key being spilled for a later cycle. */
+TEST_F(SpillSubmitTest, ActiveExpireSkipsAKeyMidSpill) {
+    mstime_t now = mstime();
+    robj *entry = addKeyWithExpire("key", rawValue(), now + 1000);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    EXPECT_EQ(activeExpireCycleTryExpire(server.db[0], entry, now + 2000, 0), 0);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+}
+
+/* A lookup of an expired key being spilled reports it missing without
+ * deleting it. */
+TEST_F(SpillSubmitTest, AnExpiredKeyMidSpillIsMissingButNotDeleted) {
+    mstime_t now = mstime();
+    robj *entry = addKeyWithExpire("key", rawValue(), now + 1000);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    server.cmd_time_snapshot = now + 2000;
+    robj *key = createStringObject("key", 3);
+    EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr);
+    decrRefCount(key);
+    EXPECT_TRUE(keyExists("key"));
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    server.cmd_time_snapshot = 0;
 }
 
 /* Replacing a hash on flash keeps the object in the keyspace for the new

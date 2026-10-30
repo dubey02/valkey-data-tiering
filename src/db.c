@@ -45,7 +45,6 @@
 #include "ext_storage.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
-#include "ext_storage.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -108,9 +107,14 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         }
     }
 
+    /* TODO(#129): block the client while the key is being spilled. Until then
+     * nothing stops the command from using the value the engine is reading. */
+    if (val && val->storage_state == STORAGE_STATE_COPYING_TO_FLASH)
+        serverLog(LL_WARNING, "A command used a key while its value was being spilled.");
+
     /* TODO(#39): fetch the value. Until then a key on flash reads as missing,
      * and a write deletes it first so the command starts from an empty key. */
-    if (val && spillIsOnFlash(val)) {
+    if (val && extStorageIsOnFlash(val)) {
         if (flags & LOOKUP_WRITE) {
             dbDelete(db, key);
             signalModifiedKey(NULL, db, key);
@@ -135,7 +139,6 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
 
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
         /* TODO: Use separate hits stats for WRITE */
-        if (flags & LOOKUP_WRITE) spillBeforeWrite(val);
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE))) notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
         if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_misses++;
@@ -355,7 +358,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
     robj *new;
-    spillBeforeRemove(old);
+    serverAssert(old->storage_state != STORAGE_STATE_COPYING_TO_FLASH);
 
     if (overwrite) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
@@ -516,7 +519,7 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         hotkeysRecordDelete(key, db->id, flags);
 
         robj *val = *ref;
-        spillBeforeRemove(val);
+        serverAssert(val->storage_state != STORAGE_STATE_COPYING_TO_FLASH);
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
         incrRefCount(val);
@@ -710,7 +713,7 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     if (dbnum == -1) bgIteration_flushall();
 
     /* The storage engine may still be reading values that are about to be freed. */
-    spillDrain();
+    extStorageSpillDrain();
 
     /* Fire the flushdb modules event. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_FLUSHDB, VALKEYMODULE_SUBEVENT_FLUSHDB_START, &fi);
@@ -2243,6 +2246,8 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
         return KEY_VALID;
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
+    /* A key being spilled is deleted on a later access, once the spill finishes. */
+    if (val && val->storage_state == STORAGE_STATE_COPYING_TO_FLASH) return KEY_EXPIRED;
 
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;

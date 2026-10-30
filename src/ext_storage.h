@@ -57,22 +57,11 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_MEMORY;
 }
 
-void spillCancel(robj *entry);
-void spillRemove(robj *entry);
-void spillDrain(void);
-
-/* Call before a write changes a key's value in place. */
-static inline void spillBeforeWrite(robj *o) {
-    if (o->storage_state == STORAGE_STATE_COPYING_TO_FLASH) spillCancel(o);
-}
-
-/* Call before a key is deleted or its value replaced. */
-static inline void spillBeforeRemove(robj *o) {
-    if (o->storage_state != STORAGE_STATE_ONLY_MEMORY) spillRemove(o);
-}
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void);
 
 /* Whether the key's value is on flash and not in DRAM. */
-static inline bool spillIsOnFlash(const robj *o) {
+static inline bool extStorageIsOnFlash(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_FLASH;
 }
 
@@ -82,15 +71,9 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;
 }
-static inline void spillBeforeWrite(robj *o) {
-    UNUSED(o);
+static inline void extStorageSpillDrain(void) {
 }
-static inline void spillBeforeRemove(robj *o) {
-    UNUSED(o);
-}
-static inline void spillDrain(void) {
-}
-static inline bool spillIsOnFlash(const robj *o) {
+static inline bool extStorageIsOnFlash(const robj *o) {
     UNUSED(o);
     return false;
 }
