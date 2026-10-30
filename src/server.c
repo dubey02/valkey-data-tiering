@@ -5030,6 +5030,7 @@ int processCommand(client *c) {
     if (throttle_throttleClientIfNeeded(c)) return C_OK;
 
 #ifdef USE_EXT_STORAGE
+    // Any pre command execution checks that require accessing a value must come after this call
     if (externalStorage_blockClientIfNeeded(c)) return C_OK;
 #endif
 

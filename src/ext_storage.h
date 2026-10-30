@@ -64,9 +64,6 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
     return true;
 }
 
-/* Polls the storage engine and handles finished requests. */
-void externalStorage_processCompletedRequests(void);
-
 /* Starts fetches for spilled keys and blocks the client. Returns true if blocked. */
 bool externalStorage_blockClientIfNeeded(client *c);
 
