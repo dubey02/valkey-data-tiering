@@ -243,6 +243,7 @@ static void extStorageProcessCompletion(const storageCompletion *c) {
     switch (c->op_type) {
     case STORAGE_OP_PUT:
         spillComplete(c);
+        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
         break;
     case STORAGE_OP_GET:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
@@ -507,7 +508,6 @@ static void spillComplete(const storageCompletion *comp) {
     if (comp->status == STORAGE_OK) {
         spillFreeValue(entry);
         setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
-        ext_storage.stats.total_num_items_spilled++;
     } else {
         setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
     }
