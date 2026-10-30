@@ -12,7 +12,6 @@
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
-#include "bgiteration.h"
 #include "rdb.h"
 #include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
@@ -484,6 +483,20 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     return STORAGE_OK;
 }
 
+/* Frees the value the way dbSetValue() frees an overwritten one. The object,
+ * which holds the key, stays.
+ * TODO(#81): pass the key and dbid once module values spill, since a module's
+ * free_effort callback may read them. */
+static void spillFreeValue(robj *entry) {
+    robj *val = createObject(objectGetType(entry), objectGetVal(entry));
+    val->encoding = objectGetEncoding(entry);
+    objectSetVal(entry, NULL);
+    if (server.lazyfree_lazy_server_del)
+        freeObjAsync(NULL, val, -1);
+    else
+        decrRefCount(val);
+}
+
 /* Finishes a spill. On success the value is freed and only the key stays in
  * DRAM. On failure the value was never released, so the key is back in memory
  * and can be picked again. */
@@ -492,11 +505,11 @@ static void spillComplete(const storageCompletion *comp) {
     robj *entry = req->entry;
     serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
 
-    /* Keep a value that something else still references. */
-    bool in_use = objectGetRefcount(entry) != 1 || bgIteration_isEntryInuse(entry);
+    /* Keep a value that something else still references, such as a reply or a
+     * background iteration. */
+    bool in_use = objectGetRefcount(entry) != 1;
     if (comp->status == STORAGE_OK && !in_use) {
-        freeObjectVal(entry);
-        objectSetVal(entry, NULL);
+        spillFreeValue(entry);
         setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
     } else {
         /* TODO(#34): delete the flash copy when the write succeeded. */
