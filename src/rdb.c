@@ -50,6 +50,7 @@
 #include "compression.h"
 #include "compression_stream.h"
 #include "forkless.h"
+#include "ext_storage.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -1304,9 +1305,9 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
-    /* TODO(#64): save values that are on flash. */
-    if (val->storage_state == STORAGE_STATE_ONLY_FLASH) {
-        serverLog(LL_WARNING, "Can't save a key whose value is on flash.");
+    /* TODO(#64): save values that aren't only in memory. */
+    if (!extStorageIsMemoryOnly(val)) {
+        serverLog(LL_WARNING, "Can't save a key whose value isn't only in memory.");
         errno = ENOTSUP;
         return -1;
     }

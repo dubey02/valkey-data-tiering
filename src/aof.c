@@ -38,6 +38,7 @@
 #include "functions.h"
 #include "module.h"
 #include "util.h"
+#include "ext_storage.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -2503,9 +2504,9 @@ int rewriteAppendOnlyFileRio(rio *aof) {
         while (kvstoreIteratorNext(kvs_it, &next)) {
             robj *o = next;
 
-            /* TODO(#64): rewrite values that are on flash. */
-            if (o->storage_state == STORAGE_STATE_ONLY_FLASH) {
-                serverLog(LL_WARNING, "Can't rewrite a key whose value is on flash.");
+            /* TODO(#64): rewrite values that aren't only in memory. */
+            if (!extStorageIsMemoryOnly(o)) {
+                serverLog(LL_WARNING, "Can't rewrite a key whose value isn't only in memory.");
                 errno = ENOTSUP;
                 goto werr;
             }

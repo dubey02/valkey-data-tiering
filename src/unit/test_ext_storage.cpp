@@ -1791,17 +1791,23 @@ TEST_F(SpillSubmitTest, ClosingTheEngineFinishesSpillsInFlight) {
     EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_FLASH);
 }
 
-TEST_F(SpillSubmitTest, SavingAKeyOnFlashFails) {
+/* Nothing may read a value that isn't only in memory, so a save fails both
+ * while the key is being spilled and once it is on flash. */
+TEST_F(SpillSubmitTest, SavingAKeyNotOnlyInMemoryFails) {
     robj *entry = addRawKey("key");
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    ASSERT_EQ(finishSpills(), 1);
-
-    rio rdb;
-    rioInitWithBuffer(&rdb, sdsempty());
     robj *key = createStringObject("key", 3);
-    EXPECT_EQ(rdbSaveKeyValuePair(&rdb, key, entry, -1, 0, RDB_VERSION), -1);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        rio rdb;
+        rioInitWithBuffer(&rdb, sdsempty());
+        EXPECT_EQ(rdbSaveKeyValuePair(&rdb, key, entry, -1, 0, RDB_VERSION), -1) << "on flash " << on_flash;
+        sdsfree(rdb.io.buffer.ptr);
+    }
     decrRefCount(key);
-    sdsfree(rdb.io.buffer.ptr);
 }
 
 /* TODO(#39): a read fetches the value instead. */
