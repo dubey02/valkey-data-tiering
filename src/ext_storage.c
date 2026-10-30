@@ -505,16 +505,13 @@ static void handleGetCompletion(const storageCompletion *c) {
     if (c->status == STORAGE_OK) {
         ext_storage.stats.total_num_items_fetched++;
     } else {
-        // TODO: think about retry paths / failure cases
+        serverPanic("Fetch from flash failed"); // TODO: Proper error handling
     }
 
     robj *key = c->request_ctx;
     robj *o = dbFind(server.db[c->db_id], objectGetVal(key));
     serverAssert(o && getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
 
-    // As far as I can tell there's no guaranteed status.
-    // If there is we should probably check status = STORAGE_OK;
-    serverAssert(c->value);
 
     // todo: see if it still makes sense to do something similar to replaceDbEntryValue
     // todo: handle embedded strings separately
