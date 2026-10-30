@@ -107,21 +107,11 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         }
     }
 
-    /* TODO(#129): block the client while the key is being spilled. Until then
-     * nothing stops the command from using the value the engine is reading. */
-    if (val && val->storage_state == STORAGE_STATE_COPYING_TO_FLASH)
-        serverLog(LL_WARNING, "A command used a key while its value was being spilled.");
-
-    /* TODO(#39): fetch the value. Until then a key on flash reads as missing,
-     * and a write deletes it first so the command starts from an empty key. */
-    if (val && extStorageIsOnFlash(val)) {
-        if (flags & LOOKUP_WRITE) {
-            dbDelete(db, key);
-            signalModifiedKey(NULL, db, key);
-            propagateDeletion(db, key, server.lazyfree_lazy_server_del, dict_index);
-        }
-        val = NULL;
-    }
+    /* TODO(#129): block the client until the value is only in memory. Until
+     * then nothing stops the command from using a value being spilled or on
+     * flash. */
+    if (val && !extStorageIsMemoryOnly(val))
+        serverLog(LL_WARNING, "A command used a key whose value isn't only in memory.");
 
     if (val) {
         /* Update the access time for the ageing algorithm.

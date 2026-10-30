@@ -28,6 +28,7 @@ void createSharedObjects(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
 int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx);
+void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o);
 }
 
 /* The log and the thread setup. */
@@ -1810,14 +1811,18 @@ TEST_F(SpillSubmitTest, SavingAKeyNotOnlyInMemoryFails) {
     decrRefCount(key);
 }
 
-/* TODO(#39): a read fetches the value instead. */
-TEST_F(SpillSubmitTest, AKeyOnFlashReadsAsMissing) {
-    robj *entry = addRawKey("key");
+/* DEBUG DIGEST reads every value, so it must skip one that isn't in memory. */
+TEST_F(SpillSubmitTest, ADigestSkipsAValueNotOnlyInMemory) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    ASSERT_EQ(finishSpills(), 1);
+    robj *key = createStringObject("list", 4);
+    unsigned char digest[20] = {0};
 
-    robj *key = createStringObject("key", 3);
-    EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr);
+    xorObjectDigest(server.db[0], key, digest, entry);
+    ASSERT_EQ(finishSpills(), 1);
+    xorObjectDigest(server.db[0], key, digest, entry);
     decrRefCount(key);
 }
 

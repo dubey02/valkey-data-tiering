@@ -756,8 +756,8 @@ static void resumeRehashing(dbEntry *de) {
 
 // Maintain a list of entries which are currently in-use.  These items should not be modified.
 static void incrementEntryInuse(dbEntry *de) {
-    /* TODO(#64): handle keys whose value isn't only in memory. Until then the
-     * iterator can read a value being spilled, or one already on flash. */
+    /* No spill runs during an iteration, so this is a key on flash.
+     * TODO(#64): iterate keys on flash. */
     if (!extStorageIsMemoryOnly(de))
         serverLog(LL_WARNING, "Background iteration used a key whose value isn't only in memory.");
     dictEntry *existingEntry;
@@ -1989,6 +1989,10 @@ static bgIterator *bgIteratorCreate(const char *name,
     serverAssert(server.forkless_infrastructure_enabled);
     serverAssert(hasMainThreadExclusivity());
     serverAssert(server.cluster_enabled || iter_type == BGITERATION_TYPE_FULLSCAN);
+
+    /* The iterator takes a reference to each entry, which a spill doesn't allow.
+     * Spills in flight finish first, and none start while it runs. */
+    extStorageSpillDrain();
 
     int flags;
     switch (consistency) {

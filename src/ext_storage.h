@@ -60,11 +60,6 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
 /* Waits for every spill in flight to finish. */
 void extStorageSpillDrain(void);
 
-/* Whether the key's value is on flash and not in DRAM. */
-static inline bool extStorageIsOnFlash(const robj *o) {
-    return o->storage_state == STORAGE_STATE_ONLY_FLASH;
-}
-
 #else
 
 static inline bool extStorageIsMemoryOnly(const robj *o) {
@@ -72,10 +67,6 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
     return true;
 }
 static inline void extStorageSpillDrain(void) {
-}
-static inline bool extStorageIsOnFlash(const robj *o) {
-    UNUSED(o);
-    return false;
 }
 
 #endif /* USE_EXT_STORAGE */

@@ -162,8 +162,11 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
     long long expiretime = objectGetExpire(o);
     char buf[128];
 
-    /* Save the key and associated value */
-    if (objectGetType(o) == OBJ_STRING) {
+    /* Save the key and associated value.
+     * TODO(#39): include a value that isn't only in memory. */
+    if (!extStorageIsMemoryOnly(o)) {
+        /* The value is being spilled or is on flash. */
+    } else if (objectGetType(o) == OBJ_STRING) {
         mixStringObjectDigest(digest, o);
     } else if (objectGetType(o) == OBJ_LIST) {
         listTypeIterator *li = listTypeInitIterator(o, 0, LIST_TAIL);
