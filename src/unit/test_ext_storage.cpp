@@ -1686,15 +1686,20 @@ TEST_F(SpillSubmitTest, EverySpillableTypeCompletes) {
 }
 
 /* Freeing a value something else references would leave it dangling. */
-TEST_F(SpillSubmitTest, AReferencedValueStaysInMemory) {
+/* Nothing may reference a value while it is being spilled, so a reference at
+ * completion is a bug. */
+TEST_F(SpillSubmitTest, AReferenceTakenDuringASpillCrashes) {
     robj *entry = addRawKey("key");
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
     incrRefCount(entry);
+    ASSERT_EQ(storageMockRunIo(1), 1);
 
-    ASSERT_EQ(finishSpills(), 1);
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_NE(objectGetVal(entry), nullptr);
+    EXPECT_DEATH(extStorageBeforeSleep(), "");
+
+    /* The death ran in a child, so finish the spill here. */
     decrRefCount(entry);
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 
 /* Deleting or overwriting a hash checks it for field expirations. */

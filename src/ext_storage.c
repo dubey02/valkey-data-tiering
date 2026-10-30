@@ -242,7 +242,6 @@ static void spillComplete(const storageCompletion *comp);
 static void extStorageProcessCompletion(const storageCompletion *c) {
     switch (c->op_type) {
     case STORAGE_OP_PUT:
-        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
         spillComplete(c);
         break;
     case STORAGE_OP_GET:
@@ -496,22 +495,20 @@ static void spillFreeValue(robj *entry) {
         decrRefCount(val);
 }
 
-/* Finishes a spill. On success the value is freed and only the key stays in
- * DRAM. On failure the value was never released, so the key is back in memory
- * and can be picked again. */
+/* Handles a finished write. A key is spilled only when nothing else references
+ * it, and nothing may take a reference while it is COPYING_TO_FLASH. So a
+ * written value is always freed, and only a failed write keeps it in memory. */
 static void spillComplete(const storageCompletion *comp) {
     spillRequest *req = comp->request_ctx;
     robj *entry = req->entry;
     serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
+    serverAssert(objectGetRefcount(entry) == 1);
 
-    /* Keep a value that something else still references, such as a reply or a
-     * background iteration. */
-    bool in_use = objectGetRefcount(entry) != 1;
-    if (comp->status == STORAGE_OK && !in_use) {
+    if (comp->status == STORAGE_OK) {
         spillFreeValue(entry);
         setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+        ext_storage.stats.total_num_items_spilled++;
     } else {
-        /* TODO(#34): delete the flash copy when the write succeeded. */
         setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
     }
     zfree(req);
