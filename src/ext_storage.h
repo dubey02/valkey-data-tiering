@@ -57,15 +57,15 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_MEMORY;
 }
 
+/* Starts fetches for spilled keys and blocks the client. Returns true if blocked. */
+bool externalStorage_blockClientIfNeeded(client *c);
+
 #else
 
 static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;
 }
-
-/* Starts fetches for spilled keys and blocks the client. Returns true if blocked. */
-bool externalStorage_blockClientIfNeeded(client *c);
 
 #endif /* USE_EXT_STORAGE */
 

@@ -1664,7 +1664,7 @@ class FetchCompletionTest : public SpillSelectTest {
         sds key = objectGetKey(entry);
         robj *k = createStringObject(key, sdslen(key));
         extStorageTestFetchKey(server.db[0], k);
-        decrRefCount(k); /* the fetch holds its own reference */
+        decrRefCount(k); /* the fetch holds the entry, not this key */
     }
 
     /* Queues deletes until the engine refuses one, so the next request gets
@@ -1681,7 +1681,7 @@ class FetchCompletionTest : public SpillSelectTest {
         storageCompletion comp;
         while (engine->poll_completions(&comp, 1) == 1) {
             if (comp.value) decrRefCount((robj *)comp.value);
-            decrRefCount((robj *)comp.request_ctx);
+            decrRefCount((robj *)comp.request_ctx); /* the fetch's reference on the entry */
         }
     }
 };
@@ -1708,14 +1708,17 @@ TEST_F(FetchCompletionTest, AFailedFetchPanics) {
     discardCompletions();
 }
 
-TEST_F(FetchCompletionTest, AFetchForADeletedKeyPanics) {
+TEST_F(FetchCompletionTest, AFetchForADeletedKeyCompletesOnTheDetachedEntry) {
     robj *entry = addRawKey("key");
     spill(entry);
     startFetch(entry);
-    kvstoreHashtableDelete(server.db[0]->keys, 0, objectGetKey(entry));
-    // todo: match on the assert message instead of passing on any crash
-    EXPECT_DEATH(extStorageBeforeSleep(), "");
-    discardCompletions();
+    kvstoreHashtableDelete(server.db[0]->keys, 0, objectGetKey(entry)); /* the fetch still holds the entry */
+
+    /* Puts the value into the detached entry, then frees it. */
+    extStorageBeforeSleep();
+    sds key = sdsnew("key");
+    EXPECT_EQ(dbFind(server.db[0], key), nullptr);
+    sdsfree(key);
 }
 
 /* ---------------------------------------------------------------------------

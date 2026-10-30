@@ -497,12 +497,12 @@ static void fetchKey(serverDb *db, robj *key) {
     storageState state = getStorageState(o);
     if (state == STORAGE_STATE_COPYING_TO_MEMORY) return;
     serverAssert(state == STORAGE_STATE_ONLY_FLASH);
-    storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), key);
+    storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), o);
     if (st != STORAGE_OK) {
         // STORAGE_WOULDBLOCK: queue full. TODO: retry later, or reply with an error.
         serverPanic("Storage Layer failed to accept fetch");
     } 
-    incrRefCount(key); // released in handleGetCompletion
+    incrRefCount(o); // released in handleGetCompletion
     setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
     ext_storage.stats.num_items_fetching++;
 }
@@ -512,7 +512,9 @@ void extStorageTestFetchKey(serverDb *db, robj *key) {
     fetchKey(db, key);
 }
 
-/* request_ctx for a GET is the key, a refcounted string robj. */
+/* request_ctx for a GET is the keyspace entry. fetchKey holds a reference on
+ * it, so it is not freed if the key is deleted meanwhile, and defrag does not
+ * move it. */
 static void handleGetCompletion(const storageCompletion *c) {
     serverAssert(ext_storage.stats.num_items_fetching > 0);
     ext_storage.stats.num_items_fetching--;
@@ -524,10 +526,8 @@ static void handleGetCompletion(const storageCompletion *c) {
         serverPanic("Fetch from flash failed"); // TODO: Proper error handling
     }
 
-    robj *key = c->request_ctx;
-    robj *o = dbFind(server.db[c->db_id], objectGetVal(key));
-    serverAssert(o && getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
-
+    robj *o = c->request_ctx;
+    serverAssert(getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
 
     // todo: see if it still makes sense to do something similar to replaceDbEntryValue
     // todo: handle embedded strings separately
@@ -542,8 +542,10 @@ static void handleGetCompletion(const storageCompletion *c) {
     o->lru = lrulfu_touch(o->lru);
     setStorageState(o, STORAGE_STATE_ONLY_MEMORY);
 
-    unblockClientsInUseOnKey(key);
-    decrRefCount(key);
+    robj key;
+    initStaticStringObject(key, objectGetKey(o));
+    unblockClientsInUseOnKey(&key);
+    decrRefCount(o);
 }
 
 /* Returns true if the key's value is in memory. A key that doesn't exist has
