@@ -485,18 +485,19 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
 
 
 /* Submits a fetch for one ONLY_FLASH object. Returns true if the engine accepted it. */
-static bool fetchKey(serverDb *db, robj *key, robj *o) {
-    // call get_async, with appropriate error handling
-    // Once we fire the async function, update the storage status to STORAGE_STATE_COPYING_TO_MEMORY
+static void fetchKey(serverDb *db, robj *key) {
+    robj *o = dbFind(db, objectGetVal(key));
+    storageState state = getStorageState(o);
+    if (state == STORAGE_STATE_COPYING_TO_MEMORY) return;
+    serverAssert(state == STORAGE_STATE_ONLY_FLASH);
     storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), key);
     if (st != STORAGE_OK) {
         // STORAGE_WOULDBLOCK: queue full. TODO: retry later, or reply with an error.
-        return false;
-    }
+        serverPanic("Storage Layer failed to accept fetch");
+    } 
     incrRefCount(key); // released in handleGetCompletion
     setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
-    // todo: arm the 1 ms timer if it is not armed
-    return true;
+    // todo metric fetching from flash?
 }
 
 /* request_ctx for a GET is the key, a refcounted string robj. */
@@ -529,15 +530,14 @@ static void handleGetCompletion(const storageCompletion *c) {
     decrRefCount(key);
 }
 
-/* Starts a fetch if the key is only on flash. Returns true if the client must wait for it. */
-static bool fetchKeyIfNeeded(serverDb *db, robj *key) {
+/* Returns true if the key's value is in memory. A key that doesn't exist has
+ * nothing to fetch, so it counts as in memory. */
+static bool isValueInMemory(serverDb *db, robj *key) {
     robj *o = dbFind(db, objectGetVal(key));
-    if (!o) return false;
-    switch (getStorageState(o)) {
-    case STORAGE_STATE_ONLY_FLASH: return fetchKey(db, key, o);
-    case STORAGE_STATE_COPYING_TO_MEMORY: return true; // a fetch is already in flight, just block
-    default: return false; // todo: COPYING_TO_FLASH should block write commands once spill exists
-    }
+    if (!o) return true;
+    storageState state = getStorageState(o);
+    // TODO: Embedded case
+    return (state == STORAGE_STATE_ONLY_MEMORY) || (state == STORAGE_STATE_COPYING_TO_FLASH);
 }
 
 /* Returns true if the client was blocked and the command must not run now. */
@@ -556,7 +556,10 @@ bool externalStorage_blockClientIfNeeded(client *c) {
     int n = 0;
     for (int i = 0; i < numkeys; i++) {
         robj *key = c->argv[result.keys[i].pos];
-        if (fetchKeyIfNeeded(c->db, key)) keys[n++] = key;
+        if (!isValueInMemory(c->db, key)) {
+            fetchKey(c->db, key);
+            keys[n++] = key;
+        }
     }
     // double check the order of fetching and blocking doesn't matter
     if (n > 0) blockClientInUseOnKeys(c, n, keys); // all the keys that spilled

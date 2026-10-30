@@ -1666,6 +1666,14 @@ class FetchCompletionTest : public SpillSelectTest {
         setStorageState(entry, STORAGE_STATE_COPYING_TO_MEMORY);
     }
 
+    /* Queues deletes until the engine refuses one, so the next request gets
+     * STORAGE_WOULDBLOCK. Their completions are harmless for extStorageDeinit. */
+    void fillEngineQueue() {
+        storageStatus st;
+        while ((st = engine->del_async(0, "filler", 6, nullptr)) == STORAGE_OK);
+        ASSERT_EQ(st, STORAGE_WOULDBLOCK);
+    }
+
     /* Discards completions left unhandled in the parent of a death test, so
      * extStorageDeinit does not process them. */
     void discardCompletions() {
@@ -1880,6 +1888,20 @@ TEST_F(BlockClientTest, AKeyBeingCopiedToFlashDoesNotBlockARead) {
 
     EXPECT_FALSE(externalStorage_blockClientIfNeeded(c));
     setStorageState(a, STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
+    addFlashKey("a");
+    client *c = makeClient("get a");
+    fillEngineQueue();
+
+    EXPECT_DEATH(
+        {
+            /* The panic message goes to the server log, which is stdout by default. */
+            server.logfile = (char *)"/dev/stderr";
+            externalStorage_blockClientIfNeeded(c);
+        },
+        "Storage Layer failed to accept fetch");
 }
 
 #endif /* USE_EXT_STORAGE */
