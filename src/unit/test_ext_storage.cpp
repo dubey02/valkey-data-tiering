@@ -1805,19 +1805,37 @@ TEST_F(SpillSubmitTest, ADigestSkipsAValueNotOnlyInMemory) {
     decrRefCount(key);
 }
 
-/* Deleting a key on flash frees only the object, so lazy free must not read
- * the quicklist it no longer has. */
-TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
-    robj *list = createQuicklistObject(-2, 0);
-    addOneElement(list);
-    robj *entry = addKey("list", list);
+/* Commands on a value being spilled or on flash are rejected before they run,
+ * and expiry skips it, so a delete reaching one is a bug. */
+TEST_F(SpillSubmitTest, DeletingAKeyNotInMemoryCrashes) {
+    robj *entry = addRawKey("key");
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    ASSERT_EQ(finishSpills(), 1);
-    ASSERT_EQ(objectGetVal(entry), nullptr);
-
     initServerForDeletes();
-    robj *key = createStringObject("list", 4);
-    EXPECT_EQ(dbAsyncDelete(server.db[0], key), 1);
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_DEATH(dbAsyncDelete(server.db[0], key), "") << "on flash " << on_flash;
+    }
+    decrRefCount(key);
+}
+
+/* A key a command doesn't declare isn't checked before it runs. A read of it
+ * misses, and a write is a bug. */
+TEST_F(SpillSubmitTest, AnUndeclaredKeyNotInMemoryMissesOnRead) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr) << "on flash " << on_flash;
+        EXPECT_DEATH(lookupKeyWriteWithFlags(server.db[0], key, LOOKUP_NONOTIFY), "") << "on flash " << on_flash;
+    }
     decrRefCount(key);
 }
 

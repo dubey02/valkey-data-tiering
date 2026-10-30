@@ -107,11 +107,14 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         }
     }
 
-    /* TODO(#129): block the client until the value is only in memory. Until
-     * then nothing stops the command from using a value being spilled or on
-     * flash. */
-    if (val && !extStorageIsMemoryOnly(val))
-        serverLog(LL_WARNING, "A command used a key whose value isn't only in memory.");
+    /* Commands are rejected on their keys before they run, but not on keys
+     * they don't declare, like those a script reads. A read of such a key
+     * misses, and a write can't happen.
+     * TODO(#129): block on undeclared keys too. */
+    if (val && !extStorageIsMemoryOnly(val)) {
+        serverAssert(!(flags & LOOKUP_WRITE));
+        val = NULL;
+    }
 
     if (val) {
         /* Update the access time for the ageing algorithm.
@@ -508,9 +511,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
         hotkeysRecordDelete(key, db->id, flags);
 
         robj *val = *ref;
-        /* TODO(#129): block commands on a key being spilled.
-         * TODO(#34): delete the flash copy of a key on flash. */
-        if (!extStorageIsMemoryOnly(val)) serverLog(LL_WARNING, "Deleted a key whose value isn't only in memory.");
+        /* A value being spilled or on flash can't be deleted. Commands on it
+         * are rejected before they run, and expiry skips it. */
+        serverAssertWithInfo(NULL, key, extStorageIsMemoryOnly(val));
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain val */
         incrRefCount(val);

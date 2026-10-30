@@ -40,7 +40,6 @@
 #include "sds.h"
 #include "module.h"
 #include "bgiteration.h"
-#include "ext_storage.h"
 #include <math.h>
 #include <ctype.h>
 
@@ -1939,9 +1938,7 @@ void memoryCommand(client *c) {
             addReplyNull(c);
             return;
         }
-        /* Only the object is counted while the value isn't only in memory. */
-        size_t usage = extStorageIsMemoryOnly(obj) ? objectComputeSize(c->argv[2], obj, samples, c->db->id)
-                                                   : zmalloc_size((void *)obj);
+        size_t usage = objectComputeSize(c->argv[2], obj, samples, c->db->id);
         addReplyLongLong(c, usage);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "stats") && c->argc == 2) {
         struct serverMemOverhead *mh = getMemoryOverheadData();
