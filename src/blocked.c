@@ -911,10 +911,10 @@ static bool isClientBlockedInUse(client *c) {
  * in another DB is unblocked.
  *
  * The client remains blocked until ALL of its keys are unblocked via
- * unblockClientsInUseOnKey(). // tiered storage needs to call this
+ * unblockClientsInUseOnKey(). 
  *
  * The caller should return without executing the command after calling this. */
-void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) { // we need to call this for any keys that are spilled tiered storage
+void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {
     serverAssert(!c->flag.blocked && !c->flag.unblocked);
     serverAssert(c->flag.pending_command == 1);
     serverAssert(num_keys > 0);
