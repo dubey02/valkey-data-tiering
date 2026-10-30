@@ -70,6 +70,20 @@ if {$tiering_built} {
             assert_match {* storage_state:2 *} [r debug object big fast]
         } {} {needs:debug}
 
+        test {Commands on a key on flash get TRYAGAIN and leave it on flash} {
+            r flushall
+            r set big [string repeat x 1000]
+            r set mem v
+            assert_equal OK [r debug spill big]
+            assert_error {TRYAGAIN*} {r get big}
+            assert_error {TRYAGAIN*} {r append big x}
+            assert_error {TRYAGAIN*} {r del big}
+            assert_error {TRYAGAIN*} {r mget mem big}
+            assert_match {* storage_state:2 *} [r debug object big fast]
+            # Keys in memory aren't affected.
+            assert_equal v [r get mem]
+        } {} {needs:debug}
+
         # Active defrag needs the jemalloc the source distribution ships, as in memefficiency.tcl.
         if {[string match {*jemalloc*} [s mem_allocator]] && [r debug mallctl arenas.page] <= 8192} {
             test {Active defrag skips keys on flash} {
