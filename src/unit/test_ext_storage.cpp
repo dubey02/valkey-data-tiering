@@ -24,6 +24,8 @@ extern "C" {
 #include "storage/storage.h"
 #include "storage/storage_mock.h"
 void extStorageTestResetRegistry(void);
+void extStorageTestFetchKey(serverDb *db, robj *key);
+extern hashtableType commandSetType;
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
@@ -1617,5 +1619,317 @@ TEST(DefragLaterTest, SkipsAValueThatIsNotOnlyInMemory) {
 }
 
 #endif /* HAVE_DEFRAG */
+
+/* ---------------------------------------------------------------------------
+ * Fetch completion
+ * ---------------------------------------------------------------------------*/
+
+class FetchCompletionTest : public SpillSelectTest {
+  protected:
+    const storageEngine *engine = storageMockEngine();
+
+    void SetUp() override {
+        SpillSelectTest::SetUp();
+        extStorageTestResetRegistry();
+        server.logfile = zstrdup("");
+        crc64_init();
+        server.ext_storage_enabled = 1;
+        server.ext_storage_engine = zstrdup("mock");
+        server.ext_storage_path = zstrdup("");
+        extStorageInit();
+    }
+
+    void TearDown() override {
+        extStorageDeinit();
+        zfree(server.ext_storage_engine);
+        zfree(server.ext_storage_path);
+        zfree(server.logfile);
+        SpillSelectTest::TearDown();
+    }
+
+    /* Stores the key's value in the engine and frees it from memory, as a spill would. */
+    void spill(robj *entry) {
+        sds key = objectGetKey(entry);
+        ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
+        storageMockRunIo(1);
+        storageCompletion comp;
+        ASSERT_EQ(engine->poll_completions(&comp, 1), 1);
+        sdsfree((sds)objectGetVal(entry));
+        objectSetVal(entry, NULL);
+        setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    }
+
+    /* Submits a fetch the way a blocked command does. */
+    void startFetch(robj *entry) {
+        sds key = objectGetKey(entry);
+        robj *k = createStringObject(key, sdslen(key));
+        extStorageTestFetchKey(server.db[0], k);
+        decrRefCount(k); /* the fetch holds the entry, not this key */
+    }
+
+    /* Queues deletes until the engine refuses one, so the next request gets
+     * STORAGE_WOULDBLOCK. Their completions are harmless for extStorageDeinit. */
+    void fillEngineQueue() {
+        storageStatus st;
+        while ((st = engine->del_async(0, "filler", 6, nullptr)) == STORAGE_OK);
+        ASSERT_EQ(st, STORAGE_WOULDBLOCK);
+    }
+
+    /* Discards completions left unhandled in the parent of a death test, so
+     * extStorageDeinit does not process them. */
+    void discardCompletions() {
+        storageCompletion comp;
+        while (engine->poll_completions(&comp, 1) == 1) {
+            if (comp.value) decrRefCount((robj *)comp.value);
+            decrRefCount((robj *)comp.request_ctx); /* the fetch's reference on the entry */
+        }
+    }
+};
+
+TEST_F(FetchCompletionTest, AFetchedValueIsBackInMemory) {
+    robj *entry = addRawKey("key");
+    spill(entry);
+    startFetch(entry);
+
+    extStorageBeforeSleep();
+
+    robj *expected = rawValue();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), (sds)objectGetVal(expected)), 0);
+    decrRefCount(expected);
+}
+
+TEST_F(FetchCompletionTest, AFailedFetchPanics) {
+    robj *entry = addRawKey("key");
+    setStorageState(entry, STORAGE_STATE_ONLY_FLASH); /* never spilled, so the engine returns NOT_FOUND */
+    startFetch(entry);
+    // todo: match on the assert message instead of passing on any crash
+    EXPECT_DEATH(extStorageBeforeSleep(), "");
+    discardCompletions();
+}
+
+TEST_F(FetchCompletionTest, AFetchForADeletedKeyCompletesOnTheDetachedEntry) {
+    robj *entry = addRawKey("key");
+    spill(entry);
+    startFetch(entry);
+    kvstoreHashtableDelete(server.db[0]->keys, 0, objectGetKey(entry)); /* the fetch still holds the entry */
+
+    /* Puts the value into the detached entry, then frees it. */
+    extStorageBeforeSleep();
+    sds key = sdsnew("key");
+    EXPECT_EQ(dbFind(server.db[0], key), nullptr);
+    sdsfree(key);
+}
+
+/* ---------------------------------------------------------------------------
+ * Client blocking
+ * ---------------------------------------------------------------------------*/
+
+class BlockClientTest : public FetchCompletionTest {
+  protected:
+    static inline hashtable *commands = nullptr;
+    static inline hashtable *orig_commands = nullptr;
+    static inline ConnectionType conn_type = {0};
+    client *clients[8];
+    int num_clients = 0;
+
+    static int setReadHandler(connection *conn, ConnectionCallbackFunc func) {
+        conn->read_handler = func;
+        return C_OK;
+    }
+
+    void SetUp() override {
+        FetchCompletionTest::SetUp();
+        if (!commands) {
+            server.commands = hashtableCreate(&commandSetType);
+            server.orig_commands = hashtableCreate(&commandSetType);
+            populateCommandTable();
+            commands = server.commands;
+            orig_commands = server.orig_commands;
+            conn_type.set_read_handler = setReadHandler;
+        }
+        server.commands = commands;
+        server.orig_commands = orig_commands;
+        server.unblocked_clients = listCreate();
+    }
+
+    void TearDown() override {
+        for (int j = 0; j < num_clients; j++) {
+            client *c = clients[j];
+            for (int i = 0; i < c->argc; i++) decrRefCount(c->argv[i]);
+            zfree(c->argv);
+            freeClientBlockingState(c);
+            zfree(c->conn);
+            zfree(c);
+        }
+        listRelease(server.unblocked_clients);
+        FetchCompletionTest::TearDown();
+    }
+
+    /* A client about to run 'cmdline', such as "mget a b", on db 0. */
+    client *makeClient(const char *cmdline) {
+        client *c = (client *)zcalloc(sizeof(client));
+        sds *args = sdssplitargs(cmdline, &c->argc);
+        c->argv = (robj **)zmalloc(sizeof(robj *) * c->argc);
+        for (int i = 0; i < c->argc; i++) c->argv[i] = createObject(OBJ_STRING, args[i]);
+        zfree(args);
+        c->cmd = lookupCommandByCString((const char *)objectGetVal(c->argv[0]));
+        c->db = server.db[0];
+        c->conn = (connection *)zcalloc(sizeof(connection));
+        c->conn->type = &conn_type;
+        c->flag.pending_command = 1;
+        clients[num_clients++] = c;
+        return c;
+    }
+
+    robj *addFlashKey(const char *key) {
+        robj *entry = addRawKey(key);
+        spill(entry);
+        return entry;
+    }
+
+    bool isBlocked(client *c) {
+        return c->flag.blocked && c->bstate->btype == BLOCKED_INUSE;
+    }
+
+    uint64_t infoField(const char *field) {
+        sds info = extStorageInfoString(sdsempty());
+        const char *p = strstr(info, field);
+        uint64_t n = p ? strtoull(p + strlen(field), nullptr, 10) : 0;
+        sdsfree(info);
+        return n;
+    }
+
+    uint64_t numFetched() {
+        return infoField("ext_storage_total_num_items_fetched_from_storage:");
+    }
+
+    uint64_t numFetching() {
+        return infoField("ext_storage_num_items_fetching_from_storage:");
+    }
+};
+
+TEST_F(BlockClientTest, NoKeysOnFlashDoesNotBlock) {
+    addRawKey("a");
+    addRawKey("b");
+    client *c = makeClient("mget a b");
+
+    EXPECT_FALSE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_FALSE(c->flag.blocked);
+}
+
+TEST_F(BlockClientTest, AKeylessCommandDoesNotBlock) {
+    client *c = makeClient("ping");
+
+    EXPECT_FALSE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_FALSE(c->flag.blocked);
+}
+
+TEST_F(BlockClientTest, AKeyOnFlashBlocksUntilFetched) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+
+    EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_TRUE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_MEMORY);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_TRUE(c->flag.unblocked);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(BlockClientTest, MultipleKeysOnFlashBlockUntilAllAreFetched) {
+    robj *a = addFlashKey("a");
+    robj *b = addFlashKey("b");
+    client *c = makeClient("mget a b");
+
+    EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_TRUE(isBlocked(c));
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(BlockClientTest, OnlyTheKeysOnFlashBlock) {
+    addRawKey("a");
+    addFlashKey("b");
+    client *c = makeClient("mget a b");
+
+    EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_EQ(dictSize(c->bstate->keys), 1u);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+}
+
+TEST_F(BlockClientTest, StaysBlockedUntilTheLastKeyIsFetched) {
+    addFlashKey("a");
+    robj *b = addFlashKey("b");
+    setStorageState(b, STORAGE_STATE_COPYING_TO_MEMORY); /* its fetch hasn't been submitted yet */
+    client *c = makeClient("mget a b");
+
+    EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
+    extStorageBeforeSleep();
+    EXPECT_TRUE(isBlocked(c)); /* a is back, b is not */
+
+    setStorageState(b, STORAGE_STATE_ONLY_FLASH); /* now submit its fetch */
+    startFetch(b);
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+}
+
+TEST_F(BlockClientTest, AKeyBeingCopiedToMemoryBlocksWithoutASecondFetch) {
+    robj *a = addFlashKey("a");
+    uint64_t fetched_before = numFetched();
+    startFetch(a);
+    client *c = makeClient("get a");
+
+    EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_TRUE(isBlocked(c));
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(numFetched() - fetched_before, 1u);
+}
+
+TEST_F(BlockClientTest, AFetchInFlightIsCounted) {
+    addFlashKey("a");
+    client *c = makeClient("get a");
+    uint64_t fetching_before = numFetching();
+    uint64_t fetched_before = numFetched();
+
+    EXPECT_TRUE(externalStorage_blockClientIfNeeded(c));
+    EXPECT_EQ(numFetching() - fetching_before, 1u);
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(numFetching(), fetching_before);
+    EXPECT_EQ(numFetched() - fetched_before, 1u);
+}
+
+TEST_F(BlockClientTest, AKeyBeingCopiedToFlashDoesNotBlockARead) {
+    robj *a = addRawKey("a");
+    setStorageState(a, STORAGE_STATE_COPYING_TO_FLASH); /* the value is still in memory */
+    client *c = makeClient("get a");
+
+    EXPECT_FALSE(externalStorage_blockClientIfNeeded(c));
+    setStorageState(a, STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
+    addFlashKey("a");
+    client *c = makeClient("get a");
+    fillEngineQueue();
+
+    EXPECT_DEATH(
+        {
+            /* The panic message goes to the server log, which is stdout by default. */
+            server.logfile = (char *)"/dev/stderr";
+            externalStorage_blockClientIfNeeded(c);
+        },
+        "Storage Layer failed to accept fetch");
+}
 
 #endif /* USE_EXT_STORAGE */

@@ -1992,6 +1992,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Release keys from bgIteration before processing unblocked clients. */
     bgIteration_beforeSleep();
+
     /* Handle blocked clients.
      * must be done before flushAppendOnlyFile, in case of appendfsync=always,
      * since the unblocked clients may write data. */
@@ -5027,6 +5028,11 @@ int processCommand(client *c) {
     }
 
     if (throttle_throttleClientIfNeeded(c)) return C_OK;
+
+#ifdef USE_EXT_STORAGE
+    // Any pre command execution checks that require accessing a value must come after this call
+    if (externalStorage_blockClientIfNeeded(c)) return C_OK;
+#endif
 
     /* Exec the command */
     if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&

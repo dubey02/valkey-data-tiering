@@ -911,7 +911,7 @@ static bool isClientBlockedInUse(client *c) {
  * in another DB is unblocked.
  *
  * The client remains blocked until ALL of its keys are unblocked via
- * unblockClientsInUseOnKey().
+ * unblockClientsInUseOnKey(). 
  *
  * The caller should return without executing the command after calling this. */
 void blockClientInUseOnKeys(client *c, int num_keys, robj *keys[]) {

@@ -40,11 +40,14 @@ void extStorageTestResetRegistry(void) {
     registered_engine = NULL;
 }
 
-/* Counted on the main thread as completions are handled. */
+/* Counted on the main thread. */
 typedef struct extStorageStats {
     uint64_t total_num_items_spilled;
     uint64_t total_num_items_fetched;
     uint64_t total_num_items_deleted;
+    /* Fetches the storage engine accepted whose completion is not handled yet. */
+    uint64_t num_items_fetching;
+    uint64_t total_num_fetch_errors;
 } extStorageStats;
 
 /* Storage Context. */
@@ -233,6 +236,7 @@ void extStorageInit(void) {
               (unsigned long long)server.ext_storage_capacity);
 }
 
+static void handleGetCompletion(const storageCompletion *c); 
 /* Completions
  * extStorageBeforeSleep and the shutdown drain both go through here. */
 
@@ -242,10 +246,8 @@ static void extStorageProcessCompletion(const storageCompletion *c) {
     case STORAGE_OP_PUT:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
         break;
-    case STORAGE_OP_GET:
-        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
-        /* No command path reads a fetched value yet, so it has no owner. */
-        if (c->value) decrRefCount((robj *)c->value);
+    case STORAGE_OP_GET: 
+        handleGetCompletion(c); 
         break;
     case STORAGE_OP_DEL:
         if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_deleted++;
@@ -325,12 +327,16 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_capacity_bytes:%llu\r\n"
                         "ext_storage_total_num_items_spilled_to_storage:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
-                        "ext_storage_total_num_items_deleted_from_storage:%llu\r\n",
+                        "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
+                        "ext_storage_num_items_fetching_from_storage:%llu\r\n"
+                        "ext_storage_total_num_fetch_errors:%llu\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
                         (unsigned long long)st->total_num_items_spilled,
                         (unsigned long long)st->total_num_items_fetched,
-                        (unsigned long long)st->total_num_items_deleted);
+                        (unsigned long long)st->total_num_items_deleted,
+                        (unsigned long long)st->num_items_fetching,
+                        (unsigned long long)st->total_num_fetch_errors);
 }
 
 /* The INFO buffer under construction, handed to the storage engine as the
@@ -478,6 +484,107 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
     return STORAGE_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Fetching Paths
+ * ---------------------------------------------------------------------------*/
+
+
+/* Submits a fetch for one ONLY_FLASH object. Returns true if the engine accepted it. */
+static void fetchKey(serverDb *db, robj *key) {
+    robj *o = dbFind(db, objectGetVal(key));
+    storageState state = getStorageState(o);
+    if (state == STORAGE_STATE_COPYING_TO_MEMORY) return;
+    serverAssert(state == STORAGE_STATE_ONLY_FLASH);
+    storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), o);
+    if (st != STORAGE_OK) {
+        // STORAGE_WOULDBLOCK: queue full. TODO: retry later, or reply with an error.
+        serverPanic("Storage Layer failed to accept fetch");
+    } 
+    incrRefCount(o); // released in handleGetCompletion
+    setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
+    ext_storage.stats.num_items_fetching++;
+}
+
+/* Test-only. Submits a fetch through the same path as a blocked command. */
+void extStorageTestFetchKey(serverDb *db, robj *key) {
+    fetchKey(db, key);
+}
+
+/* request_ctx for a GET is the keyspace entry. fetchKey holds a reference on
+ * it, so it is not freed if the key is deleted meanwhile, and defrag does not
+ * move it. */
+static void handleGetCompletion(const storageCompletion *c) {
+    serverAssert(ext_storage.stats.num_items_fetching > 0);
+    ext_storage.stats.num_items_fetching--;
+    if (c->status == STORAGE_OK) {
+        ext_storage.stats.total_num_items_fetched++;
+    } else {
+        /* Counted before the panic so it shows in the crash report's INFO. */
+        ext_storage.stats.total_num_fetch_errors++;
+        serverPanic("Fetch from flash failed"); // TODO: Proper error handling
+    }
+
+    robj *o = c->request_ctx;
+    serverAssert(getStorageState(o) == STORAGE_STATE_COPYING_TO_MEMORY);
+
+    // todo: see if it still makes sense to do something similar to replaceDbEntryValue
+    // todo: handle embedded strings separately
+    serverAssert(objectGetType(o) == objectGetType(c->value));
+    objectSetVal(o, objectGetVal(c->value));
+    o->encoding = c->value->encoding;
+    objectSetVal(c->value, NULL);
+    decrRefCount(c->value); // frees only the shell
+    /* A fetched key was just accessed, so it shouldn't be the next spill
+     * candidate. Unlike lookupKey, no copy-on-write guard: the header was
+     * already written above. */
+    o->lru = lrulfu_touch(o->lru);
+    setStorageState(o, STORAGE_STATE_ONLY_MEMORY);
+
+    robj key;
+    initStaticStringObject(key, objectGetKey(o));
+    unblockClientsInUseOnKey(&key);
+    decrRefCount(o);
+}
+
+/* Returns true if the key's value is in memory. A key that doesn't exist has
+ * nothing to fetch, so it counts as in memory. */
+static bool isValueInMemory(serverDb *db, robj *key) {
+    robj *o = dbFind(db, objectGetVal(key));
+    if (!o) return true;
+    storageState state = getStorageState(o);
+    // TODO: Embedded case
+    return (state == STORAGE_STATE_ONLY_MEMORY) || (state == STORAGE_STATE_COPYING_TO_FLASH);
+}
+
+/* Returns true if the client was blocked and the command must not run now. */
+bool externalStorage_blockClientIfNeeded(client *c) {
+    if (!ext_storage.open) return false;
+    if (!doesCommandHaveKeys(c->cmd)) return false;
+    // logic will need to be added for edge cases like multi/exec in milestone 5
+
+    // if any of the keys are spilled for this command, then we need to block the client for tiered storage
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+
+    robj *stackbuf[16];
+    robj **keys = numkeys <= 16 ? stackbuf : zmalloc(sizeof(robj *) * numkeys);
+    int n = 0;
+    for (int i = 0; i < numkeys; i++) {
+        robj *key = c->argv[result.keys[i].pos];
+        if (!isValueInMemory(c->db, key)) {
+            fetchKey(c->db, key);
+            keys[n++] = key;
+        }
+    }
+    // double check the order of fetching and blocking doesn't matter
+    if (n > 0) blockClientInUseOnKeys(c, n, keys); // all the keys that spilled
+
+    if (keys != stackbuf) zfree(keys);
+    getKeysFreeResult(&result);
+    return n > 0;
 }
 
 #endif /* USE_EXT_STORAGE */
