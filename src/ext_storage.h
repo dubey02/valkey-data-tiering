@@ -52,16 +52,24 @@ robj *extStorageSpillSelectCandidate(int *dbid);
  * returns STORAGE_OK. */
 storageStatus extStorageSpillItem(int dbid, robj *entry);
 
+/* DEBUG SPILL <key> [<key> ...]. */
+void debugSpillCommand(client *c);
+
 /* Whether the value is only in DRAM, so it can be moved or freed. */
 static inline bool extStorageIsMemoryOnly(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_MEMORY;
 }
+
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void);
 
 #else
 
 static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;
+}
+static inline void extStorageSpillDrain(void) {
 }
 
 #endif /* USE_EXT_STORAGE */

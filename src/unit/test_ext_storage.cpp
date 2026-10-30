@@ -27,6 +27,8 @@ void extStorageTestResetRegistry(void);
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
+void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o);
+int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx);
 }
 
 /* The log and the thread setup. */
@@ -996,8 +998,8 @@ class SpillSelectTest : public ::testing::Test {
 
     /* Runs performEvictions() one byte over maxmemory, so it evicts one key and
      * leaves the rest of its sample in the pool. */
-    void evictOneKey(void) {
-        /* Evicting a key notifies modules, touches watched keys and propagates a DEL. */
+    /* Deleting a key notifies modules and uses the shared objects. */
+    static void initServerForDeletes(void) {
         static bool server_initialized = false;
         if (!server_initialized) {
             monotonicInit();
@@ -1005,6 +1007,11 @@ class SpillSelectTest : public ::testing::Test {
             moduleInitModulesSystem();
             server_initialized = true;
         }
+    }
+
+    void evictOneKey(void) {
+        /* Evicting a key also touches watched keys and propagates a DEL. */
+        initServerForDeletes();
         server.replicas = listCreate();
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
 
@@ -1505,19 +1512,20 @@ class SpillSubmitTest : public SpillSelectTest {
     }
 
     void TearDown() override {
-        storageMockRunIo(1000);
-        storageCompletion done[16];
-        int n;
-        while ((n = storageMockEngine()->poll_completions(done, 16)) > 0) {
-            for (int i = 0; i < n; i++) {
-                if (done[i].op_type == STORAGE_OP_PUT) zfree(done[i].request_ctx);
-            }
-        }
+        finishSpills();
         extStorageDeinit();
         zfree(server.ext_storage_engine);
         zfree(server.ext_storage_path);
         zfree(server.logfile);
         SpillSelectTest::TearDown();
+    }
+
+    /* Runs every queued request and processes its completion. Returns how
+     * many ran. */
+    int finishSpills() {
+        int n = storageMockRunIo(1000);
+        extStorageBeforeSleep();
+        return n;
     }
 };
 
@@ -1527,14 +1535,8 @@ TEST_F(SpillSubmitTest, SubmitsTheValue) {
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
 
-    /* The engine writes the borrowed value and hands back our request. */
-    ASSERT_EQ(storageMockRunIo(1), 1);
-    storageCompletion comp = {};
-    ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
-    EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
-    EXPECT_EQ(comp.status, STORAGE_OK);
-    EXPECT_NE(comp.request_ctx, nullptr);
-    zfree(comp.request_ctx);
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 
 /* Each type and encoding takes its own path through the serializer, which
@@ -1555,11 +1557,9 @@ TEST_F(SpillSubmitTest, SubmitsEveryTypeOfValue) {
         robj *entry = addKey(name, objs[i]);
 
         ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
-        ASSERT_EQ(storageMockRunIo(1), 1);
-        storageCompletion comp = {};
-        ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
-        EXPECT_EQ(comp.status, STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
-        zfree(comp.request_ctx);
+        ASSERT_EQ(finishSpills(), 1);
+        EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH)
+            << "type " << type << " encoding " << strEncoding(encoding);
     }
 }
 
@@ -1617,5 +1617,226 @@ TEST(DefragLaterTest, SkipsAValueThatIsNotOnlyInMemory) {
 }
 
 #endif /* HAVE_DEFRAG */
+
+/* ---------------------------------------------------------------------------
+ * Spill completion
+ * ---------------------------------------------------------------------------*/
+
+TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_STREQ(objectGetKey(entry), "key");
+    EXPECT_FALSE(isSelected(entry));
+}
+
+/* A failed write leaves the value in DRAM, so the key can be picked again. */
+TEST_F(SpillSubmitTest, AFailedSpillKeepsTheValueInMemory) {
+    extStorageDeinit();
+    server.ext_storage_capacity = 1;
+    extStorageInit();
+
+    robj *entry = addRawKey("key");
+    sds val = sdsdup((sds)objectGetVal(entry));
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), val), 0);
+    EXPECT_TRUE(isSelected(entry));
+    sdsfree(val);
+}
+
+/* Each type's value is freed by its own free function. */
+TEST_F(SpillSubmitTest, EverySpillableTypeCompletes) {
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    robj *spilled[NUM_TEST_OBJECTS];
+    int num_spilled = 0;
+    for (int i = 0; i < n; i++) {
+        addOneElement(objs[i]);
+
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addKey(key, objs[i]);
+        /* Embedded and INT strings have no separate value to spill. */
+        if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
+        ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK) << "type " << entry->type;
+        spilled[num_spilled++] = entry;
+    }
+    /* All but the embedded and INT strings. */
+    ASSERT_EQ(num_spilled, n - 2);
+
+    EXPECT_EQ(finishSpills(), num_spilled);
+    for (int i = 0; i < num_spilled; i++) {
+        EXPECT_EQ(getStorageState(spilled[i]), STORAGE_STATE_ONLY_FLASH)
+            << "type " << spilled[i]->type << " encoding " << strEncoding(spilled[i]->encoding);
+        EXPECT_EQ(objectGetVal(spilled[i]), nullptr);
+    }
+}
+
+/* Freeing a value something else references would leave it dangling. */
+/* Nothing may reference a value while it is being spilled, so a reference at
+ * completion is a bug. */
+TEST_F(SpillSubmitTest, AReferenceTakenDuringASpillCrashes) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    incrRefCount(entry);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+
+    EXPECT_DEATH(extStorageBeforeSleep(), "");
+
+    /* The death ran in a child, so finish the spill here. */
+    decrRefCount(entry);
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+}
+
+/* Deleting or overwriting a hash checks it for field expirations. */
+TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
+    robj *listpack = createHashObject();
+    robj *hashtable = createHashObject();
+    hashTypeConvert(hashtable, OBJ_ENCODING_HASHTABLE);
+    robj *hashes[] = {addKey("listpack", listpack), addKey("hashtable", hashtable)};
+    for (int i = 0; i < 2; i++) {
+        sds field = sdsnew("field");
+        hashTypeSet(hashes[i], field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+        sdsfree(field);
+        ASSERT_EQ(extStorageSpillItem(0, hashes[i]), STORAGE_OK);
+    }
+    ASSERT_EQ(finishSpills(), 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(objectGetVal(hashes[i]), nullptr);
+        EXPECT_FALSE(hashTypeHasVolatileFields(hashes[i]));
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Values in flight
+ * ---------------------------------------------------------------------------*/
+
+/* An expired key isn't deleted while its value is being spilled or on flash.
+ * A lookup reports it missing. TODO(#56), TODO(#57): delete it. */
+TEST_F(SpillSubmitTest, AnExpiredKeyNotInMemoryIsNotDeleted) {
+    mstime_t now = mstime();
+    robj *entry = addKeyWithExpire("key", rawValue(), now + 1000);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+    server.cmd_time_snapshot = now + 2000;
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_EQ(activeExpireCycleTryExpire(server.db[0], entry, now + 2000, 0), 0) << "on flash " << on_flash;
+        EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr) << "on flash " << on_flash;
+        EXPECT_TRUE(keyExists("key")) << "on flash " << on_flash;
+    }
+    server.cmd_time_snapshot = 0;
+    decrRefCount(key);
+}
+
+/* Commands on a value being spilled or on flash are rejected before they run,
+ * so a replace reaching one is a bug. */
+TEST_F(SpillSubmitTest, ReplacingAKeyNotInMemoryCrashes) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        robj *val = rawValue();
+        EXPECT_DEATH(dbReplaceValue(server.db[0], key, &val), "") << "on flash " << on_flash;
+        decrRefCount(val);
+    }
+    decrRefCount(key);
+}
+
+/* Closing the engine discards completions it hasn't handed back, which would
+ * leak the requests and leave keys COPYING_TO_FLASH. */
+TEST_F(SpillSubmitTest, ClosingTheEngineFinishesSpillsInFlight) {
+    robj *a = addRawKey("a");
+    robj *b = addRawKey("b");
+    ASSERT_EQ(extStorageSpillItem(0, a), STORAGE_OK);
+    ASSERT_EQ(extStorageSpillItem(0, b), STORAGE_OK);
+
+    extStorageDeinit();
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_FLASH);
+}
+
+/* Nothing may read a value that isn't only in memory, so a save fails both
+ * while the key is being spilled and once it is on flash. */
+TEST_F(SpillSubmitTest, SavingAKeyNotOnlyInMemoryFails) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        rio rdb;
+        rioInitWithBuffer(&rdb, sdsempty());
+        EXPECT_EQ(rdbSaveKeyValuePair(&rdb, key, entry, -1, 0, RDB_VERSION), -1) << "on flash " << on_flash;
+        sdsfree(rdb.io.buffer.ptr);
+    }
+    decrRefCount(key);
+}
+
+/* DEBUG DIGEST reads every value, so it must skip one that isn't in memory. */
+TEST_F(SpillSubmitTest, ADigestSkipsAValueNotOnlyInMemory) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("list", 4);
+    unsigned char digest[20] = {0};
+
+    xorObjectDigest(server.db[0], key, digest, entry);
+    ASSERT_EQ(finishSpills(), 1);
+    xorObjectDigest(server.db[0], key, digest, entry);
+    decrRefCount(key);
+}
+
+/* Commands on a value being spilled or on flash are rejected before they run,
+ * and expiry skips it, so a delete reaching one is a bug. */
+TEST_F(SpillSubmitTest, DeletingAKeyNotInMemoryCrashes) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    initServerForDeletes();
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_DEATH(dbAsyncDelete(server.db[0], key), "") << "on flash " << on_flash;
+    }
+    decrRefCount(key);
+}
+
+/* A key a command doesn't declare isn't checked before it runs. A read of it
+ * misses, and a write is a bug. */
+TEST_F(SpillSubmitTest, AnUndeclaredKeyNotInMemoryMissesOnRead) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr) << "on flash " << on_flash;
+        EXPECT_DEATH(lookupKeyWriteWithFlags(server.db[0], key, LOOKUP_NONOTIFY), "") << "on flash " << on_flash;
+    }
+    decrRefCount(key);
+}
 
 #endif /* USE_EXT_STORAGE */
