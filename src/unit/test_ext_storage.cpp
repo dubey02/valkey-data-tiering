@@ -19,6 +19,7 @@ extern "C" {
 #ifdef USE_EXT_STORAGE
 
 extern "C" {
+#include "bio.h"
 #include "ext_storage.h"
 #include "module.h"
 #include "storage/storage.h"
@@ -996,8 +997,8 @@ class SpillSelectTest : public ::testing::Test {
 
     /* Runs performEvictions() one byte over maxmemory, so it evicts one key and
      * leaves the rest of its sample in the pool. */
-    void evictOneKey(void) {
-        /* Evicting a key notifies modules, touches watched keys and propagates a DEL. */
+    /* Deleting a key notifies modules and uses the shared objects. */
+    static void initServerForDeletes(void) {
         static bool server_initialized = false;
         if (!server_initialized) {
             monotonicInit();
@@ -1005,6 +1006,11 @@ class SpillSelectTest : public ::testing::Test {
             moduleInitModulesSystem();
             server_initialized = true;
         }
+    }
+
+    void evictOneKey(void) {
+        /* Evicting a key also touches watched keys and propagates a DEL. */
+        initServerForDeletes();
         server.replicas = listCreate();
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
 
@@ -1505,19 +1511,33 @@ class SpillSubmitTest : public SpillSelectTest {
     }
 
     void TearDown() override {
-        storageMockRunIo(1000);
-        storageCompletion done[16];
-        int n;
-        while ((n = storageMockEngine()->poll_completions(done, 16)) > 0) {
-            for (int i = 0; i < n; i++) {
-                if (done[i].op_type == STORAGE_OP_PUT) zfree(done[i].request_ctx);
-            }
-        }
+        finishSpills();
         extStorageDeinit();
         zfree(server.ext_storage_engine);
         zfree(server.ext_storage_path);
         zfree(server.logfile);
         SpillSelectTest::TearDown();
+    }
+
+    /* Runs every queued request and processes its completion. Returns how
+     * many ran. */
+    int finishSpills() {
+        int n = storageMockRunIo(1000);
+        extStorageBeforeSleep();
+        return n;
+    }
+
+    /* Reads one ext_storage INFO field. The stats outlive each test, so
+     * callers compare before and after. */
+    unsigned long long infoField(const char *name) {
+        sds info = extStorageInfoString(sdsempty());
+        sds field = sdscatfmt(sdsempty(), "%s:", name);
+        const char *at = strstr(info, field);
+        EXPECT_NE(at, nullptr) << name;
+        unsigned long long v = at ? strtoull(at + sdslen(field), NULL, 10) : 0;
+        sdsfree(field);
+        sdsfree(info);
+        return v;
     }
 };
 
@@ -1617,5 +1637,192 @@ TEST(DefragLaterTest, SkipsAValueThatIsNotOnlyInMemory) {
 }
 
 #endif /* HAVE_DEFRAG */
+
+/* ---------------------------------------------------------------------------
+ * Spill completion
+ * ---------------------------------------------------------------------------*/
+
+TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_STREQ(objectGetKey(entry), "key");
+    EXPECT_FALSE(isSelected(entry));
+}
+
+/* A write the storage engine accepted must succeed. */
+TEST_F(SpillSubmitTest, AFailedSpillCrashes) {
+    extStorageDeinit();
+    server.ext_storage_capacity = 1;
+    extStorageInit();
+
+    /* Submitted in the child only, so the parent has no failed write to drain. */
+    robj *entry = addRawKey("key");
+    EXPECT_DEATH(
+        {
+            extStorageSpillItem(0, entry);
+            finishSpills();
+        },
+        "");
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* Each type's value is freed by its own free function. */
+TEST_F(SpillSubmitTest, EverySpillableTypeCompletes) {
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    robj *spilled[NUM_TEST_OBJECTS];
+    int num_spilled = 0;
+    for (int i = 0; i < n; i++) {
+        addOneElement(objs[i]);
+
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addKey(key, objs[i]);
+        /* Embedded and INT strings have no separate value to spill. */
+        if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
+        ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK) << "type " << entry->type;
+        spilled[num_spilled++] = entry;
+    }
+    /* All but the embedded and INT strings. */
+    ASSERT_EQ(num_spilled, n - 2);
+
+    EXPECT_EQ(finishSpills(), num_spilled);
+    for (int i = 0; i < num_spilled; i++) {
+        EXPECT_EQ(getStorageState(spilled[i]), STORAGE_STATE_ONLY_FLASH)
+            << "type " << spilled[i]->type << " encoding " << strEncoding(spilled[i]->encoding);
+        EXPECT_EQ(objectGetVal(spilled[i]), nullptr);
+    }
+}
+
+/* Nothing may reference a value while it is being spilled, so a reference at
+ * completion is a bug. */
+TEST_F(SpillSubmitTest, AReferenceTakenDuringASpillCrashes) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    incrRefCount(entry);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+
+    EXPECT_DEATH(extStorageBeforeSleep(), "");
+
+    /* The death ran in a child, so finish the spill here. */
+    decrRefCount(entry);
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+}
+
+/* Deleting or overwriting a hash checks it for field expirations. */
+TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
+    robj *listpack = createHashObject();
+    robj *hashtable = createHashObject();
+    hashTypeConvert(hashtable, OBJ_ENCODING_HASHTABLE);
+    robj *hashes[] = {addKey("listpack", listpack), addKey("hashtable", hashtable)};
+    for (int i = 0; i < 2; i++) {
+        sds field = sdsnew("field");
+        hashTypeSet(hashes[i], field, field, EXPIRY_NONE, HASH_SET_COPY, NULL);
+        sdsfree(field);
+        ASSERT_EQ(extStorageSpillItem(0, hashes[i]), STORAGE_OK);
+    }
+    ASSERT_EQ(finishSpills(), 2);
+    for (int i = 0; i < 2; i++) {
+        ASSERT_EQ(objectGetVal(hashes[i]), nullptr);
+        EXPECT_FALSE(hashTypeHasVolatileFields(hashes[i]));
+    }
+}
+
+/* Deleting a key on flash frees only the object, so lazy free must not read
+ * the quicklist it no longer has. */
+TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    ASSERT_EQ(objectGetVal(entry), nullptr);
+
+    initServerForDeletes();
+    robj *key = createStringObject("list", 4);
+    EXPECT_EQ(dbAsyncDelete(server.db[0], key), 1);
+    decrRefCount(key);
+}
+
+/* Active expire and eviction delete synchronously, which frees the object
+ * without its value. */
+TEST_F(SpillSubmitTest, AKeyOnFlashIsDeletedSynchronously) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    ASSERT_EQ(objectGetVal(entry), nullptr);
+
+    initServerForDeletes();
+    robj *key = createStringObject("list", 4);
+    EXPECT_EQ(dbSyncDelete(server.db[0], key), 1);
+    EXPECT_FALSE(keyExists("list"));
+    decrRefCount(key);
+}
+
+/* lazyfree-lazy-server-del is on by default, so large spilled values are
+ * freed on the lazy free thread. */
+TEST_F(SpillSubmitTest, ALargeSpilledValueIsFreedInTheBackground) {
+    static bool bio_started = false;
+    if (!bio_started) {
+        bioInit();
+        bio_started = true;
+    }
+    server.lazyfree_lazy_server_del = 1;
+
+    /* One element per node, so freeing it takes more than LAZYFREE_THRESHOLD frees. */
+    robj *list = createQuicklistObject(1, 0);
+    robj *ele = createStringObject("v", 1);
+    for (int i = 0; i < 100; i++) listTypePush(list, ele, LIST_TAIL);
+    decrRefCount(ele);
+    robj *entry = addKey("list", list);
+    size_t freed = lazyfreeGetFreedObjectsCount();
+
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    bioDrainWorker(BIO_LAZY_FREE);
+
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_EQ(lazyfreeGetFreedObjectsCount(), freed + 1);
+    server.lazyfree_lazy_server_del = 0;
+}
+
+/* Shutdown drains in-flight writes through the same completion path. */
+TEST_F(SpillSubmitTest, ShutdownFinishesASpillInFlight) {
+    robj *entry = addRawKey("key");
+    unsigned long long spilling = infoField("ext_storage_num_items_spilling_to_storage");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+
+    extStorageDeinit();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+
+    extStorageInit();
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling);
+}
+
+/* A write counts as spilling until it completes, then as spilled. */
+TEST_F(SpillSubmitTest, ASpillIsCountedAsSpillingThenSpilled) {
+    robj *entry = addRawKey("key");
+    unsigned long long spilling = infoField("ext_storage_num_items_spilling_to_storage");
+    unsigned long long spilled = infoField("ext_storage_total_num_items_spilled_to_storage");
+
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling + 1);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled + 1);
+}
 
 #endif /* USE_EXT_STORAGE */

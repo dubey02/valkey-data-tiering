@@ -42,6 +42,7 @@
 #include "expire.h"
 #include "bgiteration.h"
 #include "forkless.h"
+#include "ext_storage.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
 
@@ -525,7 +526,8 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        if (async) {
+        /* A value on flash is already freed, so only the object is left. */
+        if (async && extStorageIsMemoryOnly(val)) {
             freeObjAsync(key, val, db->id);
         } else {
             decrRefCount(val);
