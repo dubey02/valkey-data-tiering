@@ -1640,20 +1640,20 @@ TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
 }
 
 /* A failed write leaves the value in DRAM, so the key can be picked again. */
-TEST_F(SpillSubmitTest, AFailedSpillKeepsTheValueInMemory) {
+TEST_F(SpillSubmitTest, AFailedSpillCrashes) {
     extStorageDeinit();
     server.ext_storage_capacity = 1;
     extStorageInit();
 
+    /* Submitted in the child only, so the parent has no failed write to drain. */
     robj *entry = addRawKey("key");
-    sds val = sdsdup((sds)objectGetVal(entry));
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-
-    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_DEATH(
+        {
+            extStorageSpillItem(0, entry);
+            finishSpills();
+        },
+        "");
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
-    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), val), 0);
-    EXPECT_TRUE(isSelected(entry));
-    sdsfree(val);
 }
 
 /* Each type's value is freed by its own free function. */

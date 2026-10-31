@@ -403,7 +403,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
     if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
         /* OK */
-    } else if (server.lazyfree_lazy_server_del && extStorageIsMemoryOnly(old)) {
+    } else if (server.lazyfree_lazy_server_del) {
         freeObjAsync(key, old, db->id);
     } else {
         decrRefCount(old);

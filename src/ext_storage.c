@@ -40,8 +40,10 @@ void extStorageTestResetRegistry(void) {
     registered_engine = NULL;
 }
 
-/* Counted on the main thread as completions are handled. */
+/* Counted on the main thread as requests are submitted and completed. */
 typedef struct extStorageStats {
+    /* Writes submitted and not yet completed. */
+    uint64_t num_items_spilling;
     uint64_t total_num_items_spilled;
     uint64_t total_num_items_fetched;
     uint64_t total_num_items_deleted;
@@ -239,19 +241,18 @@ void extStorageInit(void) {
 static void spillComplete(const storageCompletion *comp);
 
 /* Handles one finished request. */
-static void extStorageProcessCompletion(const storageCompletion *c) {
-    switch (c->op_type) {
+static void extStorageProcessCompletion(const storageCompletion *completion) {
+    switch (completion->op_type) {
     case STORAGE_OP_PUT:
-        spillComplete(c);
-        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_spilled++;
+        spillComplete(completion);
         break;
     case STORAGE_OP_GET:
-        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
+        if (completion->status == STORAGE_OK) ext_storage.stats.total_num_items_fetched++;
         /* No command path reads a fetched value yet, so it has no owner. */
-        if (c->value) decrRefCount((robj *)c->value);
+        if (completion->value) decrRefCount((robj *)completion->value);
         break;
     case STORAGE_OP_DEL:
-        if (c->status == STORAGE_OK) ext_storage.stats.total_num_items_deleted++;
+        if (completion->status == STORAGE_OK) ext_storage.stats.total_num_items_deleted++;
         break;
     }
 }
@@ -326,11 +327,13 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_engine:%s\r\n"
                         "ext_storage_api_version:%d\r\n"
                         "ext_storage_capacity_bytes:%llu\r\n"
+                        "ext_storage_num_items_spilling_to_storage:%llu\r\n"
                         "ext_storage_total_num_items_spilled_to_storage:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
+                        (unsigned long long)st->num_items_spilling,
                         (unsigned long long)st->total_num_items_spilled,
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted);
@@ -479,6 +482,7 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     }
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
+    ext_storage.stats.num_items_spilling++;
     return STORAGE_OK;
 }
 
@@ -497,20 +501,19 @@ static void spillFreeValue(robj *entry) {
 }
 
 /* Handles a finished write. A key is spilled only when nothing else references
- * it, and nothing may take a reference while it is COPYING_TO_FLASH. So a
- * written value is always freed, and only a failed write keeps it in memory. */
+ * it, and nothing may take a reference while it is COPYING_TO_FLASH. A write
+ * accepted by the storage engine must succeed, so the value is always freed. */
 static void spillComplete(const storageCompletion *comp) {
     spillRequest *req = comp->request_ctx;
     robj *entry = req->entry;
     serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
     serverAssert(objectGetRefcount(entry) == 1);
+    serverAssert(comp->status == STORAGE_OK);
 
-    if (comp->status == STORAGE_OK) {
-        spillFreeValue(entry);
-        setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
-    } else {
-        setStorageState(entry, STORAGE_STATE_ONLY_MEMORY);
-    }
+    spillFreeValue(entry);
+    setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    ext_storage.stats.num_items_spilling--;
+    ext_storage.stats.total_num_items_spilled++;
     zfree(req);
 }
 
