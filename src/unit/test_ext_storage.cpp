@@ -19,6 +19,7 @@ extern "C" {
 #ifdef USE_EXT_STORAGE
 
 extern "C" {
+#include "bio.h"
 #include "ext_storage.h"
 #include "module.h"
 #include "storage/storage.h"
@@ -1525,6 +1526,19 @@ class SpillSubmitTest : public SpillSelectTest {
         extStorageBeforeSleep();
         return n;
     }
+
+    /* Reads one ext_storage INFO field. The stats outlive each test, so
+     * callers compare before and after. */
+    unsigned long long infoField(const char *name) {
+        sds info = extStorageInfoString(sdsempty());
+        sds field = sdscatfmt(sdsempty(), "%s:", name);
+        const char *at = strstr(info, field);
+        EXPECT_NE(at, nullptr) << name;
+        unsigned long long v = at ? strtoull(at + sdslen(field), NULL, 10) : 0;
+        sdsfree(field);
+        sdsfree(info);
+        return v;
+    }
 };
 
 TEST_F(SpillSubmitTest, SubmitsTheValue) {
@@ -1639,7 +1653,7 @@ TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
     EXPECT_FALSE(isSelected(entry));
 }
 
-/* A failed write leaves the value in DRAM, so the key can be picked again. */
+/* A write the storage engine accepted must succeed. */
 TEST_F(SpillSubmitTest, AFailedSpillCrashes) {
     extStorageDeinit();
     server.ext_storage_capacity = 1;
@@ -1685,7 +1699,6 @@ TEST_F(SpillSubmitTest, EverySpillableTypeCompletes) {
     }
 }
 
-/* Freeing a value something else references would leave it dangling. */
 /* Nothing may reference a value while it is being spilled, so a reference at
  * completion is a bug. */
 TEST_F(SpillSubmitTest, AReferenceTakenDuringASpillCrashes) {
@@ -1735,6 +1748,81 @@ TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
     robj *key = createStringObject("list", 4);
     EXPECT_EQ(dbAsyncDelete(server.db[0], key), 1);
     decrRefCount(key);
+}
+
+/* Active expire and eviction delete synchronously, which frees the object
+ * without its value. */
+TEST_F(SpillSubmitTest, AKeyOnFlashIsDeletedSynchronously) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    ASSERT_EQ(objectGetVal(entry), nullptr);
+
+    initServerForDeletes();
+    robj *key = createStringObject("list", 4);
+    EXPECT_EQ(dbSyncDelete(server.db[0], key), 1);
+    EXPECT_FALSE(keyExists("list"));
+    decrRefCount(key);
+}
+
+/* lazyfree-lazy-server-del is on by default, so large spilled values are
+ * freed on the lazy free thread. */
+TEST_F(SpillSubmitTest, ALargeSpilledValueIsFreedInTheBackground) {
+    static bool bio_started = false;
+    if (!bio_started) {
+        bioInit();
+        bio_started = true;
+    }
+    server.lazyfree_lazy_server_del = 1;
+
+    /* One element per node, so freeing it takes more than LAZYFREE_THRESHOLD frees. */
+    robj *list = createQuicklistObject(1, 0);
+    robj *ele = createStringObject("v", 1);
+    for (int i = 0; i < 100; i++) listTypePush(list, ele, LIST_TAIL);
+    decrRefCount(ele);
+    robj *entry = addKey("list", list);
+    size_t freed = lazyfreeGetFreedObjectsCount();
+
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    bioDrainWorker(BIO_LAZY_FREE);
+
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_EQ(lazyfreeGetFreedObjectsCount(), freed + 1);
+    server.lazyfree_lazy_server_del = 0;
+}
+
+/* Shutdown drains in-flight writes through the same completion path. */
+TEST_F(SpillSubmitTest, ShutdownFinishesASpillInFlight) {
+    robj *entry = addRawKey("key");
+    unsigned long long spilling = infoField("ext_storage_num_items_spilling_to_storage");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+
+    extStorageDeinit();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+
+    extStorageInit();
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling);
+}
+
+/* A write counts as spilling until it completes, then as spilled. */
+TEST_F(SpillSubmitTest, ASpillIsCountedAsSpillingThenSpilled) {
+    robj *entry = addRawKey("key");
+    unsigned long long spilling = infoField("ext_storage_num_items_spilling_to_storage");
+    unsigned long long spilled = infoField("ext_storage_total_num_items_spilled_to_storage");
+
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling + 1);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled + 1);
 }
 
 #endif /* USE_EXT_STORAGE */
