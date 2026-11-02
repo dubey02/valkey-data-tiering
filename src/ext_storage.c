@@ -744,4 +744,85 @@ void extStorageSpillDrain(void) {
     while (ext_storage.stats.num_items_spilling > 0) extStoragePollCompletions();
 }
 
+/* Spill accounting
+ *
+ * Estimates the total inflight bytes of all spill requests:
+ * - From submit to serialize, a spill isn't sized yet. The number of these
+ *   spills is multiplied by the EMA of serialized sizes to estimate their bytes.
+ * - From serialize to completion, a spill counts as its measured size.
+ * Completion subtracts what a spill added. */
+static unsigned long spill_account_requests;         /* Submission increments, completion or refusal decrements. */
+static _Atomic unsigned long spill_account_sized;    /* Serialization increments, completion decrements. */
+static _Atomic size_t spill_account_sized_ram_bytes; /* Serialization adds, completion subtracts. */
+static _Atomic size_t spill_account_ram_mean;        /* Serialization updates, main thread reads. */
+
+/* Weight of a new size in the mean: 1/16. */
+#define SPILL_RAM_MEAN_SHIFT 4
+
+/* Moves the mean 1/16 of the way to a new size. The first size sets it. */
+static size_t spillRamMeanStep(size_t mean, size_t bytes) {
+    if (mean == 0) return bytes;
+    if (bytes >= mean) return mean + ((bytes - mean) >> SPILL_RAM_MEAN_SHIFT);
+    return mean - ((mean - bytes) >> SPILL_RAM_MEAN_SHIFT);
+}
+
+/* Test-only reset, including spills a failed test left inflight. */
+void extStorageTestResetSpillAccount(void) {
+    spill_account_requests = 0;
+    atomic_store_explicit(&spill_account_sized, 0, memory_order_relaxed);
+    atomic_store_explicit(&spill_account_sized_ram_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&spill_account_ram_mean, 0, memory_order_relaxed);
+}
+
+void extStorageSpillAccountSubmit(extStorageSpillSizing *s) {
+    s->sized = false;
+    s->ram_bytes = 0;
+    spill_account_requests++;
+}
+
+/* Adds the spill's measured size and updates the mean. The count is added
+ * before the bytes (release), so a reader that sees the bytes sees the count. */
+void extStorageSpillAccountSized(extStorageSpillSizing *s, size_t ram_bytes) {
+    serverAssert(!s->sized);
+    s->ram_bytes = ram_bytes;
+    s->sized = true;
+    atomic_fetch_add_explicit(&spill_account_sized, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&spill_account_sized_ram_bytes, ram_bytes, memory_order_release);
+
+    size_t mean = atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(&spill_account_ram_mean, &mean, spillRamMeanStep(mean, ram_bytes),
+                                                  memory_order_relaxed, memory_order_relaxed));
+}
+
+void extStorageSpillAccountFinish(extStorageSpillSizing *s) {
+    serverAssert(spill_account_requests > 0);
+    if (s->sized) {
+        atomic_fetch_sub_explicit(&spill_account_sized_ram_bytes, s->ram_bytes, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&spill_account_sized, 1, memory_order_relaxed);
+    }
+    spill_account_requests--;
+}
+
+/* Reads the serialized bytes (acquire), then the unserialized count. A spill
+ * serialized in between may be missed, but never counted twice. */
+static void spillAccountRead(size_t *sized_ram_bytes, unsigned long *unsized_requests) {
+    *sized_ram_bytes = atomic_load_explicit(&spill_account_sized_ram_bytes, memory_order_acquire);
+    unsigned long sized = atomic_load_explicit(&spill_account_sized, memory_order_relaxed);
+    serverAssert(sized <= spill_account_requests);
+    *unsized_requests = spill_account_requests - sized;
+}
+
+size_t extStorageSpillAccountInflightRamBytes(void) {
+    size_t sized_ram_bytes;
+    unsigned long unsized_requests;
+    spillAccountRead(&sized_ram_bytes, &unsized_requests);
+    return sized_ram_bytes + unsized_requests * atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
+}
+
+void extStorageSpillAccountGetStats(extStorageSpillAccountStats *out) {
+    out->inflight_requests = spill_account_requests;
+    spillAccountRead(&out->sized_ram_bytes, &out->unsized_requests);
+    out->ram_mean = atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
+}
+
 #endif /* USE_EXT_STORAGE */

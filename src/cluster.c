@@ -121,6 +121,12 @@ ConnectionType *connTypeOfCluster(void) {
 /* Generates a DUMP-format representation of the object 'o', adding it to the
  * io stream pointed by 'rio'. This function can't fail. */
 void createDumpPayload(rio *payload, robj *o, robj *key, int dbid) {
+    createDumpPayloadSized(payload, o, key, dbid, NULL);
+}
+
+/* Like createDumpPayload(). If ram_bytes isn't NULL, also adds the value's
+ * memory to it, as rdbSaveObjectSized() does. */
+void createDumpPayloadSized(rio *payload, robj *o, robj *key, int dbid, size_t *ram_bytes) {
     unsigned char buf[2];
     uint64_t crc;
 
@@ -130,7 +136,7 @@ void createDumpPayload(rio *payload, robj *o, robj *key, int dbid) {
     int rdbtype = rdbGetObjectType(o, RDB_VERSION);
     serverAssert(rdbtype >= 0);
     serverAssert(rdbSaveType(payload, rdbtype));
-    serverAssert(rdbSaveObject(payload, o, key, dbid, rdbtype));
+    serverAssert(rdbSaveObjectSized(payload, o, key, dbid, rdbtype, ram_bytes));
 
     /* Write the footer, this is how it looks like:
      * ----------------+---------------------+---------------+

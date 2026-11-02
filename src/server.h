@@ -4432,6 +4432,7 @@ void askingCommand(client *c);
 void readonlyCommand(client *c);
 void readwriteCommand(client *c);
 void createDumpPayload(rio *payload, robj *o, robj *key, int dbid);
+void createDumpPayloadSized(rio *payload, robj *o, robj *key, int dbid, size_t *ram_bytes);
 int verifyDumpPayload(unsigned char *p, size_t len, uint16_t *rdbver_ptr);
 void dumpCommand(client *c);
 void objectCommand(client *c);

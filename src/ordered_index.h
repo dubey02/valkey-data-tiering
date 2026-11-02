@@ -184,6 +184,11 @@ OrderedIndexItem *orderedIndexNext(OrderedIndexIterator *iter);
 /* Advance iterator backward. Returns the previous item, or NULL at start. */
 OrderedIndexItem *orderedIndexPrev(OrderedIndexIterator *iter);
 
+/* Like orderedIndexPrev(), and adds each leaf node's allocation size to
+ * *leaf_bytes as the iterator enters it. Walking an unseeked iterator to the
+ * start counts every leaf once. */
+OrderedIndexItem *orderedIndexPrevSized(OrderedIndexIterator *iter, size_t *leaf_bytes);
+
 /* Position the cursor before rank N (Java ListIterator semantics). After
  * seeking:
  * - next() returns the item at rank N (or NULL if N >= length).
@@ -218,6 +223,10 @@ void orderedIndexDismissMemory(OrderedIndex *oi);
  * owned jointly with the caller (e.g. a companion hashtable) and are not
  * included; callers account for them by sampling the items they hold. */
 size_t orderedIndexEstimateStructureMemory(const OrderedIndex *oi);
+
+/* Allocation size of the index struct and its inner nodes, without the leaf
+ * nodes or items. Visits only the inner nodes. */
+size_t orderedIndexAllocSizeWithoutLeaves(const OrderedIndex *oi);
 
 /* Defrag the index's own top-level struct. All node and item allocations are
  * handled incrementally by orderedIndexScanDefrag. Returns the index pointer,
