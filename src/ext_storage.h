@@ -32,9 +32,6 @@ void extStorageKillThreads(void);
 /* Returns 1 while a storage engine is open and ready. */
 int extStorageIsActive(void);
 
-/* Clears the counters for CONFIG RESETSTAT. Gauges are left as they are. */
-void extStorageResetStats(void);
-
 /* Appends the Ext_storage INFO fields, the ones the valkey server counts. */
 sds extStorageInfoString(sds info);
 

@@ -319,13 +319,6 @@ int extStorageIsActive(void) {
  * Storage_engine section holds what the storage engine reports through the
  * sink below. */
 
-void extStorageResetStats(void) {
-    /* num_items_spilling counts writes in flight, so it is not reset. */
-    ext_storage.stats.total_num_items_spilled = 0;
-    ext_storage.stats.total_num_items_fetched = 0;
-    ext_storage.stats.total_num_items_deleted = 0;
-}
-
 sds extStorageInfoString(sds info) {
     if (!extStorageIsActive()) return sdscatprintf(info, "ext_storage_enabled:0\r\n");
 
