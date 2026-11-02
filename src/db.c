@@ -42,6 +42,7 @@
 #include "expire.h"
 #include "bgiteration.h"
 #include "forkless.h"
+#include "ext_storage.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
 
@@ -104,6 +105,15 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
             /* The key is no longer valid. */
             val = NULL;
         }
+    }
+
+    /* Commands block on their keys before they run, but not on keys they
+     * don't declare, like those a script reads. A read of such a key misses,
+     * and a write can't happen.
+     * TODO(#45, #46): block on keys used by MULTI/EXEC and scripts. */
+    if (val && !extStorageIsMemoryOnly(val)) {
+        serverAssert(!(flags & LOOKUP_WRITE));
+        val = NULL;
     }
 
     if (val) {
@@ -688,6 +698,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
 
     /* bgIteration must be notified for flushall. */
     if (dbnum == -1) bgIteration_flushall();
+
+    /* The storage engine may still be reading values that are about to be freed. */
+    extStorageSpillDrain();
 
     /* Fire the flushdb modules event. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_FLUSHDB, VALKEYMODULE_SUBEVENT_FLUSHDB_START, &fi);
@@ -2220,6 +2233,8 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
         return KEY_VALID;
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
+    /* TODO(#56): delete an expired key whose value isn't only in memory. */
+    if (val && !extStorageIsMemoryOnly(val)) return KEY_EXPIRED;
 
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;

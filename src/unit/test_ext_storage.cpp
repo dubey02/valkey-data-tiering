@@ -30,6 +30,8 @@ extern hashtableType commandSetType;
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
+void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o);
+int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx);
 }
 
 /* The log and the thread setup. */
@@ -1729,6 +1731,83 @@ TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
         ASSERT_EQ(objectGetVal(hashes[i]), nullptr);
         EXPECT_FALSE(hashTypeHasVolatileFields(hashes[i]));
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Values in flight
+ * ---------------------------------------------------------------------------*/
+
+/* An expired key isn't deleted while its value is being spilled or on flash.
+ * A lookup reports it missing. */
+TEST_F(SpillSubmitTest, AnExpiredKeyNotInMemoryIsNotDeleted) {
+    mstime_t now = mstime();
+    robj *entry = addKeyWithExpire("key", rawValue(), now + 1000);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+    server.cmd_time_snapshot = now + 2000;
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_EQ(activeExpireCycleTryExpire(server.db[0], entry, now + 2000, 0), 0) << "on flash " << on_flash;
+        EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr) << "on flash " << on_flash;
+        EXPECT_TRUE(keyExists("key")) << "on flash " << on_flash;
+    }
+    server.cmd_time_snapshot = 0;
+    decrRefCount(key);
+}
+
+/* Nothing may read a value that isn't only in memory, so a save skips the key
+ * both while it is being spilled and once it is on flash. */
+TEST_F(SpillSubmitTest, SavingSkipsAKeyNotOnlyInMemory) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        rio rdb;
+        rioInitWithBuffer(&rdb, sdsempty());
+        EXPECT_EQ(rdbSaveKeyValuePair(&rdb, key, entry, -1, 0, RDB_VERSION), 0) << "on flash " << on_flash;
+        EXPECT_EQ(sdslen(rdb.io.buffer.ptr), 0u) << "on flash " << on_flash;
+        sdsfree(rdb.io.buffer.ptr);
+    }
+    decrRefCount(key);
+}
+
+/* DEBUG DIGEST reads every value, so it must skip one that isn't in memory. */
+TEST_F(SpillSubmitTest, ADigestSkipsAValueNotOnlyInMemory) {
+    robj *list = createQuicklistObject(-2, 0);
+    addOneElement(list);
+    robj *entry = addKey("list", list);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("list", 4);
+    unsigned char digest[20] = {0};
+
+    xorObjectDigest(server.db[0], key, digest, entry);
+    ASSERT_EQ(finishSpills(), 1);
+    xorObjectDigest(server.db[0], key, digest, entry);
+    decrRefCount(key);
+}
+
+/* A key a command doesn't declare isn't checked before it runs. A read of it
+ * misses, and a write is a bug. */
+TEST_F(SpillSubmitTest, AnUndeclaredKeyNotInMemoryMissesOnRead) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    robj *key = createStringObject("key", 3);
+
+    for (int on_flash = 0; on_flash < 2; on_flash++) {
+        if (on_flash) {
+            ASSERT_EQ(finishSpills(), 1);
+        }
+        EXPECT_EQ(lookupKeyReadWithFlags(server.db[0], key, LOOKUP_NONOTIFY), nullptr) << "on flash " << on_flash;
+        EXPECT_DEATH(lookupKeyWriteWithFlags(server.db[0], key, LOOKUP_NONOTIFY), "") << "on flash " << on_flash;
+    }
+    decrRefCount(key);
 }
 
 /* lazyfree-lazy-server-del is on by default, so large spilled values are

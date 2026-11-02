@@ -642,4 +642,8 @@ bool extStorageBlockClientIfRequired(client *c) {
     return n > 0;
 }
 
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void) {
+    while (ext_storage.stats.num_items_spilling > 0) extStorageBeforeSleep();
+}
 #endif /* USE_EXT_STORAGE */

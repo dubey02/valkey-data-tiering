@@ -50,6 +50,7 @@
 #include "compression.h"
 #include "compression_stream.h"
 #include "forkless.h"
+#include "ext_storage.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -1304,6 +1305,12 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
+    /* TODO(#64): save values that aren't only in memory. */
+    if (!extStorageIsMemoryOnly(val)) {
+        serverLog(LL_WARNING, "Skipped saving a key whose value isn't only in memory.");
+        return 0;
+    }
+
     /* Save the expire time */
     if (expiretime != -1) {
         if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) return -1;
@@ -1541,7 +1548,7 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, int rdbver, long *key_counte
          * OS and possibly avoid or decrease COW. We give the dismiss
          * mechanism a hint about an estimated size of the object we stored. */
         size_t dump_size = rdb->processed_bytes - rdb_bytes_before_key;
-        if (server.in_fork_child) dismissObject(o, dump_size);
+        if (server.in_fork_child && extStorageIsMemoryOnly(o)) dismissObject(o, dump_size);
 
         /* Update child info every 1 second (approximately).
          * in order to avoid calling mstime() on each iteration, we will

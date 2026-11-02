@@ -60,11 +60,16 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
 /* Starts fetches for spilled keys and blocks the client. Returns true if blocked. */
 bool extStorageBlockClientIfRequired(client *c);
 
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void);
+
 #else
 
 static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;
+}
+static inline void extStorageSpillDrain(void) {
 }
 
 #endif /* USE_EXT_STORAGE */
