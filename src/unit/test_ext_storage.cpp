@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include "custom_matchers.hpp"
 #include "generated_wrappers.hpp"
 
 #include <cstring>
@@ -1823,6 +1824,27 @@ TEST_F(SpillSubmitTest, ASpillIsCountedAsSpillingThenSpilled) {
     ASSERT_EQ(finishSpills(), 1);
     EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling);
     EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled + 1);
+}
+
+/* Counts from a previous open must not carry over. */
+TEST_F(SpillSubmitTest, ReopeningTheStorageEngineResetsTheStats) {
+    ASSERT_EQ(extStorageSpillItem(0, addRawKey("key")), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    ASSERT_GT(infoField("ext_storage_total_num_items_spilled_to_storage"), 0u);
+
+    extStorageDeinit();
+    extStorageInit();
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 0u);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), 0u);
+}
+
+/* A client that blocked on a key being spilled must wake when it completes. */
+TEST_F(SpillSubmitTest, ACompletedSpillUnblocksClientsOnTheKey) {
+    MockValkey mock;
+    EXPECT_CALL(mock, unblockClientsInUseOnKey(robjEqualsStr("key"))).Times(1);
+
+    ASSERT_EQ(extStorageSpillItem(0, addRawKey("key")), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
 }
 
 #endif /* USE_EXT_STORAGE */

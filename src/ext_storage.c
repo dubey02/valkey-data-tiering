@@ -230,6 +230,7 @@ void extStorageInit(void) {
     ext_storage.engine = engine;
     ext_storage.open = 1;
     ext_storage.capacity_bytes = cfg.capacity_bytes;
+    memset(&ext_storage.stats, 0, sizeof(ext_storage.stats));
 
     serverLog(LL_NOTICE, "Data tiering enabled. Storage engine \"%s\", capacity %llu bytes.", engine->name,
               (unsigned long long)server.ext_storage_capacity);
@@ -514,6 +515,12 @@ static void spillComplete(const storageCompletion *comp) {
     setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
     ext_storage.stats.num_items_spilling--;
     ext_storage.stats.total_num_items_spilled++;
+
+    /* Wake clients that blocked on the key while it was being spilled. */
+    sds name = objectGetKey(entry);
+    robj *key = createStringObject(name, sdslen(name));
+    unblockClientsInUseOnKey(key);
+    decrRefCount(key);
     zfree(req);
 }
 
