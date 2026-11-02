@@ -511,6 +511,19 @@ size_t entryMemUsage(entry *entry) {
     return mem;
 }
 
+/* Returns the memory freed with a hash field entry: its allocation, plus its
+ * value if allocated separately. A string ref counts the ref, not its buffer. */
+size_t entryAllocSize(const entry *entry) {
+    size_t mem = zmalloc_size(entryGetAllocPtr(entry));
+    if (entryHasStringRef(entry)) {
+        stringRef *string_ref = entryGetStringRefRef(entry);
+        if (string_ref) mem += zmalloc_size(string_ref);
+    } else if (!entryHasEmbeddedValue(entry)) {
+        mem += sdsAllocSize(*entryGetSdsValueRef(entry));
+    }
+    return mem;
+}
+
 /* Defragments an entry (field-value pair) if needed, using the
  * provided defrag functions. The defrag functions return NULL if the allocation
  * was not moved, otherwise they return a pointer to the new memory location.
