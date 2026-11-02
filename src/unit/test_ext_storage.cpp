@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include "custom_matchers.hpp"
 #include "generated_wrappers.hpp"
 
 #include <cstring>
