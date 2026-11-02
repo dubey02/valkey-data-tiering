@@ -1838,6 +1838,22 @@ TEST_F(SpillSubmitTest, ReopeningTheStorageEngineResetsTheStats) {
     EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), 0u);
 }
 
+/* CONFIG RESETSTAT clears the spilled total but keeps counting writes in
+ * flight, so a reset mid-spill can't underflow the gauge. */
+TEST_F(SpillSubmitTest, ResetStatClearsCountersButNotSpillsInFlight) {
+    ASSERT_EQ(extStorageSpillItem(0, addRawKey("done")), STORAGE_OK);
+    ASSERT_EQ(finishSpills(), 1);
+    ASSERT_EQ(extStorageSpillItem(0, addRawKey("in_flight")), STORAGE_OK);
+
+    extStorageResetStats();
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), 0u);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 1u);
+
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), 1u);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 0u);
+}
+
 /* A client that blocked on a key being spilled must wake when it completes. */
 TEST_F(SpillSubmitTest, ACompletedSpillUnblocksClientsOnTheKey) {
     MockValkey mock;

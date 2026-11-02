@@ -230,7 +230,7 @@ void extStorageInit(void) {
     ext_storage.engine = engine;
     ext_storage.open = 1;
     ext_storage.capacity_bytes = cfg.capacity_bytes;
-    memset(&ext_storage.stats, 0, sizeof(ext_storage.stats));
+    ext_storage.stats = (extStorageStats){0};
 
     serverLog(LL_NOTICE, "Data tiering enabled. Storage engine \"%s\", capacity %llu bytes.", engine->name,
               (unsigned long long)server.ext_storage_capacity);
@@ -318,6 +318,13 @@ int extStorageIsActive(void) {
  * The Ext_storage section holds what the valkey server counts. The
  * Storage_engine section holds what the storage engine reports through the
  * sink below. */
+
+void extStorageResetStats(void) {
+    /* num_items_spilling counts writes in flight, so it is not reset. */
+    ext_storage.stats.total_num_items_spilled = 0;
+    ext_storage.stats.total_num_items_fetched = 0;
+    ext_storage.stats.total_num_items_deleted = 0;
+}
 
 sds extStorageInfoString(sds info) {
     if (!extStorageIsActive()) return sdscatprintf(info, "ext_storage_enabled:0\r\n");

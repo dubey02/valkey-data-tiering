@@ -3005,6 +3005,9 @@ void resetServerStats(void) {
     server.acl_info.acl_access_denied_tls_cert = 0;
     server.acl_info.invalid_db_accesses = 0;
     lazyfreeResetStats();
+#ifdef USE_EXT_STORAGE
+    extStorageResetStats();
+#endif
 }
 
 /* Make the thread killable at any time, so that kill threads functions
