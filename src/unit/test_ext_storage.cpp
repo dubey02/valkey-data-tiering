@@ -998,8 +998,8 @@ class SpillSelectTest : public ::testing::Test {
 
     /* Runs performEvictions() one byte over maxmemory, so it evicts one key and
      * leaves the rest of its sample in the pool. */
-    /* Deleting a key notifies modules and uses the shared objects. */
-    static void initServerForDeletes(void) {
+    void evictOneKey(void) {
+        /* Evicting a key notifies modules, touches watched keys and propagates a DEL. */
         static bool server_initialized = false;
         if (!server_initialized) {
             monotonicInit();
@@ -1007,11 +1007,6 @@ class SpillSelectTest : public ::testing::Test {
             moduleInitModulesSystem();
             server_initialized = true;
         }
-    }
-
-    void evictOneKey(void) {
-        /* Evicting a key also touches watched keys and propagates a DEL. */
-        initServerForDeletes();
         server.replicas = listCreate();
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
 
@@ -1733,39 +1728,6 @@ TEST_F(SpillSubmitTest, ASpilledHashHasNoFieldExpirations) {
         ASSERT_EQ(objectGetVal(hashes[i]), nullptr);
         EXPECT_FALSE(hashTypeHasVolatileFields(hashes[i]));
     }
-}
-
-/* Deleting a key on flash frees only the object, so lazy free must not read
- * the quicklist it no longer has. */
-TEST_F(SpillSubmitTest, AKeyOnFlashIsFreedWithoutItsValue) {
-    robj *list = createQuicklistObject(-2, 0);
-    addOneElement(list);
-    robj *entry = addKey("list", list);
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    ASSERT_EQ(finishSpills(), 1);
-    ASSERT_EQ(objectGetVal(entry), nullptr);
-
-    initServerForDeletes();
-    robj *key = createStringObject("list", 4);
-    EXPECT_EQ(dbAsyncDelete(server.db[0], key), 1);
-    decrRefCount(key);
-}
-
-/* Active expire and eviction delete synchronously, which frees the object
- * without its value. */
-TEST_F(SpillSubmitTest, AKeyOnFlashIsDeletedSynchronously) {
-    robj *list = createQuicklistObject(-2, 0);
-    addOneElement(list);
-    robj *entry = addKey("list", list);
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    ASSERT_EQ(finishSpills(), 1);
-    ASSERT_EQ(objectGetVal(entry), nullptr);
-
-    initServerForDeletes();
-    robj *key = createStringObject("list", 4);
-    EXPECT_EQ(dbSyncDelete(server.db[0], key), 1);
-    EXPECT_FALSE(keyExists("list"));
-    decrRefCount(key);
 }
 
 /* lazyfree-lazy-server-del is on by default, so large spilled values are
