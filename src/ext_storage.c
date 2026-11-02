@@ -516,7 +516,7 @@ static void spillComplete(const storageCompletion *comp) {
     ext_storage.stats.num_items_spilling--;
     ext_storage.stats.total_num_items_spilled++;
 
-    /* Wake clients that blocked on the key while it was being spilled. */
+    /* Unblock clients blocked on the key while it was being spilled. */
     sds name = objectGetKey(entry);
     robj *key = createStringObject(name, sdslen(name));
     unblockClientsInUseOnKey(key);
