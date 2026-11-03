@@ -220,6 +220,10 @@ jobs:
       # works. What proves tiering works are the unit tests above.
       - name: test-ext-storage-build
         run: ./runtest --verbose --dump-logs
+      # hellostorage builds only with data tiering, so this is the only job that
+      # compiles and loads it.
+      - name: test-ext-storage-moduleapi
+        run: CFLAGS='-Werror' ./runtest-moduleapi --single unit/moduleapi/storage_engine --verbose --dump-logs
       # And the other direction: the tree still builds, and still passes, with
       # every line of it compiled out.
       - name: make-without-ext-storage

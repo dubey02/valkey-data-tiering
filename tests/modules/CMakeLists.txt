@@ -43,10 +43,9 @@ list(APPEND MODULES_LIST "crash")
 list(APPEND MODULES_LIST "cluster")
 list(APPEND MODULES_LIST "helloscripting")
 
-# storage_mock_module registers a storage engine, so it builds only with data
-# tiering.
+# hellostorage registers a storage engine, so it builds only with data tiering.
 if (USE_EXT_STORAGE EQUAL 1)
-    list(APPEND MODULES_LIST "storage_mock_module")
+    list(APPEND MODULES_LIST "hellostorage")
 endif ()
 
 foreach (MODULE_NAME ${MODULES_LIST})
@@ -64,15 +63,3 @@ foreach (MODULE_NAME ${MODULES_LIST})
         target_link_options(${MODULE_NAME} PRIVATE -undefined dynamic_lookup)
     endif ()
 endforeach ()
-
-# storage_mock_module also links the shared mock storage engine from src/storage
-# and needs the storage engine headers. The valkey server exports its own copy
-# of storageMockEngine, so -Bsymbolic binds the module's references at link
-# time rather than letting the dynamic linker pick the valkey server's copy.
-if (USE_EXT_STORAGE EQUAL 1)
-    target_sources(storage_mock_module PRIVATE "${CMAKE_SOURCE_DIR}/src/storage/storage_mock.c")
-    target_include_directories(storage_mock_module PRIVATE "${CMAKE_SOURCE_DIR}/src/storage")
-    if (NOT APPLE)
-        target_link_options(storage_mock_module PRIVATE -Wl,-Bsymbolic)
-    endif ()
-endif ()
