@@ -2348,4 +2348,87 @@ TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
         "Storage engine rejected the fetch");
 }
 
+/* ---------------------------------------------------------------------------
+ * DEBUG SPILL on keys in flight
+ * ---------------------------------------------------------------------------*/
+
+/* The mock storage engine runs nothing until extStorageBeforeSleep(), so a
+ * spill or a fetch stays in flight while DEBUG SPILL runs. */
+class DebugSpillTest : public BlockClientTest {
+  protected:
+    void SetUp() override {
+        BlockClientTest::SetUp();
+        if (!server.errors) server.errors = raxNew();
+        /* The replies use the shared objects. */
+        if (!shared.ok) createSharedObjects();
+    }
+
+    /* Runs DEBUG SPILL on 'keys' and returns its reply. The caller frees it. */
+    sds debugSpill(const char *keys) {
+        sds cmdline = sdscatfmt(sdsempty(), "debug spill %s", keys);
+        client *c = makeClient(cmdline);
+        sdsfree(cmdline);
+        c->buf = (char *)zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
+        c->reply = listCreate();
+        c->deferred_reply_bytes = ULLONG_MAX; /* replies go straight to c->buf */
+        c->flag.pending_write = 1;            /* keeps it off the write queue */
+
+        extStorageDebugSpillCommand(c);
+        sds reply = sdsnewlen(c->buf, c->bufpos);
+        EXPECT_EQ(listLength(c->reply), 0u);
+        zfree(c->buf);
+        listRelease(c->reply);
+        c->buf = NULL;
+        c->reply = NULL;
+        return reply;
+    }
+};
+
+TEST_F(DebugSpillTest, LeavesAKeyBeingSpilledAsItIs) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    uint64_t spilled = infoField("ext_storage_total_num_items_spilled_to_storage:");
+
+    sds reply = debugSpill("key");
+    EXPECT_STREQ(reply, "+OK\r\n");
+    sdsfree(reply);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage:"), 1u);
+
+    /* Only the first submit completes. */
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage:"), spilled + 1);
+}
+
+TEST_F(DebugSpillTest, LeavesAKeyOnFlashAsItIs) {
+    robj *entry = addFlashKey("key");
+    uint64_t spilled = infoField("ext_storage_total_num_items_spilled_to_storage:");
+
+    sds reply = debugSpill("key");
+    EXPECT_STREQ(reply, "+OK\r\n");
+    sdsfree(reply);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage:"), 0u);
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage:"), spilled);
+}
+
+TEST_F(DebugSpillTest, RefusesAKeyBeingFetched) {
+    robj *entry = addFlashKey("key");
+    startFetch(entry);
+    ASSERT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_MEMORY);
+
+    sds reply = debugSpill("key");
+    EXPECT_STREQ(reply, "-ERR The key 'key' is being fetched\r\n");
+    sdsfree(reply);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage:"), 0u);
+
+    /* The fetch completes and the value is back in memory. */
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_NE(objectGetVal(entry), nullptr);
+}
+
 #endif /* USE_EXT_STORAGE */

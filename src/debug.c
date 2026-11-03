@@ -297,8 +297,9 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
  * of the digests of their elements. This way the order will not change
  * the result. For list instead we use a feedback entering the output digest
  * as input in order to ensure that a different ordered list will result in
- * a different digest. */
-void computeDatasetDigest(unsigned char *final) {
+ * a different digest.
+ * Returns C_ERR if a value isn't only in memory, since it can't be read. */
+int computeDatasetDigest(unsigned char *final) {
     unsigned char digest[20];
     uint32_t aux;
 
@@ -320,6 +321,11 @@ void computeDatasetDigest(unsigned char *final) {
             sds key;
             robj *keyobj;
 
+            if (!extStorageIsMemoryOnly(o)) {
+                kvstoreIteratorRelease(kvs_it);
+                return C_ERR;
+            }
+
             memset(digest, 0, 20); /* This key-val digest */
             key = objectGetKey(o);
             keyobj = createStringObject(key, sdslen(key));
@@ -334,6 +340,7 @@ void computeDatasetDigest(unsigned char *final) {
         }
         kvstoreIteratorRelease(kvs_it);
     }
+    return C_OK;
 }
 
 #ifdef USE_JEMALLOC
@@ -513,6 +520,10 @@ void debugCommand(client *c) {
             "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
+#ifdef USE_EXT_STORAGE
+            "SPILL <key> [<key> ...]",
+            "    Submit each key's value to the storage engine. Stops at the first key that fails.",
+#endif
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -710,7 +721,8 @@ void debugCommand(client *c) {
         strenc = strEncoding(val->encoding);
 
         char extra[138] = {0};
-        if (val->encoding == OBJ_ENCODING_QUICKLIST) {
+        /* A value being spilled or on flash isn't read. */
+        if (val->encoding == OBJ_ENCODING_QUICKLIST && extStorageIsMemoryOnly(val)) {
             char *nextra = extra;
             int remaining = sizeof(extra);
             quicklist *ql = objectGetVal(val);
@@ -749,7 +761,8 @@ void debugCommand(client *c) {
 #ifdef USE_EXT_STORAGE
         s = sdscatprintf(s, " storage_state:%d", (int)val->storage_state);
 #endif
-        if (!fast) s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
+        if (!fast && extStorageIsMemoryOnly(val))
+            s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
         /* Either lru or lfu field could work correctly which depends on server.maxmemory_policy. */
         if (lrulfu_isUsingLFU()) {
             s = sdscatprintf(s, " lfu_freq:%u lfu_access_time_minutes:%u", objectGetLFUFrequency(val), val->lru >> 8);
@@ -769,7 +782,10 @@ void debugCommand(client *c) {
         }
         key = objectGetKey(val);
 
-        if (val->type != OBJ_STRING || !sdsEncodedObject(val)) {
+        /* TODO(#138): support a value that isn't only in memory. */
+        if (!extStorageIsMemoryOnly(val)) {
+            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
+        } else if (val->type != OBJ_STRING || !sdsEncodedObject(val)) {
             addReplyError(c, "Not an sds encoded string.");
         } else {
             /* Report the complete robj allocation size as the key's allocation
@@ -788,7 +804,10 @@ void debugCommand(client *c) {
 
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr)) == NULL) return;
 
-        if (objectGetEncoding(o) != OBJ_ENCODING_LISTPACK) {
+        /* TODO(#138): support a value that isn't only in memory. */
+        if (!extStorageIsMemoryOnly(o)) {
+            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
+        } else if (objectGetEncoding(o) != OBJ_ENCODING_LISTPACK) {
             addReplyError(c, "Not a listpack encoded object.");
         } else {
             lpRepr(objectGetVal(o));
@@ -801,7 +820,10 @@ void debugCommand(client *c) {
 
         int full = 0;
         if (c->argc == 4) full = atoi(objectGetVal(c->argv[3]));
-        if (objectGetEncoding(o) != OBJ_ENCODING_QUICKLIST) {
+        /* TODO(#138): support a value that isn't only in memory. */
+        if (!extStorageIsMemoryOnly(o)) {
+            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
+        } else if (objectGetEncoding(o) != OBJ_ENCODING_QUICKLIST) {
             addReplyError(c, "Not a quicklist encoded object.");
         } else {
             quicklistRepr(objectGetVal(o), full);
@@ -851,12 +873,25 @@ void debugCommand(client *c) {
         unsigned char digest[20];
         sds d = sdsempty();
 
-        computeDatasetDigest(digest);
+        /* TODO(#138): support a value that isn't only in memory. */
+        if (computeDatasetDigest(digest) == C_ERR) {
+            sdsfree(d);
+            addReplyError(c, "A value isn't in memory");
+            return;
+        }
         for (int i = 0; i < 20; i++) d = sdscatprintf(d, "%02x", digest[i]);
         addReplyStatus(c, d);
         sdsfree(d);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "digest-value") && c->argc >= 2) {
         /* DEBUG DIGEST-VALUE key key ... key. */
+        for (int j = 2; j < c->argc; j++) {
+            robj *o = dbFind(c->db, objectGetVal(c->argv[j]));
+            /* TODO(#138): support a value that isn't only in memory. */
+            if (o && !extStorageIsMemoryOnly(o)) {
+                addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[j]));
+                return;
+            }
+        }
         addReplyArrayLen(c, c->argc - 2);
         for (int j = 2; j < c->argc; j++) {
             unsigned char digest[20];
@@ -943,6 +978,10 @@ void debugCommand(client *c) {
         tv.tv_nsec = (utime % 1000000) * 1000;
         nanosleep(&tv, NULL);
         addReply(c, shared.ok);
+#ifdef USE_EXT_STORAGE
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc >= 3) {
+        extStorageDebugSpillCommand(c);
+#endif
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-active-expire") && c->argc == 3) {
         server.active_expire_enabled = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
@@ -1020,6 +1059,11 @@ void debugCommand(client *c) {
 
         robj *o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr);
         if (o == NULL) return;
+        /* TODO(#138): support a value that isn't only in memory. */
+        if (!extStorageIsMemoryOnly(o)) {
+            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
+            return;
+        }
 
         /* Get the hashtable reference from the object, if possible. */
         hashtable *ht = NULL;

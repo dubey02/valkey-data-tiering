@@ -497,6 +497,47 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     return STORAGE_OK;
 }
 
+/* Most keys one DEBUG SPILL submits.
+ * TODO(#80): drop the cap once spilling is throttled. */
+#define DEBUG_SPILL_MAX_KEYS 256
+
+/* DEBUG SPILL <key> [<key> ...]: submits each key's value to the storage engine. */
+void extStorageDebugSpillCommand(client *c) {
+    if (!extStorageIsActive()) {
+        addReplyError(c, "Data tiering is not enabled");
+        return;
+    }
+    if (c->argc - 2 > DEBUG_SPILL_MAX_KEYS) {
+        addReplyErrorFormat(c, "DEBUG SPILL takes at most %d keys", DEBUG_SPILL_MAX_KEYS);
+        return;
+    }
+    /* Stops at the first key that fails. The keys before it stay submitted. */
+    for (int j = 2; j < c->argc; j++) {
+        sds key = objectGetVal(c->argv[j]);
+        robj *entry = dbFind(c->db, key);
+        if (entry == NULL) {
+            addReplyErrorFormat(c, "No such key '%s'", key);
+            return;
+        }
+        storageState state = getStorageState(entry);
+        /* Already on flash or on its way there, so there's nothing to do. */
+        if (state == STORAGE_STATE_COPYING_TO_FLASH || state == STORAGE_STATE_ONLY_FLASH) continue;
+        if (state == STORAGE_STATE_COPYING_TO_MEMORY) {
+            addReplyErrorFormat(c, "The key '%s' is being fetched", key);
+            return;
+        }
+        if (!isSpillCandidate(entry)) {
+            addReplyErrorFormat(c, "The key '%s' can't be spilled", key);
+            return;
+        }
+        if (extStorageSpillItem(c->db->id, entry) != STORAGE_OK) {
+            addReplyErrorFormat(c, "Spilling the key '%s' failed", key);
+            return;
+        }
+    }
+    addReply(c, shared.ok);
+}
+
 /* Frees the value the way dbSetValue() frees an overwritten one. The object,
  * which holds the key, stays.
  * TODO(#81): pass the key and dbid once module values spill, since a module's
