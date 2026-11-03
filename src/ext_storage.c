@@ -546,7 +546,7 @@ void fetchItem(serverDb *db, robj *key) {
     serverAssert(state == STORAGE_STATE_ONLY_FLASH);
     storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), o);
     if (st != STORAGE_OK) {
-        /* STORAGE_WOULDBLOCK: queue full. TODO: retry later, or reply with an error. */
+        /* STORAGE_WOULDBLOCK: queue full. TODO(#136): retry later, or reply with an error. */
         serverPanic("Storage engine rejected the fetch");
     }
     incrRefCount(o); /* Released in handleGetCompletion. */
@@ -565,7 +565,7 @@ static void handleGetCompletion(const storageCompletion *completion) {
     } else {
         /* Counted before the panic so it shows in the crash report's INFO. */
         ext_storage.stats.total_num_fetch_errors++;
-        serverPanic("Fetch from flash failed"); /* TODO: Proper error handling. */
+        serverPanic("Fetch from flash failed"); /* TODO(#137): Proper error handling. */
     }
 
     robj *entry = completion->request_ctx;

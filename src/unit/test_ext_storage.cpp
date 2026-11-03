@@ -1837,23 +1837,18 @@ class FetchCompletionTest : public SpillSelectTest {
         SpillSelectTest::TearDown();
     }
 
-    /* Stores the key's value in the engine and frees it from memory, as a spill would. */
-    void spill(robj *entry) {
-        sds key = objectGetKey(entry);
-        ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
-        storageMockRunIo(1);
-        storageCompletion comp;
-        ASSERT_EQ(engine->poll_completions(&comp, 1), 1);
-        sdsfree((sds)objectGetVal(entry));
-        objectSetVal(entry, NULL);
-        setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    /* Spills the entry through the real write path, which frees its value. */
+    void spill(robj *entry, int dbid = 0) {
+        ASSERT_EQ(extStorageSpillItem(dbid, entry), STORAGE_OK);
+        extStorageBeforeSleep();
+        ASSERT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
     }
 
     /* Submits a fetch the way a blocked command does. */
-    void startFetch(robj *entry) {
+    void startFetch(robj *entry, int dbid = 0) {
         sds key = objectGetKey(entry);
         robj *k = createStringObject(key, sdslen(key));
-        fetchItem(server.db[0], k);
+        fetchItem(server.db[dbid], k);
         decrRefCount(k); /* the fetch holds the entry, not this key */
     }
 
@@ -1905,12 +1900,129 @@ TEST_F(FetchCompletionTest, AShortStringComesBackAsACopy) {
     EXPECT_EQ(memcmp(objectGetVal(entry), "short", 5), 0);
 }
 
+/* Loading encodes a digit string as an integer. */
+TEST_F(FetchCompletionTest, ADigitStringComesBackAsAnInteger) {
+    robj *entry = addKey("key", createRawStringObject("12345", 5));
+    ASSERT_EQ(entry->encoding, OBJ_ENCODING_RAW);
+    ASSERT_FALSE(entry->hasembval);
+    spill(entry);
+    startFetch(entry);
+
+    extStorageBeforeSleep();
+
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(entry->encoding, OBJ_ENCODING_INT);
+    EXPECT_EQ((long)objectGetVal(entry), 12345);
+}
+
+/* Loading picks each value's encoding from the current config, so it may differ
+ * from the spilled one. Each fetched entry must match what the serializer loads
+ * from the same bytes: same type, same encoding, same DUMP payload. */
+TEST_F(FetchCompletionTest, EverySpillableTypeComesBackAsLoaded) {
+    const storageSerializer *serializer = extStorageSerializer();
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    robj *entries[NUM_TEST_OBJECTS];
+    robj *loaded[NUM_TEST_OBJECTS];
+    int num_spilled = 0;
+    for (int i = 0; i < n; i++) {
+        addOneElement(objs[i]);
+
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addKey(key, objs[i]);
+        /* Embedded and INT strings have no separate value to spill. */
+        if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
+
+        char *bytes;
+        int len = serializer->serialize(key, strlen(key), entry, &bytes);
+        ASSERT_GT(len, 0);
+        loaded[num_spilled] = (robj *)serializer->deserialize(key, strlen(key), bytes, len);
+        serializer->free_serialized(bytes);
+        ASSERT_NE(loaded[num_spilled], nullptr);
+
+        spill(entry);
+        entries[num_spilled++] = entry;
+    }
+    /* All but the embedded and INT strings. */
+    ASSERT_EQ(num_spilled, n - 2);
+
+    for (int i = 0; i < num_spilled; i++) startFetch(entries[i]);
+    extStorageBeforeSleep();
+
+    for (int i = 0; i < num_spilled; i++) {
+        robj *entry = entries[i];
+        sds key = objectGetKey(entry);
+        EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY) << key;
+        EXPECT_EQ(entry->type, loaded[i]->type) << key;
+        /* An embedded value is copied out of the fetched shell as RAW. */
+        int encoding = loaded[i]->encoding == OBJ_ENCODING_EMBSTR ? OBJ_ENCODING_RAW : loaded[i]->encoding;
+        EXPECT_EQ(entry->encoding, encoding) << key;
+
+        char *got, *want;
+        int got_len = serializer->serialize(key, sdslen(key), entry, &got);
+        int want_len = serializer->serialize(key, sdslen(key), loaded[i], &want);
+        EXPECT_TRUE(got_len == want_len && memcmp(got, want, got_len) == 0)
+            << key << " type " << entry->type << " encoding " << strEncoding(entry->encoding);
+        serializer->free_serialized(got);
+        serializer->free_serialized(want);
+        decrRefCount(loaded[i]);
+    }
+}
+
+/* A fetched key was just accessed, so it must look less idle than before the
+ * spill, under LRU and LFU alike. */
+TEST_F(FetchCompletionTest, AFetchedKeyIsTouched) {
+    int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_LFU};
+    for (int i = 0; i < 2; i++) {
+        usePolicy(policies[i]);
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addRawKey(key);
+        objectSetLRUOrLFU(entry, 0, 10000); /* LFU frequency 0, or LRU idle for 10000 seconds */
+        uint32_t idle_before, idle_after;
+        lrulfu_getIdleness(entry->lru, &idle_before);
+        spill(entry);
+        startFetch(entry);
+
+        extStorageBeforeSleep();
+
+        lrulfu_getIdleness(entry->lru, &idle_after);
+        EXPECT_LT(idle_after, idle_before) << "policy " << policies[i];
+    }
+}
+
 TEST_F(FetchCompletionTest, AFailedFetchPanics) {
     robj *entry = addRawKey("key");
     setStorageState(entry, STORAGE_STATE_ONLY_FLASH); /* never spilled, so the engine returns NOT_FOUND */
     startFetch(entry);
-    // todo: match on the assert message instead of passing on any crash
-    EXPECT_DEATH(extStorageBeforeSleep(), "");
+    EXPECT_DEATH(
+        {
+            /* The panic message goes to the server log, which is stdout by default. */
+            server.logfile = (char *)"/dev/stderr";
+            extStorageBeforeSleep();
+        },
+        "Fetch from flash failed");
+    discardCompletions();
+}
+
+/* A spill frees the value, so a fetch that finds one would leak it. */
+TEST_F(FetchCompletionTest, AFetchOntoAnEntryWithAValuePanics) {
+    robj *entry = addRawKey("key");
+    /* Stores the record without freeing the value, which a real spill would do. */
+    sds key = objectGetKey(entry);
+    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
+    storageCompletion comp;
+    ASSERT_EQ(engine->poll_completions(&comp, 1), 1);
+    setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    startFetch(entry);
+
+    EXPECT_DEATH(
+        {
+            server.logfile = (char *)"/dev/stderr";
+            extStorageBeforeSleep();
+        },
+        "objectGetVal\\(entry\\) == NULL");
     discardCompletions();
 }
 
@@ -1996,6 +2108,15 @@ class BlockClientTest : public FetchCompletionTest {
 
     bool isBlocked(client *c) {
         return c->flag.blocked && c->bstate->btype == BLOCKED_INUSE;
+    }
+
+    /* Takes an unblocked client off the reprocessing queue, as
+     * processUnblockedClients does before running its command again. */
+    void resume(client *c) {
+        listNode *ln = listSearchKey(server.unblocked_clients, c);
+        ASSERT_NE(ln, nullptr);
+        listDelNode(server.unblocked_clients, ln);
+        c->flag.unblocked = 0;
     }
 
     uint64_t infoField(const char *field) {
@@ -2132,24 +2253,85 @@ TEST_F(BlockClientTest, AFetchInFlightIsCounted) {
 }
 
 /* The value is still in memory, but a write would race the spill, so the
- * client waits for the PUT completion instead of fetching. */
-TEST_F(BlockClientTest, AKeyBeingCopiedToFlashBlocksWithoutAFetch) {
+ * client waits for the spill to complete without fetching. Run again, it
+ * finds the key on flash and fetches it. */
+TEST_F(BlockClientTest, AKeyBeingCopiedToFlashBlocksUntilTheSpillCompletes) {
     robj *a = addRawKey("a");
-    setStorageState(a, STORAGE_STATE_COPYING_TO_FLASH);
+    ASSERT_EQ(extStorageSpillItem(0, a), STORAGE_OK);
     client *c = makeClient("get a");
     uint64_t fetching_before = numFetching();
 
     EXPECT_TRUE(extStorageBlockClientIfRequired(c));
     EXPECT_TRUE(isBlocked(c));
     EXPECT_EQ(numFetching(), fetching_before);
-    EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_FLASH);
 
-    /* Stands in for the PUT completion, which is not implemented yet. */
-    robj *key = createStringObject("a", 1);
-    unblockClientsInUseOnKey(key);
-    decrRefCount(key);
+    extStorageBeforeSleep(); /* the spill completes and wakes the client */
     EXPECT_FALSE(isBlocked(c));
-    setStorageState(a, STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_FLASH);
+
+    resume(c);
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numFetching(), fetching_before + 1);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* freeClient unblocks a blocked client without queueing it to run again. The
+ * fetch it started still completes. */
+TEST_F(BlockClientTest, AFetchCompletesAfterItsClientIsFreed) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+
+    unblockClient(c, 0); /* as freeClient does */
+    EXPECT_FALSE(isBlocked(c));
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_FALSE(c->flag.unblocked);
+}
+
+/* Clients block on the key name, whatever the db. A fetch of the same name in
+ * another db wakes the client early, and the gate blocks it again. */
+TEST_F(BlockClientTest, AFetchInAnotherDbWakesTheClientToBlockAgain) {
+    server.dbnum = 2;
+    server.db = (serverDb **)zrealloc(server.db, sizeof(serverDb *) * 2);
+    server.db[1] = (serverDb *)zcalloc(sizeof(serverDb));
+    server.db[1]->id = 1;
+    server.db[1]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+    server.db[1]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, 0, 0);
+    /* Reopened so the storage engine accepts db 1. */
+    extStorageDeinit();
+    extStorageInit();
+
+    robj *a0 = addFlashKey("a");
+    setStorageState(a0, STORAGE_STATE_COPYING_TO_MEMORY); /* its fetch hasn't been submitted yet */
+    robj *a1 = addKeyTo(server.db[1], 0, "a", rawValue(), -1);
+    spill(a1, 1);
+    client *c = makeClient("get a"); /* on db 0 */
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+
+    startFetch(a1, 1);
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a0), STORAGE_STATE_COPYING_TO_MEMORY);
+
+    resume(c);
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+
+    /* Fetch db 0's key so the client is released before teardown. */
+    setStorageState(a0, STORAGE_STATE_ONLY_FLASH);
+    startFetch(a0);
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+
+    drainPool();
+    kvstoreRelease(server.db[1]->expires);
+    kvstoreRelease(server.db[1]->keys);
+    zfree(server.db[1]);
+    server.dbnum = 1;
 }
 
 TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
