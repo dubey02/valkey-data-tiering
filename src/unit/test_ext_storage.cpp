@@ -25,6 +25,8 @@ extern "C" {
 #include "storage/storage.h"
 #include "storage/storage_mock.h"
 void extStorageTestResetRegistry(void);
+void fetchItem(serverDb *db, robj *key);
+extern hashtableType commandSetType;
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
 void setStorageState(robj *o, storageState state);
@@ -1806,6 +1808,544 @@ TEST_F(SpillSubmitTest, ACompletedSpillUnblocksClientsOnTheKey) {
 
     ASSERT_EQ(extStorageSpillItem(0, addRawKey("key")), STORAGE_OK);
     ASSERT_EQ(finishSpills(), 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * Fetch completion
+ * ---------------------------------------------------------------------------*/
+
+class FetchCompletionTest : public SpillSelectTest {
+  protected:
+    const storageEngine *engine = storageMockEngine();
+
+    void SetUp() override {
+        SpillSelectTest::SetUp();
+        extStorageTestResetRegistry();
+        server.logfile = zstrdup("");
+        crc64_init();
+        server.ext_storage_enabled = 1;
+        server.ext_storage_engine = zstrdup("mock");
+        server.ext_storage_path = zstrdup("");
+        extStorageInit();
+    }
+
+    void TearDown() override {
+        extStorageDeinit();
+        zfree(server.ext_storage_engine);
+        zfree(server.ext_storage_path);
+        zfree(server.logfile);
+        SpillSelectTest::TearDown();
+    }
+
+    /* Spills the entry through the real write path, which frees its value. */
+    void spill(robj *entry, int dbid = 0) {
+        ASSERT_EQ(extStorageSpillItem(dbid, entry), STORAGE_OK);
+        extStorageBeforeSleep();
+        ASSERT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    }
+
+    /* Submits a fetch the way a blocked command does. */
+    void startFetch(robj *entry, int dbid = 0) {
+        sds key = objectGetKey(entry);
+        robj *k = createStringObject(key, sdslen(key));
+        fetchItem(server.db[dbid], k);
+        decrRefCount(k); /* the fetch holds the entry, not this key */
+    }
+
+    /* Queues deletes until the engine refuses one, so the next request gets
+     * STORAGE_WOULDBLOCK. Their completions are harmless for extStorageDeinit. */
+    void fillEngineQueue() {
+        storageStatus st;
+        while ((st = engine->del_async(0, "filler", 6, nullptr)) == STORAGE_OK);
+        ASSERT_EQ(st, STORAGE_WOULDBLOCK);
+    }
+
+    /* Discards completions left unhandled in the parent of a death test, so
+     * extStorageDeinit does not process them. */
+    void discardCompletions() {
+        storageCompletion comp;
+        while (engine->poll_completions(&comp, 1) == 1) {
+            if (comp.value) decrRefCount((robj *)comp.value);
+            decrRefCount((robj *)comp.request_ctx); /* the fetch's reference on the entry */
+        }
+    }
+};
+
+TEST_F(FetchCompletionTest, AFetchedValueIsBackInMemory) {
+    robj *entry = addRawKey("key");
+    spill(entry);
+    startFetch(entry);
+
+    extStorageBeforeSleep();
+
+    robj *expected = rawValue();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(sdscmp((sds)objectGetVal(entry), (sds)objectGetVal(expected)), 0);
+    decrRefCount(expected);
+}
+
+/* Loading embeds a short string, so its bytes are copied out of the fetched shell. */
+TEST_F(FetchCompletionTest, AShortStringComesBackAsACopy) {
+    robj *entry = addKey("key", createRawStringObject("short", 5));
+    ASSERT_EQ(entry->encoding, OBJ_ENCODING_RAW);
+    ASSERT_FALSE(entry->hasembval);
+    spill(entry);
+    startFetch(entry);
+
+    extStorageBeforeSleep();
+
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(entry->encoding, OBJ_ENCODING_RAW);
+    EXPECT_EQ(sdslen((sds)objectGetVal(entry)), 5u);
+    EXPECT_EQ(memcmp(objectGetVal(entry), "short", 5), 0);
+}
+
+/* Loading encodes a digit string as an integer. */
+TEST_F(FetchCompletionTest, ADigitStringComesBackAsAnInteger) {
+    robj *entry = addKey("key", createRawStringObject("12345", 5));
+    ASSERT_EQ(entry->encoding, OBJ_ENCODING_RAW);
+    ASSERT_FALSE(entry->hasembval);
+    spill(entry);
+    startFetch(entry);
+
+    extStorageBeforeSleep();
+
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(entry->encoding, OBJ_ENCODING_INT);
+    EXPECT_EQ((long)objectGetVal(entry), 12345);
+}
+
+/* Loading picks each value's encoding from the current config, so it may differ
+ * from the spilled one. Each fetched entry must match what the serializer loads
+ * from the same bytes: same type, same encoding, same DUMP payload. */
+TEST_F(FetchCompletionTest, EverySpillableTypeComesBackAsLoaded) {
+    const storageSerializer *serializer = extStorageSerializer();
+    robj *objs[NUM_TEST_OBJECTS];
+    int n = createOneOfEachObject(objs);
+    robj *entries[NUM_TEST_OBJECTS];
+    robj *loaded[NUM_TEST_OBJECTS];
+    int num_spilled = 0;
+    for (int i = 0; i < n; i++) {
+        addOneElement(objs[i]);
+
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addKey(key, objs[i]);
+        /* Embedded and INT strings have no separate value to spill. */
+        if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
+
+        char *bytes;
+        int len = serializer->serialize(key, strlen(key), entry, &bytes);
+        ASSERT_GT(len, 0);
+        loaded[num_spilled] = (robj *)serializer->deserialize(key, strlen(key), bytes, len);
+        serializer->free_serialized(bytes);
+        ASSERT_NE(loaded[num_spilled], nullptr);
+
+        spill(entry);
+        entries[num_spilled++] = entry;
+    }
+    /* All but the embedded and INT strings. */
+    ASSERT_EQ(num_spilled, n - 2);
+
+    for (int i = 0; i < num_spilled; i++) startFetch(entries[i]);
+    extStorageBeforeSleep();
+
+    for (int i = 0; i < num_spilled; i++) {
+        robj *entry = entries[i];
+        sds key = objectGetKey(entry);
+        EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY) << key;
+        EXPECT_EQ(entry->type, loaded[i]->type) << key;
+        /* An embedded value is copied out of the fetched shell as RAW. */
+        int encoding = loaded[i]->encoding == OBJ_ENCODING_EMBSTR ? OBJ_ENCODING_RAW : loaded[i]->encoding;
+        EXPECT_EQ(entry->encoding, encoding) << key;
+
+        char *got, *want;
+        int got_len = serializer->serialize(key, sdslen(key), entry, &got);
+        int want_len = serializer->serialize(key, sdslen(key), loaded[i], &want);
+        EXPECT_TRUE(got_len == want_len && memcmp(got, want, got_len) == 0)
+            << key << " type " << entry->type << " encoding " << strEncoding(entry->encoding);
+        serializer->free_serialized(got);
+        serializer->free_serialized(want);
+        decrRefCount(loaded[i]);
+    }
+}
+
+/* A fetched key was just accessed, so it must look less idle than before the
+ * spill, under LRU and LFU alike. */
+TEST_F(FetchCompletionTest, AFetchedKeyIsTouched) {
+    int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_LFU};
+    for (int i = 0; i < 2; i++) {
+        usePolicy(policies[i]);
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        robj *entry = addRawKey(key);
+        objectSetLRUOrLFU(entry, 0, 10000); /* LFU frequency 0, or LRU idle for 10000 seconds */
+        uint32_t idle_before, idle_after;
+        lrulfu_getIdleness(entry->lru, &idle_before);
+        spill(entry);
+        startFetch(entry);
+
+        extStorageBeforeSleep();
+
+        lrulfu_getIdleness(entry->lru, &idle_after);
+        EXPECT_LT(idle_after, idle_before) << "policy " << policies[i];
+    }
+}
+
+TEST_F(FetchCompletionTest, AFailedFetchPanics) {
+    robj *entry = addRawKey("key");
+    setStorageState(entry, STORAGE_STATE_ONLY_FLASH); /* never spilled, so the engine returns NOT_FOUND */
+    startFetch(entry);
+    EXPECT_DEATH(
+        {
+            /* The panic message goes to the server log, which is stdout by default. */
+            server.logfile = (char *)"/dev/stderr";
+            extStorageBeforeSleep();
+        },
+        "Fetch from flash failed");
+    discardCompletions();
+}
+
+/* A spill frees the value, so a fetch that finds one would leak it. */
+TEST_F(FetchCompletionTest, AFetchOntoAnEntryWithAValuePanics) {
+    robj *entry = addRawKey("key");
+    /* Stores the record without freeing the value, which a real spill would do. */
+    sds key = objectGetKey(entry);
+    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
+    storageCompletion comp;
+    ASSERT_EQ(engine->poll_completions(&comp, 1), 1);
+    setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    startFetch(entry);
+
+    EXPECT_DEATH(
+        {
+            server.logfile = (char *)"/dev/stderr";
+            extStorageBeforeSleep();
+        },
+        "objectGetVal\\(entry\\) == NULL");
+    discardCompletions();
+}
+
+TEST_F(FetchCompletionTest, AFetchForADeletedKeyCompletesOnTheDetachedEntry) {
+    robj *entry = addRawKey("key");
+    spill(entry);
+    startFetch(entry);
+    kvstoreHashtableDelete(server.db[0]->keys, 0, objectGetKey(entry)); /* the fetch still holds the entry */
+
+    /* Puts the value into the detached entry, then frees it. */
+    extStorageBeforeSleep();
+    sds key = sdsnew("key");
+    EXPECT_EQ(dbFind(server.db[0], key), nullptr);
+    sdsfree(key);
+}
+
+/* ---------------------------------------------------------------------------
+ * Client blocking
+ * ---------------------------------------------------------------------------*/
+
+class BlockClientTest : public FetchCompletionTest {
+  protected:
+    static inline hashtable *commands = nullptr;
+    static inline hashtable *orig_commands = nullptr;
+    static inline ConnectionType conn_type = {0};
+    client *clients[8];
+    int num_clients = 0;
+
+    static int setReadHandler(connection *conn, ConnectionCallbackFunc func) {
+        conn->read_handler = func;
+        return C_OK;
+    }
+
+    void SetUp() override {
+        FetchCompletionTest::SetUp();
+        if (!commands) {
+            server.commands = hashtableCreate(&commandSetType);
+            server.orig_commands = hashtableCreate(&commandSetType);
+            populateCommandTable();
+            commands = server.commands;
+            orig_commands = server.orig_commands;
+            conn_type.set_read_handler = setReadHandler;
+        }
+        server.commands = commands;
+        server.orig_commands = orig_commands;
+        server.unblocked_clients = listCreate();
+    }
+
+    void TearDown() override {
+        for (int j = 0; j < num_clients; j++) {
+            client *c = clients[j];
+            for (int i = 0; i < c->argc; i++) decrRefCount(c->argv[i]);
+            zfree(c->argv);
+            freeClientBlockingState(c);
+            zfree(c->conn);
+            zfree(c);
+        }
+        listRelease(server.unblocked_clients);
+        FetchCompletionTest::TearDown();
+    }
+
+    /* A client about to run 'cmdline', such as "mget a b", on db 0. */
+    client *makeClient(const char *cmdline) {
+        client *c = (client *)zcalloc(sizeof(client));
+        sds *args = sdssplitargs(cmdline, &c->argc);
+        c->argv = (robj **)zmalloc(sizeof(robj *) * c->argc);
+        for (int i = 0; i < c->argc; i++) c->argv[i] = createObject(OBJ_STRING, args[i]);
+        zfree(args);
+        c->cmd = lookupCommandByCString((const char *)objectGetVal(c->argv[0]));
+        c->db = server.db[0];
+        c->conn = (connection *)zcalloc(sizeof(connection));
+        c->conn->type = &conn_type;
+        c->flag.pending_command = 1;
+        clients[num_clients++] = c;
+        return c;
+    }
+
+    robj *addFlashKey(const char *key) {
+        robj *entry = addRawKey(key);
+        spill(entry);
+        return entry;
+    }
+
+    bool isBlocked(client *c) {
+        return c->flag.blocked && c->bstate->btype == BLOCKED_INUSE;
+    }
+
+    /* Takes an unblocked client off the reprocessing queue, as
+     * processUnblockedClients does before running its command again. */
+    void resume(client *c) {
+        listNode *ln = listSearchKey(server.unblocked_clients, c);
+        ASSERT_NE(ln, nullptr);
+        listDelNode(server.unblocked_clients, ln);
+        c->flag.unblocked = 0;
+    }
+
+    uint64_t infoField(const char *field) {
+        sds info = extStorageInfoString(sdsempty());
+        const char *p = strstr(info, field);
+        uint64_t n = p ? strtoull(p + strlen(field), nullptr, 10) : 0;
+        sdsfree(info);
+        return n;
+    }
+
+    uint64_t numFetched() {
+        return infoField("ext_storage_total_num_items_fetched_from_storage:");
+    }
+
+    uint64_t numFetching() {
+        return infoField("ext_storage_num_items_fetching_from_storage:");
+    }
+};
+
+TEST_F(BlockClientTest, NoKeysOnFlashDoesNotBlock) {
+    addRawKey("a");
+    addRawKey("b");
+    client *c = makeClient("mget a b");
+
+    EXPECT_FALSE(extStorageBlockClientIfRequired(c));
+    EXPECT_FALSE(c->flag.blocked);
+}
+
+TEST_F(BlockClientTest, AKeylessCommandDoesNotBlock) {
+    client *c = makeClient("ping");
+
+    EXPECT_FALSE(extStorageBlockClientIfRequired(c));
+    EXPECT_FALSE(c->flag.blocked);
+}
+
+TEST_F(BlockClientTest, AKeyOnFlashBlocksUntilFetched) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_TRUE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_MEMORY);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_TRUE(c->flag.unblocked);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(BlockClientTest, MultipleKeysOnFlashBlockUntilAllAreFetched) {
+    robj *a = addFlashKey("a");
+    robj *b = addFlashKey("b");
+    client *c = makeClient("mget a b");
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_TRUE(isBlocked(c));
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(BlockClientTest, OnlyTheKeysOnFlashBlock) {
+    addRawKey("a");
+    addFlashKey("b");
+    client *c = makeClient("mget a b");
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(dictSize(c->bstate->keys), 1u);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+}
+
+/* A command can name new keys alongside keys on flash, like an MSET that
+ * creates one key and overwrites another. A new key has no entry, which must
+ * not crash or block, and must not stop the keys after it from being checked. */
+TEST_F(BlockClientTest, ANewKeyNextToAKeyOnFlashOnlyBlocksOnTheFlashKey) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("mset new 1 a 2");
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(dictSize(c->bstate->keys), 1u);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_MEMORY);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+}
+
+TEST_F(BlockClientTest, StaysBlockedUntilTheLastKeyIsFetched) {
+    addFlashKey("a");
+    robj *b = addFlashKey("b");
+    setStorageState(b, STORAGE_STATE_COPYING_TO_MEMORY); /* its fetch hasn't been submitted yet */
+    client *c = makeClient("mget a b");
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    extStorageBeforeSleep();
+    EXPECT_TRUE(isBlocked(c)); /* a is back, b is not */
+
+    setStorageState(b, STORAGE_STATE_ONLY_FLASH); /* now submit its fetch */
+    startFetch(b);
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+}
+
+TEST_F(BlockClientTest, AKeyBeingCopiedToMemoryBlocksWithoutASecondFetch) {
+    robj *a = addFlashKey("a");
+    uint64_t fetched_before = numFetched();
+    startFetch(a);
+    client *c = makeClient("get a");
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_TRUE(isBlocked(c));
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(numFetched() - fetched_before, 1u);
+}
+
+TEST_F(BlockClientTest, AFetchInFlightIsCounted) {
+    addFlashKey("a");
+    client *c = makeClient("get a");
+    uint64_t fetching_before = numFetching();
+    uint64_t fetched_before = numFetched();
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numFetching() - fetching_before, 1u);
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(numFetching(), fetching_before);
+    EXPECT_EQ(numFetched() - fetched_before, 1u);
+}
+
+/* The value is still in memory, but a write would race the spill, so the
+ * client waits for the spill to complete without fetching. Run again, it
+ * finds the key on flash and fetches it. */
+TEST_F(BlockClientTest, AKeyBeingCopiedToFlashBlocksUntilTheSpillCompletes) {
+    robj *a = addRawKey("a");
+    ASSERT_EQ(extStorageSpillItem(0, a), STORAGE_OK);
+    client *c = makeClient("get a");
+    uint64_t fetching_before = numFetching();
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_TRUE(isBlocked(c));
+    EXPECT_EQ(numFetching(), fetching_before);
+
+    extStorageBeforeSleep(); /* the spill completes and wakes the client */
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_FLASH);
+
+    resume(c);
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numFetching(), fetching_before + 1);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* freeClient unblocks a blocked client without queueing it to run again. The
+ * fetch it started still completes. */
+TEST_F(BlockClientTest, AFetchCompletesAfterItsClientIsFreed) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+
+    unblockClient(c, 0); /* as freeClient does */
+    EXPECT_FALSE(isBlocked(c));
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_FALSE(c->flag.unblocked);
+}
+
+/* Clients block on the key name, whatever the db. A fetch of the same name in
+ * another db wakes the client early, and the gate blocks it again. */
+TEST_F(BlockClientTest, AFetchInAnotherDbWakesTheClientToBlockAgain) {
+    server.dbnum = 2;
+    server.db = (serverDb **)zrealloc(server.db, sizeof(serverDb *) * 2);
+    server.db[1] = (serverDb *)zcalloc(sizeof(serverDb));
+    server.db[1]->id = 1;
+    server.db[1]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+    server.db[1]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, 0, 0);
+    /* Reopened so the storage engine accepts db 1. */
+    extStorageDeinit();
+    extStorageInit();
+
+    robj *a0 = addFlashKey("a");
+    setStorageState(a0, STORAGE_STATE_COPYING_TO_MEMORY); /* its fetch hasn't been submitted yet */
+    robj *a1 = addKeyTo(server.db[1], 0, "a", rawValue(), -1);
+    spill(a1, 1);
+    client *c = makeClient("get a"); /* on db 0 */
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+
+    startFetch(a1, 1);
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a0), STORAGE_STATE_COPYING_TO_MEMORY);
+
+    resume(c);
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+
+    /* Fetch db 0's key so the client is released before teardown. */
+    setStorageState(a0, STORAGE_STATE_ONLY_FLASH);
+    startFetch(a0);
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+
+    drainPool();
+    kvstoreRelease(server.db[1]->expires);
+    kvstoreRelease(server.db[1]->keys);
+    zfree(server.db[1]);
+    server.dbnum = 1;
+}
+
+TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
+    addFlashKey("a");
+    client *c = makeClient("get a");
+    fillEngineQueue();
+
+    EXPECT_DEATH(
+        {
+            /* The panic message goes to the server log, which is stdout by default. */
+            server.logfile = (char *)"/dev/stderr";
+            extStorageBlockClientIfRequired(c);
+        },
+        "Storage engine rejected the fetch");
 }
 
 #endif /* USE_EXT_STORAGE */

@@ -28,6 +28,7 @@ typedef struct serverObject valkeyObject;
 
 /* Result of a storage operation. Negative values are failures. */
 typedef enum {
+    /* Must be returned if the storage engine accepts the request, and on all successful completions. */
     STORAGE_OK = 0,
     /* No record for this (db_id, key), on a get. */
     STORAGE_NOT_FOUND = 1,
