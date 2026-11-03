@@ -20,19 +20,7 @@ endif
 
 .SUFFIXES: .c .so .xo .o
 
-MODULES = helloworld.so hellotype.so helloblock.so hellocluster.so hellotimer.so hellodict.so hellohook.so helloacl.so
-
-# hellostorage registers a storage engine, so it builds only with data
-# tiering. When BUILD_EXT_STORAGE is not passed in, fall back to how the server
-# was built, recorded in src/.make-settings.
-ifeq ($(BUILD_EXT_STORAGE),)
-BUILD_EXT_STORAGE := $(shell sed -n 's/^BUILD_EXT_STORAGE=//p' ../.make-settings 2>/dev/null)
-endif
-ifeq ($(BUILD_EXT_STORAGE),yes)
-MODULES += hellostorage.so
-endif
-
-all: $(MODULES)
+all: helloworld.so hellotype.so helloblock.so hellocluster.so hellotimer.so hellodict.so hellohook.so helloacl.so
 
 .c.xo:
 	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
@@ -75,13 +63,6 @@ hellohook.so: hellohook.xo
 helloacl.xo: ../valkeymodule.h
 
 helloacl.so: helloacl.xo
-	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lc
-
-# hellostorage needs the storage engine interface header.
-hellostorage.xo: hellostorage.c ../valkeymodule.h ../storage/storage.h
-	$(CC) -I. -I.. -I../storage $(CFLAGS) $(SHOBJ_CFLAGS) -fPIC -c $< -o $@
-
-hellostorage.so: hellostorage.xo
 	$(LD) -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lc
 
 clean:

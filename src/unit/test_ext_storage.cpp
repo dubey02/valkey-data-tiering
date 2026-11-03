@@ -66,31 +66,16 @@ static const storageInfoSink stat_map_sink_template = {
 /* ---------------------------------------------------------------------------
  * Mock storage engine
  *
- * These tests drive the mock storage engine with the real serializer. Each one
- * runs twice: once against the storage engine taken natively, and once against
- * the same storage engine reached through the module path (register then look
- * up by name). The module path is what a loaded storage engine module does, so
- * the two give the same storage engine the two ways the valkey server can get
- * it.
+ * These tests drive the mock storage engine with the real serializer.
  * ---------------------------------------------------------------------------*/
 
-/* The storage-engine-acquisition path under test. Native uses the storage
- * engine directly. Module registers a renamed copy and looks it up by name, the
- * way the module's OnLoad does. */
-enum EngineSource { EngineNative,
-                    EngineModule };
-
-class StorageMockTest : public ::testing::TestWithParam<EngineSource> {
+class StorageMockTest : public ::testing::Test {
   protected:
     MockValkey mock;
     RealValkey real;
 
     const storageEngine *engine = nullptr;
     storageConfig cfg = {};
-
-    /* Holds the renamed copy for the module path. It must outlive the test, so
-     * it is a member, not a local. */
-    storageEngine module_engine = {};
 
     void SetUp() override {
         extStorageTestResetRegistry();
@@ -101,16 +86,7 @@ class StorageMockTest : public ::testing::TestWithParam<EngineSource> {
         server.logfile = zstrdup("");
         crc64_init();
 
-        if (GetParam() == EngineModule) {
-            module_engine = *storageMockEngine();
-            module_engine.name = "module_mock";
-            ASSERT_EQ(storageRegisterEngine(&module_engine), STORAGE_OK);
-            engine = storageLookupEngine("module_mock");
-            ASSERT_NE(engine, nullptr);
-        } else {
-            engine = storageMockEngine();
-        }
-
+        engine = storageMockEngine();
         cfg.path = "";
         cfg.capacity_bytes = 0; /* unbounded unless a test overrides it */
         cfg.num_databases = 4;
@@ -228,41 +204,24 @@ class StorageMockTest : public ::testing::TestWithParam<EngineSource> {
     }
 };
 
-/* Registration semantics stand on their own, so they do not run through the
- * parametrized storage-engine source. They register storage engines directly
- * and check the registry's answers. */
-class StorageRegistryTest : public ::testing::Test {
-  protected:
-    MockValkey mock;
-    RealValkey real;
-
-    void SetUp() override {
-        extStorageTestResetRegistry();
-    }
-
-    void TearDown() override {
-        extStorageTestResetRegistry();
-    }
-};
-
-TEST_F(StorageRegistryTest, ARegisteredEngineIsFoundByName) {
+TEST_F(StorageMockTest, ARegisteredEngineIsFoundByName) {
     ASSERT_EQ(storageRegisterEngine(storageMockEngine()), STORAGE_OK);
     ASSERT_NE(storageLookupEngine("mock"), nullptr);
 }
 
-TEST_F(StorageRegistryTest, RejectsAnEngineWithAMismatchedApiVersion) {
+TEST_F(StorageMockTest, RejectsAnEngineWithAMismatchedApiVersion) {
     storageEngine bad = *storageMockEngine();
     bad.api_version = VALKEY_STORAGE_API_VERSION + 1;
     EXPECT_EQ(storageRegisterEngine(&bad), STORAGE_ERR_REJECTED);
     EXPECT_EQ(storageLookupEngine("mock"), nullptr);
 }
 
-TEST_F(StorageRegistryTest, RejectsASecondEngine) {
+TEST_F(StorageMockTest, RejectsASecondEngine) {
     ASSERT_EQ(storageRegisterEngine(storageMockEngine()), STORAGE_OK);
     EXPECT_EQ(storageRegisterEngine(storageMockEngine()), STORAGE_ERR_REJECTED);
 }
 
-TEST_P(StorageMockTest, RefusesToOpenWithoutSerializer) {
+TEST_F(StorageMockTest, RefusesToOpenWithoutSerializer) {
     storageConfig missing_serialize = cfg;
     missing_serialize.serializer.serialize = nullptr;
     EXPECT_EQ(engine->open(&missing_serialize), STORAGE_ERR_REJECTED);
@@ -276,14 +235,14 @@ TEST_P(StorageMockTest, RefusesToOpenWithoutSerializer) {
     EXPECT_EQ(engine->open(&missing_free), STORAGE_ERR_REJECTED);
 }
 
-TEST_P(StorageMockTest, RejectsAnUnknownOption) {
+TEST_F(StorageMockTest, RejectsAnUnknownOption) {
     storageOption opts[] = {{"no-such-option", "1"}};
     cfg.options = opts;
     cfg.num_options = 1;
     EXPECT_EQ(engine->open(&cfg), STORAGE_ERR_REJECTED);
 }
 
-TEST_P(StorageMockTest, RejectsABadDbIdAtSubmit) {
+TEST_F(StorageMockTest, RejectsABadDbIdAtSubmit) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
@@ -296,7 +255,7 @@ TEST_P(StorageMockTest, RejectsABadDbIdAtSubmit) {
     decrRefCount(entry);
 }
 
-TEST_P(StorageMockTest, PutGetDelRoundTrip) {
+TEST_F(StorageMockTest, PutGetDelRoundTrip) {
     openEngine();
     sds key = sdsnew("k1");
     dbEntry *entry = makeEntry(key, "hello");
@@ -330,7 +289,7 @@ TEST_P(StorageMockTest, PutGetDelRoundTrip) {
 /* A keyspace entry carries its key inside the object, and for a short string the
  * value is embedded in the same allocation. Both make the value accessors take
  * branches a keyless object does not. */
-TEST_P(StorageMockTest, EmbeddedKeyEntryRoundTrips) {
+TEST_F(StorageMockTest, EmbeddedKeyEntryRoundTrips) {
     openEngine();
     sds key = sdsnew("embedded");
     dbEntry *entry = makeEntry(key, "value");
@@ -352,7 +311,7 @@ TEST_P(StorageMockTest, EmbeddedKeyEntryRoundTrips) {
 }
 
 /* An entry with an expire shifts the offset of every field that follows it. */
-TEST_P(StorageMockTest, EntryWithAnExpireRoundTrips) {
+TEST_F(StorageMockTest, EntryWithAnExpireRoundTrips) {
     openEngine();
     sds key = sdsnew("volatile");
     dbEntry *entry = makeEntry(key, "value", 1893456000000LL);
@@ -377,7 +336,7 @@ TEST_P(StorageMockTest, EntryWithAnExpireRoundTrips) {
 
 /* A value too large to embed keeps its value in a separate allocation, so the
  * entry takes the val_ptr branch rather than the embedded one. */
-TEST_P(StorageMockTest, UnembeddedValueEntryRoundTrips) {
+TEST_F(StorageMockTest, UnembeddedValueEntryRoundTrips) {
     openEngine();
     sds key = sdsnew("big");
     std::string big(200, 'x');
@@ -398,7 +357,7 @@ TEST_P(StorageMockTest, UnembeddedValueEntryRoundTrips) {
 
 /* An integer value is OBJ_ENCODING_INT, not an sds. It must round-trip through
  * the real serializer as its numeric value. */
-TEST_P(StorageMockTest, IntEncodedValueRoundTrips) {
+TEST_F(StorageMockTest, IntEncodedValueRoundTrips) {
     openEngine();
     sds key = sdsnew("counter");
     dbEntry *entry = makeIntEntry(key, 1234567);
@@ -419,7 +378,7 @@ TEST_P(StorageMockTest, IntEncodedValueRoundTrips) {
 }
 
 /* The same key in two databases is two records. */
-TEST_P(StorageMockTest, KeysAreScopedPerDatabase) {
+TEST_F(StorageMockTest, KeysAreScopedPerDatabase) {
     openEngine();
     sds key = sdsnew("same");
     dbEntry *e0 = makeEntry(key, "in-db-0");
@@ -443,7 +402,7 @@ TEST_P(StorageMockTest, KeysAreScopedPerDatabase) {
     decrRefCount(e2);
 }
 
-TEST_P(StorageMockTest, RejectsOutOfRangeDatabase) {
+TEST_F(StorageMockTest, RejectsOutOfRangeDatabase) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
@@ -452,7 +411,7 @@ TEST_P(StorageMockTest, RejectsOutOfRangeDatabase) {
     decrRefCount(entry);
 }
 
-TEST_P(StorageMockTest, OverwriteReplacesRatherThanAccumulates) {
+TEST_F(StorageMockTest, OverwriteReplacesRatherThanAccumulates) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *first = makeEntry(key, "aaaa");
@@ -476,7 +435,7 @@ TEST_P(StorageMockTest, OverwriteReplacesRatherThanAccumulates) {
     decrRefCount(second);
 }
 
-TEST_P(StorageMockTest, ReportsFullWhenOverCapacity) {
+TEST_F(StorageMockTest, ReportsFullWhenOverCapacity) {
     /* Two serialized five-byte values must not both fit. */
     cfg.capacity_bytes = serializedLen("12345") + 1;
     openEngine();
@@ -501,7 +460,7 @@ TEST_P(StorageMockTest, ReportsFullWhenOverCapacity) {
 
 /* An async request is accepted but not executed at submit. Polling executes
  * the queued work and delivers its completion. */
-TEST_P(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
+TEST_F(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
@@ -528,7 +487,7 @@ TEST_P(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     decrRefCount(entry);
 }
 
-TEST_P(StorageMockTest, AsyncGetDeliversTheValueOnTheCompletion) {
+TEST_F(StorageMockTest, AsyncGetDeliversTheValueOnTheCompletion) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "payload");
@@ -550,7 +509,7 @@ TEST_P(StorageMockTest, AsyncGetDeliversTheValueOnTheCompletion) {
     decrRefCount(entry);
 }
 
-TEST_P(StorageMockTest, AsyncMissReportsNotFoundAndNoValue) {
+TEST_F(StorageMockTest, AsyncMissReportsNotFoundAndNoValue) {
     openEngine();
     sds key = sdsnew("absent");
     int token = 0;
@@ -565,7 +524,7 @@ TEST_P(StorageMockTest, AsyncMissReportsNotFoundAndNoValue) {
     sdsfree(key);
 }
 
-TEST_P(StorageMockTest, CompletionsArriveInSubmissionOrder) {
+TEST_F(StorageMockTest, CompletionsArriveInSubmissionOrder) {
     openEngine();
     sds k1 = sdsnew("k1");
     sds k2 = sdsnew("k2");
@@ -591,7 +550,7 @@ TEST_P(StorageMockTest, CompletionsArriveInSubmissionOrder) {
 
 /* A full request queue must return WOULDBLOCK so the caller can back off and
  * retry. Running the IO thread and draining the completions makes room. */
-TEST_P(StorageMockTest, ReportsWouldBlockWhenTheQueueIsFull) {
+TEST_F(StorageMockTest, ReportsWouldBlockWhenTheQueueIsFull) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
@@ -625,7 +584,7 @@ TEST_P(StorageMockTest, ReportsWouldBlockWhenTheQueueIsFull) {
     decrRefCount(entry);
 }
 
-TEST_P(StorageMockTest, PollingAnIdleEngineReturnsNothing) {
+TEST_F(StorageMockTest, PollingAnIdleEngineReturnsNothing) {
     openEngine();
     storageCompletion comps[4] = {};
     EXPECT_EQ(engine->poll_completions(comps, 4), 0);
@@ -633,7 +592,7 @@ TEST_P(StorageMockTest, PollingAnIdleEngineReturnsNothing) {
 
 /* The key is only lent for the submit call, so the storage engine has to copy it.
  * Overwriting the caller's buffer afterwards must not move the record. */
-TEST_P(StorageMockTest, TheKeyIsOnlyLentForTheCall) {
+TEST_F(StorageMockTest, TheKeyIsOnlyLentForTheCall) {
     openEngine();
     sds key = sdsnew("k1");
     dbEntry *entry = makeEntry(key, "hello");
@@ -658,7 +617,7 @@ TEST_P(StorageMockTest, TheKeyIsOnlyLentForTheCall) {
 }
 
 /* A close after everything was polled leaves no record behind on reopen. */
-TEST_P(StorageMockTest, ClosingAfterPollingKeepsNothing) {
+TEST_F(StorageMockTest, ClosingAfterPollingKeepsNothing) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
@@ -681,7 +640,7 @@ TEST_P(StorageMockTest, ClosingAfterPollingKeepsNothing) {
 
 /* Close is refused while a request is unpolled and the storage engine stays
  * open. Once the request is polled, close goes through. */
-TEST_P(StorageMockTest, CloseIsRefusedWhileARequestIsUnpolled) {
+TEST_F(StorageMockTest, CloseIsRefusedWhileARequestIsUnpolled) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
@@ -700,7 +659,7 @@ TEST_P(StorageMockTest, CloseIsRefusedWhileARequestIsUnpolled) {
 
 /* An IO tick executes only up to its budget. The rest stay queued for a later
  * tick. */
-TEST_P(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
+TEST_F(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
     openEngine();
     sds k1 = sdsnew("k1");
     sds k2 = sdsnew("k2");
@@ -736,13 +695,6 @@ TEST_P(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
     decrRefCount(e2);
     decrRefCount(e3);
 }
-
-/* Every round-trip case runs twice: once against the storage engine taken
- * directly, and once against the same storage engine reached through the module
- * registration path. */
-INSTANTIATE_TEST_SUITE_P(EngineSources, StorageMockTest, ::testing::Values(EngineNative, EngineModule), [](const ::testing::TestParamInfo<EngineSource> &info) {
-    return info.param == EngineModule ? "Module" : "Native";
-});
 
 /* ---------------------------------------------------------------------------
  * Engine serialization

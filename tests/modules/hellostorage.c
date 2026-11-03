@@ -12,17 +12,22 @@
  * It is a complete, if minimal, in-memory storage engine so a third party can
  * see every part a real storage engine must provide.
  *
- * The storage engine keeps serialized value bytes in a per-database hash table.
- * It never touches disk, so the storage logic stays out of the way of the
- * lesson, which is the shape of the interface in src/storage/storage.h.
+ * The storage engine keeps serialized values in an in-memory per-database hash
+ * table. It does not use disk. It only serves as an example of implementing the
+ * interface in src/storage/storage.h.
  *
- * To load it:
- *   valkey-server --loadmodule hellostorage.so \
+ * It is also the storage engine that tests/unit/moduleapi/storage_engine.tcl
+ * loads to test the module path. It builds with the other test modules when
+ * the valkey server is built with BUILD_EXT_STORAGE=yes.
+ *
+ * To build and load it:
+ *   make -C tests/modules hellostorage.so
+ *   valkey-server --loadmodule tests/modules/hellostorage.so \
  *                 --ext-storage-enabled yes \
  *                 --ext-storage-engine hellostorage
  *
- * The real shippable storage engine, FlashCache, lives in its own repository and
- * follows this same shape at production scale. */
+ * The built-in FlashCache storage engine in src/storage/storage_flashcache.c
+ * implements the same interface. */
 
 #include "storage/storage.h"
 #include "valkeymodule.h"
@@ -231,6 +236,7 @@ static storageStatus helloDel(uint32_t db_id, const char *key, size_t key_len) {
  * ---------------------------------------------------------------------------*/
 
 static storageStatus helloSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
+    if (db_id >= hello.num_databases) return STORAGE_ERR_REJECTED;
     /* A full request ring means the storage engine is busy. The valkey server retries. */
     if (hello.requests_len == HELLO_MAX_INFLIGHT) return STORAGE_WOULDBLOCK;
 
