@@ -44,6 +44,7 @@
 #include "forkless.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
+#include "ext_storage.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -688,6 +689,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
 
     /* bgIteration must be notified for flushall. */
     if (dbnum == -1) bgIteration_flushall();
+
+    /* The storage engine may still be reading values that are about to be freed. */
+    extStorageSpillDrain();
 
     /* Fire the flushdb modules event. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_FLUSHDB, VALKEYMODULE_SUBEVENT_FLUSHDB_START, &fi);

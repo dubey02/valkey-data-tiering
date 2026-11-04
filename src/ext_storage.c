@@ -697,4 +697,35 @@ bool extStorageBlockClientIfRequired(client *c) {
     return n > 0;
 }
 
+/* Keys spilled per call, to bound the time spent selecting. */
+#define SPILL_MAX_PER_CALL 64
+
+/* Spills 64 cold keys, or fewer if no candidate is found or the storage engine
+ * refuses one. Returns what eviction must still free: nothing while spills are
+ * in flight, since they free memory once they complete, otherwise all of
+ * mem_tofree.
+ * TODO(#110): spill only what projected memory needs. */
+size_t extStorageSpillToFree(size_t mem_tofree) {
+    if (!extStorageIsActive()) return mem_tofree;
+
+    for (int i = 0; i < SPILL_MAX_PER_CALL; i++) {
+        int dbid;
+        robj *entry = extStorageSpillSelectCandidate(&dbid);
+        if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
+    }
+    return ext_storage.stats.num_items_spilling > 0 ? 0 : mem_tofree;
+}
+
+void extStorageSpillCron(void) {
+    size_t mem_tofree;
+    if (server.loading || getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
+    extStorageSpillToFree(mem_tofree);
+}
+
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void) {
+    if (!ext_storage.open) return;
+    while (ext_storage.stats.num_items_spilling > 0) extStoragePollCompletions();
+}
+
 #endif /* USE_EXT_STORAGE */
