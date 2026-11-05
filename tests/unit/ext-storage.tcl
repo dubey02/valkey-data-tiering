@@ -15,7 +15,7 @@ start_server {tags {"ext-storage"}} {
             assert_error {*ext-storage is not enabled*} {r debug ext-storage pause-foreground 1}
         } {} {needs:debug}
 
-        # FlashCache keeps its file under the test server's own directory.
+        # FlashCache keeps its file in each test valkey server's own directory.
         set engines {
             mock {ext-storage-enabled yes ext-storage-engine mock}
             flashcache {ext-storage-enabled yes ext-storage-engine flashcache ext-storage-path fc ext-storage-capacity 64mb}

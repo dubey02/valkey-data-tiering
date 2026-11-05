@@ -63,9 +63,9 @@ typedef struct extStorageContext {
     int open;
     /* The byte budget the storage engine was opened with. */
     uint64_t capacity_bytes;
-    /* Set by DEBUG EXT-STORAGE PAUSE-FOREGROUND. Completions are not polled. */
+    /* While set, completions are not polled. */
     int foreground_paused;
-    /* Set by DEBUG EXT-STORAGE PAUSE-BACKGROUND. The storage engine starts no new request. */
+    /* While set, the storage engine starts no new request. */
     int background_paused;
     extStorageStats stats;
 } extStorageContext;
@@ -290,8 +290,7 @@ static void extStoragePauseForeground(int paused) {
     ext_storage.foreground_paused = paused;
 }
 
-/* Pauses or resumes the storage engine's processing. Returns false when the
- * storage engine has no pause support. */
+/* Pauses or resumes the storage engine. Returns false if it can't pause. */
 static bool extStoragePauseBackground(int paused) {
     if (ext_storage.engine->pause_processing == NULL) return false;
     ext_storage.engine->pause_processing(paused);
@@ -300,8 +299,8 @@ static bool extStoragePauseBackground(int paused) {
 }
 
 /* Closes the storage engine. Outstanding requests are polled and handled first.
- * Nothing new is submitted, so the drain ends when they finish. A DEBUG pause
- * is lifted first, or the drain would never end. */
+ * Nothing new is submitted, so the drain ends when they finish. Any DEBUG
+ * pause is lifted first. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
     extStoragePauseForeground(0);
@@ -344,9 +343,8 @@ int extStorageIsActive(void) {
 }
 
 /* DEBUG EXT-STORAGE PAUSE-FOREGROUND|PAUSE-BACKGROUND <0|1>
- * Foreground is the main thread handling completions. Background is the
- * storage engine running requests. Tests pause either side to hold a request
- * at a known point. */
+ * Foreground stops completion handling. Background stops the storage engine
+ * from starting requests. */
 static void extStorageDebugPause(client *c, const char *subcommand) {
     if (c->argc != 4) {
         addReplySubcommandSyntaxError(c);
@@ -375,9 +373,8 @@ static void extStorageDebugPause(client *c, const char *subcommand) {
     addReply(c, shared.ok);
 }
 
-/* Handles every DEBUG EXT-STORAGE subcommand. Returns 1 when the command was
- * DEBUG EXT-STORAGE and a reply was sent, 0 when it was some other DEBUG
- * subcommand and nothing was replied. */
+/* Handles DEBUG EXT-STORAGE. Returns 0, without replying, for any other DEBUG
+ * subcommand. */
 int extStorageDebugCommand(client *c) {
     if (c->argc < 3 || strcasecmp(objectGetVal(c->argv[1]), "ext-storage")) return 0;
     if (!ext_storage.open) {

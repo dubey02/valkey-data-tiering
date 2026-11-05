@@ -64,7 +64,7 @@ static struct {
     int completions_head;
     int completions_len;
 
-    /* Set while processing is paused. No request runs. */
+    /* Set while paused. */
     int paused;
 
     /* The counters INFO reports. Everything here runs on the main thread, so
@@ -322,8 +322,7 @@ static storageStatus mockOpen(const storageConfig *cfg) {
     return STORAGE_OK;
 }
 
-/* Requests run on the caller's thread at poll time, so pausing only has to
- * stop that step. */
+/* Stops storageMockRunIo from running requests. */
 static void mockPauseProcessing(int paused) {
     mock.paused = paused;
 }

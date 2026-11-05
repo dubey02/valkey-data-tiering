@@ -32,8 +32,8 @@ void extStorageKillThreads(void);
 /* Returns 1 while a storage engine is open and ready. */
 int extStorageIsActive(void);
 
-/* Handles every DEBUG EXT-STORAGE subcommand. Returns 1 if it replied, 0 if
- * the DEBUG subcommand is not EXT-STORAGE. */
+/* Handles DEBUG EXT-STORAGE. Returns 0, without replying, for any other DEBUG
+ * subcommand. */
 int extStorageDebugCommand(client *c);
 
 /* Appends the Ext_storage INFO fields, the ones the valkey server counts. */

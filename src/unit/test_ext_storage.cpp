@@ -62,9 +62,8 @@ static void sinkBeginDict(void *, const char *) {
 }
 static void sinkEndDict(void *) {
 }
-/* Runs extStorageDebugCommand on DEBUG plus the given arguments. Returns the
- * raw reply and sets *handled to its return value. A module client keeps its
- * reply in its own buffer, so no connection is needed. */
+/* Runs extStorageDebugCommand on DEBUG <args>, returns the raw reply and sets
+ * *handled. A module client keeps the reply in c->buf. */
 static std::string runDebug(int argc, const char **args, int *handled) {
     if (shared.ok == NULL) createSharedObjects();
     client *c = (client *)zcalloc(sizeof(client));
@@ -211,7 +210,7 @@ class StorageMockTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        /* A test that failed while paused must not wedge close. */
+        /* Resume first, so a test that failed while paused still closes. */
         engine->pause_processing(0);
         drainCompletions();
         EXPECT_EQ(engine->close(), STORAGE_OK);
@@ -1911,8 +1910,8 @@ TEST_F(SpillSubmitTest, ACompletedSpillUnblocksClientsOnTheKey) {
     ASSERT_EQ(finishSpills(), 1);
 }
 
-/* Other DEBUG subcommands are left for debug.c with no reply. Every
- * EXT-STORAGE form is handled here, a bad one with a syntax error. */
+/* Other DEBUG subcommands return 0 with no reply. Any EXT-STORAGE form returns
+ * 1, a bad one with a syntax error. */
 TEST_F(SpillSubmitTest, DebugDispatchClaimsOnlyExtStorage) {
     int handled = -1;
     const char *other[] = {"sleep", "0"};
@@ -1934,8 +1933,8 @@ TEST_F(SpillSubmitTest, DebugDispatchClaimsOnlyExtStorage) {
     EXPECT_EQ(debugExtStorage("pause-foreground", "0"), "+OK\r\n");
 }
 
-/* A storage engine without pause_processing refuses PAUSE-BACKGROUND and
- * stays unpaused. PAUSE-FOREGROUND still works, since the valkey server owns it. */
+/* Without pause_processing, PAUSE-BACKGROUND is refused. PAUSE-FOREGROUND
+ * still works. */
 TEST_F(SpillSubmitTest, PauseBackgroundIsRefusedWithoutStorageEngineSupport) {
     extStorageDeinit();
     static storageEngine no_pause;
@@ -2554,7 +2553,7 @@ TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
 
 class ExtStoragePauseTest : public SpillSelectTest, public ::testing::WithParamInterface<const char *> {
   protected:
-    /* Data directory for FlashCache, pid-unique so parallel runs never collide. */
+    /* Per-test FlashCache directory, pid-unique for parallel runs. */
     char data_dir[256];
     char data_file[300];
 
@@ -2601,7 +2600,7 @@ class ExtStoragePauseTest : public SpillSelectTest, public ::testing::WithParamI
         if (isMock()) storageMockRunIo(1000);
     }
 
-    /* One event loop pass: the storage engine runs, then completions are handled. */
+    /* One event loop pass. Runs the storage engine, then handles completions. */
     void pump() {
         runStorageEngine();
         extStorageBeforeSleep();
@@ -2627,7 +2626,7 @@ class ExtStoragePauseTest : public SpillSelectTest, public ::testing::WithParamI
         return true;
     }
 
-    /* Records the storage engine holds, from its INFO fields. */
+    /* Number of records the storage engine holds, read from its INFO fields. */
     unsigned long long storageEngineItems() {
         sds info = extStorageEngineInfoString(sdsempty());
         const char *field = "storage_engine_total_num_items:";
@@ -2673,7 +2672,7 @@ class ExtStoragePauseTest : public SpillSelectTest, public ::testing::WithParamI
         decrRefCount(k);
     }
 
-    /* The 200-byte raw value addRawKey stores is back in memory. */
+    /* Checks the 200-byte value from addRawKey is back in memory. */
     void expectValueBack(robj *entry) {
         ASSERT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
         ASSERT_NE(objectGetVal(entry), nullptr);
@@ -2726,7 +2725,7 @@ TEST_P(ExtStoragePauseTest, AFinishedFetchWaitsWhileTheForegroundIsPaused) {
     spill(entry);
     ASSERT_EQ(debugExtStorage("pause-foreground", "1"), "+OK\r\n");
     startFetch(entry);
-    /* A get consumes the record, so the storage engine is done at zero. */
+    /* A get consumes the record, so zero means the fetch ran. */
     ASSERT_TRUE(waitForStorageEngineItems(0));
 
     EXPECT_TRUE(staysInState(entry, STORAGE_STATE_COPYING_TO_MEMORY));

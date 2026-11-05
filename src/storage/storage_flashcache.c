@@ -117,8 +117,7 @@ static struct {
     pthread_mutex_t wake_mutex;
     pthread_cond_t wake_cond;
 
-    /* Set while processing is paused. No new request is taken. Guarded by
-     * wake_mutex. */
+    /* Set while paused. Guarded by wake_mutex. */
     int paused;
 
     /* Counters the IO thread owns. Nothing else reads them. */
@@ -260,8 +259,8 @@ static void fcWaitForWork(void) {
     pthread_mutex_unlock(&fc_io.wake_mutex);
 }
 
-/* Takes the next request, or NULL while paused. The check and the pop share
- * wake_mutex, so nothing is taken once fcPauseProcessing has returned. */
+/* Returns the next request, or NULL while paused. Holds wake_mutex so no
+ * request is taken once fcPauseProcessing returns. */
 static fcRequest *fcPopRequest(void) {
     pthread_mutex_lock(&fc_io.wake_mutex);
     fcRequest *r = fc_io.paused ? NULL : mutexQueuePop(fc_io.requests, false);
@@ -371,8 +370,8 @@ static void fcInfo(const storageInfoSink *s) {
     s->add_ulong_long(s->ctx, "total_num_disk_writes", snap.num_disk_writes);
 }
 
-/* While paused, the IO thread takes no new request but still runs
- * FlashCache's cron, so a request it already started can finish. */
+/* While paused, cron keeps running, so a request already handed to
+ * FlashCache can finish. */
 static void fcPauseProcessing(int paused) {
     if (!fc_io.running) return;
     pthread_mutex_lock(&fc_io.wake_mutex);
@@ -578,7 +577,7 @@ static storageStatus fcOpen(const storageConfig *cfg) {
 /* Stops the IO thread and tears FlashCache down. */
 static storageStatus fcClose(void) {
     if (!fc_io.running) return STORAGE_OK;
-    /* A paused IO thread would never take the stop request. */
+    /* A paused IO thread never takes the stop request. */
     assert(!fc_io.paused);
     /* An unpolled completion may hold a fetched value nobody else owns. */
     if (fc_io.outstanding > 0) return STORAGE_WOULDBLOCK;
