@@ -69,13 +69,13 @@ static int serialize_calls = 0;
 static pthread_t serialize_thread;
 static const char *serialize_key_ptr;
 static char serialize_key[16];
-static int (*real_serialize)(const char *, size_t, const valkeyObject *, char **);
-static int recordingSerialize(const char *key, size_t key_len, const valkeyObject *entry, char **out) {
+static int (*real_serialize)(const char *, size_t, const valkeyObject *, void *, char **);
+static int recordingSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
     serialize_thread = pthread_self();
     serialize_calls++;
     serialize_key_ptr = key;
     snprintf(serialize_key, sizeof(serialize_key), "%.*s", (int)key_len, key);
-    return real_serialize(key, key_len, entry, out);
+    return real_serialize(key, key_len, entry, request_ctx, out);
 }
 
 class StorageFlashCacheTest : public ::testing::Test {

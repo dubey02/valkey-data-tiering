@@ -85,14 +85,22 @@ static void extStorageReleaseLoadingLock(void) {
 /* Serialization and Deserialization Functions
  * The storage engine may call these from its own IO thread. */
 
-/* Serialize in the DUMP wire format, so every type and encoding is handled. */
-static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, char **out) {
+/* A put in flight, passed to the engine as its request_ctx. */
+typedef struct spillRequest {
+    robj *entry;
+    extStorageSpillSizing sizing;
+} spillRequest;
+
+/* Serialize in the DUMP wire format, so every type and encoding is handled.
+ * Records the spill's size in sizing, if it isn't NULL. */
+static int serializeEntry(const char *key, size_t key_len, const valkeyObject *entry, extStorageSpillSizing *sizing, char **out) {
     sds key_sds = sdsnewlen(key, key_len);
     robj key_obj;
     initStaticStringObject(key_obj, key_sds);
 
     rio payload;
-    createDumpPayload(&payload, (robj *)entry, &key_obj, -1);
+    size_t ram_bytes = 0;
+    createDumpPayloadSized(&payload, (robj *)entry, &key_obj, -1, sizing ? &ram_bytes : NULL);
     sdsfree(key_sds);
 
     size_t len = sdslen(payload.io.buffer.ptr);
@@ -101,8 +109,21 @@ static int extStorageSerialize(const char *key, size_t key_len, const valkeyObje
         *out = NULL;
         return -1;
     }
+    if (sizing) extStorageSpillAccountSized(sizing, ram_bytes);
     *out = payload.io.buffer.ptr;
     return (int)len;
+}
+
+static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
+    UNUSED(request_ctx);
+    return serializeEntry(key, key_len, entry, NULL, out);
+}
+
+/* Like extStorageSerialize(), for puts from extStorageSpillItem(). */
+static int spillSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
+    spillRequest *req = request_ctx;
+    serverAssert(req);
+    return serializeEntry(key, key_len, entry, &req->sizing, out);
 }
 
 static valkeyObject *extStorageDeserialize(const char *key, size_t key_len, const char *bytes, int len) {
@@ -222,7 +243,7 @@ void extStorageInit(void) {
         .path = server.ext_storage_path,
         .capacity_bytes = server.ext_storage_capacity,
         .num_databases = (uint32_t)server.dbnum,
-        .serializer = ext_storage_serializer,
+        .serializer = {spillSerialize, extStorageDeserialize, extStorageFreeSerialized},
         .thread_config = ext_storage_thread_config,
         .logger = extStorageLog,
         .monotonic_clock_us = getMonotonicUs,
@@ -489,11 +510,6 @@ robj *extStorageSpillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(server.ext_storage_spill_policy, isSpillCandidate, dbid);
 }
 
-/* A put in flight, passed to the engine as its request_ctx. */
-typedef struct spillRequest {
-    robj *entry;
-} spillRequest;
-
 /* Submits an item to the storage engine, which borrows it until the completion
  * is polled. On any status other than STORAGE_OK nothing changes. */
 storageStatus extStorageSpillItem(int dbid, robj *entry) {
@@ -501,11 +517,13 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
 
     spillRequest *req = zmalloc(sizeof(*req));
     req->entry = entry;
+    extStorageSpillAccountSubmit(&req->sizing);
     sds key = objectGetKey(entry);
     incrRefCount(entry); /* Released in spillComplete(), keeps defrag from moving the entry. */
     storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
     if (status != STORAGE_OK) {
         decrRefCount(entry);
+        extStorageSpillAccountFinish(&req->sizing);
         zfree(req);
         return status;
     }
@@ -594,6 +612,7 @@ static void spillComplete(const storageCompletion *comp) {
 
     spillFreeValue(entry);
     setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    extStorageSpillAccountFinish(&req->sizing);
     ext_storage.stats.num_items_spilling--;
     ext_storage.stats.total_num_items_spilled++;
 
@@ -719,16 +738,21 @@ bool extStorageBlockClientIfRequired(client *c) {
 /* Keys spilled per call, to bound the time spent selecting. */
 #define SPILL_MAX_PER_CALL 64
 
-/* Spills 64 cold keys, or fewer if no candidate is found or the storage engine
- * refuses one. Returns false when writes must be rejected: used memory is over
- * 1.2x maxmemory, or nothing could be spilled and no spill is in flight.
- * Otherwise the spills in flight free memory once they complete.
- * TODO(#110): spill only what projected memory needs, make the cap a config,
- * and throttle writes below it. */
+/* Spills cold keys until used memory, minus what spills in flight will free,
+ * is under maxmemory. Spills at most 64, or fewer if no candidate is found or
+ * the storage engine refuses one. The first call spills 64, since no spill
+ * size is known yet. Returns false when writes must be rejected: used memory
+ * is over 1.2x maxmemory, or nothing could be spilled and no spill is in
+ * flight.
+ * TODO(#110): make the cap a config, and throttle writes below it. A value
+ * freed in the background stops counting as in flight before its memory is
+ * freed, so a few extra keys may be spilled. */
 bool extStorageSpillOverMaxmemory(void) {
     if (!extStorageIsActive()) return true;
 
-    for (int i = 0; i < SPILL_MAX_PER_CALL; i++) {
+    for (int i = 0;
+         i < SPILL_MAX_PER_CALL && zmalloc_used_memory() > server.maxmemory + extStorageSpillAccountInflightRamBytes();
+         i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;

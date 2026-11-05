@@ -188,7 +188,7 @@ class StorageMockTest : public ::testing::Test {
     size_t serializedLen(const char *s) {
         robj *o = createStringObject(s, strlen(s));
         char *bytes = nullptr;
-        int len = cfg.serializer.serialize("k", 1, o, &bytes);
+        int len = cfg.serializer.serialize("k", 1, o, NULL, &bytes);
         cfg.serializer.free_serialized(bytes);
         decrRefCount(o);
         return (size_t)len;
@@ -744,7 +744,7 @@ TEST_F(ExtStorageSerializerTest, StringValueSurvivesTheRoundTrip) {
     dbEntry *entry = makeEntry("mykey", "some value");
 
     char *bytes = nullptr;
-    int len = s->serialize("mykey", 5, entry, &bytes);
+    int len = s->serialize("mykey", 5, entry, NULL, &bytes);
     ASSERT_GT(len, 0);
     ASSERT_NE(bytes, nullptr);
 
@@ -770,8 +770,8 @@ TEST_F(ExtStorageSerializerTest, TheKeyIsNotPartOfTheRecord) {
 
     char *a = nullptr;
     char *b = nullptr;
-    int alen = s->serialize("short", 5, e1, &a);
-    int blen = s->serialize("a-much-longer-key", 17, e2, &b);
+    int alen = s->serialize("short", 5, e1, NULL, &a);
+    int blen = s->serialize("a-much-longer-key", 17, e2, NULL, &b);
     ASSERT_GT(alen, 0);
     ASSERT_EQ(alen, blen);
     EXPECT_EQ(memcmp(a, b, (size_t)alen), 0);
@@ -794,8 +794,8 @@ TEST_F(ExtStorageSerializerTest, AnExpireIsNotPartOfTheRecord) {
 
     char *a = nullptr;
     char *b = nullptr;
-    int alen = s->serialize("k", 1, with, &a);
-    int blen = s->serialize("k", 1, without, &b);
+    int alen = s->serialize("k", 1, with, NULL, &a);
+    int blen = s->serialize("k", 1, without, NULL, &b);
     ASSERT_GT(alen, 0);
     ASSERT_EQ(alen, blen);
     EXPECT_EQ(memcmp(a, b, (size_t)alen), 0);
@@ -816,7 +816,7 @@ TEST_F(ExtStorageSerializerTest, RejectsAMalformedBuffer) {
     // valid type but fail verification.
     dbEntry *entry = makeEntry("k", "some value");
     char *bytes = nullptr;
-    int len = s->serialize("k", 1, entry, &bytes);
+    int len = s->serialize("k", 1, entry, NULL, &bytes);
     ASSERT_GT(len, 10);
     EXPECT_EQ(s->deserialize("k", 1, bytes, len - 4), nullptr);
     s->free_serialized(bytes);
@@ -876,7 +876,7 @@ TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndNoDbId) {
     observed_saves = 0;
 
     char *bytes = nullptr;
-    int len = s->serialize(key, sdslen(key), entry, &bytes);
+    int len = s->serialize(key, sdslen(key), entry, NULL, &bytes);
     ASSERT_GT(len, 0);
     ASSERT_EQ(observed_saves, 1);
     EXPECT_EQ(observed_key, "mykey");
@@ -1543,6 +1543,7 @@ class SpillSubmitTest : public SpillSelectTest {
         server.ext_storage_engine = zstrdup("mock");
         server.ext_storage_path = zstrdup("");
         extStorageInit();
+        extStorageTestResetSpillAccount();
     }
 
     void TearDown() override {
@@ -2421,7 +2422,7 @@ TEST_F(FetchCompletionTest, EverySpillableTypeComesBackAsLoaded) {
         if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
 
         char *bytes;
-        int len = serializer->serialize(key, strlen(key), entry, &bytes);
+        int len = serializer->serialize(key, strlen(key), entry, NULL, &bytes);
         ASSERT_GT(len, 0);
         loaded[num_spilled] = (robj *)serializer->deserialize(key, strlen(key), bytes, len);
         serializer->free_serialized(bytes);
@@ -2446,8 +2447,8 @@ TEST_F(FetchCompletionTest, EverySpillableTypeComesBackAsLoaded) {
         EXPECT_EQ(entry->encoding, encoding) << key;
 
         char *got, *want;
-        int got_len = serializer->serialize(key, sdslen(key), entry, &got);
-        int want_len = serializer->serialize(key, sdslen(key), loaded[i], &want);
+        int got_len = serializer->serialize(key, sdslen(key), entry, NULL, &got);
+        int want_len = serializer->serialize(key, sdslen(key), loaded[i], NULL, &want);
         EXPECT_TRUE(got_len == want_len && memcmp(got, want, got_len) == 0)
             << key << " type " << entry->type << " encoding " << strEncoding(entry->encoding);
         serializer->free_serialized(got);
@@ -2495,12 +2496,8 @@ TEST_F(FetchCompletionTest, AFailedFetchPanics) {
 /* A spill frees the value, so a fetch that finds one would leak it. */
 TEST_F(FetchCompletionTest, AFetchOntoAnEntryWithAValuePanics) {
     robj *entry = addRawKey("key");
-    /* Stores the record without freeing the value, which a real spill would do. */
-    sds key = objectGetKey(entry);
-    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
-    storageCompletion comp;
-    ASSERT_EQ(engine->poll_completions(&comp, 1), 1);
-    setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
+    spill(entry);
+    objectSetVal(entry, sdsnew("v")); /* A value that a real spill would have freed. */
     startFetch(entry);
 
     EXPECT_DEATH(
@@ -2929,7 +2926,7 @@ TEST_F(DebugSpillTest, ADebugReadOfAKeyBeingSpilledFails) {
 /* While spills are in flight, writes are allowed: the spills free memory once
  * they complete. */
 TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
-    server.maxmemory = 100000000;
+    server.maxmemory = zmalloc_used_memory() - 1;
     robj *coldest = addRawKey("coldest");
     objectSetLRUOrLFU(coldest, -1, 1000);
     objectSetLRUOrLFU(addRawKey("hot"), -1, 10);
@@ -2942,7 +2939,7 @@ TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
 
 /* Writes are rejected when no key can be spilled. */
 TEST_F(SpillSubmitTest, RejectsWritesWhenNothingCanBeSpilled) {
-    server.maxmemory = 100000000;
+    server.maxmemory = zmalloc_used_memory() - 1;
     addKey("embedded", createStringObject("short", 5));
     EXPECT_FALSE(extStorageSpillOverMaxmemory());
     server.maxmemory = 0;
@@ -2952,7 +2949,7 @@ TEST_F(SpillSubmitTest, RejectsWritesWhenNothingCanBeSpilled) {
  * but the keys are still spilled. */
 TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhileStillSpilling) {
     addRawKey("key");
-    server.maxmemory = zmalloc_used_memory(); /* At maxmemory, under the cap. */
+    server.maxmemory = zmalloc_used_memory() - 1; /* Just over maxmemory, under the cap. */
     EXPECT_TRUE(extStorageSpillOverMaxmemory());
     ASSERT_EQ(finishSpills(), 1);
 
@@ -2972,10 +2969,50 @@ TEST_F(SpillSubmitTest, SpillsAtMostTheLimitPerCall) {
         snprintf(key, sizeof(key), "key%d", i);
         addRawKey(key);
     }
-    server.maxmemory = 100000000;
+    server.maxmemory = zmalloc_used_memory() - 1;
     EXPECT_TRUE(extStorageSpillOverMaxmemory());
     EXPECT_EQ(finishSpills(), 64);
     server.maxmemory = 0;
+}
+
+/* The first spill sets the mean, so the next call spills only what covers the
+ * deficit. Large values keep the spill requests' own memory out of the count. */
+TEST_F(SpillSubmitTest, SpillsOnlyWhatTheDeficitNeeds) {
+    server.maxmemory_samples = 128;
+    static char val[4000];
+    memset(val, 'v', sizeof(val));
+    robj *first = addKey("first", createStringObject(val, sizeof(val)));
+    size_t bytes = sdsAllocSize((sds)objectGetVal(first));
+    ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
+    finishSpills();
+
+    for (int i = 0; i < 10; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        addKey(key, createStringObject(val, sizeof(val)));
+    }
+    server.maxmemory = zmalloc_used_memory() - bytes - bytes / 2; /* 1.5 values over. */
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 0;
+    EXPECT_EQ(finishSpills(), 2);
+}
+
+/* A spill that is serialized but not completed counts as its measured size. */
+TEST_F(SpillSubmitTest, ASerializedSpillCoversTheDeficit) {
+    server.maxmemory_samples = 128;
+    static char val[4000];
+    memset(val, 'v', sizeof(val));
+    robj *first = addKey("first", createStringObject(val, sizeof(val)));
+    size_t bytes = sdsAllocSize((sds)objectGetVal(first));
+    ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
+    ASSERT_EQ(storageMockRunIo(1), 1); /* Serialized, completion not polled. */
+
+    robj *second = addKey("second", createStringObject(val, sizeof(val)));
+    server.maxmemory = zmalloc_used_memory() - bytes / 2;
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 0;
+    EXPECT_EQ(getStorageState(second), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(getStorageState(first), STORAGE_STATE_COPYING_TO_FLASH);
 }
 
 TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
@@ -3003,7 +3040,7 @@ TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
  * the values it would free. */
 TEST_F(SpillSubmitTest, AFlushWaitsForSpillsInFlight) {
     robj *entry = addRawKey("key");
-    server.maxmemory = 100000000;
+    server.maxmemory = zmalloc_used_memory() - 1;
     ASSERT_TRUE(extStorageSpillOverMaxmemory());
     server.maxmemory = 0;
     ASSERT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
