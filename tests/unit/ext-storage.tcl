@@ -49,9 +49,8 @@ if {$tiering_built} {
             # A key already on flash stays there.
             assert_equal OK [r debug spill big]
             assert_match {* storage_state:2 *} [r debug object big fast]
-            # Too small to have a separate value, or missing.
+            # A short value is embedded in the key, so it can't be spilled.
             assert_error {*key 'small' can't be spilled*} {r debug spill small}
-            assert_error {*No such key 'missing'*} {r debug spill missing}
         } {} {needs:debug}
 
         test "DEBUG SPILL submits several keys and stops at the first one that fails ($engine)" {

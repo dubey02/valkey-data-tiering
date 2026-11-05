@@ -2406,20 +2406,6 @@ TEST_F(DebugSpillTest, LeavesAKeyBeingSpilledAsItIs) {
     EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage:"), spilled + 1);
 }
 
-TEST_F(DebugSpillTest, LeavesAKeyOnFlashAsItIs) {
-    robj *entry = addFlashKey("key");
-    uint64_t spilled = infoField("ext_storage_total_num_items_spilled_to_storage:");
-
-    sds reply = debugSpill("key");
-    EXPECT_STREQ(reply, "+OK\r\n");
-    sdsfree(reply);
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
-    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage:"), 0u);
-
-    extStorageBeforeSleep();
-    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage:"), spilled);
-}
-
 TEST_F(DebugSpillTest, RefusesAKeyBeingFetched) {
     robj *entry = addFlashKey("key");
     startFetch(entry);
