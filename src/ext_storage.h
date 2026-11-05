@@ -57,7 +57,8 @@ storageStatus extStorageSpillItem(int dbid, robj *entry);
  * SPILL <key> [<key> ...] submits each key's value to the storage engine, in
  * order. A key already being spilled or on flash is left as it is. Replies
  * with an error at the first key that is missing, can't be spilled, or the
- * storage engine doesn't accept. */
+ * storage engine doesn't accept.
+ * PAUSE-FOREGROUND and PAUSE-BACKGROUND take <0|1> and pause either side. */
 int extStorageDebugCommand(client *c);
 
 /* Whether the value is only in DRAM, so it can be moved or freed. */
