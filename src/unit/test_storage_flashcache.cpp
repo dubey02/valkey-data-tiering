@@ -214,6 +214,8 @@ class StorageFlashCacheTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        /* A test that failed while paused must not wedge close. */
+        engine->pause_processing(0);
         drainAndClose();
         extStorageTestResetRegistry();
         zfree(server.logfile);
@@ -702,6 +704,128 @@ TEST_F(StorageFlashCacheTest, NonStringTypeSurvivesTheRoundTrip) {
 
     sdsfree(key);
     decrRefCount(entry);
+}
+
+/* While paused, a put is accepted but never completes, even given far more
+ * time than it needs. Once resumed it completes and the value reads back. */
+TEST_F(StorageFlashCacheTest, NothingCompletesWhilePaused) {
+    openEngine();
+    sds key = sdsnew("k");
+    dbEntry *entry = makeEntry(key, "paused-value");
+
+    engine->pause_processing(1);
+    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
+    storageCompletion comp = {};
+    for (int i = 0; i < 50; i++) {
+        ASSERT_EQ(engine->poll_completions(&comp, 1), 0) << "a request completed while paused";
+        usleep(WAIT_STEP_US);
+    }
+
+    engine->pause_processing(0);
+    ASSERT_EQ(waitForCompletions(&comp), 1);
+    EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+
+    comp = getAndWait(0, key);
+    ASSERT_EQ(comp.status, STORAGE_OK);
+    robj *got = (robj *)comp.value;
+    EXPECT_STREQ((const char *)objectGetVal(got), "paused-value");
+    decrRefCount(got);
+
+    sdsfree(key);
+    decrRefCount(entry);
+}
+
+/* A completion that finished before the pause can still be polled. */
+TEST_F(StorageFlashCacheTest, ACompletionFromBeforeThePauseCanBePolled) {
+    openEngine();
+    sds key = sdsnew("k");
+    dbEntry *entry = makeEntry(key, "v");
+    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
+    /* The IO thread queues the completion before it counts the item. */
+    ASSERT_TRUE(waitForStat("total_num_items", [](unsigned long long n) { return n == 1; }));
+
+    engine->pause_processing(1);
+    storageCompletion comp = {};
+    EXPECT_EQ(engine->poll_completions(&comp, 1), 1);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+
+    engine->pause_processing(0);
+    sdsfree(key);
+    decrRefCount(entry);
+}
+
+/* A paused storage engine returns the same codes at submit as a running one. */
+TEST_F(StorageFlashCacheTest, SubmitReturnsTheUsualCodesWhilePaused) {
+    openEngine();
+    engine->pause_processing(1);
+    sds key = sdsnew("k");
+    EXPECT_EQ(engine->get_async(cfg.num_databases, key, sdslen(key), nullptr), STORAGE_ERR_REJECTED);
+
+    int accepted = 0;
+    for (int i = 0; i < 1000; i++) {
+        if (engine->get_async(0, key, sdslen(key), nullptr) != STORAGE_OK) break;
+        accepted++;
+    }
+    ASSERT_GT(accepted, 0);
+    EXPECT_EQ(engine->get_async(0, key, sdslen(key), nullptr), STORAGE_WOULDBLOCK);
+
+    engine->pause_processing(0);
+    sdsfree(key);
+}
+
+/* A second pause and a second resume are harmless. Requests then flow again. */
+TEST_F(StorageFlashCacheTest, PausingAndResumingTwiceIsHarmless) {
+    openEngine();
+    engine->pause_processing(1);
+    engine->pause_processing(1);
+    sds key = sdsnew("k");
+    dbEntry *entry = makeEntry(key, "v");
+    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
+    storageCompletion comp = {};
+    EXPECT_EQ(engine->poll_completions(&comp, 1), 0);
+
+    engine->pause_processing(0);
+    engine->pause_processing(0);
+    ASSERT_EQ(waitForCompletions(&comp), 1);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+    sdsfree(key);
+    decrRefCount(entry);
+}
+
+/* Pausing and resuming while requests flow drops and repeats nothing. */
+TEST_F(StorageFlashCacheTest, PausingUnderLoadLosesNoRequest) {
+    openEngine();
+    const int total = 2000;
+    static int seen[total];
+    static sds keys[total];
+    static dbEntry *entries[total];
+    memset(seen, 0, sizeof(seen));
+    for (int i = 0; i < total; i++) {
+        keys[i] = sdscatprintf(sdsempty(), "key-%d", i);
+        entries[i] = makeEntry(keys[i], "v");
+    }
+
+    int completed = 0;
+    for (int i = 0; i < total; i++) {
+        if (i % 50 == 0) engine->pause_processing(1);
+        if (i % 50 == 25) engine->pause_processing(0);
+        storageStatus st;
+        while ((st = engine->put_async(0, keys[i], sdslen(keys[i]), entries[i], (void *)(intptr_t)i)) ==
+               STORAGE_WOULDBLOCK) {
+            engine->pause_processing(0);
+            ASSERT_NO_FATAL_FAILURE(collectCompletions(seen, &completed));
+        }
+        ASSERT_EQ(st, STORAGE_OK);
+    }
+    engine->pause_processing(0);
+    while (completed < total) ASSERT_NO_FATAL_FAILURE(collectCompletions(seen, &completed));
+    for (int i = 0; i < total; i++) EXPECT_EQ(seen[i], 1) << "request " << i;
+
+    for (int i = 0; i < total; i++) {
+        sdsfree(keys[i]);
+        decrRefCount(entries[i]);
+    }
 }
 
 #endif /* USE_EXT_STORAGE */

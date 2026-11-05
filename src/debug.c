@@ -557,6 +557,12 @@ void debugCommand(client *c) {
             "    Force TLS write error for testing.",
             "BIO-DRAIN <type>",
             "    Wait for the specified bio job queue to become empty.",
+#ifdef USE_EXT_STORAGE
+            "EXT-STORAGE <subcommand> [<arg> ...]",
+            "    Data tiering test hooks. Subcommands:",
+            "    PAUSE-FOREGROUND <0|1>: Pause handling of storage engine completions.",
+            "    PAUSE-BACKGROUND <0|1>: Stop the storage engine from starting new requests.",
+#endif
             NULL};
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "segfault")) {
@@ -1166,6 +1172,10 @@ void debugCommand(client *c) {
         }
         bioDrainWorker(type);
         addReply(c, shared.ok);
+#ifdef USE_EXT_STORAGE
+    } else if (extStorageDebugCommand(c)) {
+        /* Data tiering handled it. */
+#endif
     } else if (!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;

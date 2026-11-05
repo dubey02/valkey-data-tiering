@@ -117,6 +117,10 @@ static struct {
     pthread_mutex_t wake_mutex;
     pthread_cond_t wake_cond;
 
+    /* Set while processing is paused. No new request is taken. Guarded by
+     * wake_mutex. */
+    int paused;
+
     /* Counters the IO thread owns. Nothing else reads them. */
     struct {
         /* Number of puts FlashCache turned away. Each one was retried later. */
@@ -250,8 +254,19 @@ static void fcWaitForWork(void) {
         deadline.tv_nsec -= 1000000000L;
     }
     pthread_mutex_lock(&fc_io.wake_mutex);
-    if (mutexQueueLength(fc_io.requests) == 0) pthread_cond_timedwait(&fc_io.wake_cond, &fc_io.wake_mutex, &deadline);
+    if (mutexQueueLength(fc_io.requests) == 0 || fc_io.paused) {
+        pthread_cond_timedwait(&fc_io.wake_cond, &fc_io.wake_mutex, &deadline);
+    }
     pthread_mutex_unlock(&fc_io.wake_mutex);
+}
+
+/* Takes the next request, or NULL while paused. The check and the pop share
+ * wake_mutex, so nothing is taken once fcPauseProcessing has returned. */
+static fcRequest *fcPopRequest(void) {
+    pthread_mutex_lock(&fc_io.wake_mutex);
+    fcRequest *r = fc_io.paused ? NULL : mutexQueuePop(fc_io.requests, false);
+    pthread_mutex_unlock(&fc_io.wake_mutex);
+    return r;
 }
 
 /* The IO thread. It hands requests to FlashCache and pumps FlashCache's cron,
@@ -271,7 +286,7 @@ static void *fcIOThreadMain(void *arg) {
                 progressed = true;
             }
         } else {
-            fcRequest *r = mutexQueuePop(fc_io.requests, false);
+            fcRequest *r = fcPopRequest();
             if (r == &FC_STOP_REQUEST) break;
             if (r != NULL) {
                 progressed = true;
@@ -354,6 +369,16 @@ static void fcInfo(const storageInfoSink *s) {
     s->add_ulong_long(s->ctx, "total_num_items_evicted", snap.num_items_evicted);
     s->add_ulong_long(s->ctx, "total_num_disk_reads", snap.num_disk_reads);
     s->add_ulong_long(s->ctx, "total_num_disk_writes", snap.num_disk_writes);
+}
+
+/* While paused, the IO thread takes no new request but still runs
+ * FlashCache's cron, so a request it already started can finish. */
+static void fcPauseProcessing(int paused) {
+    if (!fc_io.running) return;
+    pthread_mutex_lock(&fc_io.wake_mutex);
+    fc_io.paused = paused;
+    pthread_cond_signal(&fc_io.wake_cond);
+    pthread_mutex_unlock(&fc_io.wake_mutex);
 }
 
 /* Collects finished requests. */
@@ -553,6 +578,8 @@ static storageStatus fcOpen(const storageConfig *cfg) {
 /* Stops the IO thread and tears FlashCache down. */
 static storageStatus fcClose(void) {
     if (!fc_io.running) return STORAGE_OK;
+    /* A paused IO thread would never take the stop request. */
+    assert(!fc_io.paused);
     /* An unpolled completion may hold a fetched value nobody else owns. */
     if (fc_io.outstanding > 0) return STORAGE_WOULDBLOCK;
 
@@ -596,6 +623,7 @@ static const storageEngine flashcache_storage_engine = {
     .del_async = fcDelAsync,
     .poll_completions = fcPollCompletions,
     .info = fcInfo,
+    .pause_processing = fcPauseProcessing,
 };
 
 const storageEngine *storageFlashCacheEngine(void) {

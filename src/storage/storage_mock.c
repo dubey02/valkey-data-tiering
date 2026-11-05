@@ -64,6 +64,9 @@ static struct {
     int completions_head;
     int completions_len;
 
+    /* Set while processing is paused. No request runs. */
+    int paused;
+
     /* The counters INFO reports. Everything here runs on the main thread, so
      * INFO reads them as they are. */
     struct {
@@ -244,8 +247,9 @@ static void mockInfo(const storageInfoSink *s) {
 
 /* Executes up to max queued requests and enqueues a completion for each. Stops
  * early when the completion ring is full, leaving the request in place for a
- * later pass. Returns the number executed. */
+ * later pass. Runs nothing while paused. Returns the number executed. */
 int storageMockRunIo(int max) {
+    if (mock.paused) return 0;
     int n = 0;
     while (n < max && mock.requests_len > 0 && mock.completions_len < MOCK_MAX_COMPLETED) {
         mockRequest *req = &mock.requests[mock.requests_head];
@@ -318,7 +322,14 @@ static storageStatus mockOpen(const storageConfig *cfg) {
     return STORAGE_OK;
 }
 
+/* Requests run on the caller's thread at poll time, so pausing only has to
+ * stop that step. */
+static void mockPauseProcessing(int paused) {
+    mock.paused = paused;
+}
+
 static storageStatus mockClose(void) {
+    assert(!mock.paused);
     /* An unpolled request may be a fetched value nobody else holds, so the
      * storage engine stays open until the caller has polled it. */
     if (mock.requests_len > 0 || mock.completions_len > 0) return STORAGE_WOULDBLOCK;
@@ -349,6 +360,7 @@ static const storageEngine mock_storage_engine = {
     .del_async = mockDelAsync,
     .poll_completions = mockPollCompletions,
     .info = mockInfo,
+    .pause_processing = mockPauseProcessing,
 };
 
 const storageEngine *storageMockEngine(void) {

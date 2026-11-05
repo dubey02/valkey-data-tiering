@@ -198,6 +198,14 @@ typedef struct storageEngine {
      * thread, so a storage engine with its own threads reads a snapshot it
      * refreshes itself. May be NULL when there is nothing to report. */
     void (*info)(const storageInfoSink *sink);
+
+    /* For tests. Pauses the storage engine's processing when paused is 1 and
+     * resumes it when paused is 0. While paused, requests are still accepted
+     * with the usual return codes, but a request submitted after the call
+     * that pauses does not run until the call that resumes. A request the
+     * storage engine started before may still complete. close is never
+     * called while paused. May be NULL. */
+    void (*pause_processing)(int paused);
 } storageEngine;
 
 /* ---------------------------------------------------------------------------
