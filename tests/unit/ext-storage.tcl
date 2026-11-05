@@ -369,10 +369,22 @@ if {$tiering_built} {
             assert_equal OK [r save]
         } {} {needs:save}
 
+        test "ext-storage-spill-policy must agree with an LRU or LFU maxmemory-policy ($engine)" {
+            r config set maxmemory-policy allkeys-lru
+            assert_error {*must match*} {r config set ext-storage-spill-policy allkeys-lfu}
+            assert_error {*must match*} {r config set maxmemory-policy allkeys-lfu}
+            r config set maxmemory-policy allkeys-lfu ext-storage-spill-policy allkeys-lfu
+            r config set maxmemory-policy noeviction
+            r config set ext-storage-spill-policy allkeys-lru
+            r config set maxmemory-policy allkeys-lru
+        }
+
         foreach policy {allkeys-random allkeys-lru allkeys-lfu} {
             test "Eviction under $policy only takes keys in memory ($engine)" {
                 mostly_on_flash
-                r config set maxmemory-policy $policy
+                # An LFU maxmemory-policy needs spilling to rank by LFU too.
+                set spill_policy [expr {$policy eq "allkeys-lfu" ? "allkeys-lfu" : "allkeys-lru"}]
+                r config set maxmemory-policy $policy ext-storage-spill-policy $spill_policy
                 # One key per sample, so most samples hold only keys on flash. A
                 # sample with only keys on flash gives up with OOM, so retry.
                 r config set maxmemory-samples 1
@@ -382,7 +394,7 @@ if {$tiering_built} {
                 }
                 r config set maxmemory 0
                 r config set maxmemory-samples 5
-                r config set maxmemory-policy allkeys-lru
+                r config set maxmemory-policy allkeys-lru ext-storage-spill-policy allkeys-lru
                 assert_morethan [s evicted_keys] 0
                 for {set i 0} {$i < 300} {incr i} {
                     assert_match {* storage_state:2 *} [r debug object flash:$i fast]

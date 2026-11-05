@@ -50,6 +50,7 @@
 #include "compression.h"
 #include "compression_stream.h"
 #include "forkless.h"
+#include "ext_storage.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -1305,6 +1306,7 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
     /* TODO(#64): a value that isn't only in memory can't be saved yet. */
+    serverAssert(extStorageIsMemoryOnly(val));
 
     /* Save the expire time */
     if (expiretime != -1) {

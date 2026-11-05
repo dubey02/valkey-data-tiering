@@ -1438,7 +1438,11 @@ static inline void updateCachedTimeWithUs(int update_daylight_info, const ustime
     server.ustime = ustime;
     server.mstime = server.ustime / 1000;
     server.unixtime = server.mstime / 1000;
-    lrulfu_updateClockAndPolicy(server.mstime, (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != 0);
+    /* Data tiering spills by ext-storage-spill-policy, which agrees with an LRU or
+     * LFU maxmemory-policy. */
+    bool lfu = (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) ||
+               (server.ext_storage_enabled && server.ext_storage_spill_policy == MAXMEMORY_ALLKEYS_LFU);
+    lrulfu_updateClockAndPolicy(server.mstime, lfu);
 
     /* To get information about daylight saving time, we need to call
      * localtime_r and cache the result. However calling localtime_r in this

@@ -2500,6 +2500,7 @@ struct valkeyServer {
     char *ext_storage_path;                  /* Path the engine stores data under. */
     unsigned long long ext_storage_capacity; /* Max bytes the engine may use. */
     char *ext_storage_cpulist;               /* cpu affinity list of the storage engine threads. */
+    int ext_storage_spill_policy;            /* Ranks keys for spilling: MAXMEMORY_ALLKEYS_LRU or _LFU. */
     /* Lazy free */
     int lazyfree_lazy_eviction;
     int lazyfree_lazy_expire;
@@ -4183,6 +4184,8 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms);
 /* evict.c -- maxmemory handling and LRU eviction. */
 void evictionPoolAlloc(void);
 typedef bool evictionPoolFilter(const robj *o);
+bool extStorageSpillPolicyConflicts(void);
+void evictionPoolSampleColdest(int policy, evictionPoolFilter *filter);
 robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid);
 #define EVICT_OK 0
 #define EVICT_RUNNING 1

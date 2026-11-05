@@ -283,16 +283,22 @@ static unsigned long evictionPoolSample(int policy, evictionPoolFilter *filter) 
     return total_keys;
 }
 
-/* Samples under 'policy', which must rank by LRU or LFU, and returns the
- * coldest key that 'filter' accepts, setting *dbid, or NULL if none of the
- * sampled keys pass.
+/* Samples under 'policy', which must rank by LRU or LFU, adding the keys that
+ * 'filter' accepts to the pool.
  * The pool is shared with eviction. Entries left by the other caller are kept
  * when they were scored on the same scale, and every pop rechecks its key. */
+void evictionPoolSampleColdest(int policy, evictionPoolFilter *filter) {
+    serverAssert(policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU));
+    evictionPoolSetPolicy(policy);
+    evictionPoolSample(policy, filter);
+}
+
+/* Removes and returns the coldest pooled key that 'filter' accepts, setting
+ * *dbid, or NULL once the pool runs out. 'policy' is the one the pool was
+ * sampled under. */
 robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid) {
     serverAssert(policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU));
     evictionPoolSetPolicy(policy);
-
-    evictionPoolSample(policy, filter);
     int slot;
     return evictionPoolPop(policy, filter, dbid, &slot);
 }
@@ -566,7 +572,8 @@ int performEvictions(void) {
         goto update_metrics;
     }
 
-    /* Spilled values free their DRAM once written, so eviction only frees the rest. */
+    /* Spilled values free their DRAM when the completion is handled, so eviction
+     * only frees the rest. */
     mem_tofree = extStorageSpillToFree(mem_tofree);
     if (mem_tofree == 0) {
         result = EVICT_OK;

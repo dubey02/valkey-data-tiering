@@ -45,7 +45,11 @@ sds extStorageEngineInfoString(sds info);
 /* The serialization callbacks. */
 const storageSerializer *extStorageSerializer(void);
 
-/* Returns the coldest key that can be spilled and sets *dbid, or NULL. */
+/* Samples keys that can be spilled into the eviction pool. */
+void extStorageSpillSample(void);
+
+/* Returns the coldest sampled key that can be spilled and sets *dbid, or NULL
+ * once the pool runs out. */
 robj *extStorageSpillSelectCandidate(int *dbid);
 
 /* Submits a key's value to the storage engine. Nothing changes unless it

@@ -8100,8 +8100,8 @@ void removeChannelsInSlot(unsigned int slot) {
 /* Remove all the keys in the specified hash slot.
  * The number of removed items is returned. */
 unsigned int delKeysInSlot(unsigned int hashslot, int lazy, bool propagate_del, bool send_del_event) {
-    /* TODO(#77): keys being spilled or on flash are deleted without waiting
-     * for the storage engine or removing their records. */
+    /* TODO(#77): keys being spilled or on flash leave their records in the
+     * storage engine. */
     if (!countKeysInSlot(hashslot)) return 0;
 
     /* We may lose a slot during the pause. We need to track this
