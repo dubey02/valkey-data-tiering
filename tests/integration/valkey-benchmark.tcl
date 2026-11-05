@@ -572,6 +572,12 @@ tags {"benchmark network external:skip logreqres:skip"} {
             assert_match "*--zipfian requires a keyspace*" $error
         }
 
+        test {benchmark: zipfian is rejected with dataset} {
+            set cmd [valkeybenchmark $master_host $master_port "--dataset unused.csv -r 10 -n 5 --zipfian -- SET doc:__rand_int__ \"__field:title__\""]
+            catch { exec {*}$cmd } error
+            assert_match "*--zipfian is not supported with --dataset*" $error
+        }
+
         foreach bad {0 1.2x} {
             test "benchmark: zipfian rejects alpha '$bad'" {
                 set cmd [valkeybenchmark $master_host $master_port "-r 10 -n 5 --zipfian $bad -t set"]
@@ -601,6 +607,15 @@ tags {"benchmark network external:skip logreqres:skip"} {
             assert_match "*WARNING: --keysize 5 is below the minimum, using 12.*" $output
             foreach key [r keys *] {
                 assert_equal 12 [string length $key]
+            }
+        }
+
+        test {benchmark: keysize warns that it is ignored with a custom command} {
+            set cmd [valkeybenchmark $master_host $master_port "-r 10 -n 10 --keysize 40 -- set k:__rand_int__ v"]
+            set output [common_bench_setup $cmd]
+            assert_match "*WARNING: Option --keysize is ignored.*" $output
+            foreach key [r keys *] {
+                assert_equal 14 [string length $key]
             }
         }
 

@@ -2225,7 +2225,8 @@ usage:
         "                    Zipfian distribution over the keyspace instead of drawing\n"
         "                    them uniformly, so low numbered keys are hit far more\n"
         "                    often. alpha is the exponent and defaults to 1.0. Requires\n"
-        "                    -r, and --sequential takes precedence over it.\n"
+        "                    -r, and --sequential takes precedence over it. Not\n"
+        "                    supported with --dataset.\n"
         "                    Higher alpha means more skew. Share of requests that go\n"
         "                    to the hottest keys, with -r 1000000:\n"
         "                      alpha   top 1% of keys   top 10% of keys\n"
@@ -2529,6 +2530,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Option --zipfian requires a keyspace, use -r <keyspacelen>\n");
         exit(1);
     }
+    if (config.zipfian && config.dataset_file) {
+        fprintf(stderr, "Option --zipfian is not supported with --dataset\n");
+        exit(1);
+    }
     zipfianInit();
 
     /* Setup dataset if specified */
@@ -2742,6 +2747,9 @@ int main(int argc, char **argv) {
     }
     if (argc > 0 && config.tests != NULL) {
         fprintf(stderr, "WARNING: Option -t is ignored.\n");
+    }
+    if (argc > 0 && config.keysize != 0) {
+        fprintf(stderr, "WARNING: Option --keysize is ignored.\n");
     }
 
     if (config.idlemode) {
