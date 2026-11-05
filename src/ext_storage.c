@@ -522,10 +522,6 @@ void extStorageDebugSpillCommand(client *c) {
         storageState state = getStorageState(entry);
         /* Already on flash or on its way there, so there's nothing to do. */
         if (state == STORAGE_STATE_COPYING_TO_FLASH || state == STORAGE_STATE_ONLY_FLASH) continue;
-        if (state == STORAGE_STATE_COPYING_TO_MEMORY) {
-            addReplyErrorFormat(c, "The key '%s' is being fetched", key);
-            return;
-        }
         if (!isSpillCandidate(entry)) {
             addReplyErrorFormat(c, "The key '%s' can't be spilled", key);
             return;

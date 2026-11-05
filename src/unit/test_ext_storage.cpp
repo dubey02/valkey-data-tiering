@@ -2363,23 +2363,28 @@ class DebugSpillTest : public BlockClientTest {
         if (!shared.ok) createSharedObjects();
     }
 
-    /* Runs DEBUG SPILL on 'keys' and returns its reply. The caller frees it. */
-    sds debugSpill(const char *keys) {
-        sds cmdline = sdscatfmt(sdsempty(), "debug spill %s", keys);
+    /* Runs 'cmdline' through 'proc' and returns its reply. The caller frees it. */
+    sds run(const char *cmdline, void (*proc)(client *c)) {
         client *c = makeClient(cmdline);
-        sdsfree(cmdline);
         c->buf = (char *)zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
         c->reply = listCreate();
         c->deferred_reply_bytes = ULLONG_MAX; /* replies go straight to c->buf */
         c->flag.pending_write = 1;            /* keeps it off the write queue */
 
-        extStorageDebugSpillCommand(c);
+        proc(c);
         sds reply = sdsnewlen(c->buf, c->bufpos);
         EXPECT_EQ(listLength(c->reply), 0u);
         zfree(c->buf);
         listRelease(c->reply);
         c->buf = NULL;
         c->reply = NULL;
+        return reply;
+    }
+
+    sds debugSpill(const char *keys) {
+        sds cmdline = sdscatfmt(sdsempty(), "debug spill %s", keys);
+        sds reply = run(cmdline, extStorageDebugSpillCommand);
+        sdsfree(cmdline);
         return reply;
     }
 };
@@ -2421,7 +2426,7 @@ TEST_F(DebugSpillTest, RefusesAKeyBeingFetched) {
     ASSERT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_MEMORY);
 
     sds reply = debugSpill("key");
-    EXPECT_STREQ(reply, "-ERR The key 'key' is being fetched\r\n");
+    EXPECT_STREQ(reply, "-ERR The key 'key' can't be spilled\r\n");
     sdsfree(reply);
     EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage:"), 0u);
 
@@ -2429,6 +2434,20 @@ TEST_F(DebugSpillTest, RefusesAKeyBeingFetched) {
     extStorageBeforeSleep();
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
     EXPECT_NE(objectGetVal(entry), nullptr);
+}
+
+/* DEBUG doesn't read a value the storage engine is still writing. */
+TEST_F(DebugSpillTest, ADebugReadOfAKeyBeingSpilledFails) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    sds reply = run("debug sdslen key", debugCommand);
+    EXPECT_STREQ(reply, "-ERR The value of 'key' isn't in memory\r\n");
+    sdsfree(reply);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 
 #endif /* USE_EXT_STORAGE */

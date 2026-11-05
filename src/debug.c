@@ -412,6 +412,15 @@ void mallctl_string(client *c, robj **argv, int argc) {
 }
 #endif
 
+/* Replies with an error if the value isn't only in memory, since it can't be
+ * read. Returns false when it replied.
+ * TODO(#138): support a value that isn't only in memory. */
+static bool debugValueInMemoryOrReply(client *c, robj *o, robj *key) {
+    if (extStorageIsMemoryOnly(o)) return true;
+    addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(key));
+    return false;
+}
+
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
         const char *help[] = {
@@ -780,12 +789,10 @@ void debugCommand(client *c) {
             addReplyErrorObject(c, shared.nokeyerr);
             return;
         }
+        if (!debugValueInMemoryOrReply(c, val, c->argv[2])) return;
         key = objectGetKey(val);
 
-        /* TODO(#138): support a value that isn't only in memory. */
-        if (!extStorageIsMemoryOnly(val)) {
-            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
-        } else if (val->type != OBJ_STRING || !sdsEncodedObject(val)) {
+        if (val->type != OBJ_STRING || !sdsEncodedObject(val)) {
             addReplyError(c, "Not an sds encoded string.");
         } else {
             /* Report the complete robj allocation size as the key's allocation
@@ -803,11 +810,9 @@ void debugCommand(client *c) {
         robj *o;
 
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr)) == NULL) return;
+        if (!debugValueInMemoryOrReply(c, o, c->argv[2])) return;
 
-        /* TODO(#138): support a value that isn't only in memory. */
-        if (!extStorageIsMemoryOnly(o)) {
-            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
-        } else if (objectGetEncoding(o) != OBJ_ENCODING_LISTPACK) {
+        if (objectGetEncoding(o) != OBJ_ENCODING_LISTPACK) {
             addReplyError(c, "Not a listpack encoded object.");
         } else {
             lpRepr(objectGetVal(o));
@@ -817,13 +822,11 @@ void debugCommand(client *c) {
         robj *o;
 
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr)) == NULL) return;
+        if (!debugValueInMemoryOrReply(c, o, c->argv[2])) return;
 
         int full = 0;
         if (c->argc == 4) full = atoi(objectGetVal(c->argv[3]));
-        /* TODO(#138): support a value that isn't only in memory. */
-        if (!extStorageIsMemoryOnly(o)) {
-            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
-        } else if (objectGetEncoding(o) != OBJ_ENCODING_QUICKLIST) {
+        if (objectGetEncoding(o) != OBJ_ENCODING_QUICKLIST) {
             addReplyError(c, "Not a quicklist encoded object.");
         } else {
             quicklistRepr(objectGetVal(o), full);
@@ -886,11 +889,7 @@ void debugCommand(client *c) {
         /* DEBUG DIGEST-VALUE key key ... key. */
         for (int j = 2; j < c->argc; j++) {
             robj *o = dbFind(c->db, objectGetVal(c->argv[j]));
-            /* TODO(#138): support a value that isn't only in memory. */
-            if (o && !extStorageIsMemoryOnly(o)) {
-                addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[j]));
-                return;
-            }
+            if (o && !debugValueInMemoryOrReply(c, o, c->argv[j])) return;
         }
         addReplyArrayLen(c, c->argc - 2);
         for (int j = 2; j < c->argc; j++) {
@@ -1059,11 +1058,7 @@ void debugCommand(client *c) {
 
         robj *o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr);
         if (o == NULL) return;
-        /* TODO(#138): support a value that isn't only in memory. */
-        if (!extStorageIsMemoryOnly(o)) {
-            addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(c->argv[2]));
-            return;
-        }
+        if (!debugValueInMemoryOrReply(c, o, c->argv[2])) return;
 
         /* Get the hashtable reference from the object, if possible. */
         hashtable *ht = NULL;
