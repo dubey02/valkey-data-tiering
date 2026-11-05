@@ -297,8 +297,9 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
  * of the digests of their elements. This way the order will not change
  * the result. For list instead we use a feedback entering the output digest
  * as input in order to ensure that a different ordered list will result in
- * a different digest. */
-void computeDatasetDigest(unsigned char *final) {
+ * a different digest.
+ * Returns C_ERR if a value isn't only in memory, since it can't be read. */
+int computeDatasetDigest(unsigned char *final) {
     unsigned char digest[20];
     uint32_t aux;
 
@@ -320,6 +321,11 @@ void computeDatasetDigest(unsigned char *final) {
             sds key;
             robj *keyobj;
 
+            if (!extStorageIsMemoryOnly(o)) {
+                kvstoreIteratorRelease(kvs_it);
+                return C_ERR;
+            }
+
             memset(digest, 0, 20); /* This key-val digest */
             key = objectGetKey(o);
             keyobj = createStringObject(key, sdslen(key));
@@ -334,6 +340,7 @@ void computeDatasetDigest(unsigned char *final) {
         }
         kvstoreIteratorRelease(kvs_it);
     }
+    return C_OK;
 }
 
 #ifdef USE_JEMALLOC
@@ -404,6 +411,15 @@ void mallctl_string(client *c, robj **argv, int argc) {
         addReply(c, shared.ok);
 }
 #endif
+
+/* Replies with an error if the value isn't only in memory, since it can't be
+ * read. Returns false when it replied.
+ * TODO(#138): support a value that isn't only in memory. */
+static bool debugValueInMemoryOrReply(client *c, robj *o, robj *key) {
+    if (extStorageIsMemoryOnly(o)) return true;
+    addReplyErrorFormat(c, "The value of '%s' isn't in memory", (sds)objectGetVal(key));
+    return false;
+}
 
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
@@ -557,6 +573,11 @@ void debugCommand(client *c) {
             "    Force TLS write error for testing.",
             "BIO-DRAIN <type>",
             "    Wait for the specified bio job queue to become empty.",
+#ifdef USE_EXT_STORAGE
+            "EXT-STORAGE <subcommand> [<arg> ...]",
+            "    Data tiering test hooks. Subcommands:",
+            "    SPILL <key> [<key> ...]: Submit each key's value to the storage engine. Stops at the first key that fails.",
+#endif
             NULL};
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "segfault")) {
@@ -710,7 +731,8 @@ void debugCommand(client *c) {
         strenc = strEncoding(val->encoding);
 
         char extra[138] = {0};
-        if (val->encoding == OBJ_ENCODING_QUICKLIST) {
+        /* A value being spilled or on flash isn't read. */
+        if (val->encoding == OBJ_ENCODING_QUICKLIST && extStorageIsMemoryOnly(val)) {
             char *nextra = extra;
             int remaining = sizeof(extra);
             quicklist *ql = objectGetVal(val);
@@ -749,7 +771,8 @@ void debugCommand(client *c) {
 #ifdef USE_EXT_STORAGE
         s = sdscatprintf(s, " storage_state:%d", (int)val->storage_state);
 #endif
-        if (!fast) s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
+        if (!fast && extStorageIsMemoryOnly(val))
+            s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
         /* Either lru or lfu field could work correctly which depends on server.maxmemory_policy. */
         if (lrulfu_isUsingLFU()) {
             s = sdscatprintf(s, " lfu_freq:%u lfu_access_time_minutes:%u", objectGetLFUFrequency(val), val->lru >> 8);
@@ -767,6 +790,7 @@ void debugCommand(client *c) {
             addReplyErrorObject(c, shared.nokeyerr);
             return;
         }
+        if (!debugValueInMemoryOrReply(c, val, c->argv[2])) return;
         key = objectGetKey(val);
 
         if (val->type != OBJ_STRING || !sdsEncodedObject(val)) {
@@ -787,6 +811,7 @@ void debugCommand(client *c) {
         robj *o;
 
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr)) == NULL) return;
+        if (!debugValueInMemoryOrReply(c, o, c->argv[2])) return;
 
         if (objectGetEncoding(o) != OBJ_ENCODING_LISTPACK) {
             addReplyError(c, "Not a listpack encoded object.");
@@ -798,6 +823,7 @@ void debugCommand(client *c) {
         robj *o;
 
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr)) == NULL) return;
+        if (!debugValueInMemoryOrReply(c, o, c->argv[2])) return;
 
         int full = 0;
         if (c->argc == 4) full = atoi(objectGetVal(c->argv[3]));
@@ -851,12 +877,21 @@ void debugCommand(client *c) {
         unsigned char digest[20];
         sds d = sdsempty();
 
-        computeDatasetDigest(digest);
+        /* TODO(#138): support a value that isn't only in memory. */
+        if (computeDatasetDigest(digest) == C_ERR) {
+            sdsfree(d);
+            addReplyError(c, "A value isn't in memory");
+            return;
+        }
         for (int i = 0; i < 20; i++) d = sdscatprintf(d, "%02x", digest[i]);
         addReplyStatus(c, d);
         sdsfree(d);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "digest-value") && c->argc >= 2) {
         /* DEBUG DIGEST-VALUE key key ... key. */
+        for (int j = 2; j < c->argc; j++) {
+            robj *o = dbFind(c->db, objectGetVal(c->argv[j]));
+            if (o && !debugValueInMemoryOrReply(c, o, c->argv[j])) return;
+        }
         addReplyArrayLen(c, c->argc - 2);
         for (int j = 2; j < c->argc; j++) {
             unsigned char digest[20];
@@ -1020,6 +1055,7 @@ void debugCommand(client *c) {
 
         robj *o = objectCommandLookupOrReply(c, c->argv[2], shared.nokeyerr);
         if (o == NULL) return;
+        if (!debugValueInMemoryOrReply(c, o, c->argv[2])) return;
 
         /* Get the hashtable reference from the object, if possible. */
         hashtable *ht = NULL;
@@ -1166,6 +1202,10 @@ void debugCommand(client *c) {
         }
         bioDrainWorker(type);
         addReply(c, shared.ok);
+#ifdef USE_EXT_STORAGE
+    } else if (extStorageDebugCommand(c)) {
+        /* Data tiering handled it. */
+#endif
     } else if (!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;

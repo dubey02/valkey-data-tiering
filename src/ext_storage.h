@@ -52,6 +52,14 @@ robj *extStorageSpillSelectCandidate(int *dbid);
  * returns STORAGE_OK. */
 storageStatus extStorageSpillItem(int dbid, robj *entry);
 
+/* Handles DEBUG EXT-STORAGE. Returns 0, without replying, for any other DEBUG
+ * subcommand.
+ * SPILL <key> [<key> ...] submits each key's value to the storage engine, in
+ * order. A key already being spilled or on flash is left as it is. Replies
+ * with an error at the first key that is missing, can't be spilled, or the
+ * storage engine doesn't accept. */
+int extStorageDebugCommand(client *c);
+
 /* Whether the value is only in DRAM, so it can be moved or freed. */
 static inline bool extStorageIsMemoryOnly(const robj *o) {
     return o->storage_state == STORAGE_STATE_ONLY_MEMORY;
