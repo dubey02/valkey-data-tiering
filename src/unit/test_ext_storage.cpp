@@ -2541,8 +2541,8 @@ TEST_F(SpillSelectTest, EvictionSkipsAKeyBeingSpilled) {
     }
 }
 
-/* With every key on flash, eviction stops after EV_MAX_REJECTED_KEYS instead of
- * sampling forever, under both the pool and the random sampler. */
+/* With every key on flash, eviction gives up instead of sampling forever, under
+ * both the pool and the random sampler. */
 TEST_F(SpillSelectTest, EvictionGivesUpWhenNoKeyIsInMemory) {
     int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_RANDOM};
     for (int i = 0; i < 2; i++) {

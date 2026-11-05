@@ -285,7 +285,7 @@ if {$tiering_built} {
             }
         }
 
-        # Eviction skips keys on flash, so it must give up rather than resample
+        # Eviction skips keys on flash, so it gives up rather than resample
         # forever once nothing in memory can be evicted.
         test "Writes fail with OOM once nothing can be spilled or evicted ($engine)" {
             r config set maxmemory 1
@@ -373,10 +373,13 @@ if {$tiering_built} {
             test "Eviction under $policy only takes keys in memory ($engine)" {
                 mostly_on_flash
                 r config set maxmemory-policy $policy
-                # One key per sample, so most samples hold only keys on flash.
+                # One key per sample, so most samples hold only keys on flash. A
+                # sample with only keys on flash gives up with OOM, so retry.
                 r config set maxmemory-samples 1
                 r config set maxmemory [expr {[s used_memory] - 20000}]
-                r set trigger v
+                for {set i 0} {$i < 100 && [s evicted_keys] == 0} {incr i} {
+                    catch {r set trigger v}
+                }
                 r config set maxmemory 0
                 r config set maxmemory-samples 5
                 r config set maxmemory-policy allkeys-lru
