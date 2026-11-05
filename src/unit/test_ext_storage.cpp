@@ -2349,11 +2349,11 @@ TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
 }
 
 /* ---------------------------------------------------------------------------
- * DEBUG SPILL on keys in flight
+ * DEBUG EXT-STORAGE SPILL on keys in flight
  * ---------------------------------------------------------------------------*/
 
 /* The mock storage engine runs nothing until extStorageBeforeSleep(), so a
- * spill or a fetch stays in flight while DEBUG SPILL runs. */
+ * spill or a fetch stays in flight while DEBUG EXT-STORAGE SPILL runs. */
 class DebugSpillTest : public BlockClientTest {
   protected:
     void SetUp() override {
@@ -2382,8 +2382,8 @@ class DebugSpillTest : public BlockClientTest {
     }
 
     sds debugSpill(const char *keys) {
-        sds cmdline = sdscatfmt(sdsempty(), "debug spill %s", keys);
-        sds reply = run(cmdline, extStorageDebugSpillCommand);
+        sds cmdline = sdscatfmt(sdsempty(), "debug ext-storage spill %s", keys);
+        sds reply = run(cmdline, debugCommand);
         sdsfree(cmdline);
         return reply;
     }

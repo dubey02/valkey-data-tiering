@@ -497,22 +497,23 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     return STORAGE_OK;
 }
 
-/* Most keys one DEBUG SPILL submits.
+/* Most keys one DEBUG EXT-STORAGE SPILL submits.
  * TODO(#80): drop the cap once spilling is throttled. */
 #define DEBUG_SPILL_MAX_KEYS 256
 
-/* DEBUG SPILL <key> [<key> ...]: submits each key's value to the storage engine. */
-void extStorageDebugSpillCommand(client *c) {
-    if (!extStorageIsActive()) {
-        addReplyError(c, "Data tiering is not enabled");
+/* DEBUG EXT-STORAGE SPILL <key> [<key> ...]
+ * Submits each key's value to the storage engine. */
+static void extStorageDebugSpill(client *c) {
+    if (c->argc < 4) {
+        addReplySubcommandSyntaxError(c);
         return;
     }
-    if (c->argc - 2 > DEBUG_SPILL_MAX_KEYS) {
-        addReplyErrorFormat(c, "DEBUG SPILL takes at most %d keys", DEBUG_SPILL_MAX_KEYS);
+    if (c->argc - 3 > DEBUG_SPILL_MAX_KEYS) {
+        addReplyErrorFormat(c, "DEBUG EXT-STORAGE SPILL takes at most %d keys", DEBUG_SPILL_MAX_KEYS);
         return;
     }
     /* Stops at the first key that fails. The keys before it stay submitted. */
-    for (int j = 2; j < c->argc; j++) {
+    for (int j = 3; j < c->argc; j++) {
         sds key = objectGetVal(c->argv[j]);
         robj *entry = dbFind(c->db, key);
         if (entry == NULL) {
@@ -532,6 +533,23 @@ void extStorageDebugSpillCommand(client *c) {
         }
     }
     addReply(c, shared.ok);
+}
+
+/* Handles DEBUG EXT-STORAGE. Returns 0, without replying, for any other DEBUG
+ * subcommand. */
+int extStorageDebugCommand(client *c) {
+    if (c->argc < 3 || strcasecmp(objectGetVal(c->argv[1]), "ext-storage")) return 0;
+    if (!ext_storage.open) {
+        addReplyError(c, "ext-storage is not enabled");
+        return 1;
+    }
+    const char *subcommand = objectGetVal(c->argv[2]);
+    if (!strcasecmp(subcommand, "spill")) {
+        extStorageDebugSpill(c);
+    } else {
+        addReplySubcommandSyntaxError(c);
+    }
+    return 1;
 }
 
 /* Frees the value the way dbSetValue() frees an overwritten one. The object,

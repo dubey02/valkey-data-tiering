@@ -14,15 +14,15 @@ start_server {tags {"ext-storage"}} {
             }
         } {} {needs:debug}
 
-        test {DEBUG SPILL needs data tiering enabled} {
+        test {DEBUG EXT-STORAGE SPILL needs data tiering enabled} {
             r set big [string repeat x 1000]
-            assert_error {*not enabled*} {r debug spill big}
+            assert_error {*not enabled*} {r debug ext-storage spill big}
         } {} {needs:debug external:skip}
     }
 }
 
-# A storage engine may finish a spill after DEBUG SPILL returns, so this waits
-# until each key's value is on flash.
+# A storage engine may finish a spill after DEBUG EXT-STORAGE SPILL returns, so
+# this waits until each key's value is on flash.
 proc wait_for_flash {args} {
     foreach key $args {
         wait_for_condition 100 50 {
@@ -41,40 +41,43 @@ if {$tiering_built} {
     # The valkey server runs in its own directory, so the path is absolute.
     set path [file normalize [tmpdir ext-storage-$engine]]
     start_server [list tags {"ext-storage external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $path ext-storage-capacity 128mb save ""]] {
-        test "DEBUG SPILL submits a key and refuses keys it can't spill ($engine)" {
+        test "DEBUG EXT-STORAGE SPILL submits a key and refuses keys it can't spill ($engine)" {
             r set big [string repeat x 1000]
             r set small v
-            assert_equal OK [r debug spill big]
+            assert_equal OK [r debug ext-storage spill big]
             wait_for_flash big
             # A key already on flash stays there.
-            assert_equal OK [r debug spill big]
+            assert_equal OK [r debug ext-storage spill big]
             assert_match {* storage_state:2 *} [r debug object big fast]
             # A short value is embedded in the key, so it can't be spilled.
-            assert_error {*key 'small' can't be spilled*} {r debug spill small}
+            assert_error {*key 'small' can't be spilled*} {r debug ext-storage spill small}
+            # No key, or a subcommand that doesn't exist.
+            assert_error {*unknown subcommand*} {r debug ext-storage spill}
+            assert_error {*unknown subcommand*} {r debug ext-storage nosuch}
         } {} {needs:debug}
 
-        test "DEBUG SPILL submits several keys and stops at the first one that fails ($engine)" {
+        test "DEBUG EXT-STORAGE SPILL submits several keys and stops at the first one that fails ($engine)" {
             r flushall
             r set a [string repeat x 1000]
             r set b [string repeat x 1000]
             r set c [string repeat x 1000]
-            assert_equal OK [r debug spill a b]
+            assert_equal OK [r debug ext-storage spill a b]
             wait_for_flash a b
             # c is submitted before the missing key stops the command.
-            assert_error {*No such key 'missing'*} {r debug spill c missing}
+            assert_error {*No such key 'missing'*} {r debug ext-storage spill c missing}
             wait_for_flash c
         } {} {needs:debug}
 
-        test "DEBUG SPILL refuses more than 256 keys and submits none ($engine)" {
+        test "DEBUG EXT-STORAGE SPILL refuses more than 256 keys and submits none ($engine)" {
             r flushall
             set keys {}
             for {set i 0} {$i < 257} {incr i} {
                 r set key:$i [string repeat x 1000]
                 lappend keys key:$i
             }
-            assert_error {*at most 256 keys*} {r debug spill {*}$keys}
+            assert_error {*at most 256 keys*} {r debug ext-storage spill {*}$keys}
             assert_match {* storage_state:0 *} [r debug object key:0 fast]
-            assert_equal OK [r debug spill {*}[lrange $keys 0 255]]
+            assert_equal OK [r debug ext-storage spill {*}[lrange $keys 0 255]]
             # The storage engine completes a batch per event loop cycle.
             wait_for_condition 100 50 {
                 [getInfoProperty [r info ext_storage] ext_storage_num_items_spilling_to_storage] == 0
@@ -100,7 +103,7 @@ if {$tiering_built} {
             assert_encoding hashtable hash
             r set mem v
             set mem_digest [lindex [r debug digest-value mem] 0]
-            assert_equal OK [r debug spill str list hash]
+            assert_equal OK [r debug ext-storage spill str list hash]
             wait_for_flash str list hash
 
             assert_error {*value of 'str' isn't in memory*} {r debug sdslen str}
@@ -123,7 +126,7 @@ if {$tiering_built} {
             # Over list-max-listpack-size, so it's a quicklist.
             r rpush list [string repeat x 10000]
             assert_encoding quicklist list
-            assert_equal OK [r debug spill list]
+            assert_equal OK [r debug ext-storage spill list]
             wait_for_flash list
             set info [r debug object list]
             assert_match {* storage_state:2 *} $info
@@ -137,21 +140,21 @@ if {$tiering_built} {
             r set big $val
             r set mem v
 
-            assert_equal OK [r debug spill big]
+            assert_equal OK [r debug ext-storage spill big]
             wait_for_flash big
             assert_equal $val [r get big]
             assert_match {* storage_state:0 *} [r debug object big fast]
 
-            assert_equal OK [r debug spill big]
+            assert_equal OK [r debug ext-storage spill big]
             wait_for_flash big
             assert_equal 1001 [r append big y]
             assert_equal ${val}y [r get big]
 
-            assert_equal OK [r debug spill big]
+            assert_equal OK [r debug ext-storage spill big]
             wait_for_flash big
             assert_equal [list v ${val}y] [r mget mem big]
 
-            assert_equal OK [r debug spill big]
+            assert_equal OK [r debug ext-storage spill big]
             wait_for_flash big
             assert_equal 1 [r del big]
             assert_equal 0 [r exists big]
@@ -164,8 +167,8 @@ if {$tiering_built} {
                 for {set i 0} {$i < 100} {incr i} {
                     r set key:$i [string repeat x 1000]
                     r rpush list:$i [string repeat x 1000]
-                    assert_equal OK [r debug spill key:$i]
-                    assert_equal OK [r debug spill list:$i]
+                    assert_equal OK [r debug ext-storage spill key:$i]
+                    assert_equal OK [r debug ext-storage spill list:$i]
                     # Keys in memory, so the scan visibly makes progress.
                     r set mem:$i [string repeat x 1000]
                 }

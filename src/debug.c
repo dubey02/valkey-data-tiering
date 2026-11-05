@@ -529,10 +529,6 @@ void debugCommand(client *c) {
             "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
-#ifdef USE_EXT_STORAGE
-            "SPILL <key> [<key> ...]",
-            "    Submit each key's value to the storage engine. Stops at the first key that fails.",
-#endif
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -577,6 +573,11 @@ void debugCommand(client *c) {
             "    Force TLS write error for testing.",
             "BIO-DRAIN <type>",
             "    Wait for the specified bio job queue to become empty.",
+#ifdef USE_EXT_STORAGE
+            "EXT-STORAGE <subcommand> [<arg> ...]",
+            "    Data tiering test hooks. Subcommands:",
+            "    SPILL <key> [<key> ...]: Submit each key's value to the storage engine. Stops at the first key that fails.",
+#endif
             NULL};
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "segfault")) {
@@ -977,10 +978,6 @@ void debugCommand(client *c) {
         tv.tv_nsec = (utime % 1000000) * 1000;
         nanosleep(&tv, NULL);
         addReply(c, shared.ok);
-#ifdef USE_EXT_STORAGE
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "spill") && c->argc >= 3) {
-        extStorageDebugSpillCommand(c);
-#endif
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "set-active-expire") && c->argc == 3) {
         server.active_expire_enabled = atoi(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
@@ -1205,6 +1202,10 @@ void debugCommand(client *c) {
         }
         bioDrainWorker(type);
         addReply(c, shared.ok);
+#ifdef USE_EXT_STORAGE
+    } else if (extStorageDebugCommand(c)) {
+        /* Data tiering handled it. */
+#endif
     } else if (!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;
