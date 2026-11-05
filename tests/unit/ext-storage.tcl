@@ -202,14 +202,56 @@ if {$tiering_built} {
   }
 }
 
-proc spilled_keys {} {
-    return [getInfoProperty [r info ext_storage] ext_storage_total_num_items_spilled_to_storage]
+proc spilled_keys {{level 0}} {
+    return [getInfoProperty [r $level info ext_storage] ext_storage_total_num_items_spilled_to_storage]
+}
+
+# Prints the storage state and the end of the log of valkey server 'level',
+# then fails.
+proc fail_with_state {msg {level 0}} {
+    puts [r $level info ext_storage]
+    puts [exec tail -n 20 < [srv $level stdout]]
+    fail $msg
+}
+
+# Puts 300 keys on flash and leaves 100 in memory, with nothing left to spill.
+proc mostly_on_flash {} {
+    r flushall
+    r config set maxmemory 0
+    set val [string repeat x 1000]
+    for {set i 0} {$i < 300} {incr i} {
+        r set flash:$i $val
+    }
+    # A hash with a field TTL can't be spilled.
+    for {set i 0} {$i < 100} {incr i} {
+        r hset mem:$i f $val
+        r hexpire mem:$i 100000 FIELDS 1 f
+    }
+    # Far below what is in use, so every spillable key spills, and
+    # noeviction keeps eviction from taking any. Sampling every key
+    # keeps the last few from waiting on unlucky samples.
+    set before [spilled_keys]
+    r config set maxmemory-samples 64
+    r config set maxmemory-policy noeviction
+    r config set maxmemory 1
+    wait_for_condition 100 100 {
+        [spilled_keys] - $before >= 300 &&
+        [getInfoProperty [r info ext_storage] ext_storage_num_items_spilling_to_storage] == 0
+    } else {
+        fail_with_state "the strings weren't all spilled"
+    }
+    r config set maxmemory 0
+    r config set maxmemory-samples 5
+    r config resetstat
 }
 
 # A server built without data tiering refuses to start with it enabled.
 if {$tiering_built} {
-    start_server {tags {"ext-storage external:skip"} overrides {ext-storage-enabled yes ext-storage-engine mock save ""}} {
-        test {Keys over maxmemory are spilled instead of evicted} {
+  foreach engine {mock flashcache} {
+    # The valkey server runs in its own directory, so the paths are absolute.
+    set path [file normalize [tmpdir ext-storage-$engine]]
+    start_server [list tags {"ext-storage external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $path ext-storage-capacity 128mb save ""]] {
+        test "Keys over maxmemory are spilled instead of evicted ($engine)" {
             r config set maxmemory-policy allkeys-lru
             set val [string repeat x 1000]
             for {set i 0} {$i < 2000} {incr i} {
@@ -222,27 +264,40 @@ if {$tiering_built} {
             wait_for_condition 50 100 {
                 [s used_memory] <= [s maxmemory]
             } else {
-                fail "used_memory didn't drop below maxmemory"
+                fail_with_state "used_memory didn't drop below maxmemory"
             }
             assert_morethan [spilled_keys] 0
             assert_equal 0 [s evicted_keys]
-            assert_equal 2200 [r dbsize]
-            assert_equal PONG [r ping]
+            r config set maxmemory 0
+            # A batch of keys waits for its fetches once. TODO(#136): over 256
+            # fetches at once fill the storage engine's queue.
+            set keys {}
+            for {set i 0} {$i < 2000} {incr i} {
+                lappend keys key:$i
+            }
+            for {set i 0} {$i < 200} {incr i} {
+                lappend keys new:$i
+            }
+            for {set i 0} {$i < [llength $keys]} {incr i 200} {
+                foreach value [r mget {*}[lrange $keys $i [expr {$i + 199}]]] {
+                    assert_equal $val $value
+                }
+            }
         }
 
         # Eviction skips keys on flash, so it must give up rather than resample
         # forever once nothing in memory can be evicted.
-        test {Writes fail with OOM once nothing can be spilled or evicted} {
+        test "Writes fail with OOM once nothing can be spilled or evicted ($engine)" {
             r config set maxmemory 1
             set err {}
             for {set i 0} {$i < 1000} {incr i} {
                 if {[catch {r set small:$i v} err]} break
             }
             assert_match {OOM*} $err
-            r config set maxmemory [expr {[s used_memory] + 10000000}]
+            r config set maxmemory 0
         }
 
-        test {Spilled hashes and lists can be deleted and overwritten} {
+        test "Spilled hashes and lists can be deleted and overwritten ($engine)" {
             r flushall
             r config set maxmemory 0
             set val [string repeat x 100]
@@ -261,19 +316,28 @@ if {$tiering_built} {
             wait_for_condition 50 100 {
                 [s used_memory] <= [s maxmemory]
             } else {
-                fail "used_memory didn't drop below maxmemory"
+                fail_with_state "used_memory didn't drop below maxmemory"
             }
-            assert_morethan [spilled_keys] 0
             r config set maxmemory 0
+            set on_flash 0
+            for {set i 0} {$i < 100} {incr i} {
+                foreach key [list small_hash:$i big_hash:$i list:$i] {
+                    if {![string match {* storage_state:0 *} [r debug object $key fast]]} {
+                        incr on_flash
+                    }
+                }
+            }
+            assert_morethan $on_flash 0
             for {set i 0} {$i < 100} {incr i} {
                 r del small_hash:$i big_hash:$i
                 r set list:$i v
             }
             assert_equal 101 [r dbsize]
+            assert_equal 0 [r exists small_hash:0 big_hash:0]
             assert_equal v [r get list:0]
-        }
+        } {} {needs:debug}
 
-        test {Keys over maxmemory are spilled under noeviction} {
+        test "Keys over maxmemory are spilled under noeviction ($engine)" {
             r flushall
             r config set maxmemory 0
             r config set maxmemory-policy noeviction
@@ -288,53 +352,25 @@ if {$tiering_built} {
             wait_for_condition 50 100 {
                 [spilled_keys] > $before
             } else {
-                fail "no key was spilled"
+                fail_with_state "no key was spilled"
             }
             assert_equal 0 [s evicted_keys]
             r config set maxmemory 0
             r config set maxmemory-policy allkeys-lru
         }
 
-        test {Spilled keys can be flushed} {
+        test "Keys on flash can be flushed ($engine)" {
+            mostly_on_flash
             r flushall
             assert_equal 0 [r dbsize]
-            r config set maxmemory 0
             r set key v
+            assert_equal v [r get key]
+            # Saving a key on flash crashes, so this also shows none is left.
             assert_equal OK [r save]
-        }
+        } {} {needs:save}
 
-        # Puts 300 keys on flash and leaves 100 in memory, with nothing left to spill.
-        proc mostly_on_flash {} {
-            r flushall
-            r config set maxmemory 0
-            set val [string repeat x 1000]
-            for {set i 0} {$i < 300} {incr i} {
-                r set flash:$i $val
-            }
-            # A hash with a field TTL can't be spilled.
-            for {set i 0} {$i < 100} {incr i} {
-                r hset mem:$i f $val
-                r hexpire mem:$i 100000 FIELDS 1 f
-            }
-            # Far below what is in use, so every spillable key spills, and
-            # noeviction keeps eviction from taking any. Sampling every key
-            # keeps the last few from waiting on unlucky samples.
-            set before [spilled_keys]
-            r config set maxmemory-samples 64
-            r config set maxmemory-policy noeviction
-            r config set maxmemory 1
-            wait_for_condition 100 100 {
-                [spilled_keys] - $before >= 300
-            } else {
-                fail "the strings weren't all spilled"
-            }
-            r config set maxmemory 0
-            r config set maxmemory-samples 5
-            r config resetstat
-        }
-
-        foreach policy {allkeys-random allkeys-lru} {
-            test "Eviction under $policy only takes keys in memory" {
+        foreach policy {allkeys-random allkeys-lru allkeys-lfu} {
+            test "Eviction under $policy only takes keys in memory ($engine)" {
                 mostly_on_flash
                 r config set maxmemory-policy $policy
                 # One key per sample, so most samples hold only keys on flash.
@@ -348,17 +384,21 @@ if {$tiering_built} {
                 for {set i 0} {$i < 300} {incr i} {
                     assert_match {* storage_state:2 *} [r debug object flash:$i fast]
                 }
+                assert_equal [string repeat x 1000] [r get flash:0]
             } {} {needs:debug}
         }
     }
+    file delete -force $path
 
     # Each replica decides what to spill from its own reads.
-    start_server {tags {"ext-storage repl external:skip"} overrides {ext-storage-enabled yes ext-storage-engine mock save ""}} {
-    start_server {overrides {ext-storage-enabled yes ext-storage-engine mock save ""}} {
+    set primary_path [file normalize [tmpdir ext-storage-primary-$engine]]
+    set replica_path [file normalize [tmpdir ext-storage-replica-$engine]]
+    start_server [list tags {"ext-storage repl external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $primary_path ext-storage-capacity 128mb save ""]] {
+    start_server [list overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $replica_path ext-storage-capacity 128mb save ""]] {
         set primary [srv -1 client]
         set replica [srv 0 client]
 
-        test {A replica spills on its own and never evicts} {
+        test "A replica spills on its own and never evicts ($engine)" {
             set val [string repeat x 1000]
             for {set i 0} {$i < 1000} {incr i} {
                 $primary set key:$i $val
@@ -367,20 +407,25 @@ if {$tiering_built} {
             wait_for_condition 50 100 {
                 [s 0 master_link_status] eq {up} && [$replica dbsize] == 1000
             } else {
-                fail "replica didn't sync"
+                fail_with_state "replica didn't sync"
             }
             $replica config set maxmemory-policy allkeys-lru
             $replica config set maxmemory [expr {[s 0 used_memory] - 200000}]
             $replica ping
             wait_for_condition 50 100 {
-                [getInfoProperty [$replica info ext_storage] ext_storage_total_num_items_spilled_to_storage] > 0
+                [spilled_keys] > 0
             } else {
-                fail "replica didn't spill"
+                fail_with_state "replica didn't spill"
             }
             assert_equal 0 [s 0 evicted_keys]
             assert_equal 1000 [$replica dbsize]
-            assert_equal 0 [getInfoProperty [$primary info ext_storage] ext_storage_total_num_items_spilled_to_storage]
+            assert_equal 0 [spilled_keys -1]
+            $replica config set maxmemory 0
+            assert_equal $val [$replica get key:0]
+            assert_equal $val [$replica get key:999]
         }
     }
     }
+    file delete -force $primary_path $replica_path
+  }
 }

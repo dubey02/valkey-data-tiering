@@ -690,7 +690,8 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     /* bgIteration must be notified for flushall. */
     if (dbnum == -1) bgIteration_flushall();
 
-    /* The storage engine may still be reading values that are about to be freed. */
+    /* The storage engine may still be reading values that are about to be freed.
+     * TODO(#51): values on flash are not deleted from the storage engine. */
     extStorageSpillDrain();
 
     /* Fire the flushdb modules event. */

@@ -1304,6 +1304,8 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
 
+    /* TODO(#64): a value that isn't only in memory can't be saved yet. */
+
     /* Save the expire time */
     if (expiretime != -1) {
         if (rdbSaveType(rdb, RDB_OPCODE_EXPIRETIME_MS) == -1) return -1;

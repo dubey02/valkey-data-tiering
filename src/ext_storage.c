@@ -448,14 +448,14 @@ void setStorageState(robj *o, storageState state) {
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
- * Module values have no serializer yet (#81). Expired keys are left for
- * expiry to delete. A hash with field expirations stays in DRAM because active
- * field expiry reads and changes its value.
- * TODO(#57): spill it once expiry handles keys on flash. */
+ * Module values have no serializer yet (#81). A key with a TTL, or a hash with
+ * field expirations, stays in DRAM because expiry deletes and changes values
+ * without checking where they are.
+ * TODO(#57): spill them once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
     if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
     if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
-    if (timestampIsExpired(objectGetExpire(o))) return false;
+    if (objectGetExpire(o) != EXPIRY_NONE) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }
 
@@ -716,9 +716,12 @@ size_t extStorageSpillToFree(size_t mem_tofree) {
     return ext_storage.stats.num_items_spilling > 0 ? 0 : mem_tofree;
 }
 
+/* TODO(#74): on a replica, a replicated write to a spilled key would block the
+ * primary's client, which blockClient() doesn't allow. */
 void extStorageSpillCron(void) {
     size_t mem_tofree;
-    if (server.loading || getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
+    if (!extStorageIsActive() || server.loading) return;
+    if (getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
     extStorageSpillToFree(mem_tofree);
 }
 

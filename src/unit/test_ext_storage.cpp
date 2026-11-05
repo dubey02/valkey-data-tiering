@@ -997,10 +997,8 @@ class SpillSelectTest : public ::testing::Test {
         lrulfu_updateClockAndPolicy(mstime(), (policy & MAXMEMORY_FLAG_LFU) != 0);
     }
 
-    /* Runs performEvictions() one byte over maxmemory, so it evicts one key and
-     * leaves the rest of its sample in the pool. */
-    void evictOneKey(void) {
-        /* Evicting a key notifies modules, touches watched keys and propagates a DEL. */
+    /* Deleting keys notifies modules, touches watched keys and propagates a DEL. */
+    void startKeyDeletes(void) {
         static bool server_initialized = false;
         if (!server_initialized) {
             monotonicInit();
@@ -1010,15 +1008,28 @@ class SpillSelectTest : public ::testing::Test {
         }
         server.replicas = listCreate();
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
+    }
 
-        server.maxmemory = zmalloc_used_memory() - 1;
-        EXPECT_EQ(performEvictions(), EVICT_OK);
-        server.maxmemory = 0;
-
+    void endKeyDeletes(void) {
         dictRelease(server.db[0]->watched_keys);
         server.db[0]->watched_keys = NULL;
         listRelease(server.replicas);
         server.replicas = NULL;
+    }
+
+    /* Runs performEvictions() one byte over maxmemory and returns its result. */
+    int runEvictions(void) {
+        startKeyDeletes();
+        server.maxmemory = zmalloc_used_memory() - 1;
+        int result = performEvictions();
+        server.maxmemory = 0;
+        endKeyDeletes();
+        return result;
+    }
+
+    /* Evicts one key and leaves the rest of its sample in the pool. */
+    void evictOneKey(void) {
+        EXPECT_EQ(runEvictions(), EVICT_OK);
     }
 
     bool keyExists(const char *key) {
@@ -1161,17 +1172,19 @@ TEST_F(SpillSelectTest, SkipsModuleKeys) {
     EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
 }
 
-/* An expired key that expiry hasn't deleted yet would be written to flash for
- * nothing, however cold it is. */
-TEST_F(SpillSelectTest, SkipsExpiredKeys) {
+/* Expiry deletes keys without checking where their values are, so a key with a
+ * TTL is never spilled, expired or not, however cold it is. */
+TEST_F(SpillSelectTest, SkipsKeysWithATtl) {
     usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
     server.cmd_time_snapshot = mstime();
     objectSetLRUOrLFU(addRawKeyWithExpire("expired", server.cmd_time_snapshot - 1000), -1, 5000);
-    robj *live = addRawKeyWithExpire("live", server.cmd_time_snapshot + 3600 * 1000);
-    objectSetLRUOrLFU(live, -1, 10);
+    objectSetLRUOrLFU(addRawKeyWithExpire("live", server.cmd_time_snapshot + 3600 * 1000), -1, 4000);
+    robj *no_ttl = addRawKey("no_ttl");
+    objectSetLRUOrLFU(no_ttl, -1, 10);
 
     int dbid = -1;
-    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), live);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), no_ttl);
 }
 
 /* Field expiry reads and changes the hash's value, so it has to stay in DRAM. */
@@ -1415,17 +1428,16 @@ TEST_F(SpillSelectTest, KeepsCandidatesFromEarlierSelections) {
     EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), second);
 }
 
-/* Eviction under volatile-lru and spill under allkeys-lru both score by idle
- * time. Only the scale decides whether the pool is cleared, so the keys
- * eviction left in the pool must stay there for spill to pick. */
+/* Eviction and spill both score by idle time under allkeys-lru. Only the scale
+ * decides whether the pool is cleared, so the keys eviction left in the pool
+ * must stay there for spill to pick. */
 TEST_F(SpillSelectTest, KeepsEvictionCandidatesScoredOnTheSameScale) {
-    usePolicy(MAXMEMORY_VOLATILE_LRU);
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
     server.maxmemory_samples = 64; /* sample every key in one pass */
-    long long expire = mstime() + 3600 * 1000;
-    objectSetLRUOrLFU(addRawKeyWithExpire("coldest", expire), -1, 5000);
-    robj *second = addRawKeyWithExpire("second", expire);
+    objectSetLRUOrLFU(addRawKey("coldest"), -1, 5000);
+    robj *second = addRawKey("second");
     objectSetLRUOrLFU(second, -1, 4000);
-    objectSetLRUOrLFU(addRawKeyWithExpire("warm", expire), -1, 10);
+    objectSetLRUOrLFU(addRawKey("warm"), -1, 10);
 
     /* Evicts coldest and leaves second and warm in the pool. */
     evictOneKey();
@@ -2477,24 +2489,74 @@ TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
 }
 
-/* beforeSleep() spills without a command, and on a replica, which never evicts. */
-TEST_F(SpillSubmitTest, CronSpillsOverMaxmemoryOnPrimariesAndReplicas) {
-    robj *primary_key = addRawKey("primary");
+/* beforeSleep() spills without a command. The replica case is in ext-storage.tcl. */
+TEST_F(SpillSubmitTest, CronSpillsOverMaxmemory) {
+    robj *entry = addRawKey("key");
     extStorageSpillCron();
-    EXPECT_EQ(getStorageState(primary_key), STORAGE_STATE_ONLY_MEMORY); /* No maxmemory. */
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY); /* No maxmemory. */
 
     server.maxmemory = zmalloc_used_memory() - 1;
     extStorageSpillCron();
-    EXPECT_EQ(getStorageState(primary_key), STORAGE_STATE_COPYING_TO_FLASH);
-    ASSERT_EQ(finishSpills(), 1);
-
-    robj *replica_key = addRawKey("replica");
-    server.primary_host = (char *)"127.0.0.1";
-    server.maxmemory = zmalloc_used_memory() - 1;
-    extStorageSpillCron();
-    EXPECT_EQ(getStorageState(replica_key), STORAGE_STATE_COPYING_TO_FLASH);
-    server.primary_host = nullptr;
     server.maxmemory = 0;
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    EXPECT_EQ(finishSpills(), 1);
+}
+
+/* A flush waits for spills in flight, since the storage engine is still reading
+ * the values it would free. */
+TEST_F(SpillSubmitTest, AFlushWaitsForSpillsInFlight) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillToFree(100), 0u);
+    ASSERT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    uint64_t spilled = infoField("ext_storage_total_num_items_spilled_to_storage");
+
+    startKeyDeletes();
+    server.db[0]->keys_with_volatile_items = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+    emptyData(0, EMPTYDB_NOFUNCTIONS, NULL); /* FLUSHDB. FLUSHALL also needs bgIteration */
+    kvstoreRelease(server.db[0]->keys_with_volatile_items);
+    server.db[0]->keys_with_volatile_items = NULL;
+    endKeyDeletes();
+
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 0u);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled + 1);
+    EXPECT_FALSE(keyExists("key"));
+}
+
+/* Eviction never frees a value the storage engine is still writing. */
+TEST_F(SpillSelectTest, EvictionSkipsAKeyBeingSpilled) {
+    int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_RANDOM};
+    for (int i = 0; i < 2; i++) {
+        usePolicy(policies[i]);
+        server.maxmemory_samples = 64; /* sample every key in one pass */
+        robj *spilling = addRawKey("spilling");
+        objectSetLRUOrLFU(spilling, -1, 5000);
+        setStorageState(spilling, STORAGE_STATE_COPYING_TO_FLASH);
+        objectSetLRUOrLFU(addRawKey("in_memory"), -1, 10);
+
+        evictOneKey();
+        EXPECT_TRUE(keyExists("spilling"));
+        EXPECT_FALSE(keyExists("in_memory"));
+        setStorageState(spilling, STORAGE_STATE_ONLY_MEMORY);
+        drainPool();
+    }
+}
+
+/* With every key on flash, eviction stops after EV_MAX_REJECTED_KEYS instead of
+ * sampling forever, under both the pool and the random sampler. */
+TEST_F(SpillSelectTest, EvictionGivesUpWhenNoKeyIsInMemory) {
+    int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_RANDOM};
+    for (int i = 0; i < 2; i++) {
+        usePolicy(policies[i]);
+        char name[32];
+        for (int k = 0; k < 10; k++) {
+            snprintf(name, sizeof(name), "flash:%d", k);
+            setStorageState(addRawKey(name), STORAGE_STATE_ONLY_FLASH);
+        }
+
+        EXPECT_EQ(runEvictions(), EVICT_FAIL);
+        EXPECT_EQ(kvstoreSize(server.db[0]->keys), 10u);
+        drainPool();
+    }
 }
 
 #endif /* USE_EXT_STORAGE */
