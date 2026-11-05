@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string>
+#include <unistd.h>
 
 extern "C" {
 #include "server.h"
@@ -23,6 +24,7 @@ extern "C" {
 #include "ext_storage.h"
 #include "module.h"
 #include "storage/storage.h"
+#include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
 void extStorageTestResetRegistry(void);
 void fetchItem(serverDb *db, robj *key);
@@ -60,6 +62,41 @@ static void sinkBeginDict(void *, const char *) {
 }
 static void sinkEndDict(void *) {
 }
+/* Runs extStorageDebugCommand on DEBUG <args>, returns the raw reply and sets
+ * *handled. A module client keeps the reply in c->buf. */
+static std::string runDebug(int argc, const char **args, int *handled) {
+    if (shared.ok == NULL) createSharedObjects();
+    client *c = (client *)zcalloc(sizeof(client));
+    c->buf = (char *)zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
+    c->reply = listCreate();
+    c->deferred_reply_bytes = ULLONG_MAX;
+    c->flag.module = 1;
+    robj *argv[8];
+    argv[0] = createStringObject("debug", 5);
+    for (int i = 0; i < argc; i++) argv[i + 1] = createStringObject(args[i], strlen(args[i]));
+    c->argv = argv;
+    c->argc = argc + 1;
+
+    *handled = extStorageDebugCommand(c);
+    std::string reply(c->buf, c->bufpos);
+
+    for (int i = 0; i < c->argc; i++) decrRefCount(argv[i]);
+    if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
+    listRelease(c->reply);
+    zfree(c->buf);
+    zfree(c);
+    return reply;
+}
+
+/* Runs DEBUG EXT-STORAGE <subcommand> <value> and returns the raw reply. */
+static std::string debugExtStorage(const char *subcommand, const char *value) {
+    const char *args[] = {"ext-storage", subcommand, value};
+    int handled = 0;
+    std::string reply = runDebug(3, args, &handled);
+    EXPECT_EQ(handled, 1);
+    return reply;
+}
+
 static const storageInfoSink stat_map_sink_template = {
     nullptr, sinkAddLongLong, sinkAddULongLong, sinkAddDouble, sinkAddCString, sinkBeginDict, sinkEndDict};
 
@@ -173,6 +210,8 @@ class StorageMockTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        /* Resume first, so a test that failed while paused still closes. */
+        engine->pause_processing(0);
         drainCompletions();
         EXPECT_EQ(engine->close(), STORAGE_OK);
         extStorageTestResetRegistry();
@@ -696,6 +735,67 @@ TEST_F(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
     decrRefCount(e3);
 }
 
+/* While paused, a request is accepted but does not run. It runs and completes
+ * once resumed. */
+TEST_F(StorageMockTest, NothingRunsWhilePaused) {
+    openEngine();
+    sds key = sdsnew("k");
+    dbEntry *entry = makeEntry(key, "v");
+
+    engine->pause_processing(1);
+    ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
+    EXPECT_EQ(storageMockRunIo(8), 0);
+    storageCompletion comp = {};
+    EXPECT_EQ(engine->poll_completions(&comp, 1), 0);
+    EXPECT_EQ(readStats()["total_num_items"], 0u);
+
+    engine->pause_processing(0);
+    ASSERT_EQ(waitForCompletedRequest(&comp), 1);
+    EXPECT_EQ(comp.status, STORAGE_OK);
+    robj *out = nullptr;
+    ASSERT_EQ(getAndWait(0, key, &out), STORAGE_OK);
+    EXPECT_STREQ((const char *)objectGetVal(out), "v");
+
+    decrRefCount(out);
+    sdsfree(key);
+    decrRefCount(entry);
+}
+
+/* A paused storage engine returns the same codes at submit as a running one. */
+TEST_F(StorageMockTest, SubmitReturnsTheUsualCodesWhilePaused) {
+    openEngine();
+    engine->pause_processing(1);
+    sds key = sdsnew("k");
+    EXPECT_EQ(engine->get_async(cfg.num_databases, key, sdslen(key), nullptr), STORAGE_ERR_REJECTED);
+
+    int accepted = 0;
+    for (int i = 0; i < 1000; i++) {
+        if (engine->get_async(0, key, sdslen(key), nullptr) != STORAGE_OK) break;
+        accepted++;
+    }
+    ASSERT_GT(accepted, 0);
+    EXPECT_EQ(engine->get_async(0, key, sdslen(key), nullptr), STORAGE_WOULDBLOCK);
+
+    engine->pause_processing(0);
+    sdsfree(key);
+}
+
+/* A completion produced before the pause is still handed out. */
+TEST_F(StorageMockTest, ACompletionFromBeforeThePauseCanBePolled) {
+    openEngine();
+    sds key = sdsnew("k");
+    ASSERT_EQ(engine->get_async(0, key, sdslen(key), nullptr), STORAGE_OK);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+
+    engine->pause_processing(1);
+    storageCompletion comp = {};
+    EXPECT_EQ(engine->poll_completions(&comp, 1), 1);
+    EXPECT_EQ(comp.status, STORAGE_NOT_FOUND);
+
+    engine->pause_processing(0);
+    sdsfree(key);
+}
+
 /* ---------------------------------------------------------------------------
  * Engine serialization
  *
@@ -1004,7 +1104,7 @@ class SpillSelectTest : public ::testing::Test {
         static bool server_initialized = false;
         if (!server_initialized) {
             monotonicInit();
-            createSharedObjects();
+            if (shared.ok == NULL) createSharedObjects();
             moduleInitModulesSystem();
             server_initialized = true;
         }
@@ -1810,6 +1910,54 @@ TEST_F(SpillSubmitTest, ACompletedSpillUnblocksClientsOnTheKey) {
     ASSERT_EQ(finishSpills(), 1);
 }
 
+/* Other DEBUG subcommands return 0 with no reply. Any EXT-STORAGE form returns
+ * 1, a bad one with a syntax error. */
+TEST_F(SpillSubmitTest, DebugDispatchClaimsOnlyExtStorage) {
+    int handled = -1;
+    const char *other[] = {"sleep", "0"};
+    EXPECT_EQ(runDebug(2, other, &handled), "");
+    EXPECT_EQ(handled, 0);
+
+    const char *bare[] = {"ext-storage"};
+    EXPECT_EQ(runDebug(1, bare, &handled), "");
+    EXPECT_EQ(handled, 0);
+
+    const char *unknown[] = {"EXT-STORAGE", "no-such", "1"};
+    EXPECT_NE(runDebug(3, unknown, &handled).find("unknown subcommand"), std::string::npos);
+    EXPECT_EQ(handled, 1);
+
+    const char *upper[] = {"EXT-STORAGE", "PAUSE-FOREGROUND", "1"};
+    EXPECT_EQ(runDebug(3, upper, &handled), "+OK\r\n");
+    EXPECT_EQ(handled, 1);
+    EXPECT_EQ(infoField("ext_storage_foreground_paused"), 1u);
+    EXPECT_EQ(debugExtStorage("pause-foreground", "0"), "+OK\r\n");
+}
+
+/* Without pause_processing, PAUSE-BACKGROUND is refused. PAUSE-FOREGROUND
+ * still works. */
+TEST_F(SpillSubmitTest, PauseBackgroundIsRefusedWithoutStorageEngineSupport) {
+    extStorageDeinit();
+    static storageEngine no_pause;
+    no_pause = *storageMockEngine();
+    no_pause.name = "no-pause";
+    no_pause.pause_processing = NULL;
+    ASSERT_EQ(storageRegisterEngine(&no_pause), STORAGE_OK);
+    zfree(server.ext_storage_engine);
+    server.ext_storage_engine = zstrdup("no-pause");
+    extStorageInit();
+
+    EXPECT_NE(debugExtStorage("pause-background", "1").find("does not support pausing"), std::string::npos);
+    EXPECT_EQ(infoField("ext_storage_background_paused"), 0u);
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    EXPECT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+
+    EXPECT_EQ(debugExtStorage("pause-foreground", "1"), "+OK\r\n");
+    EXPECT_EQ(infoField("ext_storage_foreground_paused"), 1u);
+    EXPECT_EQ(debugExtStorage("pause-foreground", "0"), "+OK\r\n");
+}
+
 /* ---------------------------------------------------------------------------
  * Fetch completion
  * ---------------------------------------------------------------------------*/
@@ -2166,6 +2314,52 @@ TEST_F(BlockClientTest, AKeyOnFlashBlocksUntilFetched) {
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
 }
 
+/* A fetch the storage engine finished is not handled while the foreground is
+ * paused, so the client stays blocked. Resume wakes it with the value back. */
+TEST_F(BlockClientTest, AClientStaysBlockedWhileTheForegroundIsPaused) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+    ASSERT_TRUE(extStorageBlockClientIfRequired(c));
+    ASSERT_EQ(storageMockRunIo(1), 1);
+
+    ASSERT_EQ(debugExtStorage("pause-foreground", "1"), "+OK\r\n");
+    extStorageBeforeSleep();
+    EXPECT_TRUE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_MEMORY);
+    EXPECT_EQ(numFetching(), 1u);
+
+    ASSERT_EQ(debugExtStorage("pause-foreground", "0"), "+OK\r\n");
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_TRUE(c->flag.unblocked);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    ASSERT_NE(objectGetVal(a), nullptr);
+    EXPECT_EQ(sdslen((sds)objectGetVal(a)), 200u);
+}
+
+/* A fetch does not run while the background is paused, so the client stays
+ * blocked. Resume runs it and wakes the client. */
+TEST_F(BlockClientTest, AClientStaysBlockedWhileTheBackgroundIsPaused) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+    uint64_t fetched = numFetched();
+
+    ASSERT_EQ(debugExtStorage("pause-background", "1"), "+OK\r\n");
+    ASSERT_TRUE(extStorageBlockClientIfRequired(c));
+    extStorageBeforeSleep();
+    EXPECT_TRUE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_MEMORY);
+    EXPECT_EQ(numFetched(), fetched);
+
+    ASSERT_EQ(debugExtStorage("pause-background", "0"), "+OK\r\n");
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(numFetched(), fetched + 1);
+    ASSERT_NE(objectGetVal(a), nullptr);
+    EXPECT_EQ(sdslen((sds)objectGetVal(a)), 200u);
+}
+
 TEST_F(BlockClientTest, MultipleKeysOnFlashBlockUntilAllAreFetched) {
     robj *a = addFlashKey("a");
     robj *b = addFlashKey("b");
@@ -2347,5 +2541,253 @@ TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
         },
         "Storage engine rejected the fetch");
 }
+
+/* ---------------------------------------------------------------------------
+ * DEBUG EXT-STORAGE pauses, on every built-in storage engine
+ * ---------------------------------------------------------------------------*/
+
+#define PAUSE_WAIT_STEP_US 1000
+#define PAUSE_WAIT_RETRIES 5000
+/* A paused test keeps polling this long to show nothing moves. */
+#define PAUSE_HOLD_US 50000
+
+class ExtStoragePauseTest : public SpillSelectTest, public ::testing::WithParamInterface<const char *> {
+  protected:
+    /* Per-test FlashCache directory, pid-unique for parallel runs. */
+    char data_dir[256];
+    char data_file[300];
+
+    void SetUp() override {
+        SpillSelectTest::SetUp();
+        extStorageTestResetRegistry();
+        server.hz = CONFIG_DEFAULT_HZ;
+        server.logfile = zstrdup("");
+        crc64_init();
+        monotonicInit();
+
+        static int test_counter = 0;
+        snprintf(data_dir, sizeof(data_dir), "/tmp/ext-pause-unit-%d-%d", (int)getpid(), test_counter++);
+        snprintf(data_file, sizeof(data_file), "%s/%s", data_dir, STORAGE_FLASHCACHE_DB_FILE);
+        removeDataDir();
+
+        server.ext_storage_enabled = 1;
+        server.ext_storage_engine = zstrdup(GetParam());
+        server.ext_storage_path = zstrdup(isMock() ? "" : data_dir);
+        server.ext_storage_capacity = 64 * 1024 * 1024;
+        extStorageInit();
+    }
+
+    void TearDown() override {
+        extStorageDeinit();
+        zfree(server.ext_storage_engine);
+        zfree(server.ext_storage_path);
+        zfree(server.logfile);
+        removeDataDir();
+        SpillSelectTest::TearDown();
+    }
+
+    bool isMock() {
+        return strcmp(GetParam(), "mock") == 0;
+    }
+
+    void removeDataDir() {
+        unlink(data_file);
+        rmdir(data_dir);
+    }
+
+    /* Lets the storage engine run. The mock runs only when told to. */
+    void runStorageEngine() {
+        if (isMock()) storageMockRunIo(1000);
+    }
+
+    /* One event loop pass. Runs the storage engine, then handles completions. */
+    void pump() {
+        runStorageEngine();
+        extStorageBeforeSleep();
+    }
+
+    /* Pumps until the entry reaches the state. Returns false at the deadline. */
+    bool waitForState(robj *entry, storageState state) {
+        for (int retry = 0; retry < PAUSE_WAIT_RETRIES; retry++) {
+            pump();
+            if (getStorageState(entry) == state) return true;
+            usleep(PAUSE_WAIT_STEP_US);
+        }
+        return false;
+    }
+
+    /* Pumps for PAUSE_HOLD_US. Returns false if the entry left the state. */
+    bool staysInState(robj *entry, storageState state) {
+        for (int waited = 0; waited < PAUSE_HOLD_US; waited += PAUSE_WAIT_STEP_US) {
+            pump();
+            if (getStorageState(entry) != state) return false;
+            usleep(PAUSE_WAIT_STEP_US);
+        }
+        return true;
+    }
+
+    /* Number of records the storage engine holds, read from its INFO fields. */
+    unsigned long long storageEngineItems() {
+        sds info = extStorageEngineInfoString(sdsempty());
+        const char *field = "storage_engine_total_num_items:";
+        const char *at = strstr(info, field);
+        unsigned long long n = at ? strtoull(at + strlen(field), NULL, 10) : 0;
+        sdsfree(info);
+        return n;
+    }
+
+    /* Lets the storage engine run, without handling completions, until it
+     * holds the given number of records. Returns false at the deadline. */
+    bool waitForStorageEngineItems(unsigned long long want) {
+        for (int retry = 0; retry < PAUSE_WAIT_RETRIES; retry++) {
+            runStorageEngine();
+            if (storageEngineItems() == want) return true;
+            usleep(PAUSE_WAIT_STEP_US);
+        }
+        return false;
+    }
+
+    unsigned long long infoField(const char *name) {
+        sds info = extStorageInfoString(sdsempty());
+        sds field = sdscatfmt(sdsempty(), "%s:", name);
+        const char *at = strstr(info, field);
+        EXPECT_NE(at, nullptr) << name;
+        unsigned long long v = at ? strtoull(at + sdslen(field), NULL, 10) : 0;
+        sdsfree(field);
+        sdsfree(info);
+        return v;
+    }
+
+    /* Spills the entry and waits until only the key is left in memory. */
+    void spill(robj *entry) {
+        ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+        ASSERT_TRUE(waitForState(entry, STORAGE_STATE_ONLY_FLASH));
+    }
+
+    /* Submits a fetch the way a blocked command does. */
+    void startFetch(robj *entry) {
+        sds key = objectGetKey(entry);
+        robj *k = createStringObject(key, sdslen(key));
+        fetchItem(server.db[0], k);
+        decrRefCount(k);
+    }
+
+    /* Checks the 200-byte value from addRawKey is back in memory. */
+    void expectValueBack(robj *entry) {
+        ASSERT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+        ASSERT_NE(objectGetVal(entry), nullptr);
+        EXPECT_EQ(sdslen((sds)objectGetVal(entry)), 200u);
+    }
+};
+
+/* A spill the storage engine finished is not handled while the foreground is
+ * paused. The key keeps its value until resume. */
+TEST_P(ExtStoragePauseTest, AFinishedSpillWaitsWhileTheForegroundIsPaused) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(debugExtStorage("pause-foreground", "1"), "+OK\r\n");
+    EXPECT_EQ(infoField("ext_storage_foreground_paused"), 1u);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_TRUE(waitForStorageEngineItems(1));
+
+    EXPECT_TRUE(staysInState(entry, STORAGE_STATE_COPYING_TO_FLASH));
+    EXPECT_NE(objectGetVal(entry), nullptr);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 1u);
+
+    ASSERT_EQ(debugExtStorage("pause-foreground", "0"), "+OK\r\n");
+    EXPECT_EQ(infoField("ext_storage_foreground_paused"), 0u);
+    ASSERT_TRUE(waitForState(entry, STORAGE_STATE_ONLY_FLASH));
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 0u);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), 1u);
+}
+
+/* A spill does not run while the background is paused. It runs once resumed. */
+TEST_P(ExtStoragePauseTest, ASpillDoesNotRunWhileTheBackgroundIsPaused) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(debugExtStorage("pause-background", "1"), "+OK\r\n");
+    EXPECT_EQ(infoField("ext_storage_background_paused"), 1u);
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    EXPECT_TRUE(staysInState(entry, STORAGE_STATE_COPYING_TO_FLASH));
+    EXPECT_EQ(storageEngineItems(), 0u);
+    EXPECT_NE(objectGetVal(entry), nullptr);
+
+    ASSERT_EQ(debugExtStorage("pause-background", "0"), "+OK\r\n");
+    EXPECT_EQ(infoField("ext_storage_background_paused"), 0u);
+    ASSERT_TRUE(waitForState(entry, STORAGE_STATE_ONLY_FLASH));
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), 1u);
+}
+
+/* A fetch the storage engine finished is not handled while the foreground is
+ * paused. Resume puts the value back. */
+TEST_P(ExtStoragePauseTest, AFinishedFetchWaitsWhileTheForegroundIsPaused) {
+    robj *entry = addRawKey("key");
+    spill(entry);
+    ASSERT_EQ(debugExtStorage("pause-foreground", "1"), "+OK\r\n");
+    startFetch(entry);
+    /* A get consumes the record, so zero means the fetch ran. */
+    ASSERT_TRUE(waitForStorageEngineItems(0));
+
+    EXPECT_TRUE(staysInState(entry, STORAGE_STATE_COPYING_TO_MEMORY));
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+    EXPECT_EQ(infoField("ext_storage_num_items_fetching_from_storage"), 1u);
+
+    ASSERT_EQ(debugExtStorage("pause-foreground", "0"), "+OK\r\n");
+    ASSERT_TRUE(waitForState(entry, STORAGE_STATE_ONLY_MEMORY));
+    expectValueBack(entry);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_fetched_from_storage"), 1u);
+}
+
+/* A fetch does not run while the background is paused. Resume runs it. */
+TEST_P(ExtStoragePauseTest, AFetchDoesNotRunWhileTheBackgroundIsPaused) {
+    robj *entry = addRawKey("key");
+    spill(entry);
+    /* FlashCache refreshes its INFO counters on its own clock. */
+    ASSERT_TRUE(waitForStorageEngineItems(1));
+    ASSERT_EQ(debugExtStorage("pause-background", "1"), "+OK\r\n");
+    startFetch(entry);
+
+    EXPECT_TRUE(staysInState(entry, STORAGE_STATE_COPYING_TO_MEMORY));
+    EXPECT_EQ(storageEngineItems(), 1u);
+
+    ASSERT_EQ(debugExtStorage("pause-background", "0"), "+OK\r\n");
+    ASSERT_TRUE(waitForState(entry, STORAGE_STATE_ONLY_MEMORY));
+    expectValueBack(entry);
+}
+
+/* Pausing twice and resuming twice leaves the storage engine running. */
+TEST_P(ExtStoragePauseTest, PausingTwiceThenResumingTwiceRunsAgain) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(debugExtStorage("pause-background", "1"), "+OK\r\n");
+    ASSERT_EQ(debugExtStorage("pause-background", "1"), "+OK\r\n");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    EXPECT_TRUE(staysInState(entry, STORAGE_STATE_COPYING_TO_FLASH));
+
+    ASSERT_EQ(debugExtStorage("pause-background", "0"), "+OK\r\n");
+    ASSERT_EQ(debugExtStorage("pause-background", "0"), "+OK\r\n");
+    EXPECT_EQ(infoField("ext_storage_background_paused"), 0u);
+    ASSERT_TRUE(waitForState(entry, STORAGE_STATE_ONLY_FLASH));
+}
+
+/* Shutdown lifts both pauses, so the drain finishes a spill instead of hanging.
+ * A reopened storage engine starts unpaused. */
+TEST_P(ExtStoragePauseTest, ShutdownLiftsBothPausesAndFinishesASpill) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(debugExtStorage("pause-foreground", "1"), "+OK\r\n");
+    ASSERT_EQ(debugExtStorage("pause-background", "1"), "+OK\r\n");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+
+    extStorageDeinit();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(objectGetVal(entry), nullptr);
+
+    extStorageInit();
+    EXPECT_EQ(infoField("ext_storage_foreground_paused"), 0u);
+    EXPECT_EQ(infoField("ext_storage_background_paused"), 0u);
+    robj *other = addRawKey("other");
+    spill(other);
+}
+
+INSTANTIATE_TEST_SUITE_P(StorageEngines, ExtStoragePauseTest, ::testing::Values("mock", "flashcache"));
 
 #endif /* USE_EXT_STORAGE */

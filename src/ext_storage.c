@@ -63,6 +63,10 @@ typedef struct extStorageContext {
     int open;
     /* The byte budget the storage engine was opened with. */
     uint64_t capacity_bytes;
+    /* While set, completions are not polled. */
+    int foreground_paused;
+    /* While set, the storage engine starts no new request. */
+    int background_paused;
     extStorageStats stats;
 } extStorageContext;
 
@@ -237,6 +241,8 @@ void extStorageInit(void) {
     ext_storage.engine = engine;
     ext_storage.open = 1;
     ext_storage.capacity_bytes = cfg.capacity_bytes;
+    ext_storage.foreground_paused = 0;
+    ext_storage.background_paused = 0;
     ext_storage.stats = (extStorageStats){0};
 
     serverLog(LL_NOTICE, "Data tiering enabled. Storage engine \"%s\", capacity %llu bytes.", engine->name,
@@ -275,14 +281,30 @@ static int extStoragePollCompletions(void) {
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
  * the loop at least every tick, so a completion waits at most that long. */
 void extStorageBeforeSleep(void) {
-    if (!ext_storage.open) return;
+    if (!ext_storage.open || ext_storage.foreground_paused) return;
     extStoragePollCompletions();
 }
 
+/* Pauses or resumes the handling of completions. */
+static void extStoragePauseForeground(int paused) {
+    ext_storage.foreground_paused = paused;
+}
+
+/* Pauses or resumes the storage engine. Returns false if it can't pause. */
+static bool extStoragePauseBackground(int paused) {
+    if (ext_storage.engine->pause_processing == NULL) return false;
+    ext_storage.engine->pause_processing(paused);
+    ext_storage.background_paused = paused;
+    return true;
+}
+
 /* Closes the storage engine. Outstanding requests are polled and handled first.
- * Nothing new is submitted, so the drain ends when they finish. */
+ * Nothing new is submitted, so the drain ends when they finish. Any DEBUG
+ * pause is lifted first. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
+    extStoragePauseForeground(0);
+    if (ext_storage.background_paused) extStoragePauseBackground(0);
     storageStatus st;
     int drained = 0;
     mstime_t drain_start = 0;
@@ -320,6 +342,54 @@ int extStorageIsActive(void) {
     return ext_storage.open;
 }
 
+/* DEBUG EXT-STORAGE PAUSE-FOREGROUND|PAUSE-BACKGROUND <0|1>
+ * Foreground stops completion handling. Background stops the storage engine
+ * from starting requests. */
+static void extStorageDebugPause(client *c, const char *subcommand) {
+    if (c->argc != 4) {
+        addReplySubcommandSyntaxError(c);
+        return;
+    }
+    long paused;
+    if (getLongFromObjectOrReply(c, c->argv[3], &paused, NULL) != C_OK) return;
+    if (paused != 0 && paused != 1) {
+        addReplyError(c, "Value must be 0 or 1");
+        return;
+    }
+
+    const char *side;
+    if (!strcasecmp(subcommand, "pause-foreground")) {
+        extStoragePauseForeground((int)paused);
+        side = "Foreground";
+    } else {
+        if (!extStoragePauseBackground((int)paused)) {
+            addReplyErrorFormat(c, "Storage engine \"%s\" does not support pausing", ext_storage.engine->name);
+            return;
+        }
+        side = "Background";
+    }
+    serverLog(LL_NOTICE, "%s processing of storage engine \"%s\" %s by DEBUG.", side, ext_storage.engine->name,
+              paused ? "paused" : "resumed");
+    addReply(c, shared.ok);
+}
+
+/* Handles DEBUG EXT-STORAGE. Returns 0, without replying, for any other DEBUG
+ * subcommand. */
+int extStorageDebugCommand(client *c) {
+    if (c->argc < 3 || strcasecmp(objectGetVal(c->argv[1]), "ext-storage")) return 0;
+    if (!ext_storage.open) {
+        addReplyError(c, "ext-storage is not enabled");
+        return 1;
+    }
+    const char *subcommand = objectGetVal(c->argv[2]);
+    if (!strcasecmp(subcommand, "pause-foreground") || !strcasecmp(subcommand, "pause-background")) {
+        extStorageDebugPause(c, subcommand);
+    } else {
+        addReplySubcommandSyntaxError(c);
+    }
+    return 1;
+}
+
 /* INFO
  * The Ext_storage section holds what the valkey server counts. The
  * Storage_engine section holds what the storage engine reports through the
@@ -339,7 +409,9 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
                         "ext_storage_num_items_fetching_from_storage:%llu\r\n"
-                        "ext_storage_total_num_fetch_errors:%llu\r\n",
+                        "ext_storage_total_num_fetch_errors:%llu\r\n"
+                        "ext_storage_foreground_paused:%d\r\n"
+                        "ext_storage_background_paused:%d\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
                         (unsigned long long)st->num_items_spilling,
@@ -347,7 +419,9 @@ sds extStorageInfoString(sds info) {
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted,
                         (unsigned long long)st->num_items_fetching,
-                        (unsigned long long)st->total_num_fetch_errors);
+                        (unsigned long long)st->total_num_fetch_errors,
+                        ext_storage.foreground_paused,
+                        ext_storage.background_paused);
 }
 
 /* The INFO buffer under construction, handed to the storage engine as the
