@@ -221,7 +221,7 @@ class StorageFlashCacheTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        /* A test that failed while paused must not wedge close. */
+        /* Resume first, so a test that failed while paused still closes. */
         engine->pause_processing(0);
         drainAndClose();
         storageUnregisterEngine();
@@ -716,8 +716,8 @@ TEST_F(StorageFlashCacheTest, NonStringTypeSurvivesTheRoundTrip) {
     decrRefCount(entry);
 }
 
-/* While paused, a put is accepted but never completes, even given far more
- * time than it needs. Once resumed it completes and the value reads back. */
+/* A put submitted while paused does not complete until resume, then reads
+ * back. */
 TEST_F(StorageFlashCacheTest, NothingCompletesWhilePaused) {
     openEngine();
     sds key = sdsnew("k");
