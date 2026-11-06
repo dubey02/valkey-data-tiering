@@ -74,6 +74,16 @@ TEST_MODULES = \
     unsupported_features.so \
     deferred_reply.so
 
+# hellostorage registers a storage engine, so it needs data tiering. When
+# BUILD_EXT_STORAGE is not passed in, fall back to how the valkey server was
+# built, recorded in src/.make-settings.
+ifeq ($(BUILD_EXT_STORAGE),)
+BUILD_EXT_STORAGE := $(shell sed -n 's/^BUILD_EXT_STORAGE=//p' ../../src/.make-settings 2>/dev/null)
+endif
+ifeq ($(BUILD_EXT_STORAGE),yes)
+TEST_MODULES += hellostorage.so
+endif
+
 .PHONY: all
 
 all: $(TEST_MODULES)
