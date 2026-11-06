@@ -34,6 +34,7 @@
 #include "bio.h"
 #include "script.h"
 #include "cluster_migrateslots.h"
+#include "ext_storage.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -282,17 +283,19 @@ static unsigned long evictionPoolSample(int policy, evictionPoolFilter *filter) 
     return total_keys;
 }
 
-/* Samples under 'policy', which must rank by LRU or LFU, and returns the
- * coldest key that 'filter' accepts, setting *dbid, or NULL if none of the
- * sampled keys pass.
+/* Returns the coldest pooled key that 'filter' accepts under 'policy', which
+ * must rank by LRU or LFU, setting *dbid. The pool is sampled only once it has
+ * no such key left. Returns NULL if none of the sampled keys pass either.
  * The pool is shared with eviction. Entries left by the other caller are kept
  * when they were scored on the same scale, and every pop rechecks its key. */
 robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid) {
     serverAssert(policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU));
     evictionPoolSetPolicy(policy);
 
-    evictionPoolSample(policy, filter);
     int slot;
+    robj *entry = evictionPoolPop(policy, filter, dbid, &slot);
+    if (entry) return entry;
+    evictionPoolSample(policy, filter);
     return evictionPoolPop(policy, filter, dbid, &slot);
 }
 
@@ -562,6 +565,13 @@ int performEvictions(void) {
 
     if (getMaxmemoryState(&mem_reported, NULL, &mem_tofree, NULL) == C_OK) {
         result = EVICT_OK;
+        goto update_metrics;
+    }
+
+    /* With data tiering, spilling frees memory instead of eviction. Spilled
+     * values free their DRAM when the completion is handled. */
+    if (extStorageIsActive()) {
+        result = extStorageSpillOverMaxmemory() ? EVICT_OK : EVICT_FAIL;
         goto update_metrics;
     }
 

@@ -1874,7 +1874,7 @@ void objectCommand(client *c) {
         addReplyBulkCString(c, strEncoding(objectGetEncoding(o)));
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "idletime") && c->argc == 3) {
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.null[c->resp])) == NULL) return;
-        if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        if (lrulfu_isUsingLFU()) {
             addReplyError(c, "An LFU maxmemory policy is selected, idle time not tracked. Please note that when "
                              "switching between policies at runtime LRU and LFU data will take some time to adjust.");
             return;
@@ -1882,7 +1882,7 @@ void objectCommand(client *c) {
         addReplyLongLong(c, lru_getIdleSecs(objectGetLRU(o)));
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "freq") && c->argc == 3) {
         if ((o = objectCommandLookupOrReply(c, c->argv[2], shared.null[c->resp])) == NULL) return;
-        if (!(server.maxmemory_policy & MAXMEMORY_FLAG_LFU)) {
+        if (!lrulfu_isUsingLFU()) {
             addReplyError(c,
                           "An LFU maxmemory policy is not selected, access frequency not tracked. Please note that "
                           "when switching between policies at runtime LRU and LFU data will take some time to adjust.");

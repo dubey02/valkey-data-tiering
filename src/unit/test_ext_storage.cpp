@@ -967,6 +967,7 @@ class SpillSelectTest : public ::testing::Test {
         server.dbnum = 1;
         server.maxmemory_samples = 5;
         server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
+        server.ext_storage_spill_policy = MAXMEMORY_ALLKEYS_LRU;
         server.db = (serverDb **)zcalloc(sizeof(serverDb *));
         server.db[0] = (serverDb *)zcalloc(sizeof(serverDb));
         server.db[0]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
@@ -992,15 +993,15 @@ class SpillSelectTest : public ::testing::Test {
         extStorageSpillSelectCandidate(&dbid);
     }
 
+    /* Sets maxmemory-policy and a spill policy that agrees with it. */
     void usePolicy(int policy) {
         server.maxmemory_policy = policy;
+        server.ext_storage_spill_policy = (policy & MAXMEMORY_FLAG_LFU) ? MAXMEMORY_ALLKEYS_LFU : MAXMEMORY_ALLKEYS_LRU;
         lrulfu_updateClockAndPolicy(mstime(), (policy & MAXMEMORY_FLAG_LFU) != 0);
     }
 
-    /* Runs performEvictions() one byte over maxmemory, so it evicts one key and
-     * leaves the rest of its sample in the pool. */
-    void evictOneKey(void) {
-        /* Evicting a key notifies modules, touches watched keys and propagates a DEL. */
+    /* Deleting keys notifies modules, touches watched keys and propagates a DEL. */
+    void startKeyDeletes(void) {
         static bool server_initialized = false;
         if (!server_initialized) {
             monotonicInit();
@@ -1010,15 +1011,28 @@ class SpillSelectTest : public ::testing::Test {
         }
         server.replicas = listCreate();
         server.db[0]->watched_keys = dictCreate(&keylistDictType);
+    }
 
-        server.maxmemory = zmalloc_used_memory() - 1;
-        EXPECT_EQ(performEvictions(), EVICT_OK);
-        server.maxmemory = 0;
-
+    void endKeyDeletes(void) {
         dictRelease(server.db[0]->watched_keys);
         server.db[0]->watched_keys = NULL;
         listRelease(server.replicas);
         server.replicas = NULL;
+    }
+
+    /* Runs performEvictions() one byte over maxmemory and returns its result. */
+    int runEvictions(void) {
+        startKeyDeletes();
+        server.maxmemory = zmalloc_used_memory() - 1;
+        int result = performEvictions();
+        server.maxmemory = 0;
+        endKeyDeletes();
+        return result;
+    }
+
+    /* Evicts one key and leaves the rest of its sample in the pool. */
+    void evictOneKey(void) {
+        EXPECT_EQ(runEvictions(), EVICT_OK);
     }
 
     bool keyExists(const char *key) {
@@ -1115,6 +1129,25 @@ TEST_F(SpillSelectTest, PicksTheLeastFrequentlyUsedKeyUnderAllkeysLfu) {
     EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
 }
 
+/* Under a maxmemory-policy that ranks by neither LRU nor LFU, the lru field
+ * follows ext-storage-spill-policy, so spilling ranks by LFU. */
+TEST_F(SpillSelectTest, PicksTheLeastFrequentlyUsedKeyUnderNoevictionWithAnLfuSpillPolicy) {
+    server.maxmemory_policy = MAXMEMORY_NO_EVICTION;
+    server.ext_storage_spill_policy = MAXMEMORY_ALLKEYS_LFU;
+    server.ext_storage_enabled = 1;
+    updateCachedTime(0);
+    ASSERT_TRUE(lrulfu_isUsingLFU());
+
+    objectSetLRUOrLFU(addRawKey("hot"), 200, -1);
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, 1, -1);
+    objectSetLRUOrLFU(addRawKey("warm"), 50, -1);
+
+    int dbid = -1;
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), coldest);
+    server.ext_storage_enabled = 0;
+}
+
 /* Colder keys that can't be spilled are passed over. */
 TEST_F(SpillSelectTest, SkipsKeysThatCannotBeSpilled) {
     usePolicy(MAXMEMORY_ALLKEYS_LRU);
@@ -1161,17 +1194,19 @@ TEST_F(SpillSelectTest, SkipsModuleKeys) {
     EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
 }
 
-/* An expired key that expiry hasn't deleted yet would be written to flash for
- * nothing, however cold it is. */
-TEST_F(SpillSelectTest, SkipsExpiredKeys) {
+/* Expiry deletes keys without checking where their values are, so a key with a
+ * TTL is never spilled, expired or not, however cold it is. */
+TEST_F(SpillSelectTest, SkipsKeysWithATtl) {
     usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
     server.cmd_time_snapshot = mstime();
     objectSetLRUOrLFU(addRawKeyWithExpire("expired", server.cmd_time_snapshot - 1000), -1, 5000);
-    robj *live = addRawKeyWithExpire("live", server.cmd_time_snapshot + 3600 * 1000);
-    objectSetLRUOrLFU(live, -1, 10);
+    objectSetLRUOrLFU(addRawKeyWithExpire("live", server.cmd_time_snapshot + 3600 * 1000), -1, 4000);
+    robj *no_ttl = addRawKey("no_ttl");
+    objectSetLRUOrLFU(no_ttl, -1, 10);
 
     int dbid = -1;
-    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), live);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), no_ttl);
 }
 
 /* Field expiry reads and changes the hash's value, so it has to stay in DRAM. */
@@ -1415,17 +1450,16 @@ TEST_F(SpillSelectTest, KeepsCandidatesFromEarlierSelections) {
     EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), second);
 }
 
-/* Eviction under volatile-lru and spill under allkeys-lru both score by idle
- * time. Only the scale decides whether the pool is cleared, so the keys
- * eviction left in the pool must stay there for spill to pick. */
+/* Eviction and spill both score by idle time under allkeys-lru. Only the scale
+ * decides whether the pool is cleared, so the keys eviction left in the pool
+ * must stay there for spill to pick. */
 TEST_F(SpillSelectTest, KeepsEvictionCandidatesScoredOnTheSameScale) {
-    usePolicy(MAXMEMORY_VOLATILE_LRU);
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
     server.maxmemory_samples = 64; /* sample every key in one pass */
-    long long expire = mstime() + 3600 * 1000;
-    objectSetLRUOrLFU(addRawKeyWithExpire("coldest", expire), -1, 5000);
-    robj *second = addRawKeyWithExpire("second", expire);
+    objectSetLRUOrLFU(addRawKey("coldest"), -1, 5000);
+    robj *second = addRawKey("second");
     objectSetLRUOrLFU(second, -1, 4000);
-    objectSetLRUOrLFU(addRawKeyWithExpire("warm", expire), -1, 10);
+    objectSetLRUOrLFU(addRawKey("warm"), -1, 10);
 
     /* Evicts coldest and leaves second and warm in the pool. */
     evictOneKey();
@@ -1552,6 +1586,7 @@ TEST_F(SpillSubmitTest, SubmitsTheValue) {
     EXPECT_EQ(comp.status, STORAGE_OK);
     EXPECT_NE(comp.request_ctx, nullptr);
     zfree(comp.request_ctx);
+    decrRefCount(entry); /* The reference spillComplete() would release. */
 }
 
 /* Each type and encoding takes its own path through the serializer, which
@@ -1577,6 +1612,7 @@ TEST_F(SpillSubmitTest, SubmitsEveryTypeOfValue) {
         ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
         EXPECT_EQ(comp.status, STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
         zfree(comp.request_ctx);
+        decrRefCount(entry); /* The reference spillComplete() would release. */
     }
 }
 
@@ -1594,6 +1630,7 @@ TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
 
     EXPECT_EQ(extStorageSpillItem(0, entry), STORAGE_WOULDBLOCK);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetRefcount(entry), 1);
 }
 
 TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
@@ -1602,6 +1639,7 @@ TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
     /* The engine rejects a database it wasn't opened with. */
     EXPECT_EQ(extStorageSpillItem(server.dbnum, entry), STORAGE_ERR_REJECTED);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(objectGetRefcount(entry), 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1642,12 +1680,25 @@ TEST(DefragLaterTest, SkipsAValueThatIsNotOnlyInMemory) {
 TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
     robj *entry = addRawKey("key");
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    EXPECT_EQ(objectGetRefcount(entry), 2); /* Held until the completion. */
 
     ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(objectGetRefcount(entry), 1);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
     EXPECT_EQ(objectGetVal(entry), nullptr);
     EXPECT_STREQ(objectGetKey(entry), "key");
     EXPECT_FALSE(isSelected(entry));
+}
+
+/* The spill's reference keeps a key deleted while it is being spilled alive
+ * until the completion. */
+TEST_F(SpillSubmitTest, AKeyDeletedWhileSpillingIsFreedOnCompletion) {
+    robj *entry = addRawKey("key");
+    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+    ASSERT_TRUE(kvstoreHashtableDelete(server.db[0]->keys, 0, objectGetKey(entry)));
+    EXPECT_EQ(objectGetRefcount(entry), 1);
+
+    EXPECT_EQ(finishSpills(), 1);
 }
 
 /* A write the storage engine accepted must succeed. */
@@ -1694,22 +1745,6 @@ TEST_F(SpillSubmitTest, EverySpillableTypeCompletes) {
             << "type " << spilled[i]->type << " encoding " << strEncoding(spilled[i]->encoding);
         EXPECT_EQ(objectGetVal(spilled[i]), nullptr);
     }
-}
-
-/* Nothing may reference a value while it is being spilled, so a reference at
- * completion is a bug. */
-TEST_F(SpillSubmitTest, AReferenceTakenDuringASpillCrashes) {
-    robj *entry = addRawKey("key");
-    ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
-    incrRefCount(entry);
-    ASSERT_EQ(storageMockRunIo(1), 1);
-
-    EXPECT_DEATH(extStorageBeforeSleep(), "");
-
-    /* The death ran in a child, so finish the spill here. */
-    decrRefCount(entry);
-    extStorageBeforeSleep();
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 
 /* Deleting or overwriting a hash checks it for field expirations. */
@@ -2434,6 +2469,105 @@ TEST_F(DebugSpillTest, ADebugReadOfAKeyBeingSpilledFails) {
 
     extStorageBeforeSleep();
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+}
+
+/* ---------------------------------------------------------------------------
+ * Spilling over maxmemory
+ * ---------------------------------------------------------------------------*/
+
+/* While spills are in flight, writes are allowed: the spills free memory once
+ * they complete. */
+TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
+    server.maxmemory = 100000000;
+    robj *coldest = addRawKey("coldest");
+    objectSetLRUOrLFU(coldest, -1, 1000);
+    objectSetLRUOrLFU(addRawKey("hot"), -1, 10);
+
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_EQ(getStorageState(coldest), STORAGE_STATE_COPYING_TO_FLASH);
+    ASSERT_EQ(finishSpills(), 2);
+    server.maxmemory = 0;
+}
+
+/* Writes are rejected when no key can be spilled. */
+TEST_F(SpillSubmitTest, RejectsWritesWhenNothingCanBeSpilled) {
+    server.maxmemory = 100000000;
+    addKey("embedded", createStringObject("short", 5));
+    EXPECT_FALSE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 0;
+}
+
+/* More than 20% over maxmemory, writes are rejected even with spills in flight,
+ * but the keys are still spilled. */
+TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhileStillSpilling) {
+    addRawKey("key");
+    server.maxmemory = zmalloc_used_memory(); /* At maxmemory, under the cap. */
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    ASSERT_EQ(finishSpills(), 1);
+
+    robj *second = addRawKey("second");
+    server.maxmemory = zmalloc_used_memory() / 2; /* Twice maxmemory. */
+    EXPECT_FALSE(extStorageSpillOverMaxmemory());
+    EXPECT_EQ(getStorageState(second), STORAGE_STATE_COPYING_TO_FLASH);
+    ASSERT_EQ(finishSpills(), 1);
+    server.maxmemory = 0;
+}
+
+/* A call spills a bounded number of keys and leaves the rest for the next. */
+TEST_F(SpillSubmitTest, SpillsAtMostTheLimitPerCall) {
+    server.maxmemory_samples = 128; /* sample every key, so only the limit stops the loop */
+    for (int i = 0; i < 80; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "key%d", i);
+        addRawKey(key);
+    }
+    server.maxmemory = 100000000;
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_EQ(finishSpills(), 64);
+    server.maxmemory = 0;
+}
+
+TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
+    robj *entry = addRawKey("key");
+    extStorageDeinit();
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* beforeSleep() spills without a command. The replica case is in ext-storage.tcl.
+ * The mock storage engine runs the spill when completions are polled, so it
+ * completes within the same extStorageBeforeSleep(). */
+TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
+    robj *entry = addRawKey("key");
+    extStorageBeforeSleep();
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY); /* No maxmemory. */
+
+    server.maxmemory = zmalloc_used_memory() - 1;
+    extStorageBeforeSleep();
+    server.maxmemory = 0;
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+}
+
+/* A flush waits for spills in flight, since the storage engine is still reading
+ * the values it would free. */
+TEST_F(SpillSubmitTest, AFlushWaitsForSpillsInFlight) {
+    robj *entry = addRawKey("key");
+    server.maxmemory = 100000000;
+    ASSERT_TRUE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 0;
+    ASSERT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    uint64_t spilled = infoField("ext_storage_total_num_items_spilled_to_storage");
+
+    startKeyDeletes();
+    server.db[0]->keys_with_volatile_items = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+    emptyData(0, EMPTYDB_NOFUNCTIONS, NULL); /* FLUSHDB. FLUSHALL also needs bgIteration */
+    kvstoreRelease(server.db[0]->keys_with_volatile_items);
+    server.db[0]->keys_with_volatile_items = NULL;
+    endKeyDeletes();
+
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 0u);
+    EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled + 1);
+    EXPECT_FALSE(keyExists("key"));
 }
 
 #endif /* USE_EXT_STORAGE */

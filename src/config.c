@@ -40,6 +40,7 @@
 #include "eval.h"
 #include "lrulfu.h"
 #include "throttle_repl.h"
+#include "ext_storage.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -68,6 +69,11 @@ configEnum maxmemory_policy_enum[] = {
     {"allkeys-lfu", MAXMEMORY_ALLKEYS_LFU},
     {"allkeys-random", MAXMEMORY_ALLKEYS_RANDOM},
     {"noeviction", MAXMEMORY_NO_EVICTION},
+    {NULL, 0}};
+
+configEnum ext_storage_spill_policy_enum[] = {
+    {"allkeys-lru", MAXMEMORY_ALLKEYS_LRU},
+    {"allkeys-lfu", MAXMEMORY_ALLKEYS_LFU},
     {NULL, 0}};
 
 configEnum syslog_facility_enum[] = {
@@ -2676,6 +2682,12 @@ static int isValidProcTitleTemplate(char *val, const char **err) {
     return 1;
 }
 
+static int applySpillPolicy(const char **err) {
+    if (!extStorageSpillPolicyConflicts()) return 1;
+    *err = "ext-storage-spill-policy must match an LRU or LFU maxmemory-policy";
+    return 0;
+}
+
 static int updateLocaleCollate(const char **err) {
     const char *s = setlocale(LC_COLLATE, server.locale_collate);
     if (s == NULL) {
@@ -3540,7 +3552,7 @@ standardConfig static_configs[] = {
     createEnumConfig("syslog-facility", NULL, IMMUTABLE_CONFIG, syslog_facility_enum, server.syslog_facility, LOG_LOCAL0, NULL, NULL),
     createEnumConfig("repl-diskless-load", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, repl_diskless_load_enum, server.repl_diskless_load, REPL_DISKLESS_LOAD_DISABLED, NULL, NULL),
     createEnumConfig("loglevel", NULL, MODIFIABLE_CONFIG, loglevel_enum, server.verbosity, LL_NOTICE, NULL, NULL),
-    createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, NULL),
+    createEnumConfig("maxmemory-policy", NULL, MODIFIABLE_CONFIG, maxmemory_policy_enum, server.maxmemory_policy, MAXMEMORY_NO_EVICTION, NULL, applySpillPolicy),
     createEnumConfig("appendfsync", NULL, MODIFIABLE_CONFIG, aof_fsync_enum, server.aof_fsync, AOF_FSYNC_EVERYSEC, NULL, updateAppendFsync),
     createEnumConfig("oom-score-adj", NULL, MODIFIABLE_CONFIG, oom_score_adj_enum, server.oom_score_adj, OOM_SCORE_ADJ_NO, NULL, updateOOMScoreAdj),
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, 0, NULL, NULL),
@@ -3682,6 +3694,7 @@ standardConfig static_configs[] = {
     createStringConfig("ext-storage-path", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.ext_storage_path, "", NULL, NULL),
     createULongLongConfig("ext-storage-capacity", NULL, IMMUTABLE_CONFIG, 1, ULLONG_MAX, server.ext_storage_capacity, 1024ULL * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
     createStringConfig("ext-storage-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ext_storage_cpulist, NULL, NULL, NULL),
+    createEnumConfig("ext-storage-spill-policy", NULL, MODIFIABLE_CONFIG, ext_storage_spill_policy_enum, server.ext_storage_spill_policy, MAXMEMORY_ALLKEYS_LRU, NULL, applySpillPolicy),
 
     /* Tls configs */
     createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */

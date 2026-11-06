@@ -213,6 +213,11 @@ void extStorageInit(void) {
         exit(1);
     }
 
+    if (extStorageSpillPolicyConflicts()) {
+        serverLog(LL_WARNING, "ext-storage-spill-policy must match an LRU or LFU maxmemory-policy.");
+        exit(1);
+    }
+
     storageConfig cfg = {
         .path = server.ext_storage_path,
         .capacity_bytes = server.ext_storage_capacity,
@@ -272,10 +277,20 @@ static int extStoragePollCompletions(void) {
     return n;
 }
 
+/* Spills over maxmemory without a command, also on replicas, which never evict.
+ * TODO(#74): on a replica, a replicated write to a spilled key would block the
+ * primary's client, which blockClient() doesn't allow. */
+static void spillIfOverMaxmemory(void) {
+    if (!extStorageIsActive() || server.loading) return;
+    if (getMaxmemoryState(NULL, NULL, NULL, NULL) == C_OK) return;
+    extStorageSpillOverMaxmemory();
+}
+
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
  * the loop at least every tick, so a completion waits at most that long. */
 void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
+    spillIfOverMaxmemory();
     extStoragePollCompletions();
 }
 
@@ -448,29 +463,30 @@ void setStorageState(robj *o, storageState state) {
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
- * Module values have no serializer yet (#81). Expired keys are left for
- * expiry to delete. A hash with field expirations stays in DRAM because active
- * field expiry reads and changes its value.
- * TODO(#57): spill it once expiry handles keys on flash. */
+ * Module values have no serializer yet (#81). A key with a TTL, or a hash with
+ * field expirations, stays in DRAM because expiry deletes and changes values
+ * without checking where they are.
+ * TODO(#57): spill them once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
     if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
     if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
-    if (timestampIsExpired(objectGetExpire(o))) return false;
+    if (objectGetExpire(o) != EXPIRY_NONE) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }
 
-/* Picks the eviction policy used to sample and rank keys for spilling.
- * Spill ignores maxmemory-policy and ranks every key by how long it has
- * been idle. That maps to allkeys-lru. The one exception is an LFU
- * maxmemory-policy. The lru field then holds an LFU counter instead of an
- * LRU clock, so allkeys-lfu is returned to read that field correctly. */
-static int spillSamplingPolicy(void) {
-    return (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) ? MAXMEMORY_ALLKEYS_LFU : MAXMEMORY_ALLKEYS_LRU;
+/* Whether data tiering spills by LRU while maxmemory-policy evicts by LFU, or
+ * the other way round. A key has one lru field, holding either an LRU clock or
+ * an LFU counter, so the two can't rank by different ones. */
+bool extStorageSpillPolicyConflicts(void) {
+    if (!server.ext_storage_enabled) return false;
+    if (!(server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU))) return false;
+    return (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != (server.ext_storage_spill_policy & MAXMEMORY_FLAG_LFU);
 }
 
-/* Returns the coldest spillable key, or NULL if none was sampled. */
+/* Returns the coldest spillable key, or NULL if none was sampled. Every key is
+ * ranked by ext-storage-spill-policy, whatever the maxmemory-policy. */
 robj *extStorageSpillSelectCandidate(int *dbid) {
-    return evictionPoolPopColdest(spillSamplingPolicy(), isSpillCandidate, dbid);
+    return evictionPoolPopColdest(server.ext_storage_spill_policy, isSpillCandidate, dbid);
 }
 
 /* A put in flight, passed to the engine as its request_ctx. */
@@ -486,8 +502,10 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     spillRequest *req = zmalloc(sizeof(*req));
     req->entry = entry;
     sds key = objectGetKey(entry);
+    incrRefCount(entry); /* Released in spillComplete(), keeps defrag from moving the entry. */
     storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
     if (status != STORAGE_OK) {
+        decrRefCount(entry);
         zfree(req);
         return status;
     }
@@ -566,14 +584,12 @@ static void spillFreeValue(robj *entry) {
         decrRefCount(val);
 }
 
-/* Handles a finished write. A key is spilled only when nothing else references
- * it, and nothing may take a reference while it is COPYING_TO_FLASH. A write
- * accepted by the storage engine must succeed, so the value is always freed. */
+/* Handles a finished write. A write accepted by the storage engine must
+ * succeed, so the value is always freed. */
 static void spillComplete(const storageCompletion *comp) {
     spillRequest *req = comp->request_ctx;
     robj *entry = req->entry;
     serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
-    serverAssert(objectGetRefcount(entry) == 1);
     serverAssert(comp->status == STORAGE_OK);
 
     spillFreeValue(entry);
@@ -586,6 +602,7 @@ static void spillComplete(const storageCompletion *comp) {
     robj *key = createStringObject(name, sdslen(name));
     unblockClientsInUseOnKey(key);
     decrRefCount(key);
+    decrRefCount(entry);
     zfree(req);
 }
 
@@ -670,7 +687,9 @@ static bool shouldFetchItem(robj *item) {
 /* Most keys a command can have before the key array is allocated on the heap. */
 #define MAX_NUM_KEYS_FOR_STACK_BUFFER 16
 
-/* Returns true if the client was blocked and the command must not run now. */
+/* Returns true if the client was blocked and the command must not run now.
+ * TODO(#45): keys fetched while a MULTI command is queued can be spilled again
+ * before EXEC, which has no keys of its own to block on. */
 bool extStorageBlockClientIfRequired(client *c) {
     if (!ext_storage.open) return false;
     if (!doesCommandHaveKeys(c->cmd)) return false;
@@ -695,6 +714,34 @@ bool extStorageBlockClientIfRequired(client *c) {
     if (keys != stackbuf) zfree(keys);
     getKeysFreeResult(&result);
     return n > 0;
+}
+
+/* Keys spilled per call, to bound the time spent selecting. */
+#define SPILL_MAX_PER_CALL 64
+
+/* Spills 64 cold keys, or fewer if no candidate is found or the storage engine
+ * refuses one. Returns false when writes must be rejected: used memory is over
+ * 1.2x maxmemory, or nothing could be spilled and no spill is in flight.
+ * Otherwise the spills in flight free memory once they complete.
+ * TODO(#110): spill only what projected memory needs, make the cap a config,
+ * and throttle writes below it. */
+bool extStorageSpillOverMaxmemory(void) {
+    if (!extStorageIsActive()) return true;
+
+    for (int i = 0; i < SPILL_MAX_PER_CALL; i++) {
+        int dbid;
+        robj *entry = extStorageSpillSelectCandidate(&dbid);
+        if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
+    }
+
+    if (zmalloc_used_memory() > server.maxmemory + server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
+    return ext_storage.stats.num_items_spilling > 0;
+}
+
+/* Waits for every spill in flight to finish. */
+void extStorageSpillDrain(void) {
+    if (!ext_storage.open) return;
+    while (ext_storage.stats.num_items_spilling > 0) extStoragePollCompletions();
 }
 
 #endif /* USE_EXT_STORAGE */

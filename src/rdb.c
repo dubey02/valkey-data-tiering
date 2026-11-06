@@ -50,6 +50,7 @@
 #include "compression.h"
 #include "compression_stream.h"
 #include "forkless.h"
+#include "ext_storage.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -1303,6 +1304,14 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid, int rdbver) {
     int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
     int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
+    /* With tiering on, the lru field also tracks the spill policy. */
+    if (server.ext_storage_enabled) {
+        savelfu = lrulfu_isUsingLFU();
+        savelru = !savelfu;
+    }
+
+    /* TODO(#64): a value that isn't only in memory can't be saved yet. */
+    serverAssert(extStorageIsMemoryOnly(val));
 
     /* Save the expire time */
     if (expiretime != -1) {
