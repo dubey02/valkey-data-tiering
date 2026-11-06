@@ -2546,41 +2546,4 @@ TEST_F(SpillSubmitTest, AFlushWaitsForSpillsInFlight) {
     EXPECT_FALSE(keyExists("key"));
 }
 
-/* Eviction never frees a value the storage engine is still writing. */
-TEST_F(SpillSelectTest, EvictionSkipsAKeyBeingSpilled) {
-    int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_RANDOM};
-    for (int i = 0; i < 2; i++) {
-        usePolicy(policies[i]);
-        server.maxmemory_samples = 64; /* sample every key in one pass */
-        robj *spilling = addRawKey("spilling");
-        objectSetLRUOrLFU(spilling, -1, 5000);
-        setStorageState(spilling, STORAGE_STATE_COPYING_TO_FLASH);
-        objectSetLRUOrLFU(addRawKey("in_memory"), -1, 10);
-
-        evictOneKey();
-        EXPECT_TRUE(keyExists("spilling"));
-        EXPECT_FALSE(keyExists("in_memory"));
-        setStorageState(spilling, STORAGE_STATE_ONLY_MEMORY);
-        drainPool();
-    }
-}
-
-/* With every key on flash, eviction gives up instead of sampling forever, under
- * both the pool and the random sampler. */
-TEST_F(SpillSelectTest, EvictionGivesUpWhenNoKeyIsInMemory) {
-    int policies[] = {MAXMEMORY_ALLKEYS_LRU, MAXMEMORY_ALLKEYS_RANDOM};
-    for (int i = 0; i < 2; i++) {
-        usePolicy(policies[i]);
-        char name[32];
-        for (int k = 0; k < 10; k++) {
-            snprintf(name, sizeof(name), "flash:%d", k);
-            setStorageState(addRawKey(name), STORAGE_STATE_ONLY_FLASH);
-        }
-
-        EXPECT_EQ(runEvictions(), EVICT_FAIL);
-        EXPECT_EQ(kvstoreSize(server.db[0]->keys), 10u);
-        drainPool();
-    }
-}
-
 #endif /* USE_EXT_STORAGE */

@@ -68,7 +68,8 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
 /* Starts fetches for spilled keys and blocks the client. Returns true if blocked. */
 bool extStorageBlockClientIfRequired(client *c);
 
-/* Spills cold keys over maxmemory. Returns what eviction must still free. */
+/* Spills cold keys over maxmemory. Returns 0 if spilling covers mem_tofree,
+ * otherwise mem_tofree. */
 size_t extStorageSpillToFree(size_t mem_tofree);
 
 /* Waits for every spill in flight to finish. */

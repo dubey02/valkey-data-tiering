@@ -568,8 +568,8 @@ int performEvictions(void) {
         goto update_metrics;
     }
 
-    /* Spilled values free their DRAM when the completion is handled, so eviction
-     * only frees the rest. */
+    /* With data tiering, spilling frees memory instead of eviction. Spilled
+     * values free their DRAM when the completion is handled. */
     mem_tofree = extStorageSpillToFree(mem_tofree);
     if (mem_tofree == 0) {
         result = EVICT_OK;
@@ -612,12 +612,10 @@ int performEvictions(void) {
                 /* We don't want to make local-db choices when expiring keys,
                  * so to start populate the eviction pool sampling keys from
                  * every DB. */
-                unsigned long total_keys = evictionPoolSample(server.maxmemory_policy, extStorageIsMemoryOnly);
+                unsigned long total_keys = evictionPoolSample(server.maxmemory_policy, NULL);
                 if (!total_keys) break; /* No keys to evict. */
-                /* TODO(#60): every sampled key was on flash, and eviction can't free those yet. */
-                if (EvictionPoolLRU[0].key == NULL) break;
 
-                robj *valkey = evictionPoolPop(server.maxmemory_policy, extStorageIsMemoryOnly, &bestdbid, &bestslot);
+                robj *valkey = evictionPoolPop(server.maxmemory_policy, NULL, &bestdbid, &bestslot);
                 if (valkey) bestkey = objectGetKey(valkey);
             }
         }
@@ -641,8 +639,7 @@ int performEvictions(void) {
                 int slot = kvstoreGetFairRandomHashtableIndex(kvs);
                 if (slot == KVSTORE_INDEX_NOT_FOUND) continue; /* No keys in this DB. */
                 void *entry;
-                /* TODO(#60): skip a key on flash, since eviction can't free it yet. */
-                if (kvstoreHashtableRandomEntry(kvs, slot, &entry) && extStorageIsMemoryOnly(entry)) {
+                if (kvstoreHashtableRandomEntry(kvs, slot, &entry)) {
                     bestkey = objectGetKey((robj *)entry);
                     bestdbid = j;
                     bestslot = slot;

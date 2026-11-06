@@ -721,10 +721,10 @@ bool extStorageBlockClientIfRequired(client *c) {
 #define SPILL_MAX_PER_CALL 64
 
 /* Spills 64 cold keys, or fewer if no candidate is found or the storage engine
- * refuses one. Returns what eviction must still free: nothing while spills are
- * in flight, since they free memory once they complete, otherwise all of
- * mem_tofree.
- * TODO(#110): spill only what projected memory needs. */
+ * refuses one. Returns 0 while spills are in flight, since they free memory
+ * once they complete, otherwise all of mem_tofree.
+ * TODO(#110): spill only what projected memory needs, and bound memory while
+ * spills are in flight. */
 size_t extStorageSpillToFree(size_t mem_tofree) {
     if (!extStorageIsActive()) return mem_tofree;
 
