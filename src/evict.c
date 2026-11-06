@@ -283,23 +283,19 @@ static unsigned long evictionPoolSample(int policy, evictionPoolFilter *filter) 
     return total_keys;
 }
 
-/* Samples under 'policy', which must rank by LRU or LFU, adding the keys that
- * 'filter' accepts to the pool.
+/* Returns the coldest pooled key that 'filter' accepts under 'policy', which
+ * must rank by LRU or LFU, setting *dbid. The pool is sampled only once it has
+ * no such key left. Returns NULL if none of the sampled keys pass either.
  * The pool is shared with eviction. Entries left by the other caller are kept
  * when they were scored on the same scale, and every pop rechecks its key. */
-void evictionPoolSampleColdest(int policy, evictionPoolFilter *filter) {
-    serverAssert(policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU));
-    evictionPoolSetPolicy(policy);
-    evictionPoolSample(policy, filter);
-}
-
-/* Removes and returns the coldest pooled key that 'filter' accepts, setting
- * *dbid, or NULL once the pool runs out. 'policy' is the one the pool was
- * sampled under. */
 robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid) {
     serverAssert(policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU));
     evictionPoolSetPolicy(policy);
+
     int slot;
+    robj *entry = evictionPoolPop(policy, filter, dbid, &slot);
+    if (entry) return entry;
+    evictionPoolSample(policy, filter);
     return evictionPoolPop(policy, filter, dbid, &slot);
 }
 

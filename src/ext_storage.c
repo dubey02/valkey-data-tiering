@@ -281,6 +281,7 @@ static int extStoragePollCompletions(void) {
  * the loop at least every tick, so a completion waits at most that long. */
 void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
+    extStorageSpillCron();
     extStoragePollCompletions();
 }
 
@@ -464,14 +465,8 @@ static bool isSpillCandidate(const robj *o) {
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }
 
-/* Samples keys that can be spilled into the eviction pool. Every key is ranked
- * by ext-storage-spill-policy, whatever the maxmemory-policy. */
-void extStorageSpillSample(void) {
-    evictionPoolSampleColdest(server.ext_storage_spill_policy, isSpillCandidate);
-}
-
-/* Returns the coldest sampled key that can be spilled, or NULL once the pool
- * runs out. */
+/* Returns the coldest spillable key, or NULL if none was sampled. Every key is
+ * ranked by ext-storage-spill-policy, whatever the maxmemory-policy. */
 robj *extStorageSpillSelectCandidate(int *dbid) {
     return evictionPoolPopColdest(server.ext_storage_spill_policy, isSpillCandidate, dbid);
 }
@@ -714,15 +709,9 @@ bool extStorageBlockClientIfRequired(client *c) {
 size_t extStorageSpillToFree(size_t mem_tofree) {
     if (!extStorageIsActive()) return mem_tofree;
 
-    extStorageSpillSample();
     for (int i = 0; i < SPILL_MAX_PER_CALL; i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
-        /* The pool holds fewer keys than one call spills, so refill it when empty. */
-        if (entry == NULL) {
-            extStorageSpillSample();
-            entry = extStorageSpillSelectCandidate(&dbid);
-        }
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
     return ext_storage.stats.num_items_spilling > 0 ? 0 : mem_tofree;

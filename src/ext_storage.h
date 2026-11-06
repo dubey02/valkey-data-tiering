@@ -45,11 +45,7 @@ sds extStorageEngineInfoString(sds info);
 /* The serialization callbacks. */
 const storageSerializer *extStorageSerializer(void);
 
-/* Samples keys that can be spilled into the eviction pool. */
-void extStorageSpillSample(void);
-
-/* Returns the coldest sampled key that can be spilled and sets *dbid, or NULL
- * once the pool runs out. */
+/* Returns the coldest key that can be spilled and sets *dbid, or NULL. */
 robj *extStorageSpillSelectCandidate(int *dbid);
 
 /* Submits a key's value to the storage engine. Nothing changes unless it
@@ -75,7 +71,8 @@ bool extStorageBlockClientIfRequired(client *c);
 /* Spills cold keys over maxmemory. Returns what eviction must still free. */
 size_t extStorageSpillToFree(size_t mem_tofree);
 
-/* Spills over maxmemory from beforeSleep(), also on replicas, which never evict. */
+/* Spills over maxmemory from extStorageBeforeSleep(), also on replicas, which
+ * never evict. */
 void extStorageSpillCron(void);
 
 /* Waits for every spill in flight to finish. */
@@ -89,8 +86,6 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
 }
 static inline size_t extStorageSpillToFree(size_t mem_tofree) {
     return mem_tofree;
-}
-static inline void extStorageSpillCron(void) {
 }
 static inline void extStorageSpillDrain(void) {
 }

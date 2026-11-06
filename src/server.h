@@ -4185,7 +4185,6 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms);
 void evictionPoolAlloc(void);
 typedef bool evictionPoolFilter(const robj *o);
 bool extStorageSpillPolicyConflicts(void);
-void evictionPoolSampleColdest(int policy, evictionPoolFilter *filter);
 robj *evictionPoolPopColdest(int policy, evictionPoolFilter *filter, int *dbid);
 #define EVICT_OK 0
 #define EVICT_RUNNING 1
