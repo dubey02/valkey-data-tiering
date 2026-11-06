@@ -71,15 +71,20 @@ bool extStorageBlockClientIfRequired(client *c);
 /* Spills cold keys over maxmemory. Returns what eviction must still free. */
 size_t extStorageSpillToFree(size_t mem_tofree);
 
-/* Spills over maxmemory from extStorageBeforeSleep(), also on replicas, which
- * never evict. */
-void extStorageSpillCron(void);
-
 /* Waits for every spill in flight to finish. */
 void extStorageSpillDrain(void);
 
+/* Whether ext-storage-spill-policy and an LRU or LFU maxmemory-policy disagree. */
+bool extStorageSpillPolicyConflicts(void);
+
 #else
 
+static inline int extStorageIsActive(void) {
+    return 0;
+}
+static inline bool extStorageSpillPolicyConflicts(void) {
+    return false;
+}
 static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;

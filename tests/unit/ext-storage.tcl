@@ -380,27 +380,20 @@ if {$tiering_built} {
         }
 
         foreach policy {allkeys-random allkeys-lru allkeys-lfu} {
-            test "Eviction under $policy only takes keys in memory ($engine)" {
+            test "Writes fail with OOM instead of evicting under $policy ($engine)" {
                 mostly_on_flash
                 # An LFU maxmemory-policy needs spilling to rank by LFU too.
                 set spill_policy [expr {$policy eq "allkeys-lfu" ? "allkeys-lfu" : "allkeys-lru"}]
                 r config set maxmemory-policy $policy ext-storage-spill-policy $spill_policy
-                # One key per sample, so most samples hold only keys on flash. A
-                # sample with only keys on flash gives up with OOM, so retry.
-                r config set maxmemory-samples 1
+                # Nothing is left to spill, so the write is refused.
                 r config set maxmemory [expr {[s used_memory] - 20000}]
-                for {set i 0} {$i < 100 && [s evicted_keys] == 0} {incr i} {
-                    catch {r set trigger v}
-                }
+                assert_error {OOM*} {r set trigger v}
                 r config set maxmemory 0
-                r config set maxmemory-samples 5
                 r config set maxmemory-policy allkeys-lru ext-storage-spill-policy allkeys-lru
-                assert_morethan [s evicted_keys] 0
-                for {set i 0} {$i < 300} {incr i} {
-                    assert_match {* storage_state:2 *} [r debug object flash:$i fast]
-                }
+                assert_equal 0 [s evicted_keys]
+                assert_equal 400 [r dbsize]
                 assert_equal [string repeat x 1000] [r get flash:0]
-            } {} {needs:debug}
+            }
         }
     }
     file delete -force $path

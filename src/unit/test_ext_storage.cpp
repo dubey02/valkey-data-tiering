@@ -2512,17 +2512,18 @@ TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
 }
 
-/* beforeSleep() spills without a command. The replica case is in ext-storage.tcl. */
+/* beforeSleep() spills without a command. The replica case is in ext-storage.tcl.
+ * The mock storage engine runs the spill when completions are polled, so it
+ * completes within the same extStorageBeforeSleep(). */
 TEST_F(SpillSubmitTest, CronSpillsOverMaxmemory) {
     robj *entry = addRawKey("key");
-    extStorageSpillCron();
+    extStorageBeforeSleep();
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY); /* No maxmemory. */
 
     server.maxmemory = zmalloc_used_memory() - 1;
-    extStorageSpillCron();
+    extStorageBeforeSleep();
     server.maxmemory = 0;
-    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
-    EXPECT_EQ(finishSpills(), 1);
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 
 /* A flush waits for spills in flight, since the storage engine is still reading

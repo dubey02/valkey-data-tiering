@@ -40,6 +40,7 @@
 #include "eval.h"
 #include "lrulfu.h"
 #include "throttle_repl.h"
+#include "ext_storage.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -2679,15 +2680,6 @@ static int isValidProcTitleTemplate(char *val, const char **err) {
         return 0;
     }
     return 1;
-}
-
-/* Whether data tiering spills by LRU while maxmemory-policy evicts by LFU, or
- * the other way round. A key has one lru field, holding either an LRU clock or
- * an LFU counter, so the two can't rank by different ones. */
-bool extStorageSpillPolicyConflicts(void) {
-    if (!server.ext_storage_enabled) return false;
-    if (!(server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU))) return false;
-    return (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != (server.ext_storage_spill_policy & MAXMEMORY_FLAG_LFU);
 }
 
 static int applySpillPolicy(const char **err) {

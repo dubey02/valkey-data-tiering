@@ -277,6 +277,16 @@ static int extStoragePollCompletions(void) {
     return n;
 }
 
+/* Spills over maxmemory without a command, also on replicas, which never evict.
+ * TODO(#74): on a replica, a replicated write to a spilled key would block the
+ * primary's client, which blockClient() doesn't allow. */
+static void extStorageSpillCron(void) {
+    size_t mem_tofree;
+    if (!extStorageIsActive() || server.loading) return;
+    if (getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
+    extStorageSpillToFree(mem_tofree);
+}
+
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
  * the loop at least every tick, so a completion waits at most that long. */
 void extStorageBeforeSleep(void) {
@@ -463,6 +473,15 @@ static bool isSpillCandidate(const robj *o) {
     if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
     if (objectGetExpire(o) != EXPIRY_NONE) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
+}
+
+/* Whether data tiering spills by LRU while maxmemory-policy evicts by LFU, or
+ * the other way round. A key has one lru field, holding either an LRU clock or
+ * an LFU counter, so the two can't rank by different ones. */
+bool extStorageSpillPolicyConflicts(void) {
+    if (!server.ext_storage_enabled) return false;
+    if (!(server.maxmemory_policy & (MAXMEMORY_FLAG_LRU | MAXMEMORY_FLAG_LFU))) return false;
+    return (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != (server.ext_storage_spill_policy & MAXMEMORY_FLAG_LFU);
 }
 
 /* Returns the coldest spillable key, or NULL if none was sampled. Every key is
@@ -715,15 +734,6 @@ size_t extStorageSpillToFree(size_t mem_tofree) {
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
     return ext_storage.stats.num_items_spilling > 0 ? 0 : mem_tofree;
-}
-
-/* TODO(#74): on a replica, a replicated write to a spilled key would block the
- * primary's client, which blockClient() doesn't allow. */
-void extStorageSpillCron(void) {
-    size_t mem_tofree;
-    if (!extStorageIsActive() || server.loading) return;
-    if (getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
-    extStorageSpillToFree(mem_tofree);
 }
 
 /* Waits for every spill in flight to finish. */
