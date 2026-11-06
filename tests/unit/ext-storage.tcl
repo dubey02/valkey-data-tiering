@@ -257,7 +257,7 @@ if {$tiering_built} {
             for {set i 0} {$i < 2000} {incr i} {
                 r set key:$i $val
             }
-            r config set maxmemory [expr {[s used_memory] - 500000}]
+            r config set maxmemory [expr {[s used_memory] * 19 / 20}]
             for {set i 0} {$i < 200} {incr i} {
                 r set new:$i $val
             }
@@ -311,7 +311,7 @@ if {$tiering_built} {
                 r hset big_hash:$i {*}$fields
                 unset fields
             }
-            r config set maxmemory [expr {[s used_memory] - 500000}]
+            r config set maxmemory [expr {[s used_memory] * 19 / 20}]
             r set trigger $val
             wait_for_condition 50 100 {
                 [s used_memory] <= [s maxmemory]
@@ -347,7 +347,7 @@ if {$tiering_built} {
                 r set key:$i $val
             }
             set before [spilled_keys]
-            r config set maxmemory [expr {[s used_memory] - 200000}]
+            r config set maxmemory [expr {[s used_memory] * 19 / 20}]
             catch {r set trigger v}
             wait_for_condition 50 100 {
                 [spilled_keys] > $before
@@ -378,6 +378,21 @@ if {$tiering_built} {
             r config set ext-storage-spill-policy allkeys-lru
             r config set maxmemory-policy allkeys-lru
         }
+
+        test "OBJECT FREQ and RDB follow an LFU spill policy under noeviction ($engine)" {
+            r flushall
+            r config set maxmemory-policy noeviction ext-storage-spill-policy allkeys-lfu
+            r config set lfu-log-factor 0
+            r set key v
+            for {set i 0} {$i < 20} {incr i} { r get key }
+            set freq [r object freq key]
+            assert_morethan $freq 20
+            assert_error {*idle time not tracked*} {r object idletime key}
+            r debug reload
+            assert_equal $freq [r object freq key]
+            r config set lfu-log-factor 10
+            r config set maxmemory-policy allkeys-lru ext-storage-spill-policy allkeys-lru
+        } {OK} {needs:debug}
 
         foreach policy {allkeys-random allkeys-lru allkeys-lfu} {
             test "Writes fail with OOM instead of evicting under $policy ($engine)" {

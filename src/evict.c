@@ -570,14 +570,8 @@ int performEvictions(void) {
 
     /* With data tiering, spilling frees memory instead of eviction. Spilled
      * values free their DRAM when the completion is handled. */
-    mem_tofree = extStorageSpillToFree(mem_tofree);
-    if (mem_tofree == 0) {
-        result = EVICT_OK;
-        goto update_metrics;
-    }
-    /* Nothing could be spilled. Reject writes instead of evicting. */
     if (extStorageIsActive()) {
-        result = EVICT_FAIL;
+        result = extStorageSpillOverMaxmemory() ? EVICT_OK : EVICT_FAIL;
         goto update_metrics;
     }
 

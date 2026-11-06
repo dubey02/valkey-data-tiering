@@ -280,18 +280,17 @@ static int extStoragePollCompletions(void) {
 /* Spills over maxmemory without a command, also on replicas, which never evict.
  * TODO(#74): on a replica, a replicated write to a spilled key would block the
  * primary's client, which blockClient() doesn't allow. */
-static void extStorageSpillCron(void) {
-    size_t mem_tofree;
+static void spillIfOverMaxmemory(void) {
     if (!extStorageIsActive() || server.loading) return;
-    if (getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
-    extStorageSpillToFree(mem_tofree);
+    if (getMaxmemoryState(NULL, NULL, NULL, NULL) == C_OK) return;
+    extStorageSpillOverMaxmemory();
 }
 
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
  * the loop at least every tick, so a completion waits at most that long. */
 void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
-    extStorageSpillCron();
+    spillIfOverMaxmemory();
     extStoragePollCompletions();
 }
 
@@ -721,19 +720,22 @@ bool extStorageBlockClientIfRequired(client *c) {
 #define SPILL_MAX_PER_CALL 64
 
 /* Spills 64 cold keys, or fewer if no candidate is found or the storage engine
- * refuses one. Returns 0 while spills are in flight, since they free memory
- * once they complete, otherwise all of mem_tofree.
- * TODO(#110): spill only what projected memory needs, and bound memory while
- * spills are in flight. */
-size_t extStorageSpillToFree(size_t mem_tofree) {
-    if (!extStorageIsActive()) return mem_tofree;
+ * refuses one. Returns false when writes must be rejected: used memory is over
+ * 1.2x maxmemory, or nothing could be spilled and no spill is in flight.
+ * Otherwise the spills in flight free memory once they complete.
+ * TODO(#110): spill only what projected memory needs, make the cap a config,
+ * and throttle writes below it. */
+bool extStorageSpillOverMaxmemory(void) {
+    if (!extStorageIsActive()) return true;
 
     for (int i = 0; i < SPILL_MAX_PER_CALL; i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
-    return ext_storage.stats.num_items_spilling > 0 ? 0 : mem_tofree;
+
+    if (zmalloc_used_memory() > server.maxmemory + server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
+    return ext_storage.stats.num_items_spilling > 0;
 }
 
 /* Waits for every spill in flight to finish. */

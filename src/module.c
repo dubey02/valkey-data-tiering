@@ -15049,7 +15049,7 @@ int VM_SetLRU(ValkeyModuleKey *key, mstime_t lru_idle) {
 int VM_GetLRU(ValkeyModuleKey *key, mstime_t *lru_idle) {
     *lru_idle = -1;
     if (!key || !key->value) return VALKEYMODULE_ERR;
-    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) return VALKEYMODULE_OK;
+    if (lrulfu_isUsingLFU()) return VALKEYMODULE_OK;
     *lru_idle = objectGetLRUIdleSecs(key->value) * 1000;
     return VALKEYMODULE_OK;
 }

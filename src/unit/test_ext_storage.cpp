@@ -2475,22 +2475,42 @@ TEST_F(DebugSpillTest, ADebugReadOfAKeyBeingSpilledFails) {
  * Spilling over maxmemory
  * ---------------------------------------------------------------------------*/
 
-/* While spills are in flight, eviction has nothing to free: they free memory
- * once they complete. */
-TEST_F(SpillSubmitTest, SpillingCoversWhatMustBeFreed) {
+/* While spills are in flight, writes are allowed: the spills free memory once
+ * they complete. */
+TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
+    server.maxmemory = 100000000;
     robj *coldest = addRawKey("coldest");
     objectSetLRUOrLFU(coldest, -1, 1000);
     objectSetLRUOrLFU(addRawKey("hot"), -1, 10);
 
-    EXPECT_EQ(extStorageSpillToFree(1000000), 0u);
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
     EXPECT_EQ(getStorageState(coldest), STORAGE_STATE_COPYING_TO_FLASH);
     ASSERT_EQ(finishSpills(), 2);
+    server.maxmemory = 0;
 }
 
-/* Eviction frees the memory when no key can be spilled. */
-TEST_F(SpillSubmitTest, ReturnsEverythingWhenNothingCanBeSpilled) {
+/* Writes are rejected when no key can be spilled. */
+TEST_F(SpillSubmitTest, RejectsWritesWhenNothingCanBeSpilled) {
+    server.maxmemory = 100000000;
     addKey("embedded", createStringObject("short", 5));
-    EXPECT_EQ(extStorageSpillToFree(100), 100u);
+    EXPECT_FALSE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 0;
+}
+
+/* More than 20% over maxmemory, writes are rejected even with spills in flight,
+ * but the keys are still spilled. */
+TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhileStillSpilling) {
+    addRawKey("key");
+    server.maxmemory = zmalloc_used_memory(); /* At maxmemory, under the cap. */
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    ASSERT_EQ(finishSpills(), 1);
+
+    robj *second = addRawKey("second");
+    server.maxmemory = zmalloc_used_memory() / 2; /* Twice maxmemory. */
+    EXPECT_FALSE(extStorageSpillOverMaxmemory());
+    EXPECT_EQ(getStorageState(second), STORAGE_STATE_COPYING_TO_FLASH);
+    ASSERT_EQ(finishSpills(), 1);
+    server.maxmemory = 0;
 }
 
 /* A call spills a bounded number of keys and leaves the rest for the next. */
@@ -2501,21 +2521,23 @@ TEST_F(SpillSubmitTest, SpillsAtMostTheLimitPerCall) {
         snprintf(key, sizeof(key), "key%d", i);
         addRawKey(key);
     }
-    EXPECT_EQ(extStorageSpillToFree(1000000), 0u);
+    server.maxmemory = 100000000;
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
     EXPECT_EQ(finishSpills(), 64);
+    server.maxmemory = 0;
 }
 
 TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
     robj *entry = addRawKey("key");
     extStorageDeinit();
-    EXPECT_EQ(extStorageSpillToFree(100), 100u);
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
 }
 
 /* beforeSleep() spills without a command. The replica case is in ext-storage.tcl.
  * The mock storage engine runs the spill when completions are polled, so it
  * completes within the same extStorageBeforeSleep(). */
-TEST_F(SpillSubmitTest, CronSpillsOverMaxmemory) {
+TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
     robj *entry = addRawKey("key");
     extStorageBeforeSleep();
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY); /* No maxmemory. */
@@ -2530,7 +2552,9 @@ TEST_F(SpillSubmitTest, CronSpillsOverMaxmemory) {
  * the values it would free. */
 TEST_F(SpillSubmitTest, AFlushWaitsForSpillsInFlight) {
     robj *entry = addRawKey("key");
-    ASSERT_EQ(extStorageSpillToFree(100), 0u);
+    server.maxmemory = 100000000;
+    ASSERT_TRUE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 0;
     ASSERT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
     uint64_t spilled = infoField("ext_storage_total_num_items_spilled_to_storage");
 
