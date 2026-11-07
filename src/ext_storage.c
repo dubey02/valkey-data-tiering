@@ -85,6 +85,16 @@ static void extStorageReleaseLoadingLock(void) {
 /* Serialization and Deserialization Functions
  * The storage engine may call these from its own IO thread. */
 
+/* Per-spill accounting state. The accounting is under Spill accounting below. */
+typedef struct extStorageSpillSizing {
+    bool sized;       /* Serialized and measured. */
+    size_t ram_bytes; /* Measured size, once serialized. */
+} extStorageSpillSizing;
+void extStorageSpillAccountSubmit(extStorageSpillSizing *s);
+void extStorageSpillAccountSized(extStorageSpillSizing *s, size_t ram_bytes);
+void extStorageSpillAccountFinish(extStorageSpillSizing *s);
+size_t extStorageSpillAccountInflightRamBytes(void);
+
 /* A put in flight, passed to the engine as its request_ctx. */
 typedef struct spillRequest {
     robj *entry;
@@ -772,7 +782,8 @@ void extStorageSpillDrain(void) {
  * - From submit to serialize, a spill isn't sized yet. The number of these
  *   spills is multiplied by the EMA of serialized sizes to estimate their bytes.
  * - From serialize to completion, a spill counts as its measured size.
- * Completion subtracts what a spill added. */
+ * Completion subtracts what a spill added.
+ * Main thread only, except extStorageSpillAccountSized(). */
 static _Atomic unsigned long spill_account_sized;    /* Serialization increments, completion decrements. */
 static _Atomic size_t spill_account_sized_ram_bytes; /* Serialization adds, completion subtracts. */
 static _Atomic size_t spill_account_ram_mean;        /* Serialization updates, main thread reads. */
@@ -795,14 +806,17 @@ void extStorageTestResetSpillAccount(void) {
     atomic_store_explicit(&spill_account_ram_mean, 0, memory_order_relaxed);
 }
 
+/* Counts a spill as in flight. Call before put_async. */
 void extStorageSpillAccountSubmit(extStorageSpillSizing *s) {
     s->sized = false;
     s->ram_bytes = 0;
     ext_storage.stats.num_items_spilling++;
 }
 
-/* Adds the spill's measured size and updates the mean. The count is added
- * before the bytes (release), so a reader that sees the bytes sees the count. */
+/* Adds the spill's measured size and updates the mean. Call once per spill,
+ * before its completion is posted. Safe to call from a storage engine thread.
+ * The count is added before the bytes (release), so a reader that sees the
+ * bytes sees the count. */
 void extStorageSpillAccountSized(extStorageSpillSizing *s, size_t ram_bytes) {
     serverAssert(!s->sized);
     s->ram_bytes = ram_bytes;
@@ -815,6 +829,7 @@ void extStorageSpillAccountSized(extStorageSpillSizing *s, size_t ram_bytes) {
                                                   memory_order_relaxed, memory_order_relaxed));
 }
 
+/* Removes a spill when its completion is polled or put_async refuses it. */
 void extStorageSpillAccountFinish(extStorageSpillSizing *s) {
     serverAssert(ext_storage.stats.num_items_spilling > 0);
     if (s->sized) {
@@ -833,12 +848,21 @@ static void spillAccountRead(size_t *sized_ram_bytes, unsigned long *unsized_req
     *unsized_requests = ext_storage.stats.num_items_spilling - sized;
 }
 
+/* Estimated in-flight bytes of all spills. Unserialized spills count as the
+ * mean size, which is 0 until the first spill is serialized. */
 size_t extStorageSpillAccountInflightRamBytes(void) {
     size_t sized_ram_bytes;
     unsigned long unsized_requests;
     spillAccountRead(&sized_ram_bytes, &unsized_requests);
     return sized_ram_bytes + unsized_requests * atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
 }
+
+typedef struct extStorageSpillAccountStats {
+    unsigned long inflight_requests; /* Spills inflight. */
+    unsigned long unsized_requests;  /* Of those, not yet serialized. */
+    size_t sized_ram_bytes;          /* Measured bytes of the serialized ones. */
+    size_t ram_mean;                 /* EMA of serialized sizes. */
+} extStorageSpillAccountStats;
 
 void extStorageSpillAccountGetStats(extStorageSpillAccountStats *out) {
     out->inflight_requests = ext_storage.stats.num_items_spilling;

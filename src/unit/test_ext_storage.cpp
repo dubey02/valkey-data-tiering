@@ -30,6 +30,22 @@ void extStorageTestResetRegistry(void);
 void fetchItem(serverDb *db, robj *key);
 extern hashtableType commandSetType;
 void extStorageTestResetSpillAccount(void);
+/* Spill accounting, private to ext_storage.c. The structs must match it. */
+typedef struct extStorageSpillSizing {
+    bool sized;
+    size_t ram_bytes;
+} extStorageSpillSizing;
+typedef struct extStorageSpillAccountStats {
+    unsigned long inflight_requests;
+    unsigned long unsized_requests;
+    size_t sized_ram_bytes;
+    size_t ram_mean;
+} extStorageSpillAccountStats;
+void extStorageSpillAccountSubmit(extStorageSpillSizing *s);
+void extStorageSpillAccountSized(extStorageSpillSizing *s, size_t ram_bytes);
+void extStorageSpillAccountFinish(extStorageSpillSizing *s);
+size_t extStorageSpillAccountInflightRamBytes(void);
+void extStorageSpillAccountGetStats(extStorageSpillAccountStats *out);
 void streamFreeCG(streamCG *cg);
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
