@@ -36,17 +36,17 @@ typedef struct spillRequest {
     bool sized;
     size_t ram_bytes;
 } spillRequest;
-typedef struct extStorageSpillAccountStats {
+typedef struct spillAccountStats {
     unsigned long inflight_requests;
     unsigned long unsized_requests;
     size_t sized_ram_bytes;
     size_t ram_mean;
-} extStorageSpillAccountStats;
-void extStorageSpillAccountSubmit(spillRequest *s);
-void extStorageSpillAccountSized(spillRequest *s, size_t ram_bytes);
-void extStorageSpillAccountFinish(spillRequest *s);
-size_t extStorageSpillAccountInflightRamBytes(void);
-void extStorageSpillAccountGetStats(extStorageSpillAccountStats *out);
+} spillAccountStats;
+void spillAccountSubmit(spillRequest *s);
+void spillAccountSized(spillRequest *s, size_t ram_bytes);
+void spillAccountFinish(spillRequest *s);
+size_t spillAccountInflightRamBytes(void);
+void spillAccountGetStats(spillAccountStats *out);
 void streamFreeCG(streamCG *cg);
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
@@ -1954,9 +1954,9 @@ class SpillAccountTest : public ::testing::Test {
         extStorageTestResetSpillAccount();
     }
 
-    extStorageSpillAccountStats stats() {
-        extStorageSpillAccountStats st;
-        extStorageSpillAccountGetStats(&st);
+    spillAccountStats stats() {
+        spillAccountStats st;
+        spillAccountGetStats(&st);
         return st;
     }
 };
@@ -1966,101 +1966,101 @@ class SpillAccountTest : public ::testing::Test {
 TEST_F(SpillAccountTest, ASpillCountsAsTheMeanUntilSized) {
     spillRequest a, b;
 
-    extStorageSpillAccountSubmit(&a);
+    spillAccountSubmit(&a);
     EXPECT_EQ(stats().inflight_requests, 1u);
     EXPECT_EQ(stats().unsized_requests, 1u);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 0u); /* No sizes yet, so the mean is 0. */
+    EXPECT_EQ(spillAccountInflightRamBytes(), 0u); /* No sizes yet, so the mean is 0. */
 
-    extStorageSpillAccountSized(&a, 1000);
+    spillAccountSized(&a, 1000);
     EXPECT_TRUE(a.sized);
     EXPECT_EQ(a.ram_bytes, 1000u);
     EXPECT_EQ(stats().unsized_requests, 0u);
     EXPECT_EQ(stats().sized_ram_bytes, 1000u);
     EXPECT_EQ(stats().ram_mean, 1000u);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 1000u);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 1000u);
 
-    extStorageSpillAccountSubmit(&b);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 2000u); /* One measured, one at the mean. */
-    extStorageSpillAccountSized(&b, 3000);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 4000u); /* Both measured. */
+    spillAccountSubmit(&b);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 2000u); /* One measured, one at the mean. */
+    spillAccountSized(&b, 3000);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 4000u); /* Both measured. */
 
-    extStorageSpillAccountFinish(&a);
-    extStorageSpillAccountFinish(&b);
-    extStorageSpillAccountStats st = stats();
+    spillAccountFinish(&a);
+    spillAccountFinish(&b);
+    spillAccountStats st = stats();
     EXPECT_EQ(st.inflight_requests, 0u);
     EXPECT_EQ(st.unsized_requests, 0u);
     EXPECT_EQ(st.sized_ram_bytes, 0u);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 0u);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
     EXPECT_EQ(st.ram_mean, 1000u + 2000u / 16); /* The mean outlives the spills. */
 }
 
 /* A spill submitted after others complete counts as the mean. */
 TEST_F(SpillAccountTest, ASpillAfterAFinishCountsAsTheMean) {
     spillRequest a, b;
-    extStorageSpillAccountSubmit(&a);
-    extStorageSpillAccountSized(&a, 1000);
-    extStorageSpillAccountFinish(&a);
+    spillAccountSubmit(&a);
+    spillAccountSized(&a, 1000);
+    spillAccountFinish(&a);
 
-    extStorageSpillAccountSubmit(&b);
+    spillAccountSubmit(&b);
     EXPECT_EQ(stats().unsized_requests, 1u);
     EXPECT_EQ(stats().sized_ram_bytes, 0u);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 1000u);
-    extStorageSpillAccountFinish(&b);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 1000u);
+    spillAccountFinish(&b);
 }
 
 /* A reused spillRequest starts unserialized. */
 TEST_F(SpillAccountTest, AReusedSizingStartsUnsized) {
     spillRequest s;
-    extStorageSpillAccountSubmit(&s);
-    extStorageSpillAccountSized(&s, 1000);
-    extStorageSpillAccountFinish(&s);
+    spillAccountSubmit(&s);
+    spillAccountSized(&s, 1000);
+    spillAccountFinish(&s);
 
-    extStorageSpillAccountSubmit(&s);
+    spillAccountSubmit(&s);
     EXPECT_FALSE(s.sized);
     EXPECT_EQ(stats().unsized_requests, 1u);
-    extStorageSpillAccountSized(&s, 3000);
+    spillAccountSized(&s, 3000);
     EXPECT_EQ(s.ram_bytes, 3000u);
     EXPECT_EQ(stats().sized_ram_bytes, 3000u);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 3000u);
-    extStorageSpillAccountFinish(&s);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 3000u);
+    spillAccountFinish(&s);
 }
 
 /* The mean starts at the first size, then moves 1/16 toward each new one. */
 TEST_F(SpillAccountTest, TheMeanMovesASixteenthTowardEachSize) {
     spillRequest s[3];
-    for (spillRequest &x : s) extStorageSpillAccountSubmit(&x);
+    for (spillRequest &x : s) spillAccountSubmit(&x);
 
-    extStorageSpillAccountSized(&s[0], 1600);
+    spillAccountSized(&s[0], 1600);
     EXPECT_EQ(stats().ram_mean, 1600u);
-    extStorageSpillAccountSized(&s[1], 3200);
+    spillAccountSized(&s[1], 3200);
     EXPECT_EQ(stats().ram_mean, 1600u + 1600u / 16);
-    extStorageSpillAccountSized(&s[2], 100);
+    spillAccountSized(&s[2], 100);
     EXPECT_EQ(stats().ram_mean, 1700u - 1600u / 16);
 
-    for (spillRequest &x : s) extStorageSpillAccountFinish(&x);
+    for (spillRequest &x : s) spillAccountFinish(&x);
 }
 
 /* A refused spill was never serialized, so removing it only changes the count. */
 TEST_F(SpillAccountTest, ARefusedSpillLeavesNoCredit) {
     spillRequest sizing;
-    extStorageSpillAccountSubmit(&sizing);
-    extStorageSpillAccountFinish(&sizing);
+    spillAccountSubmit(&sizing);
+    spillAccountFinish(&sizing);
     EXPECT_FALSE(sizing.sized);
-    extStorageSpillAccountStats st = stats();
+    spillAccountStats st = stats();
     EXPECT_EQ(st.inflight_requests, 0u);
     EXPECT_EQ(st.unsized_requests, 0u);
     EXPECT_EQ(st.sized_ram_bytes, 0u);
     EXPECT_EQ(st.ram_mean, 0u);
 }
 
-/* extStorageSpillAccountSized() is called once per spill. */
+/* spillAccountSized() is called once per spill. */
 TEST_F(SpillAccountTest, SizingASpillTwiceCrashes) {
     spillRequest sizing;
-    extStorageSpillAccountSubmit(&sizing);
-    extStorageSpillAccountSized(&sizing, 1000);
-    EXPECT_DEATH(extStorageSpillAccountSized(&sizing, 5000), "");
+    spillAccountSubmit(&sizing);
+    spillAccountSized(&sizing, 1000);
+    EXPECT_DEATH(spillAccountSized(&sizing, 5000), "");
     EXPECT_EQ(stats().sized_ram_bytes, 1000u);
-    extStorageSpillAccountFinish(&sizing);
+    spillAccountFinish(&sizing);
 }
 
 #define SIZER_THREADS 4
@@ -2069,7 +2069,7 @@ TEST_F(SpillAccountTest, SizingASpillTwiceCrashes) {
 
 static void *sizeSpills(void *arg) {
     std::vector<spillRequest> *spills = (std::vector<spillRequest> *)arg;
-    for (spillRequest &s : *spills) extStorageSpillAccountSized(&s, SPILL_SIZE);
+    for (spillRequest &s : *spills) spillAccountSized(&s, SPILL_SIZE);
     return NULL;
 }
 
@@ -2080,7 +2080,7 @@ TEST_F(SpillAccountTest, SizingOnOtherThreadsBalancesOut) {
     std::vector<std::vector<spillRequest>> spills(SIZER_THREADS,
                                                   std::vector<spillRequest>(SPILLS_PER_SIZER));
     for (auto &batch : spills) {
-        for (spillRequest &s : batch) extStorageSpillAccountSubmit(&s);
+        for (spillRequest &s : batch) spillAccountSubmit(&s);
     }
     const size_t total = (size_t)SIZER_THREADS * SPILLS_PER_SIZER * SPILL_SIZE;
 
@@ -2091,24 +2091,24 @@ TEST_F(SpillAccountTest, SizingOnOtherThreadsBalancesOut) {
     /* Bounded reads while the threads run. */
     size_t max_read = 0;
     for (long i = 0; i < 10000000 && stats().unsized_requests > 0; i++) {
-        size_t read = extStorageSpillAccountInflightRamBytes();
+        size_t read = spillAccountInflightRamBytes();
         if (read > max_read) max_read = read;
     }
     for (int i = 0; i < started; i++) pthread_join(sizers[i], NULL);
     ASSERT_EQ(started, SIZER_THREADS);
     EXPECT_LE(max_read, total);
 
-    extStorageSpillAccountStats st = stats();
+    spillAccountStats st = stats();
     EXPECT_EQ(st.unsized_requests, 0u);
     EXPECT_EQ(st.sized_ram_bytes, total);
     EXPECT_EQ(st.ram_mean, (size_t)SPILL_SIZE);
     for (auto &batch : spills) {
-        for (spillRequest &s : batch) extStorageSpillAccountFinish(&s);
+        for (spillRequest &s : batch) spillAccountFinish(&s);
     }
     st = stats();
     EXPECT_EQ(st.inflight_requests, 0u);
     EXPECT_EQ(st.sized_ram_bytes, 0u);
-    EXPECT_EQ(extStorageSpillAccountInflightRamBytes(), 0u);
+    EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
 }
 
 /* ---------------------------------------------------------------------------

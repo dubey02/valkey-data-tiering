@@ -92,10 +92,10 @@ typedef struct spillRequest {
     bool sized;       /* Serialized and measured. */
     size_t ram_bytes; /* Measured size, once serialized. */
 } spillRequest;
-void extStorageSpillAccountSubmit(spillRequest *req);
-void extStorageSpillAccountSized(spillRequest *req, size_t ram_bytes);
-void extStorageSpillAccountFinish(spillRequest *req);
-size_t extStorageSpillAccountInflightRamBytes(void);
+void spillAccountSubmit(spillRequest *req);
+void spillAccountSized(spillRequest *req, size_t ram_bytes);
+void spillAccountFinish(spillRequest *req);
+size_t spillAccountInflightRamBytes(void);
 
 /* Serialize in the DUMP wire format, so every type and encoding is handled.
  * Records the spill's size in req, if it isn't NULL. */
@@ -115,7 +115,7 @@ static int serializeEntry(const char *key, size_t key_len, const valkeyObject *e
         *out = NULL;
         return -1;
     }
-    if (req) extStorageSpillAccountSized(req, ram_bytes);
+    if (req) spillAccountSized(req, ram_bytes);
     *out = payload.io.buffer.ptr;
     return (int)len;
 }
@@ -524,13 +524,13 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
 
     spillRequest *req = zmalloc(sizeof(*req));
     req->entry = entry;
-    extStorageSpillAccountSubmit(req);
+    spillAccountSubmit(req);
     sds key = objectGetKey(entry);
     incrRefCount(entry); /* Released in spillComplete(), keeps defrag from moving the entry. */
     storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
     if (status != STORAGE_OK) {
         decrRefCount(entry);
-        extStorageSpillAccountFinish(req);
+        spillAccountFinish(req);
         zfree(req);
         return status;
     }
@@ -618,7 +618,7 @@ static void spillComplete(const storageCompletion *comp) {
 
     spillFreeValue(entry);
     setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
-    extStorageSpillAccountFinish(req);
+    spillAccountFinish(req);
     ext_storage.stats.total_num_items_spilled++;
 
     /* Unblock clients blocked on the key while it was being spilled. */
@@ -755,7 +755,7 @@ bool extStorageBlockClientIfRequired(client *c) {
 bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
     if (!extStorageIsActive()) return true;
 
-    for (int i = 0; i < SPILL_MAX_PER_CALL && extStorageSpillAccountInflightRamBytes() < mem_tofree; i++) {
+    for (int i = 0; i < SPILL_MAX_PER_CALL && spillAccountInflightRamBytes() < mem_tofree; i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
@@ -778,7 +778,7 @@ void extStorageSpillDrain(void) {
  *   spills is multiplied by the EMA of serialized sizes to estimate their bytes.
  * - From serialize to completion, a spill counts as its measured size.
  * Completion subtracts what a spill added.
- * Main thread only, except extStorageSpillAccountSized(). */
+ * Main thread only, except spillAccountSized(). */
 static _Atomic unsigned long spill_account_sized;    /* Serialization increments, completion decrements. */
 static _Atomic size_t spill_account_sized_ram_bytes; /* Serialization adds, completion subtracts. */
 static _Atomic size_t spill_account_ram_mean;        /* Serialization updates, main thread reads. */
@@ -802,7 +802,7 @@ void extStorageTestResetSpillAccount(void) {
 }
 
 /* Counts a spill as in flight. Call before put_async. */
-void extStorageSpillAccountSubmit(spillRequest *req) {
+void spillAccountSubmit(spillRequest *req) {
     req->sized = false;
     req->ram_bytes = 0;
     ext_storage.stats.num_items_spilling++;
@@ -812,7 +812,7 @@ void extStorageSpillAccountSubmit(spillRequest *req) {
  * before its completion is posted. Safe to call from a storage engine thread.
  * The count is added before the bytes (release), so a reader that sees the
  * bytes sees the count. */
-void extStorageSpillAccountSized(spillRequest *req, size_t ram_bytes) {
+void spillAccountSized(spillRequest *req, size_t ram_bytes) {
     serverAssert(!req->sized);
     req->ram_bytes = ram_bytes;
     req->sized = true;
@@ -825,7 +825,7 @@ void extStorageSpillAccountSized(spillRequest *req, size_t ram_bytes) {
 }
 
 /* Removes a spill when its completion is polled or put_async refuses it. */
-void extStorageSpillAccountFinish(spillRequest *req) {
+void spillAccountFinish(spillRequest *req) {
     serverAssert(ext_storage.stats.num_items_spilling > 0);
     if (req->sized) {
         atomic_fetch_sub_explicit(&spill_account_sized_ram_bytes, req->ram_bytes, memory_order_relaxed);
@@ -845,21 +845,21 @@ static void spillAccountRead(size_t *sized_ram_bytes, unsigned long *unsized_req
 
 /* Estimated in-flight bytes of all spills. Unserialized spills count as the
  * mean size, which is 0 until the first spill is serialized. */
-size_t extStorageSpillAccountInflightRamBytes(void) {
+size_t spillAccountInflightRamBytes(void) {
     size_t sized_ram_bytes;
     unsigned long unsized_requests;
     spillAccountRead(&sized_ram_bytes, &unsized_requests);
     return sized_ram_bytes + unsized_requests * atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
 }
 
-typedef struct extStorageSpillAccountStats {
+typedef struct spillAccountStats {
     unsigned long inflight_requests; /* Spills inflight. */
     unsigned long unsized_requests;  /* Of those, not yet serialized. */
     size_t sized_ram_bytes;          /* Measured bytes of the serialized ones. */
     size_t ram_mean;                 /* EMA of serialized sizes. */
-} extStorageSpillAccountStats;
+} spillAccountStats;
 
-void extStorageSpillAccountGetStats(extStorageSpillAccountStats *out) {
+void spillAccountGetStats(spillAccountStats *out) {
     out->inflight_requests = ext_storage.stats.num_items_spilling;
     spillAccountRead(&out->sized_ram_bytes, &out->unsized_requests);
     out->ram_mean = atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
