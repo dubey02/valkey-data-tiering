@@ -13,6 +13,10 @@
 
 #include "server.h"
 
+/* Used memory, as a percent of maxmemory, over which writes are refused while
+ * spilling. TODO(#110): make it a config. */
+#define EXT_STORAGE_OOM_PERCENT 120
+
 #ifdef USE_EXT_STORAGE
 
 #include "storage/storage.h"

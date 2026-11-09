@@ -721,10 +721,9 @@ bool extStorageBlockClientIfRequired(client *c) {
 
 /* Spills 64 cold keys, or fewer if no candidate is found or the storage engine
  * refuses one. Returns false when writes must be rejected: used memory is over
- * 1.2x maxmemory, or nothing could be spilled and no spill is in flight.
- * Otherwise the spills in flight free memory once they complete.
- * TODO(#110): spill only what projected memory needs, make the cap a config,
- * and throttle writes below it. */
+ * EXT_STORAGE_OOM_PERCENT of maxmemory, or nothing could be spilled and no
+ * spill is in flight. Otherwise the spills in flight free memory once they
+ * complete. TODO(#110): spill only what projected memory needs. */
 bool extStorageSpillOverMaxmemory(void) {
     if (!extStorageIsActive()) return true;
 
@@ -734,7 +733,7 @@ bool extStorageSpillOverMaxmemory(void) {
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
 
-    if (zmalloc_used_memory() > server.maxmemory + server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
+    if (zmalloc_used_memory() > server.maxmemory / 100 * EXT_STORAGE_OOM_PERCENT) return false;
     return ext_storage.stats.num_items_spilling > 0;
 }
 

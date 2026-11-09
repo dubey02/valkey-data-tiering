@@ -214,6 +214,10 @@ proc fail_with_state {msg {level 0}} {
     fail $msg
 }
 
+proc throttle_info {field} {
+    return [getInfoProperty [r info throttling] ext_storage_throttle_$field]
+}
+
 # Puts 300 keys on flash and leaves 100 in memory, with nothing left to spill.
 proc mostly_on_flash {} {
     r flushall
@@ -409,6 +413,52 @@ if {$tiering_built} {
                 assert_equal 400 [r dbsize]
                 assert_equal [string repeat x 1000] [r get flash:0]
             }
+        }
+
+        test "The throttle cuts in proportion to used memory past maxmemory ($engine)" {
+            r flushall
+            # A hash with a field TTL can't be spilled, so used memory stays put.
+            set val [string repeat x 1000]
+            for {set i 0} {$i < 2000} {incr i} {
+                r hset mem:$i f $val
+                r hexpire mem:$i 100000 FIELDS 1 f
+            }
+            set used [s used_memory]
+            # The cut can't end past the OOM line.
+            assert_error {*must be between*} {r config set ext-storage-throttle-max-percent 121}
+            r config set ext-storage-throttle-enabled yes
+            foreach {percent min max} {110 0.3 0.7 125 1 1 50 0 0} {
+                r config set maxmemory [expr {$used * 100 / $percent}]
+                wait_for_condition 50 100 {
+                    [throttle_info fraction] >= $min && [throttle_info fraction] <= $max
+                } else {
+                    fail_with_state "the cut at $percent% wasn't between $min and $max"
+                }
+            }
+
+            # Past the max percent a read is held, and it runs once used memory
+            # falls below maxmemory. A write over maxmemory with no spill in
+            # flight is refused with OOM before the throttle sees it.
+            # TODO(#N): hold a write, using the foreground and background
+            # processing pause points once they are available.
+            r config set maxmemory [expr {$used * 100 / 125}]
+            wait_for_condition 50 100 {
+                [throttle_info fraction] == 1
+            } else {
+                fail_with_state "the throttle didn't reach a full stop"
+            }
+            set rd [valkey_deferring_client]
+            $rd hget mem:0 f
+            wait_for_condition 50 100 {
+                [throttle_info queued_clients] == 1
+            } else {
+                fail_with_state "the read wasn't held"
+            }
+            r config set maxmemory [expr {$used * 2}]
+            assert_equal $val [$rd read]
+            $rd close
+            r config set ext-storage-throttle-enabled no maxmemory 0
+            r flushall
         }
     }
     file delete -force $path
