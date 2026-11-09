@@ -2942,12 +2942,12 @@ TEST_F(DebugSpillTest, ADebugReadOfAKeyBeingSpilledFails) {
 /* While spills are in flight, writes are allowed: the spills free memory once
  * they complete. */
 TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
-    server.maxmemory = zmalloc_used_memory() - 1;
+    server.maxmemory = 100000000;
     robj *coldest = addRawKey("coldest");
     objectSetLRUOrLFU(coldest, -1, 1000);
     objectSetLRUOrLFU(addRawKey("hot"), -1, 10);
 
-    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(1));
     EXPECT_EQ(getStorageState(coldest), STORAGE_STATE_COPYING_TO_FLASH);
     ASSERT_EQ(finishSpills(), 2);
     server.maxmemory = 0;
@@ -2955,42 +2955,43 @@ TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
 
 /* Writes are rejected when no key can be spilled. */
 TEST_F(SpillSubmitTest, RejectsWritesWhenNothingCanBeSpilled) {
-    server.maxmemory = zmalloc_used_memory() - 1;
+    server.maxmemory = 100000000;
     addKey("embedded", createStringObject("short", 5));
-    EXPECT_FALSE(extStorageSpillOverMaxmemory());
+    EXPECT_FALSE(extStorageSpillOverMaxmemory(1));
     server.maxmemory = 0;
 }
 
 /* More than 20% over maxmemory, writes are rejected even with spills in flight,
  * but the keys are still spilled. */
 TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhileStillSpilling) {
+    server.maxmemory = 100000000;
     addRawKey("key");
-    server.maxmemory = zmalloc_used_memory() - 1; /* Just over maxmemory, under the cap. */
-    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(server.maxmemory / 5)); /* Exactly at the cap. */
     ASSERT_EQ(finishSpills(), 1);
 
     robj *second = addRawKey("second");
-    server.maxmemory = zmalloc_used_memory() / 2; /* Twice maxmemory. */
-    EXPECT_FALSE(extStorageSpillOverMaxmemory());
+    EXPECT_FALSE(extStorageSpillOverMaxmemory(server.maxmemory / 5 + 1));
     EXPECT_EQ(getStorageState(second), STORAGE_STATE_COPYING_TO_FLASH);
     ASSERT_EQ(finishSpills(), 1);
     server.maxmemory = 0;
 }
 
-/* A call spills a bounded number of keys and leaves the rest for the next. */
 /* Replica buffers count neither toward the cap nor toward what to spill, the
  * same as for eviction. */
 TEST_F(SpillSubmitTest, ReplicaBuffersDontCount) {
     robj *entry = addRawKey("key");
+    startKeyDeletes();
     server.repl_buffer_mem = zmalloc_used_memory() / 2;
     server.maxmemory = zmalloc_used_memory() - freeMemoryGetNotCountedMemory() - 1; /* Raw memory is 2x maxmemory. */
-    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_EQ(performEvictions(), EVICT_OK);
+    endKeyDeletes();
     server.repl_buffer_mem = 0;
     server.maxmemory = 0;
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
     ASSERT_EQ(finishSpills(), 1);
 }
 
+/* A call spills a bounded number of keys and leaves the rest for the next. */
 TEST_F(SpillSubmitTest, SpillsAtMostTheLimitPerCall) {
     server.maxmemory_samples = 128; /* sample every key, so only the limit stops the loop */
     for (int i = 0; i < 80; i++) {
@@ -2998,19 +2999,18 @@ TEST_F(SpillSubmitTest, SpillsAtMostTheLimitPerCall) {
         snprintf(key, sizeof(key), "key%d", i);
         addRawKey(key);
     }
-    server.maxmemory = zmalloc_used_memory() - 1;
-    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 100000000;
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(1000000));
     EXPECT_EQ(finishSpills(), 64);
     server.maxmemory = 0;
 }
 
 /* The first spill sets the mean, so the next call spills only what covers the
- * deficit. Large values keep the spill requests' own memory out of the count. */
+ * deficit. */
 TEST_F(SpillSubmitTest, SpillsOnlyWhatTheDeficitNeeds) {
     server.maxmemory_samples = 128;
-    static char val[4000];
-    memset(val, 'v', sizeof(val));
-    robj *first = addKey("first", createStringObject(val, sizeof(val)));
+    server.maxmemory = 100000000;
+    robj *first = addRawKey("first");
     size_t bytes = sdsAllocSize((sds)objectGetVal(first));
     ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
     finishSpills();
@@ -3018,10 +3018,9 @@ TEST_F(SpillSubmitTest, SpillsOnlyWhatTheDeficitNeeds) {
     for (int i = 0; i < 10; i++) {
         char key[16];
         snprintf(key, sizeof(key), "key%d", i);
-        addKey(key, createStringObject(val, sizeof(val)));
+        addRawKey(key);
     }
-    server.maxmemory = zmalloc_used_memory() - bytes - bytes / 2; /* 1.5 values over. */
-    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(bytes + bytes / 2)); /* 1.5 values. */
     server.maxmemory = 0;
     EXPECT_EQ(finishSpills(), 2);
 }
@@ -3029,16 +3028,14 @@ TEST_F(SpillSubmitTest, SpillsOnlyWhatTheDeficitNeeds) {
 /* A spill that is serialized but not completed counts as its measured size. */
 TEST_F(SpillSubmitTest, ASerializedSpillCoversTheDeficit) {
     server.maxmemory_samples = 128;
-    static char val[4000];
-    memset(val, 'v', sizeof(val));
-    robj *first = addKey("first", createStringObject(val, sizeof(val)));
+    server.maxmemory = 100000000;
+    robj *first = addRawKey("first");
     size_t bytes = sdsAllocSize((sds)objectGetVal(first));
     ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
     ASSERT_EQ(storageMockRunIo(1), 1); /* Serialized, completion not polled. */
 
-    robj *second = addKey("second", createStringObject(val, sizeof(val)));
-    server.maxmemory = zmalloc_used_memory() - bytes / 2;
-    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    robj *second = addRawKey("second");
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(bytes / 2));
     server.maxmemory = 0;
     EXPECT_EQ(getStorageState(second), STORAGE_STATE_ONLY_MEMORY);
     EXPECT_EQ(getStorageState(first), STORAGE_STATE_COPYING_TO_FLASH);
@@ -3047,7 +3044,7 @@ TEST_F(SpillSubmitTest, ASerializedSpillCoversTheDeficit) {
 TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
     robj *entry = addRawKey("key");
     extStorageDeinit();
-    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(100));
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
 }
 
@@ -3069,8 +3066,8 @@ TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
  * the values it would free. */
 TEST_F(SpillSubmitTest, AFlushWaitsForSpillsInFlight) {
     robj *entry = addRawKey("key");
-    server.maxmemory = zmalloc_used_memory() - 1;
-    ASSERT_TRUE(extStorageSpillOverMaxmemory());
+    server.maxmemory = 100000000;
+    ASSERT_TRUE(extStorageSpillOverMaxmemory(1));
     server.maxmemory = 0;
     ASSERT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
     uint64_t spilled = infoField("ext_storage_total_num_items_spilled_to_storage");

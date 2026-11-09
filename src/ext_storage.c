@@ -313,8 +313,9 @@ static int extStoragePollCompletions(void) {
  * primary's client, which blockClient() doesn't allow. */
 static void spillIfOverMaxmemory(void) {
     if (!extStorageIsActive() || server.loading) return;
-    if (getMaxmemoryState(NULL, NULL, NULL, NULL) == C_OK) return;
-    extStorageSpillOverMaxmemory();
+    size_t mem_tofree;
+    if (getMaxmemoryState(NULL, NULL, &mem_tofree, NULL) == C_OK) return;
+    extStorageSpillOverMaxmemory(mem_tofree);
 }
 
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
@@ -746,35 +747,25 @@ bool extStorageBlockClientIfRequired(client *c) {
 /* Keys spilled per call, to bound the time spent selecting. */
 #define SPILL_MAX_PER_CALL 64
 
-/* Used memory without replica output buffers and the AOF buffer, which
- * spilling can't free. Eviction counts memory the same way. */
-static size_t spillUsedMemory(void) {
-    size_t used = zmalloc_used_memory();
-    size_t overhead = freeMemoryGetNotCountedMemory();
-    return used > overhead ? used - overhead : 0;
-}
-
-/* Spills cold keys until used memory, minus what spills in flight will free,
- * is under maxmemory. Spills at most 64, or fewer if no candidate is found or
- * the storage engine refuses one. The first call spills 64, since no spill
- * size is known yet. Returns false when writes must be rejected: used memory
- * is over 1.2x maxmemory, or nothing could be spilled and no spill is in
- * flight.
+/* Spills cold keys until the spills in flight are expected to free mem_tofree,
+ * what getMaxmemoryState() reports over maxmemory. Spills at most 64, or fewer
+ * if no candidate is found or the storage engine refuses one. The first call
+ * spills 64, since no spill size is known yet. Returns false when writes must
+ * be rejected: used memory is over 1.2x maxmemory, or nothing could be spilled
+ * and no spill is in flight.
  * TODO(#110): make the cap a config, and throttle writes below it. A value
  * freed in the background stops counting as in flight before its memory is
  * freed, so a few extra keys may be spilled. */
-bool extStorageSpillOverMaxmemory(void) {
+bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
     if (!extStorageIsActive()) return true;
 
-    for (int i = 0;
-         i < SPILL_MAX_PER_CALL && spillUsedMemory() > server.maxmemory + extStorageSpillAccountInflightRamBytes();
-         i++) {
+    for (int i = 0; i < SPILL_MAX_PER_CALL && extStorageSpillAccountInflightRamBytes() < mem_tofree; i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
 
-    if (spillUsedMemory() > server.maxmemory + server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
+    if (mem_tofree > server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
     return ext_storage.stats.num_items_spilling > 0;
 }
 
