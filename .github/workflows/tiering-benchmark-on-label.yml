@@ -1,8 +1,11 @@
 name: Data Tiering PR Benchmark
 
 # Add the run-tiering-benchmark label to a PR to benchmark it against its base
-# branch with the valkey-perf-benchmark Zipfian 80/20 tiering test. Each run
-# launches its own EC2 instance and terminates it when done.
+# branch with the data tiering tests in valkey-perf-benchmark's
+# configs/tiering.json. Label runs use the groups in TIERING_BENCHMARK_GROUPS,
+# or every group. Each run launches its own EC2 instance and terminates it
+# when done. The CPU layout in the config is scaled down to fit the instance,
+# and each result states the layout it ran on.
 
 on:
   pull_request_target:
@@ -302,6 +305,13 @@ jobs:
             mount -o noatime "$DEV" /mnt/nvme
             chown ec2-user:ec2-user /mnt/nvme
 
+      - name: Terminate the instance when it shuts itself down
+        env:
+          IID: ${{ steps.runner.outputs.ec2-instance-id }}
+        run: |
+          aws ec2 modify-instance-attribute --instance-id "$IID" \
+            --instance-initiated-shutdown-behavior terminate
+
   benchmark:
     needs: start-runner
     runs-on: ${{ needs.start-runner.outputs.label }}
@@ -372,6 +382,7 @@ jobs:
           import json, os
           cfg = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "config", "tiering.json")))
           n = os.cpu_count()
+          layouts = []
           for c in cfg:
               alloc = c.get("cpu_allocation", {})
               need = alloc.get("cores_per_server", 0) + 2 * alloc.get("cores_per_client", 0)
@@ -384,8 +395,13 @@ jobs:
                       "servers": [f"0-{server - 1}"],
                       "clients": [f"{server}-{server + 2 * per_client - 1}"],
                   }
-              print("cpu_allocation", c.get("cpu_allocation"))
+              alloc = c.get("cpu_allocation")
+              print("cpu_allocation", alloc)
+              if alloc:
+                  layouts.append(f"{alloc['cores_per_server']} server cores, {alloc['cores_per_client']} per client")
           json.dump(cfg, open("../tiering.json", "w"), indent=2)
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"CPU_LAYOUT={', '.join(dict.fromkeys(layouts))}\n")
           PY
           echo "$(nproc) cores"
 
@@ -428,7 +444,8 @@ jobs:
           python ./utils/compare_benchmark_results.py \
             --baseline "./results/$BASE_SHA/metrics.json" \
             --new "./results/$PR_SHA/metrics.json" \
-            --output ../comparison.md
+            --output ../results.md
+          { echo "Ran on \`$INSTANCE_TYPE\` ($(nproc) cores): $CPU_LAYOUT"; echo; cat ../results.md; } > ../comparison.md
           cat ../comparison.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results
