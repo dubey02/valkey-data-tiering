@@ -746,6 +746,14 @@ bool extStorageBlockClientIfRequired(client *c) {
 /* Keys spilled per call, to bound the time spent selecting. */
 #define SPILL_MAX_PER_CALL 64
 
+/* Used memory without replica output buffers and the AOF buffer, which
+ * spilling can't free. Eviction counts memory the same way. */
+static size_t spillUsedMemory(void) {
+    size_t used = zmalloc_used_memory();
+    size_t overhead = freeMemoryGetNotCountedMemory();
+    return used > overhead ? used - overhead : 0;
+}
+
 /* Spills cold keys until used memory, minus what spills in flight will free,
  * is under maxmemory. Spills at most 64, or fewer if no candidate is found or
  * the storage engine refuses one. The first call spills 64, since no spill
@@ -759,14 +767,14 @@ bool extStorageSpillOverMaxmemory(void) {
     if (!extStorageIsActive()) return true;
 
     for (int i = 0;
-         i < SPILL_MAX_PER_CALL && zmalloc_used_memory() > server.maxmemory + extStorageSpillAccountInflightRamBytes();
+         i < SPILL_MAX_PER_CALL && spillUsedMemory() > server.maxmemory + extStorageSpillAccountInflightRamBytes();
          i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
 
-    if (zmalloc_used_memory() > server.maxmemory + server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
+    if (spillUsedMemory() > server.maxmemory + server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
     return ext_storage.stats.num_items_spilling > 0;
 }
 

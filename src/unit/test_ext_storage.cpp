@@ -2978,6 +2978,19 @@ TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhileStillSpilling) {
 }
 
 /* A call spills a bounded number of keys and leaves the rest for the next. */
+/* Replica buffers count neither toward the cap nor toward what to spill, the
+ * same as for eviction. */
+TEST_F(SpillSubmitTest, ReplicaBuffersDontCount) {
+    robj *entry = addRawKey("key");
+    server.repl_buffer_mem = zmalloc_used_memory() / 2;
+    server.maxmemory = zmalloc_used_memory() - freeMemoryGetNotCountedMemory() - 1; /* Raw memory is 2x maxmemory. */
+    EXPECT_TRUE(extStorageSpillOverMaxmemory());
+    server.repl_buffer_mem = 0;
+    server.maxmemory = 0;
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    ASSERT_EQ(finishSpills(), 1);
+}
+
 TEST_F(SpillSubmitTest, SpillsAtMostTheLimitPerCall) {
     server.maxmemory_samples = 128; /* sample every key, so only the limit stops the loop */
     for (int i = 0; i < 80; i++) {
