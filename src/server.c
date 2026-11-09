@@ -52,6 +52,7 @@
 #include "compression.h"
 #include "tls.h"
 #include "ext_storage.h"
+#include "ext_storage_throttle.h"
 #include "sds.h"
 #include "module.h"
 #include "scripting_engine.h"
@@ -1774,6 +1775,9 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     }
 
     run_with_period(100) throttleRepl_adjustThrottling();
+#ifdef USE_EXT_STORAGE
+    run_with_period(100) extStorageThrottleAdjust();
+#endif
 
     /* Run the Cluster cron. */
     if (server.cluster_enabled) {
@@ -7221,6 +7225,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = sdscat(info, "# Throttling\r\n");
         info = throttle_sdscatInfoMetrics(info);
         info = throttleRepl_sdscatInfoMetrics(info);
+#ifdef USE_EXT_STORAGE
+        info = extStorageThrottleInfoString(info);
+#endif
     }
 
 #ifdef USE_EXT_STORAGE

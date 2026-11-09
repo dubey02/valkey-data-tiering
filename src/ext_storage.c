@@ -919,9 +919,10 @@ bool extStorageBlockClientIfRequired(client *c) {
  * what getMaxmemoryState() reports over maxmemory. Spills at most 64, or fewer
  * if no candidate is found or the storage engine refuses one. Every call spills
  * 64 until the first spill is sized, since the mean is 0 until then. Returns
- * false when writes must be rejected: used memory is over 1.2x maxmemory, or
- * nothing could be spilled and no spill is in flight.
- * TODO(#151): make the cap a config, and throttle writes below it.
+ * false when writes must be rejected: used memory is over
+ * EXT_STORAGE_OOM_PERCENT of maxmemory, or nothing could be spilled and no
+ * spill is in flight.
+ * TODO(#151): make the cap a config.
  * TODO(#150): with lazyfree-lazy-server-del, a completed spill leaves the
  * account before a background thread frees its value, so the loop may spill a
  * few extra keys. */
@@ -938,7 +939,7 @@ bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
         if (extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
 
-    if (mem_tofree > server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */
+    if (mem_tofree > server.maxmemory / 100 * (EXT_STORAGE_OOM_PERCENT - 100)) return false;
     return ext_storage.stats.num_items_spilling > 0;
 }
 

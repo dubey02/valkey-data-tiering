@@ -88,6 +88,7 @@ bool __wrap_hashtableScanHasPassedKey(hashtable *ht, const void *key, size_t cur
 throttler *__wrap_throttle_register(throttleCriteriaProc *criteria_proc, void *priv_data, const char *metrics_name);
 void __wrap_throttle_deregister(throttler *t);
 double __wrap_throttle_adjustRate(throttler *t, double multiplier);
+void __wrap_throttle_setRate(throttler *t, double ops_per_sec);
 void __wrap_throttle_getMetrics(const char *metrics_name, throttleMetrics *metrics);
 long __wrap_throttle_getGuardrailSecs(throttler *t);
 
