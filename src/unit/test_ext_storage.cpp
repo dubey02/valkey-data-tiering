@@ -37,7 +37,6 @@ typedef struct spillRequest {
     size_t ram_bytes;
 } spillRequest;
 typedef struct spillAccountStats {
-    unsigned long inflight_requests;
     unsigned long unsized_requests;
     size_t sized_ram_bytes;
     size_t ram_mean;
@@ -1978,7 +1977,6 @@ TEST_F(SpillAccountTest, ASpillCountsAsTheMeanUntilSized) {
     spillRequest a, b;
 
     submitSpill(&a);
-    EXPECT_EQ(stats().inflight_requests, 1u);
     EXPECT_EQ(stats().unsized_requests, 1u);
     EXPECT_EQ(spillAccountInflightRamBytes(), 0u); /* No sizes yet, so the mean is 0. */
 
@@ -1998,7 +1996,6 @@ TEST_F(SpillAccountTest, ASpillCountsAsTheMeanUntilSized) {
     finishSpill(&a);
     finishSpill(&b);
     spillAccountStats st = stats();
-    EXPECT_EQ(st.inflight_requests, 0u);
     EXPECT_EQ(st.unsized_requests, 0u);
     EXPECT_EQ(st.sized_ram_bytes, 0u);
     EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
@@ -2087,7 +2084,6 @@ TEST_F(SpillAccountTest, SizingOnOtherThreadsBalancesOut) {
         for (spillRequest &s : batch) finishSpill(&s);
     }
     st = stats();
-    EXPECT_EQ(st.inflight_requests, 0u);
     EXPECT_EQ(st.sized_ram_bytes, 0u);
     EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
 }

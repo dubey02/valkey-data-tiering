@@ -96,10 +96,9 @@ void spillAccountSized(spillRequest *req, size_t ram_bytes);
 void spillAccountFinish(spillRequest *req);
 size_t spillAccountInflightRamBytes(void);
 typedef struct spillAccountStats {
-    unsigned long inflight_requests; /* Spills inflight. */
-    unsigned long unsized_requests;  /* Of those, not yet serialized. */
-    size_t sized_ram_bytes;          /* Measured bytes of the serialized ones. */
-    size_t ram_mean;                 /* EMA of serialized sizes. */
+    unsigned long unsized_requests; /* Spills in flight not yet serialized. */
+    size_t sized_ram_bytes;         /* Measured bytes of the serialized ones. */
+    size_t ram_mean;                /* EMA of serialized sizes. */
 } spillAccountStats;
 void spillAccountGetStats(spillAccountStats *out);
 
@@ -863,7 +862,6 @@ size_t spillAccountInflightRamBytes(void) {
 }
 
 void spillAccountGetStats(spillAccountStats *out) {
-    out->inflight_requests = ext_storage.stats.num_items_spilling;
     spillAccountRead(&out->sized_ram_bytes, &out->unsized_requests);
     out->ram_mean = atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
 }
