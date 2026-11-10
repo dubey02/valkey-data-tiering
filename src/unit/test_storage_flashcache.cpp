@@ -65,6 +65,13 @@ static const storageInfoSink stat_map_sink_template = {
 
 /* Records the thread that ran serialize and the key it was handed, then
  * forwards to the real one. */
+/* The real serializer without spill sizing, so request_ctx stays an opaque
+ * token in the engine tests. */
+static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, void *ctx, char **out) {
+    (void)ctx;
+    return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
+}
+
 static int serialize_calls = 0;
 static pthread_t serialize_thread;
 static const char *serialize_key_ptr;
@@ -108,6 +115,7 @@ class StorageFlashCacheTest : public ::testing::Test {
         cfg.capacity_bytes = 128 * 1024 * 1024; /* 128mb */
         cfg.num_databases = 4;
         cfg.serializer = *extStorageSerializer();
+        cfg.serializer.serialize = serializeIgnoringCtx;
         cfg.thread_config = test_thread_config;
         cfg.logger = testLog;
         cfg.monotonic_clock_us = getMonotonicUs;

@@ -102,9 +102,11 @@ typedef struct spillAccountStats {
 } spillAccountStats;
 void spillAccountGetStats(spillAccountStats *out);
 
-/* Serialize in the DUMP wire format, so every type and encoding is handled.
- * Records the spill's size in req, if it isn't NULL. */
-static int serializeEntry(const char *key, size_t key_len, const valkeyObject *entry, spillRequest *req, char **out) {
+/* Serialize in the DUMP wire format, so every type and encoding is handled. A
+ * put from extStorageSpillItem() passes its spillRequest as request_ctx, and its
+ * size is recorded there. */
+static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
+    spillRequest *req = request_ctx;
     sds key_sds = sdsnewlen(key, key_len);
     robj key_obj;
     initStaticStringObject(key_obj, key_sds);
@@ -123,18 +125,6 @@ static int serializeEntry(const char *key, size_t key_len, const valkeyObject *e
     if (req) spillAccountSized(req, ram_bytes);
     *out = payload.io.buffer.ptr;
     return (int)len;
-}
-
-static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
-    UNUSED(request_ctx);
-    return serializeEntry(key, key_len, entry, NULL, out);
-}
-
-/* Like extStorageSerialize(), for puts from extStorageSpillItem(). */
-static int spillSerialize(const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx, char **out) {
-    spillRequest *req = request_ctx;
-    serverAssert(req);
-    return serializeEntry(key, key_len, entry, req, out);
 }
 
 static valkeyObject *extStorageDeserialize(const char *key, size_t key_len, const char *bytes, int len) {
@@ -254,7 +244,7 @@ void extStorageInit(void) {
         .path = server.ext_storage_path,
         .capacity_bytes = server.ext_storage_capacity,
         .num_databases = (uint32_t)server.dbnum,
-        .serializer = {spillSerialize, extStorageDeserialize, extStorageFreeSerialized},
+        .serializer = ext_storage_serializer,
         .thread_config = ext_storage_thread_config,
         .logger = extStorageLog,
         .monotonic_clock_us = getMonotonicUs,

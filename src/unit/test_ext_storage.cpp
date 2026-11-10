@@ -89,6 +89,13 @@ static const storageInfoSink stat_map_sink_template = {
  * These tests drive the mock storage engine with the real serializer.
  * ---------------------------------------------------------------------------*/
 
+/* The real serializer without spill sizing, so request_ctx stays an opaque
+ * token in the engine tests. */
+static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, void *ctx, char **out) {
+    (void)ctx;
+    return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
+}
+
 class StorageMockTest : public ::testing::Test {
   protected:
     MockValkey mock;
@@ -111,6 +118,7 @@ class StorageMockTest : public ::testing::Test {
         cfg.capacity_bytes = 0; /* unbounded unless a test overrides it */
         cfg.num_databases = 4;
         cfg.serializer = *extStorageSerializer();
+        cfg.serializer.serialize = serializeIgnoringCtx;
         cfg.thread_config = test_thread_config;
         cfg.logger = testLog;
     }
