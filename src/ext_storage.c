@@ -96,6 +96,13 @@ void spillAccountSubmit(spillRequest *req);
 void spillAccountSized(spillRequest *req, size_t ram_bytes);
 void spillAccountFinish(spillRequest *req);
 size_t spillAccountInflightRamBytes(void);
+typedef struct spillAccountStats {
+    unsigned long inflight_requests; /* Spills inflight. */
+    unsigned long unsized_requests;  /* Of those, not yet serialized. */
+    size_t sized_ram_bytes;          /* Measured bytes of the serialized ones. */
+    size_t ram_mean;                 /* EMA of serialized sizes. */
+} spillAccountStats;
+void spillAccountGetStats(spillAccountStats *out);
 
 /* Serialize in the DUMP wire format, so every type and encoding is handled.
  * Records the spill's size in req, if it isn't NULL. */
@@ -372,12 +379,18 @@ sds extStorageInfoString(sds info) {
     if (!extStorageIsActive()) return sdscatprintf(info, "ext_storage_enabled:0\r\n");
 
     const extStorageStats *st = &ext_storage.stats;
+    spillAccountStats sa;
+    spillAccountGetStats(&sa);
     return sdscatprintf(info,
                         "ext_storage_enabled:1\r\n"
                         "ext_storage_engine:%s\r\n"
                         "ext_storage_api_version:%d\r\n"
                         "ext_storage_capacity_bytes:%llu\r\n"
                         "ext_storage_num_items_spilling_to_storage:%llu\r\n"
+                        "ext_storage_num_items_spilling_unsized:%lu\r\n"
+                        "ext_storage_spilling_sized_bytes:%zu\r\n"
+                        "ext_storage_spill_mean_bytes:%zu\r\n"
+                        "ext_storage_spilling_bytes:%zu\r\n"
                         "ext_storage_total_num_items_spilled_to_storage:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
@@ -385,7 +398,8 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_total_num_fetch_errors:%llu\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
-                        (unsigned long long)st->num_items_spilling,
+                        (unsigned long long)st->num_items_spilling, sa.unsized_requests, sa.sized_ram_bytes,
+                        sa.ram_mean, spillAccountInflightRamBytes(),
                         (unsigned long long)st->total_num_items_spilled,
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted,
@@ -851,13 +865,6 @@ size_t spillAccountInflightRamBytes(void) {
     spillAccountRead(&sized_ram_bytes, &unsized_requests);
     return sized_ram_bytes + unsized_requests * atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
 }
-
-typedef struct spillAccountStats {
-    unsigned long inflight_requests; /* Spills inflight. */
-    unsigned long unsized_requests;  /* Of those, not yet serialized. */
-    size_t sized_ram_bytes;          /* Measured bytes of the serialized ones. */
-    size_t ram_mean;                 /* EMA of serialized sizes. */
-} spillAccountStats;
 
 void spillAccountGetStats(spillAccountStats *out) {
     out->inflight_requests = ext_storage.stats.num_items_spilling;

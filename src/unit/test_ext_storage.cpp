@@ -3042,6 +3042,23 @@ TEST_F(SpillSubmitTest, ASerializedSpillCoversTheDeficit) {
     EXPECT_EQ(getStorageState(first), STORAGE_STATE_COPYING_TO_FLASH);
 }
 
+/* INFO shows a serialized spill at its size and an unserialized one at the mean. */
+TEST_F(SpillSubmitTest, InfoReportsSpillsInFlight) {
+    robj *first = addRawKey("first");
+    size_t bytes = sdsAllocSize((sds)objectGetVal(first));
+    ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
+    ASSERT_EQ(storageMockRunIo(1), 1); /* Serialized, completion not polled. */
+    ASSERT_EQ(extStorageSpillItem(0, addRawKey("second")), STORAGE_OK);
+
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 2u);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_unsized"), 1u);
+    EXPECT_EQ(infoField("ext_storage_spilling_sized_bytes"), bytes);
+    EXPECT_EQ(infoField("ext_storage_spill_mean_bytes"), bytes);
+    EXPECT_EQ(infoField("ext_storage_spilling_bytes"), 2 * bytes);
+    ASSERT_EQ(finishSpills(), 1);
+    EXPECT_EQ(infoField("ext_storage_spilling_bytes"), 0u);
+}
+
 TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
     robj *entry = addRawKey("key");
     extStorageDeinit();
