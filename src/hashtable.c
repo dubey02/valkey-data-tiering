@@ -1390,6 +1390,25 @@ size_t hashtableMemUsage(const hashtable *ht) {
     return sizeof(hashtable) + metasize + sizeof(bucket) * num_buckets;
 }
 
+/* Returns the allocated size of the table struct, bucket arrays and child
+ * buckets, not counting entries. Walks the bucket chains to find child buckets. */
+size_t hashtableAllocSize(const hashtable *ht) {
+    size_t mem = zmalloc_size((void *)ht);
+    for (int table_index = 0; table_index <= 1; table_index++) {
+        if (ht->tables[table_index] == NULL) continue;
+        mem += zmalloc_size(ht->tables[table_index]);
+        size_t found = 0;
+        for (size_t idx = 0; found < ht->child_buckets[table_index] && idx < numBuckets(ht->bucket_exp[table_index]);
+             idx++) {
+            for (bucket *b = getChildBucket(&ht->tables[table_index][idx]); b != NULL; b = getChildBucket(b)) {
+                mem += zmalloc_size(b);
+                found++;
+            }
+        }
+    }
+    return mem;
+}
+
 /* Pauses automatic shrinking. This can be called before deleting a lot of
  * entries, to prevent automatic shrinking from being triggered multiple times.
  * Call hashtableResumeAutoShrink afterwards to restore automatic shrinking. */
