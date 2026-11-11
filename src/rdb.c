@@ -910,6 +910,15 @@ ssize_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg, size_t *ram_bytes) {
     return nwritten;
 }
 
+/* Allocated size of a hash's hashtable and its field-expiry set, not counting
+ * the fields. */
+static size_t hashtableHashAllocSize(hashtable *ht) {
+    vset *volatile_fields = hashtableMetadata(ht);
+    size_t mem = hashtableAllocSize(ht);
+    if (vsetIsValid(volatile_fields)) mem += vsetMemUsage(volatile_fields);
+    return mem;
+}
+
 /* Save an Object.
  * Returns -1 on error, number of bytes written on success. */
 ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbtype) {
@@ -1093,11 +1102,7 @@ ssize_t rdbSaveObjectSized(rio *rdb, robj *o, robj *key, int dbid, unsigned char
                 return -1;
             }
             nwritten += n;
-            if (ram_bytes) {
-                vset *volatile_fields = hashtableMetadata(ht);
-                *ram_bytes += hashtableAllocSize(ht);
-                if (vsetIsValid(volatile_fields)) *ram_bytes += vsetMemUsage(volatile_fields);
-            }
+            if (ram_bytes) *ram_bytes += hashtableHashAllocSize(ht);
             /* check if need to add expired time for the hash fields */
             bool add_expiry = (rdbtype == RDB_TYPE_HASH_2);
             hashtableIterator iter;
@@ -1264,10 +1269,7 @@ ssize_t rdbSaveObjectSized(rio *rdb, robj *o, robj *key, int dbid, unsigned char
                 if (objectGetEncoding(payload) == OBJ_ENCODING_LISTPACK) {
                     *ram_bytes += zmalloc_size(objectGetVal(payload));
                 } else {
-                    hashtable *ht = objectGetVal(payload);
-                    vset *volatile_fields = hashtableMetadata(ht);
-                    *ram_bytes += hashtableAllocSize(ht);
-                    if (vsetIsValid(volatile_fields)) *ram_bytes += vsetMemUsage(volatile_fields);
+                    *ram_bytes += hashtableHashAllocSize(objectGetVal(payload));
                 }
             }
             if ((n = rdbSaveRawString(rdb, paths.key, paths.key_len)) == -1) {
