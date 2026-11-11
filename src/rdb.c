@@ -1019,10 +1019,9 @@ ssize_t rdbSaveObjectSized(rio *rdb, robj *o, robj *key, int dbid, unsigned char
 
             if ((n = rdbSaveLen(rdb, orderedIndexLength(zs->oi))) == -1) return -1;
             nwritten += n;
-            /* The index nodes aren't walked, so estimate them. */
+            /* The walk below adds the index's leaves. */
             if (ram_bytes) {
-                *ram_bytes +=
-                    zmalloc_size(zs) + orderedIndexEstimateStructureMemory(zs->oi) + hashtableAllocSize(zs->ht);
+                *ram_bytes += zmalloc_size(zs) + orderedIndexAllocSizeWithoutLeaves(zs->oi) + hashtableAllocSize(zs->ht);
             }
 
             /* We save the skiplist elements from the greatest to the smallest
@@ -1034,7 +1033,7 @@ ssize_t rdbSaveObjectSized(rio *rdb, robj *o, robj *key, int dbid, unsigned char
             OrderedIndexIterator iter;
             orderedIndexInitIterator(&iter, zs->oi);
             OrderedIndexItem *item;
-            while ((item = orderedIndexPrev(&iter)) != NULL) {
+            while ((item = orderedIndexPrevSized(&iter, ram_bytes)) != NULL) {
                 const char *ele;
                 size_t ele_len;
                 orderedIndexItemGetElement(item, &ele, &ele_len);

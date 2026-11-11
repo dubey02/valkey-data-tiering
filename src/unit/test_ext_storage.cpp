@@ -1864,8 +1864,30 @@ TEST_F(SpillSizingTest, SerializingMeasuresWhatFreeingFrees) {
         int type = objs[i]->type, encoding = objs[i]->encoding;
         size_t measured = measure(objs[i]);
         size_t freed = freeValue(objs[i]);
-        if (encoding == OBJ_ENCODING_BTREE) continue;
         EXPECT_EQ(measured, freed) << "value " << i << " type " << type << " encoding " << strEncoding(encoding);
+    }
+
+    /* Large sorted sets. Ascending inserts fill the index's leaves, random ones
+     * leave them about half full. */
+    for (long members : {1000L, 100000L, 1000000L}) {
+        for (bool random_order : {false, true}) {
+            robj *zset = createZsetObject();
+            uint64_t seed = 12345;
+            for (long i = 0; i < members; i++) {
+                char member[17];
+                snprintf(member, sizeof(member), "m%015ld", i);
+                seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                double score = random_order ? (double)(seed >> 11) : (double)i;
+                sds ele = sdsnewlen(member, 16);
+                int out_flags = 0;
+                zsetAdd(zset, score, ele, ZADD_IN_NONE, &out_flags, NULL);
+                sdsfree(ele);
+            }
+            ASSERT_EQ(zset->encoding, OBJ_ENCODING_BTREE);
+            size_t measured = measure(zset);
+            size_t freed = freeValue(zset);
+            EXPECT_EQ(measured, freed) << members << " members, " << (random_order ? "random" : "ascending");
+        }
     }
 }
 
@@ -1905,21 +1927,6 @@ TEST_F(SpillSizingTest, CountsEveryElementOfACollection) {
     size_t freed = freeValue(list);
     EXPECT_EQ(measured, freed);
     EXPECT_LT(sampled, freed / 2);
-}
-
-/* A btree sorted set's index nodes are estimated, as MEMORY USAGE does. */
-TEST_F(SpillSizingTest, EstimatesTheIndexOfABtreeSortedSet) {
-    robj *zset = createZsetObject();
-    for (int i = 0; i < 1000; i++) {
-        sds member = sdscatprintf(sdsempty(), "member:%d", i);
-        int out_flags = 0;
-        zsetAdd(zset, i, member, ZADD_IN_NONE, &out_flags, NULL);
-        sdsfree(member);
-    }
-    ASSERT_EQ(zset->encoding, OBJ_ENCODING_BTREE);
-    size_t measured = measure(zset);
-    size_t freed = freeValue(zset);
-    EXPECT_NEAR((double)measured, (double)freed, freed * 0.02);
 }
 
 /* ---------------------------------------------------------------------------
