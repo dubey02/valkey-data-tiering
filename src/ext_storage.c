@@ -514,10 +514,18 @@ bool extStorageSpillPolicyConflicts(void) {
     return (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) != (server.ext_storage_spill_policy & MAXMEMORY_FLAG_LFU);
 }
 
+/* When most keys are already on flash, one sample can miss every spillable
+ * key. Retry a few times before giving up. */
+#define SPILL_SELECT_RETRIES 8
+
 /* Returns the coldest spillable key, or NULL if none was sampled. Every key is
  * ranked by ext-storage-spill-policy, whatever the maxmemory-policy. */
 robj *extStorageSpillSelectCandidate(int *dbid) {
-    return evictionPoolPopColdest(server.ext_storage_spill_policy, isSpillCandidate, dbid);
+    for (int i = 0; i <= SPILL_SELECT_RETRIES; i++) {
+        robj *entry = evictionPoolPopColdest(server.ext_storage_spill_policy, isSpillCandidate, dbid);
+        if (entry) return entry;
+    }
+    return NULL;
 }
 
 /* Submits an item to the storage engine, which borrows it until the completion
