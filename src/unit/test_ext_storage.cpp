@@ -40,6 +40,7 @@ typedef struct spillAccountStats {
     unsigned long unsized_requests;
     size_t sized_ram_bytes;
     size_t ram_mean;
+    size_t inflight_ram_bytes;
 } spillAccountStats;
 void extStorageTestAddSpilling(long delta);
 void spillAccountSized(spillRequest *s, size_t ram_bytes);
@@ -3036,9 +3037,9 @@ TEST_F(SpillSubmitTest, InfoReportsSpillsInFlight) {
     ASSERT_EQ(extStorageSpillItem(0, addRawKey("second")), STORAGE_OK);
 
     EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 2u);
-    EXPECT_EQ(infoField("ext_storage_num_items_spilling_unsized"), 1u);
-    EXPECT_EQ(infoField("ext_storage_spilling_sized_bytes"), bytes);
-    EXPECT_EQ(infoField("ext_storage_spill_mean_bytes"), bytes);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_unserialized"), 1u);
+    EXPECT_EQ(infoField("ext_storage_spilling_serialized_bytes"), bytes);
+    EXPECT_EQ(infoField("ext_storage_spilling_mean_bytes"), bytes);
     EXPECT_EQ(infoField("ext_storage_spilling_bytes"), 2 * bytes);
     ASSERT_EQ(finishSpills(), 1);
     EXPECT_EQ(infoField("ext_storage_spilling_bytes"), 0u);

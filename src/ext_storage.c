@@ -99,6 +99,7 @@ typedef struct spillAccountStats {
     unsigned long unsized_requests; /* Spills in flight not yet serialized. */
     size_t sized_ram_bytes;         /* Measured bytes of the serialized ones. */
     size_t ram_mean;                /* EMA of serialized sizes. */
+    size_t inflight_ram_bytes;      /* sized_ram_bytes + unsized_requests * ram_mean. */
 } spillAccountStats;
 void spillAccountGetStats(spillAccountStats *out);
 
@@ -375,9 +376,9 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_api_version:%d\r\n"
                         "ext_storage_capacity_bytes:%llu\r\n"
                         "ext_storage_num_items_spilling_to_storage:%llu\r\n"
-                        "ext_storage_num_items_spilling_unsized:%lu\r\n"
-                        "ext_storage_spilling_sized_bytes:%zu\r\n"
-                        "ext_storage_spill_mean_bytes:%zu\r\n"
+                        "ext_storage_num_items_spilling_unserialized:%lu\r\n"
+                        "ext_storage_spilling_serialized_bytes:%zu\r\n"
+                        "ext_storage_spilling_mean_bytes:%zu\r\n"
                         "ext_storage_spilling_bytes:%zu\r\n"
                         "ext_storage_total_num_items_spilled_to_storage:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
@@ -387,7 +388,7 @@ sds extStorageInfoString(sds info) {
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
                         (unsigned long long)st->num_items_spilling, sa.unsized_requests, sa.sized_ram_bytes,
-                        sa.ram_mean, spillAccountInflightRamBytes(),
+                        sa.ram_mean, sa.inflight_ram_bytes,
                         (unsigned long long)st->total_num_items_spilled,
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted,
@@ -528,15 +529,16 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     req->entry = entry;
     sds key = objectGetKey(entry);
     incrRefCount(entry); /* Released in spillComplete(), keeps defrag from moving the entry. */
+    ext_storage.stats.num_items_spilling++;
     storageStatus status = ext_storage.engine->put_async((uint32_t)dbid, key, sdslen(key), entry, req);
     if (status != STORAGE_OK) {
+        ext_storage.stats.num_items_spilling--;
         decrRefCount(entry);
         zfree(req);
         return status;
     }
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
-    ext_storage.stats.num_items_spilling++;
     return STORAGE_OK;
 }
 
@@ -845,15 +847,15 @@ static void spillAccountRead(size_t *sized_ram_bytes, unsigned long *unsized_req
 /* Estimated in-flight bytes of all spills. Unserialized spills count as the
  * mean size, which is 0 until the first spill is serialized. */
 size_t spillAccountInflightRamBytes(void) {
-    size_t sized_ram_bytes;
-    unsigned long unsized_requests;
-    spillAccountRead(&sized_ram_bytes, &unsized_requests);
-    return sized_ram_bytes + unsized_requests * atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
+    spillAccountStats sa;
+    spillAccountGetStats(&sa);
+    return sa.inflight_ram_bytes;
 }
 
 void spillAccountGetStats(spillAccountStats *out) {
     spillAccountRead(&out->sized_ram_bytes, &out->unsized_requests);
     out->ram_mean = atomic_load_explicit(&spill_account_ram_mean, memory_order_relaxed);
+    out->inflight_ram_bytes = out->sized_ram_bytes + out->unsized_requests * out->ram_mean;
 }
 
 #endif /* USE_EXT_STORAGE */
