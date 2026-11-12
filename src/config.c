@@ -3695,6 +3695,8 @@ standardConfig static_configs[] = {
     createULongLongConfig("ext-storage-capacity", NULL, IMMUTABLE_CONFIG, 1, ULLONG_MAX, server.ext_storage_capacity, 1024ULL * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
     createStringConfig("ext-storage-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ext_storage_cpulist, NULL, NULL, NULL),
     createEnumConfig("ext-storage-spill-policy", NULL, MODIFIABLE_CONFIG, ext_storage_spill_policy_enum, server.ext_storage_spill_policy, MAXMEMORY_ALLKEYS_LRU, NULL, applySpillPolicy),
+    createBoolConfig("ext-storage-throttle-enabled", NULL, MODIFIABLE_CONFIG, server.ext_storage_throttle_enabled, 0, NULL, NULL),
+    createIntConfig("ext-storage-throttle-max-percent", NULL, MODIFIABLE_CONFIG, 101, EXT_STORAGE_OOM_PERCENT, server.ext_storage_throttle_max_percent, EXT_STORAGE_OOM_PERCENT, INTEGER_CONFIG, NULL, NULL),
 
     /* Tls configs */
     createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */
