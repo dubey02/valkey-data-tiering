@@ -415,7 +415,7 @@ if {$tiering_built} {
             }
         }
 
-        test "The throttle cuts in proportion to used memory past maxmemory ($engine)" {
+        test "The throttle slows commands in proportion to used memory past maxmemory ($engine)" {
             r flushall
             # A hash with a field TTL can't be spilled, so used memory stays put.
             set val [string repeat x 1000]
@@ -423,22 +423,24 @@ if {$tiering_built} {
                 r hset mem:$i f $val
                 r hexpire mem:$i 100000 FIELDS 1 f
             }
+            r set flashed $val
+            r debug ext-storage spill flashed
+            wait_for_flash flashed
             set used [s used_memory]
-            # The cut can't end past the OOM line.
-            assert_error {*must be between*} {r config set ext-storage-throttle-max-percent 121}
             r config set ext-storage-throttle-enabled yes
             foreach {percent min max} {110 0.3 0.7 125 1 1 50 0 0} {
                 r config set maxmemory [expr {$used * 100 / $percent}]
                 wait_for_condition 50 100 {
                     [throttle_info fraction] >= $min && [throttle_info fraction] <= $max
                 } else {
-                    fail_with_state "the cut at $percent% wasn't between $min and $max"
+                    fail_with_state "the throttle fraction at $percent% wasn't between $min and $max"
                 }
             }
 
-            # Past the max percent a read is held, and it runs once used memory
-            # falls below maxmemory. A write over maxmemory with no spill in
-            # flight is refused with OOM before the throttle sees it.
+            # Past the max percent a read of a value on flash is held, and it
+            # runs once used memory falls below maxmemory. A read of a value in
+            # memory isn't held. A write over maxmemory with no spill in flight
+            # is refused with OOM before the throttle sees it.
             # TODO(#N): hold a write, using the foreground and background
             # processing pause points once they are available.
             r config set maxmemory [expr {$used * 100 / 125}]
@@ -447,8 +449,9 @@ if {$tiering_built} {
             } else {
                 fail_with_state "the throttle didn't reach a full stop"
             }
+            assert_equal $val [r hget mem:0 f]
             set rd [valkey_deferring_client]
-            $rd hget mem:0 f
+            $rd get flashed
             wait_for_condition 50 100 {
                 [throttle_info queued_clients] == 1
             } else {
@@ -459,7 +462,7 @@ if {$tiering_built} {
             $rd close
             r config set ext-storage-throttle-enabled no maxmemory 0
             r flushall
-        }
+        } {OK} {needs:debug}
     }
     file delete -force $path
 
