@@ -63,26 +63,20 @@ env:
   PERF_BENCHMARK_REF: ${{ inputs.perf_benchmark_ref || vars.PERF_BENCHMARK_REF || 'main' }}
 
 jobs:
-  start-runner:
+  prepare:
     if: github.event_name != 'pull_request_target' || github.event.label.name == 'run-tiering-benchmark'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
     outputs:
-      label: ${{ steps.runner.outputs.label }}
-      instance-id: ${{ steps.runner.outputs.ec2-instance-id }}
-      security-group-id: ${{ steps.sg.outputs.security-group-id }}
       base-sha: ${{ steps.refs.outputs.base-sha }}
       pr-sha: ${{ steps.refs.outputs.pr-sha }}
       head-sha: ${{ steps.refs.outputs.head-sha }}
       comment-number: ${{ steps.refs.outputs.comment-number }}
       pr-number: ${{ steps.refs.outputs.pr-number }}
-      groups: ${{ steps.config.outputs.groups }}
-      perf-benchmark-sha: ${{ steps.config.outputs.perf-benchmark-sha }}
     steps:
       - name: Check that the actor has write access
         env:
@@ -113,6 +107,11 @@ jobs:
             echo "::error::comment_on must be a PR or issue number"
             exit 1
           fi
+          # Written first, so a failure below still gets a comment and the label removed.
+          {
+            echo "comment-number=$COMMENT_ON"
+            echo "pr-number=$NUMBER"
+          } >> "$GITHUB_OUTPUT"
           if [[ -n "$NUMBER" ]]; then
             # Only run the head that was labeled. GitHub builds the merge commit
             # after a push, so wait until its second parent is that head.
@@ -142,11 +141,44 @@ jobs:
             echo "base-sha=$BASE"
             echo "pr-sha=$PR"
             echo "head-sha=$HEAD"
-            echo "comment-number=$COMMENT_ON"
-            echo "pr-number=$NUMBER"
           } >> "$GITHUB_OUTPUT"
           echo "pr #${NUMBER:-none}, comment on #${COMMENT_ON:-none}, base $BASE, pr $PR, $INSTANCE_TYPE in $AWS_REGION, $PERF_BENCHMARK_REPO@$PERF_BENCHMARK_REF"
 
+      - name: Comment that the benchmark started
+        if: steps.refs.outputs.comment-number != '' && env.VALKEY_REPO == github.repository
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          COMMENT_ON: ${{ steps.refs.outputs.comment-number }}
+          PR_NUMBER: ${{ steps.refs.outputs.pr-number }}
+          BASE: ${{ steps.refs.outputs.base-sha }}
+          HEAD: ${{ steps.refs.outputs.head-sha }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const link = (sha) => `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
+            const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const {PR_NUMBER, BASE, HEAD} = process.env;
+            const what = PR_NUMBER
+              ? `PR #${PR_NUMBER} merged onto base ${link(BASE)} (PR head ${link(HEAD)})`
+              : `${link(HEAD)} compared with base ${link(BASE)}`;
+            await github.rest.issues.createComment({
+              issue_number: Number(process.env.COMMENT_ON),
+              owner,
+              repo,
+              body: `**Data tiering benchmark started:** ${what} on \`${process.env.INSTANCE_TYPE}\`. [Follow the run](${run})`
+            });
+
+  # Runs the valkey-perf-benchmark code in a job that holds no AWS or App credentials.
+  config:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      groups: ${{ steps.config.outputs.groups }}
+      perf-benchmark-sha: ${{ steps.config.outputs.perf-benchmark-sha }}
+    steps:
       - name: Checkout valkey-perf-benchmark
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -195,6 +227,12 @@ jobs:
                   raise SystemExit(f"::error::the benchmark config is not valid: {e}")
               print("entry", entry.get("custom-server-configs"), [g.get("group") for g in entry.get("test_groups", [])])
 
+          groups = [g.strip() for g in os.environ["GROUPS_INPUT"].split(",") if g.strip()]
+          known = {str(g.get("group")) for entry in cfg for g in entry.get("test_groups", [])}
+          missing = [g for g in groups if g not in known]
+          if missing:
+              raise SystemExit(f"::error::not in the config: group {', '.join(missing)}. It has groups {', '.join(sorted(known))}")
+
           json.dump(cfg, open(os.path.join(os.environ["RUNNER_TEMP"], "tiering.json"), "w"), indent=2)
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"groups={os.environ['GROUPS_INPUT']}\n")
@@ -207,30 +245,18 @@ jobs:
           name: tiering-config
           path: ${{ runner.temp }}/tiering.json
 
-      - name: Comment that the benchmark started
-        if: steps.refs.outputs.comment-number != '' && env.VALKEY_REPO == github.repository
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        env:
-          COMMENT_ON: ${{ steps.refs.outputs.comment-number }}
-          PR_NUMBER: ${{ steps.refs.outputs.pr-number }}
-          BASE: ${{ steps.refs.outputs.base-sha }}
-          HEAD: ${{ steps.refs.outputs.head-sha }}
-        with:
-          script: |
-            const {owner, repo} = context.repo;
-            const link = (sha) => `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
-            const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const {PR_NUMBER, BASE, HEAD} = process.env;
-            const what = PR_NUMBER
-              ? `PR #${PR_NUMBER} merged onto base ${link(BASE)} (PR head ${link(HEAD)})`
-              : `${link(HEAD)} compared with base ${link(BASE)}`;
-            await github.rest.issues.createComment({
-              issue_number: Number(process.env.COMMENT_ON),
-              owner,
-              repo,
-              body: `**Data tiering benchmark started:** ${what} on \`${process.env.INSTANCE_TYPE}\`. [Follow the run](${run})`
-            });
-
+  start-runner:
+    needs: [prepare, config]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+      instance-id: ${{ steps.runner.outputs.ec2-instance-id }}
+      security-group-id: ${{ steps.sg.outputs.security-group-id }}
+    steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -306,6 +332,7 @@ jobs:
             chown ec2-user:ec2-user /mnt/nvme
 
       - name: Terminate the instance when it shuts itself down
+        if: always() && steps.runner.outputs.ec2-instance-id != ''
         env:
           IID: ${{ steps.runner.outputs.ec2-instance-id }}
         run: |
@@ -313,16 +340,16 @@ jobs:
             --instance-initiated-shutdown-behavior terminate
 
   benchmark:
-    needs: start-runner
+    needs: [prepare, config, start-runner]
     runs-on: ${{ needs.start-runner.outputs.label }}
     timeout-minutes: 180
     permissions:
       contents: read
     env:
       NUM_RUNS: ${{ vars.TIERING_BENCHMARK_RUNS || '3' }}
-      TIERING_GROUPS: ${{ needs.start-runner.outputs.groups }}
-      BASE_SHA: ${{ needs.start-runner.outputs.base-sha }}
-      PR_SHA: ${{ needs.start-runner.outputs.pr-sha }}
+      TIERING_GROUPS: ${{ needs.config.outputs.groups }}
+      BASE_SHA: ${{ needs.prepare.outputs.base-sha }}
+      PR_SHA: ${{ needs.prepare.outputs.pr-sha }}
     steps:
       - name: Checkout valkey-data-tiering
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -346,7 +373,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ env.PERF_BENCHMARK_REPO }}
-          ref: ${{ needs.start-runner.outputs.perf-benchmark-sha }}
+          ref: ${{ needs.config.outputs.perf-benchmark-sha }}
           path: valkey-perf-benchmark
           fetch-depth: 1
           persist-credentials: false
@@ -405,38 +432,28 @@ jobs:
           PY
           echo "$(nproc) cores"
 
-      - name: Run base benchmark
+      - name: Run the base and PR benchmarks in turn
         working-directory: valkey-perf-benchmark
         run: |
-          git -C ../valkey checkout --detach "$BASE_SHA"
-          # Free the blocks earlier runs wrote, so both sides start from the same SSD state
-          sudo fstrim -v /mnt/nvme
-          python ./benchmark.py \
-            --config ../tiering.json \
-            --commits "$BASE_SHA" \
-            --valkey-path ../valkey \
-            --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
-            --target-ip 127.0.0.1 \
-            --results-dir results \
-            ${TIERING_GROUPS:+--groups "$TIERING_GROUPS"} \
-            --runs "$NUM_RUNS"
-          test "$(git -C ../valkey rev-parse HEAD)" = "$BASE_SHA"
-
-      - name: Run PR benchmark
-        working-directory: valkey-perf-benchmark
-        run: |
-          git -C ../valkey checkout --detach "$PR_SHA"
-          sudo fstrim -v /mnt/nvme
-          python ./benchmark.py \
-            --config ../tiering.json \
-            --commits "$PR_SHA" \
-            --valkey-path ../valkey \
-            --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
-            --target-ip 127.0.0.1 \
-            --results-dir results \
-            ${TIERING_GROUPS:+--groups "$TIERING_GROUPS"} \
-            --runs "$NUM_RUNS"
-          test "$(git -C ../valkey rev-parse HEAD)" = "$PR_SHA"
+          for ((run = 1; run <= NUM_RUNS; run++)); do
+            for SHA in "$BASE_SHA" "$PR_SHA"; do
+              echo "::group::Run $run of $NUM_RUNS on $SHA"
+              git -C ../valkey checkout --detach "$SHA"
+              # Free the blocks earlier runs wrote, so every run starts from the same SSD state
+              sudo fstrim -v /mnt/nvme
+              python ./benchmark.py \
+                --config ../tiering.json \
+                --commits "$SHA" \
+                --valkey-path ../valkey \
+                --valkey-benchmark-path "$VALKEY_BENCHMARK_PATH" \
+                --target-ip 127.0.0.1 \
+                --results-dir results \
+                ${TIERING_GROUPS:+--groups "$TIERING_GROUPS"} \
+                --runs 1
+              test "$(git -C ../valkey rev-parse HEAD)" = "$SHA"
+              echo "::endgroup::"
+            done
+          done
 
       - name: Compare results
         working-directory: valkey-perf-benchmark
@@ -458,10 +475,10 @@ jobs:
             comparison.md
 
   report:
-    needs: [start-runner, benchmark]
+    needs: [prepare, config, start-runner, benchmark]
     if: |
-      always() && needs.start-runner.result != 'skipped' &&
-      needs.start-runner.outputs.comment-number != '' && (vars.DT_VALKEY_REPO || github.repository) == github.repository
+      always() && needs.prepare.result != 'skipped' &&
+      needs.prepare.outputs.comment-number != '' && (vars.DT_VALKEY_REPO || github.repository) == github.repository
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -482,14 +499,14 @@ jobs:
             const body = fs.readFileSync('comparison.md', 'utf8');
             const {owner, repo} = context.repo;
             const link = (sha) => `[\`${sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${sha})`;
-            const base = '${{ needs.start-runner.outputs.base-sha }}';
-            const head = '${{ needs.start-runner.outputs.head-sha }}';
-            const pr = '${{ needs.start-runner.outputs.pr-number }}';
+            const base = '${{ needs.prepare.outputs.base-sha }}';
+            const head = '${{ needs.prepare.outputs.head-sha }}';
+            const pr = '${{ needs.prepare.outputs.pr-number }}';
             const what = pr
               ? `PR #${pr} merged onto base ${link(base)} (PR head ${link(head)})`
               : `${link(head)} compared with base ${link(base)}`;
             await github.rest.issues.createComment({
-              issue_number: Number('${{ needs.start-runner.outputs.comment-number }}'),
+              issue_number: Number('${{ needs.prepare.outputs.comment-number }}'),
               owner,
               repo,
               body: `**Data tiering benchmark:** ${what}\n\n${body}`
@@ -499,16 +516,16 @@ jobs:
         if: needs.benchmark.result != 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
-          RESULT: ${{ needs.benchmark.result == 'skipped' && needs.start-runner.result || needs.benchmark.result }}
+          RESULTS: ${{ needs.prepare.result }} ${{ needs.config.result }} ${{ needs.start-runner.result }} ${{ needs.benchmark.result }}
         with:
           script: |
             const {owner, repo} = context.repo;
             const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             await github.rest.issues.createComment({
-              issue_number: Number('${{ needs.start-runner.outputs.comment-number }}'),
+              issue_number: Number('${{ needs.prepare.outputs.comment-number }}'),
               owner,
               repo,
-              body: `**Data tiering benchmark ${process.env.RESULT}.** No results were posted. [See the run](${run})`
+              body: `**Data tiering benchmark ${process.env.RESULTS.split(' ').find(r => r !== 'success') || 'failed'}.** No results were posted. [See the run](${run})`
             });
 
       - name: Remove run-tiering-benchmark label
@@ -558,20 +575,20 @@ jobs:
           ec2-instance-id: ${{ needs.start-runner.outputs.instance-id }}
 
       - name: Terminate the run's instances and delete its security group
-        if: needs.start-runner.outputs.security-group-id != ''
+        if: always() && needs.start-runner.outputs.security-group-id != ''
         env:
           SG: ${{ needs.start-runner.outputs.security-group-id }}
           NAME: dt-pr-benchmark-${{ github.run_id }}
         run: |
           # Find instances by tag, so one whose start failed before its ID was
           # reported is terminated too.
-          IIDS=$(aws ec2 describe-instances \
+          read -ra IIDS <<< "$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].InstanceId' --output text)
-          if [[ -n "$IIDS" ]]; then
-            aws ec2 terminate-instances --instance-ids $IIDS > /dev/null
-            aws ec2 wait instance-terminated --instance-ids $IIDS
-            echo "terminated $IIDS"
+            --query 'Reservations[].Instances[].InstanceId' --output text)"
+          if (( ${#IIDS[@]} )); then
+            aws ec2 terminate-instances --instance-ids "${IIDS[@]}" > /dev/null
+            aws ec2 wait instance-terminated --instance-ids "${IIDS[@]}"
+            echo "terminated ${IIDS[*]}"
           fi
           for _ in $(seq 1 12); do
             if aws ec2 delete-security-group --group-id "$SG"; then
