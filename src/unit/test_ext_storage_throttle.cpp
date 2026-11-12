@@ -18,6 +18,19 @@ extern "C" {
 #include "ext_storage.h"
 #include "ext_storage_throttle.h"
 void extStorageTestResetRegistry(void);
+void setStorageState(robj *o, storageState state);
+}
+
+/* Key extraction for a test command whose only key is argv[1]. */
+static int firstArgIsKey(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+    UNUSED(cmd);
+    UNUSED(argv);
+    if (argc < 2) return 0;
+    keyReference *keys = getKeysPrepareResult(result, 1);
+    keys[0].pos = 1;
+    keys[0].flags = 0;
+    result->numkeys = 1;
+    return 1;
 }
 
 class ExtStorageThrottleTest : public ::testing::Test {
@@ -64,14 +77,19 @@ class ExtStorageThrottleTest : public ::testing::Test {
             .WillRepeatedly(DoAll(SetArgPointee<0>(used), Return(C_OK)));
     }
 
-    void setIncoming(double ops_per_sec) {
+    void setMetrics(double ops_per_sec, int queued_clients) {
         throttleMetrics m = {};
         m.incoming_tps = ops_per_sec;
+        m.num_clients_throttled = queued_clients;
         EXPECT_CALL(mock, throttle_getMetrics(_, _)).WillRepeatedly(SetArgPointee<1>(m));
     }
 
+    void setIncoming(double ops_per_sec) {
+        setMetrics(ops_per_sec, 0);
+    }
+
     /* Registers the throttler below the throttle start, where it measures the
-     * incoming rate without cutting, and returns its criteria proc. */
+     * incoming rate without throttling, and returns its criteria proc. */
     throttleCriteriaProc *install(double incoming) {
         throttleCriteriaProc *criteria = NULL;
         EXPECT_CALL(mock, throttle_register(_, _, _))
@@ -111,7 +129,7 @@ TEST_F(ExtStorageThrottleTest, NoStorageEngineNeverRegisters) {
 
 /* Below the throttle start the throttler stays registered at the unlimited
  * rate, and the incoming rate becomes the baseline. */
-TEST_F(ExtStorageThrottleTest, BelowTheStartMeasuresWithoutCutting) {
+TEST_F(ExtStorageThrottleTest, BelowTheStartMeasuresWithoutThrottling) {
     EXPECT_CALL(mock, throttle_setRate(dummy_throttler, _)).Times(0);
     install(5000);
     EXPECT_EQ(readMetric("ext_storage_throttle_rate"), -1.0);
@@ -120,9 +138,10 @@ TEST_F(ExtStorageThrottleTest, BelowTheStartMeasuresWithoutCutting) {
     EXPECT_DOUBLE_EQ(readMetric("ext_storage_throttle_memory_percent"), 95.0);
 }
 
-/* Inside the band the cut is proportional to how far used memory is past the
- * start, applied to the baseline measured before cutting began. */
-TEST_F(ExtStorageThrottleTest, CutsInProportionToTheBand) {
+/* Inside the band, the share of the baseline held back is proportional to how
+ * far used memory is past the start. The baseline is the incoming rate measured
+ * before throttling began. */
+TEST_F(ExtStorageThrottleTest, ThrottlesInProportionToTheBand) {
     install(10000);
     double activations = readMetric("ext_storage_throttle_activation_events");
 
@@ -150,29 +169,69 @@ TEST_F(ExtStorageThrottleTest, AtTheFullPercentAllowsNothing) {
     EXPECT_EQ(readMetric("ext_storage_throttle_fraction"), 1.0);
 }
 
-/* Back under the start, the rate returns to unlimited and the baseline follows
- * the incoming rate again. */
-TEST_F(ExtStorageThrottleTest, BelowTheStartAgainStopsCutting) {
+/* Back under the start with clients still held, the rate rises step by step
+ * and returns to unlimited once no client is held. The baseline stays frozen
+ * until then. */
+TEST_F(ExtStorageThrottleTest, BelowTheStartWithHeldClientsRaisesTheRateGradually) {
     install(10000);
     setUsedPercent(110);
     extStorageThrottleAdjust();
 
-    setIncoming(8000);
-    EXPECT_CALL(mock, throttle_setRate(dummy_throttler, THROTTLE_UNLIMITED_RATE)).Times(1);
+    setMetrics(4000, 3);
     setUsedPercent(98);
+    EXPECT_CALL(mock, throttle_adjustRate(dummy_throttler, DoubleEq(1.1)))
+        .WillOnce(Return(5500.0))
+        .WillOnce(Return(6050.0));
+    extStorageThrottleAdjust();
+    EXPECT_EQ(readMetric("ext_storage_throttle_rate"), 5500.0);
+    EXPECT_EQ(readMetric("ext_storage_throttle_fraction"), 0.0);
+    extStorageThrottleAdjust();
+    EXPECT_EQ(readMetric("ext_storage_throttle_rate"), 6050.0);
+    EXPECT_EQ(readMetric("ext_storage_throttle_baseline_ops_per_sec"), 10000.0);
+
+    setMetrics(6000, 0);
+    EXPECT_CALL(mock, throttle_setRate(dummy_throttler, THROTTLE_UNLIMITED_RATE)).Times(1);
     extStorageThrottleAdjust();
     EXPECT_EQ(readMetric("ext_storage_throttle_rate"), -1.0);
-    EXPECT_EQ(readMetric("ext_storage_throttle_fraction"), 0.0);
-    EXPECT_EQ(readMetric("ext_storage_throttle_baseline_ops_per_sec"), 8000.0);
+    EXPECT_EQ(readMetric("ext_storage_throttle_baseline_ops_per_sec"), 6000.0);
 }
 
-TEST_F(ExtStorageThrottleTest, TheMaxPercentSetsTheEndOfTheCut) {
+/* Going back over the start while the rate still ramps up continues the same
+ * activation, and the rate is set from the frozen baseline again. */
+TEST_F(ExtStorageThrottleTest, BackOverTheStartWhileRampingIsTheSameActivation) {
+    install(10000);
+    double activations = readMetric("ext_storage_throttle_activation_events");
+    setUsedPercent(110);
+    extStorageThrottleAdjust();
+    EXPECT_EQ(readMetric("ext_storage_throttle_activation_events"), activations + 1);
+
+    setMetrics(4000, 3);
+    setUsedPercent(98);
+    EXPECT_CALL(mock, throttle_adjustRate(dummy_throttler, DoubleEq(1.1))).WillOnce(Return(5500.0));
+    extStorageThrottleAdjust();
+
+    EXPECT_CALL(mock, throttle_setRate(dummy_throttler, DoubleNear(5000, 1e-6))).Times(1);
+    setUsedPercent(110);
+    extStorageThrottleAdjust();
+    EXPECT_EQ(readMetric("ext_storage_throttle_activation_events"), activations + 1);
+    EXPECT_NEAR(readMetric("ext_storage_throttle_rate"), 5000, 1e-2);
+}
+
+TEST_F(ExtStorageThrottleTest, TheMaxPercentSetsWhereThrottlingIsFull) {
     install(4000);
     server.ext_storage_throttle_max_percent = 110;
     EXPECT_CALL(mock, throttle_setRate(dummy_throttler, DoubleNear(1000, 1e-6))).Times(1);
     setUsedPercent(107.5);
     extStorageThrottleAdjust();
     EXPECT_NEAR(readMetric("ext_storage_throttle_fraction"), 0.75, 1e-4);
+}
+
+TEST_F(ExtStorageThrottleTest, NoMaxmemoryRemovesTheThrottler) {
+    install(1000);
+    EXPECT_CALL(mock, throttle_deregister(dummy_throttler)).Times(1);
+    server.maxmemory = 0;
+    extStorageThrottleAdjust();
+    EXPECT_EQ(readMetric("ext_storage_throttle_rate"), -1.0);
 }
 
 TEST_F(ExtStorageThrottleTest, DisablingRemovesTheThrottler) {
@@ -191,32 +250,105 @@ TEST_F(ExtStorageThrottleTest, ClosingTheStorageEngineRemovesTheThrottler) {
     extStorageThrottleAdjust();
 }
 
-/* Writes that may grow memory and reads are slowed. Other commands go through,
- * and so does the primary's replication stream. */
+/* Writes that may grow memory and scripts that may write are slowed. Other
+ * commands with no key on flash, here ones with no keys at all, go through, as
+ * does the primary's replication stream. Commands on values on flash are
+ * covered with a keyspace below. */
 TEST_F(ExtStorageThrottleTest, OnlyCommandsThatMayGrowMemoryAreThrottled) {
     throttleCriteriaProc *criteria = install(1000);
     ASSERT_NE(criteria, nullptr);
 
-    struct serverCommand write_cmd, read_cmd, del_cmd;
+    struct serverCommand write_cmd, read_cmd, del_cmd, eval_cmd, evalsha_cmd, fcall_cmd;
     memset(&write_cmd, 0, sizeof(write_cmd));
     memset(&read_cmd, 0, sizeof(read_cmd));
     memset(&del_cmd, 0, sizeof(del_cmd));
+    memset(&eval_cmd, 0, sizeof(eval_cmd));
+    memset(&evalsha_cmd, 0, sizeof(evalsha_cmd));
+    memset(&fcall_cmd, 0, sizeof(fcall_cmd));
     write_cmd.flags = CMD_WRITE | CMD_DENYOOM;
     read_cmd.flags = CMD_READONLY;
     del_cmd.flags = CMD_WRITE;
+    eval_cmd.proc = evalCommand;
+    evalsha_cmd.proc = evalShaCommand;
+    fcall_cmd.proc = fcallCommand;
     client *c = (client *)zcalloc(sizeof(client));
 
     c->cmd = &write_cmd;
     EXPECT_TRUE(criteria(c, NULL));
     c->cmd = &read_cmd;
-    EXPECT_TRUE(criteria(c, NULL));
+    EXPECT_FALSE(criteria(c, NULL));
     c->cmd = &del_cmd;
     EXPECT_FALSE(criteria(c, NULL));
+    c->cmd = &eval_cmd;
+    EXPECT_TRUE(criteria(c, NULL));
+    c->cmd = &evalsha_cmd;
+    EXPECT_TRUE(criteria(c, NULL));
+    c->cmd = &fcall_cmd;
+    EXPECT_TRUE(criteria(c, NULL));
     c->cmd = &write_cmd;
     c->flag.primary = 1;
     EXPECT_FALSE(criteria(c, NULL));
+    c->flag.primary = 0;
+    c->id = CLIENT_ID_AOF;
+    EXPECT_FALSE(criteria(c, NULL));
 
     zfree(c);
+}
+
+/* A read, or a write that doesn't grow memory, is slowed only when one of its
+ * keys is not in memory, since only then does it fetch a value back. A missing
+ * key fetches nothing. */
+TEST_F(ExtStorageThrottleTest, CommandsAreThrottledOnlyForValuesNotInMemory) {
+    throttleCriteriaProc *criteria = install(1000);
+    ASSERT_NE(criteria, nullptr);
+
+    serverDb *db = (serverDb *)zcalloc(sizeof(serverDb));
+    db->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+    db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, 0, 0);
+    const char *names[] = {"in_memory", "on_flash"};
+    storageState states[] = {STORAGE_STATE_ONLY_MEMORY, STORAGE_STATE_ONLY_FLASH};
+    bool throttled[] = {false, true};
+    robj *entries[2];
+    for (int i = 0; i < 2; i++) {
+        sds key = sdsnew(names[i]);
+        entries[i] = objectSetKeyAndExpire(createStringObject("value", 5), key, -1);
+        sdsfree(key);
+        kvstoreHashtableAdd(db->keys, 0, entries[i]);
+    }
+
+    struct serverCommand cmds[2];
+    memset(cmds, 0, sizeof(cmds));
+    cmds[0].flags = CMD_READONLY;
+    cmds[1].flags = CMD_WRITE;
+    const char *cmd_names[] = {"read", "write"};
+    client *c = (client *)zcalloc(sizeof(client));
+    robj *argv[2];
+    argv[0] = createStringObject("cmd", 3);
+    c->db = db;
+    c->argv = argv;
+    c->argc = 2;
+
+    for (int j = 0; j < 2; j++) {
+        cmds[j].getkeys_proc = firstArgIsKey;
+        c->cmd = &cmds[j];
+        for (int i = 0; i < 2; i++) {
+            setStorageState(entries[i], states[i]);
+            argv[1] = createStringObject(names[i], strlen(names[i]));
+            EXPECT_EQ(criteria(c, NULL), throttled[i]) << cmd_names[j] << " " << names[i];
+            decrRefCount(argv[1]);
+            /* Back in memory so the key can be freed. */
+            setStorageState(entries[i], STORAGE_STATE_ONLY_MEMORY);
+        }
+        argv[1] = createStringObject("missing", 7);
+        EXPECT_FALSE(criteria(c, NULL)) << cmd_names[j];
+        decrRefCount(argv[1]);
+    }
+
+    decrRefCount(argv[0]);
+    zfree(c);
+    kvstoreRelease(db->expires);
+    kvstoreRelease(db->keys);
+    zfree(db);
 }
 
 #endif /* USE_EXT_STORAGE */
