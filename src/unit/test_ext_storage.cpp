@@ -72,8 +72,8 @@ static const storageInfoSink stat_map_sink_template = {
  * These tests drive the mock storage engine with the real serializer.
  * ---------------------------------------------------------------------------*/
 
-/* The real serializer without spill sizing, so the request stays an opaque
- * token in the engine tests. */
+/* The real serializer without spill sizing. These tests pass their own tokens
+ * as the request, not spill requests, so the request isn't passed on. */
 static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out) {
     (void)request;
     return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);

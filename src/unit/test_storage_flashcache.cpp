@@ -63,15 +63,15 @@ static const storageInfoSink stat_map_sink_template = {
 #define WAIT_STEP_US 1000
 #define WAIT_RETRIES 5000
 
-/* Records the thread that ran serialize and the key it was handed, then
- * forwards to the real one. */
-/* The real serializer without spill sizing, so the request stays an opaque
- * token in the engine tests. */
+/* The real serializer without spill sizing. These tests pass their own tokens
+ * as the request, not spill requests, so the request isn't passed on. */
 static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out) {
     (void)request;
     return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
 }
 
+/* Records the thread that ran serialize and the key it was handed, then
+ * forwards to the real one. */
 static int serialize_calls = 0;
 static pthread_t serialize_thread;
 static const char *serialize_key_ptr;
