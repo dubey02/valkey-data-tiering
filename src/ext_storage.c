@@ -170,7 +170,7 @@ static void spillAccountGetStats(spillAccountStats *out) {
 
 /* Estimated memory the spills in flight will free. Unsized spills count as
  * the mean, which is 0 until the first spill is sized. */
-static size_t spillAccountEstimateInflightMem(void) {
+static size_t spillAccountGetEstimateInflightMem(void) {
     spillAccountStats st;
     spillAccountGetStats(&st);
     return st.inflight_mem;
@@ -848,7 +848,7 @@ bool extStorageBlockClientIfRequired(client *c) {
 bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
     if (!extStorageIsActive()) return true;
 
-    for (int i = 0; i < SPILL_MAX_PER_CALL && spillAccountEstimateInflightMem() < mem_tofree; i++) {
+    for (int i = 0; i < SPILL_MAX_PER_CALL && spillAccountGetEstimateInflightMem() < mem_tofree; i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
         if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
