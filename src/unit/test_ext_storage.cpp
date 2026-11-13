@@ -1307,6 +1307,29 @@ TEST_F(SpillSelectTest, ReturnsNullWhenNoKeyCanBeSpilled) {
     EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), nullptr);
 }
 
+/* One sample of one key lands on a key already on flash about 3 times in 10.
+ * Selection samples again on a miss, so every call finds a spillable key. */
+TEST_F(SpillSelectTest, ResamplesWhenASampleMissesEverySpillableKey) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 1;
+    char name[32];
+    for (int i = 0; i < 7; i++) {
+        snprintf(name, sizeof(name), "spillable:%d", i);
+        addRawKey(name);
+    }
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof(name), "on_flash:%d", i);
+        setStorageState(addRawKey(name), STORAGE_STATE_ONLY_FLASH);
+    }
+
+    int dbid = -1;
+    for (int i = 0; i < 20; i++) {
+        robj *entry = extStorageSpillSelectCandidate(&dbid);
+        ASSERT_NE(entry, nullptr) << "call " << i;
+        EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
+    }
+}
+
 /* Spill ranks every key by LRU or LFU whatever the maxmemory-policy: keys
  * without a TTL are picked under volatile-*, and volatile-ttl doesn't rank by
  * TTL. */
