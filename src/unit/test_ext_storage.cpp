@@ -29,24 +29,6 @@ extern "C" {
 void extStorageTestResetRegistry(void);
 void fetchItem(serverDb *db, robj *key);
 extern hashtableType commandSetType;
-void extStorageTestResetSpillAccount(void);
-/* Spill accounting, private to ext_storage.c. The structs must match it. */
-typedef struct spillRequest {
-    robj *entry;
-    bool sized;
-    size_t ram_bytes;
-} spillRequest;
-typedef struct spillAccountStats {
-    unsigned long unsized_requests;
-    size_t sized_ram_bytes;
-    size_t ram_mean;
-    size_t inflight_ram_bytes;
-} spillAccountStats;
-void extStorageTestAddSpilling(long delta);
-void spillAccountSized(spillRequest *s, size_t ram_bytes);
-void spillAccountFinish(spillRequest *s);
-size_t spillAccountInflightRamBytes(void);
-void spillAccountGetStats(spillAccountStats *out);
 void streamFreeCG(streamCG *cg);
 void createSharedObjects(void);
 storageState getStorageState(const robj *o);
@@ -90,10 +72,10 @@ static const storageInfoSink stat_map_sink_template = {
  * These tests drive the mock storage engine with the real serializer.
  * ---------------------------------------------------------------------------*/
 
-/* The real serializer without spill sizing, so request_ctx stays an opaque
+/* The real serializer without spill sizing, so the request stays an opaque
  * token in the engine tests. */
-static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, void *ctx, char **out) {
-    (void)ctx;
+static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out) {
+    (void)request;
     return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
 }
 
@@ -493,7 +475,7 @@ TEST_F(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
-    int token = 42;
+    storageRequest token = {};
 
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, &token), STORAGE_OK);
     EXPECT_EQ(readStats()["total_num_items"], 0u);
@@ -501,7 +483,7 @@ TEST_F(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     /* One poll both executes the queued put and delivers its completion. */
     storageCompletion comps[4] = {};
     ASSERT_EQ(engine->poll_completions(comps, 4), 1);
-    EXPECT_EQ(comps[0].request_ctx, &token);
+    EXPECT_EQ(comps[0].request, &token);
     EXPECT_EQ(comps[0].op_type, STORAGE_OP_PUT);
     EXPECT_EQ(comps[0].status, STORAGE_OK);
     EXPECT_EQ(comps[0].stored_bytes, serializedLen("v"));
@@ -522,7 +504,7 @@ TEST_F(StorageMockTest, AsyncGetDeliversTheValueOnTheCompletion) {
     dbEntry *entry = makeEntry(key, "payload");
     ASSERT_EQ(putAndWait(0, key, entry, nullptr), STORAGE_OK);
 
-    int token = 7;
+    storageRequest token = {};
     ASSERT_EQ(engine->get_async(0, key, sdslen(key), &token), STORAGE_OK);
 
     ASSERT_EQ(storageMockRunIo(2), 1);
@@ -541,7 +523,7 @@ TEST_F(StorageMockTest, AsyncGetDeliversTheValueOnTheCompletion) {
 TEST_F(StorageMockTest, AsyncMissReportsNotFoundAndNoValue) {
     openEngine();
     sds key = sdsnew("absent");
-    int token = 0;
+    storageRequest token = {};
     ASSERT_EQ(engine->get_async(0, key, sdslen(key), &token), STORAGE_OK);
 
     ASSERT_EQ(storageMockRunIo(1), 1);
@@ -559,7 +541,7 @@ TEST_F(StorageMockTest, CompletionsArriveInSubmissionOrder) {
     sds k2 = sdsnew("k2");
     dbEntry *e1 = makeEntry(k1, "v");
     dbEntry *e2 = makeEntry(k2, "v");
-    int t1 = 1, t2 = 2;
+    storageRequest t1 = {}, t2 = {};
 
     ASSERT_EQ(engine->put_async(0, k1, sdslen(k1), e1, &t1), STORAGE_OK);
     ASSERT_EQ(engine->put_async(0, k2, sdslen(k2), e2, &t2), STORAGE_OK);
@@ -568,8 +550,8 @@ TEST_F(StorageMockTest, CompletionsArriveInSubmissionOrder) {
     ASSERT_EQ(storageMockRunIo(8), 2);
     storageCompletion comps[8] = {};
     ASSERT_EQ(engine->poll_completions(comps, 8), 2);
-    EXPECT_EQ(comps[0].request_ctx, &t1);
-    EXPECT_EQ(comps[1].request_ctx, &t2);
+    EXPECT_EQ(comps[0].request, &t1);
+    EXPECT_EQ(comps[1].request, &t2);
 
     sdsfree(k1);
     sdsfree(k2);
@@ -584,7 +566,7 @@ TEST_F(StorageMockTest, ReportsWouldBlockWhenTheQueueIsFull) {
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
 
-    int token = 0;
+    storageRequest token = {};
     int accepted = 0;
     for (int i = 0; i < 1000; i++) {
         if (engine->get_async(0, key, sdslen(key), &token) != STORAGE_OK) break;
@@ -696,7 +678,7 @@ TEST_F(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
     dbEntry *e1 = makeEntry(k1, "v");
     dbEntry *e2 = makeEntry(k2, "v");
     dbEntry *e3 = makeEntry(k3, "v");
-    int t1 = 1, t2 = 2, t3 = 3;
+    storageRequest t1 = {}, t2 = {}, t3 = {};
 
     ASSERT_EQ(engine->put_async(0, k1, sdslen(k1), e1, &t1), STORAGE_OK);
     ASSERT_EQ(engine->put_async(0, k2, sdslen(k2), e2, &t2), STORAGE_OK);
@@ -711,9 +693,9 @@ TEST_F(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
     /* All three completions drain in submission order. */
     storageCompletion comps[8] = {};
     ASSERT_EQ(engine->poll_completions(comps, 8), 3);
-    EXPECT_EQ(comps[0].request_ctx, &t1);
-    EXPECT_EQ(comps[1].request_ctx, &t2);
-    EXPECT_EQ(comps[2].request_ctx, &t3);
+    EXPECT_EQ(comps[0].request, &t1);
+    EXPECT_EQ(comps[1].request, &t2);
+    EXPECT_EQ(comps[2].request, &t3);
 
     EXPECT_EQ(readStats()["total_num_items"], 3u);
 
@@ -1568,7 +1550,6 @@ class SpillSubmitTest : public SpillSelectTest {
         server.ext_storage_engine = zstrdup("mock");
         server.ext_storage_path = zstrdup("");
         extStorageInit();
-        extStorageTestResetSpillAccount();
     }
 
     void TearDown() override {
@@ -1614,8 +1595,8 @@ TEST_F(SpillSubmitTest, SubmitsTheValue) {
     ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
     EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
     EXPECT_EQ(comp.status, STORAGE_OK);
-    EXPECT_NE(comp.request_ctx, nullptr);
-    zfree(comp.request_ctx);
+    EXPECT_NE(comp.request, nullptr);
+    zfree(comp.request);
     decrRefCount(entry); /* The reference spillComplete() would release. */
 }
 
@@ -1641,7 +1622,7 @@ TEST_F(SpillSubmitTest, SubmitsEveryTypeOfValue) {
         storageCompletion comp = {};
         ASSERT_EQ(storageMockEngine()->poll_completions(&comp, 1), 1);
         EXPECT_EQ(comp.status, STORAGE_OK) << "type " << type << " encoding " << strEncoding(encoding);
-        zfree(comp.request_ctx);
+        zfree(comp.request);
         decrRefCount(entry); /* The reference spillComplete() would release. */
     }
 }
@@ -1952,149 +1933,46 @@ TEST_F(SpillSizingTest, EstimatesTheIndexOfABtreeSortedSet) {
  * Spill accounting
  * ---------------------------------------------------------------------------*/
 
-class SpillAccountTest : public ::testing::Test {
+class SpillAccountTest : public SpillSubmitTest {
   protected:
-    void SetUp() override {
-        extStorageTestResetSpillAccount();
-    }
-
-    void TearDown() override {
-        extStorageTestResetSpillAccount();
-    }
-
-    spillAccountStats stats() {
-        spillAccountStats st;
-        spillAccountGetStats(&st);
-        return st;
+    /* Submits a raw string of len bytes and returns how much memory spilling
+     * it frees. */
+    size_t submitValue(const char *name, size_t len) {
+        char val[4096];
+        memset(val, 'v', len);
+        robj *entry = addKey(name, createStringObject(val, len));
+        EXPECT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
+        return sdsAllocSize((sds)objectGetVal(entry));
     }
 };
 
-/* What extStorageSpillItem() and spillComplete() do around the accounting. */
-static void submitSpill(spillRequest *req) {
-    memset(req, 0, sizeof(*req));
-    extStorageTestAddSpilling(1);
-}
-
-static void finishSpill(spillRequest *req) {
-    spillAccountFinish(req);
-    extStorageTestAddSpilling(-1);
-}
-
-/* A spill counts as the mean until serialized, then as its measured size, and
- * completion removes it. */
-TEST_F(SpillAccountTest, ASpillCountsAsTheMeanUntilSized) {
-    spillRequest a, b;
-
-    submitSpill(&a);
-    EXPECT_EQ(stats().unsized_requests, 1u);
-    EXPECT_EQ(spillAccountInflightRamBytes(), 0u); /* No sizes yet, so the mean is 0. */
-
-    spillAccountSized(&a, 1000);
-    EXPECT_TRUE(a.sized);
-    EXPECT_EQ(a.ram_bytes, 1000u);
-    EXPECT_EQ(stats().unsized_requests, 0u);
-    EXPECT_EQ(stats().sized_ram_bytes, 1000u);
-    EXPECT_EQ(stats().ram_mean, 1000u);
-    EXPECT_EQ(spillAccountInflightRamBytes(), 1000u);
-
-    submitSpill(&b);
-    EXPECT_EQ(spillAccountInflightRamBytes(), 2000u); /* One measured, one at the mean. */
-    spillAccountSized(&b, 3000);
-    EXPECT_EQ(spillAccountInflightRamBytes(), 4000u); /* Both measured. */
-
-    finishSpill(&a);
-    finishSpill(&b);
-    spillAccountStats st = stats();
-    EXPECT_EQ(st.unsized_requests, 0u);
-    EXPECT_EQ(st.sized_ram_bytes, 0u);
-    EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
-    EXPECT_EQ(st.ram_mean, 1000u + 2000u / 16); /* The mean outlives the spills. */
-}
-
 /* A spill submitted after others complete counts as the mean. */
 TEST_F(SpillAccountTest, ASpillAfterAFinishCountsAsTheMean) {
-    spillRequest a, b;
-    submitSpill(&a);
-    spillAccountSized(&a, 1000);
-    finishSpill(&a);
+    size_t bytes = submitValue("first", 1000);
+    ASSERT_EQ(finishSpills(), 1);
 
-    submitSpill(&b);
-    EXPECT_EQ(stats().unsized_requests, 1u);
-    EXPECT_EQ(stats().sized_ram_bytes, 0u);
-    EXPECT_EQ(spillAccountInflightRamBytes(), 1000u);
-    finishSpill(&b);
+    submitValue("second", 1000);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_unsized"), 1u);
+    EXPECT_EQ(infoField("ext_storage_spilling_sized_bytes"), 0u);
+    EXPECT_EQ(infoField("ext_storage_spilling_bytes"), bytes);
 }
 
 /* The mean starts at the first size, then moves 1/16 toward each new one. */
 TEST_F(SpillAccountTest, TheMeanMovesASixteenthTowardEachSize) {
-    spillRequest s[3];
-    for (spillRequest &x : s) submitSpill(&x);
+    size_t first = submitValue("first", 1600);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    size_t mean = first;
+    EXPECT_EQ(infoField("ext_storage_spilling_mean_bytes"), mean);
 
-    spillAccountSized(&s[0], 1600);
-    EXPECT_EQ(stats().ram_mean, 1600u);
-    spillAccountSized(&s[1], 3200);
-    EXPECT_EQ(stats().ram_mean, 1600u + 1600u / 16);
-    spillAccountSized(&s[2], 100);
-    EXPECT_EQ(stats().ram_mean, 1700u - 1600u / 16);
+    size_t bigger = submitValue("bigger", 3200);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    mean += (bigger - mean) / 16;
+    EXPECT_EQ(infoField("ext_storage_spilling_mean_bytes"), mean);
 
-    for (spillRequest &x : s) finishSpill(&x);
-}
-
-/* spillAccountSized() is called once per spill. */
-TEST_F(SpillAccountTest, SizingASpillTwiceCrashes) {
-    spillRequest sizing;
-    submitSpill(&sizing);
-    spillAccountSized(&sizing, 1000);
-    EXPECT_DEATH(spillAccountSized(&sizing, 5000), "");
-    EXPECT_EQ(stats().sized_ram_bytes, 1000u);
-    finishSpill(&sizing);
-}
-
-#define SIZER_THREADS 4
-#define SPILLS_PER_SIZER 50000
-#define SPILL_SIZE 1000
-
-static void *sizeSpills(void *arg) {
-    std::vector<spillRequest> *spills = (std::vector<spillRequest> *)arg;
-    for (spillRequest &s : *spills) spillAccountSized(&s, SPILL_SIZE);
-    return NULL;
-}
-
-/* Engine threads size spills while the main thread reads the total. With equal
- * sizes, a read that counted a spill twice would exceed the total. No size is
- * lost, and completing every spill leaves zero. */
-TEST_F(SpillAccountTest, SizingOnOtherThreadsBalancesOut) {
-    std::vector<std::vector<spillRequest>> spills(SIZER_THREADS,
-                                                  std::vector<spillRequest>(SPILLS_PER_SIZER));
-    for (auto &batch : spills) {
-        for (spillRequest &s : batch) submitSpill(&s);
-    }
-    const size_t total = (size_t)SIZER_THREADS * SPILLS_PER_SIZER * SPILL_SIZE;
-
-    pthread_t sizers[SIZER_THREADS];
-    int started = 0;
-    while (started < SIZER_THREADS && pthread_create(&sizers[started], NULL, sizeSpills, &spills[started]) == 0)
-        started++;
-    /* Bounded reads while the threads run. */
-    size_t max_read = 0;
-    for (long i = 0; i < 10000000 && stats().unsized_requests > 0; i++) {
-        size_t read = spillAccountInflightRamBytes();
-        if (read > max_read) max_read = read;
-    }
-    for (int i = 0; i < started; i++) pthread_join(sizers[i], NULL);
-    ASSERT_EQ(started, SIZER_THREADS);
-    EXPECT_LE(max_read, total);
-
-    spillAccountStats st = stats();
-    EXPECT_EQ(st.unsized_requests, 0u);
-    EXPECT_EQ(st.sized_ram_bytes, total);
-    EXPECT_EQ(st.ram_mean, (size_t)SPILL_SIZE);
-    for (auto &batch : spills) {
-        for (spillRequest &s : batch) finishSpill(&s);
-    }
-    st = stats();
-    EXPECT_EQ(st.sized_ram_bytes, 0u);
-    EXPECT_EQ(spillAccountInflightRamBytes(), 0u);
+    size_t smaller = submitValue("smaller", 200);
+    ASSERT_EQ(storageMockRunIo(1), 1);
+    mean -= (mean - smaller) / 16;
+    EXPECT_EQ(infoField("ext_storage_spilling_mean_bytes"), mean);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2356,7 +2234,9 @@ class FetchCompletionTest : public SpillSelectTest {
         storageCompletion comp;
         while (engine->poll_completions(&comp, 1) == 1) {
             if (comp.value) decrRefCount((robj *)comp.value);
-            decrRefCount((robj *)comp.request_ctx); /* the fetch's reference on the entry */
+            if (!comp.request) continue;               /* a filler delete */
+            decrRefCount((robj *)comp.request->entry); /* the fetch's reference on the entry */
+            zfree(comp.request);
         }
     }
 };
@@ -3012,14 +2892,14 @@ TEST_F(SpillSubmitTest, SpillsOnlyWhatTheDeficitNeeds) {
     EXPECT_EQ(finishSpills(), 2);
 }
 
-/* A spill that is serialized but not completed counts as its measured size. */
-TEST_F(SpillSubmitTest, ASerializedSpillCoversTheDeficit) {
+/* A spill that is sized but not completed counts as its measured size. */
+TEST_F(SpillSubmitTest, ASizedSpillCoversTheDeficit) {
     server.maxmemory_samples = 128;
     server.maxmemory = 100000000;
     robj *first = addRawKey("first");
     size_t bytes = sdsAllocSize((sds)objectGetVal(first));
     ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
-    ASSERT_EQ(storageMockRunIo(1), 1); /* Serialized, completion not polled. */
+    ASSERT_EQ(storageMockRunIo(1), 1); /* Sized, completion not polled. */
 
     robj *second = addRawKey("second");
     EXPECT_TRUE(extStorageSpillOverMaxmemory(bytes / 2));
@@ -3028,17 +2908,17 @@ TEST_F(SpillSubmitTest, ASerializedSpillCoversTheDeficit) {
     EXPECT_EQ(getStorageState(first), STORAGE_STATE_COPYING_TO_FLASH);
 }
 
-/* INFO shows a serialized spill at its size and an unserialized one at the mean. */
+/* INFO shows a sized spill at its size and an unsized one at the mean. */
 TEST_F(SpillSubmitTest, InfoReportsSpillsInFlight) {
     robj *first = addRawKey("first");
     size_t bytes = sdsAllocSize((sds)objectGetVal(first));
     ASSERT_EQ(extStorageSpillItem(0, first), STORAGE_OK);
-    ASSERT_EQ(storageMockRunIo(1), 1); /* Serialized, completion not polled. */
+    ASSERT_EQ(storageMockRunIo(1), 1); /* Sized, completion not polled. */
     ASSERT_EQ(extStorageSpillItem(0, addRawKey("second")), STORAGE_OK);
 
     EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 2u);
-    EXPECT_EQ(infoField("ext_storage_num_items_spilling_unserialized"), 1u);
-    EXPECT_EQ(infoField("ext_storage_spilling_serialized_bytes"), bytes);
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_unsized"), 1u);
+    EXPECT_EQ(infoField("ext_storage_spilling_sized_bytes"), bytes);
     EXPECT_EQ(infoField("ext_storage_spilling_mean_bytes"), bytes);
     EXPECT_EQ(infoField("ext_storage_spilling_bytes"), 2 * bytes);
     ASSERT_EQ(finishSpills(), 1);
