@@ -65,7 +65,7 @@ static const storageInfoSink stat_map_sink_template = {
 
 /* The real serializer without spill sizing. These tests pass their own tokens
  * as the request, not spill requests, so the request isn't passed on. */
-static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out) {
+static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     (void)request;
     return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
 }
@@ -76,8 +76,8 @@ static int serialize_calls = 0;
 static pthread_t serialize_thread;
 static const char *serialize_key_ptr;
 static char serialize_key[16];
-static int (*real_serialize)(const char *, size_t, const valkeyObject *, storageRequest *, char **);
-static int recordingSerialize(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out) {
+static int (*real_serialize)(const char *, size_t, const valkeyObject *, storageRequestContext *, char **);
+static int recordingSerialize(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     serialize_thread = pthread_self();
     serialize_calls++;
     serialize_key_ptr = key;
@@ -163,7 +163,7 @@ class StorageFlashCacheTest : public ::testing::Test {
     }
 
     /* Takes whatever has completed and records each request once. */
-    void collectCompletions(const storageRequest *reqs, int *seen, int *completed) {
+    void collectCompletions(const storageRequestContext *reqs, int *seen, int *completed) {
         storageCompletion done[64];
         int n = waitForCompletions(done, 64);
         ASSERT_GT(n, 0) << "no completion arrived";
@@ -331,7 +331,7 @@ TEST_F(StorageFlashCacheTest, ReopenAfterCloseAcceptsRequests) {
 
 TEST_F(StorageFlashCacheTest, CompletionCarriesTheRequestContext) {
     openEngine();
-    storageRequest token = {};
+    storageRequestContext token = {};
     sds key = sdsnew("k");
     ASSERT_EQ(engine->get_async(0, key, sdslen(key), &token), STORAGE_OK);
     storageCompletion comp = {};
@@ -346,7 +346,7 @@ TEST_F(StorageFlashCacheTest, EveryRequestCompletesExactlyOnce) {
     openEngine();
     const int total = 5000;
     static int seen[total];
-    static storageRequest reqs[total];
+    static storageRequestContext reqs[total];
     static sds keys[total];
     static dbEntry *entries[total];
     memset(seen, 0, sizeof(seen));
@@ -382,7 +382,7 @@ TEST_F(StorageFlashCacheTest, EveryRequestCompletesExactlyOnce) {
 TEST_F(StorageFlashCacheTest, PartialPollsDeliverEveryCompletionOnce) {
     openEngine();
     const int total = 20;
-    storageRequest reqs[total + 1] = {};
+    storageRequestContext reqs[total + 1] = {};
     sds key = sdsnew("k");
     for (int i = 0; i < total; i++) {
         ASSERT_EQ(engine->get_async(0, key, sdslen(key), &reqs[i]), STORAGE_OK);

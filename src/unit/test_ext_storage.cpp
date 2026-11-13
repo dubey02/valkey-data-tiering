@@ -74,7 +74,7 @@ static const storageInfoSink stat_map_sink_template = {
 
 /* The real serializer without spill sizing. These tests pass their own tokens
  * as the request, not spill requests, so the request isn't passed on. */
-static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out) {
+static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     (void)request;
     return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
 }
@@ -475,7 +475,7 @@ TEST_F(StorageMockTest, AsyncPutIsNotExecutedAtSubmit) {
     openEngine();
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
-    storageRequest token = {};
+    storageRequestContext token = {};
 
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, &token), STORAGE_OK);
     EXPECT_EQ(readStats()["total_num_items"], 0u);
@@ -504,7 +504,7 @@ TEST_F(StorageMockTest, AsyncGetDeliversTheValueOnTheCompletion) {
     dbEntry *entry = makeEntry(key, "payload");
     ASSERT_EQ(putAndWait(0, key, entry, nullptr), STORAGE_OK);
 
-    storageRequest token = {};
+    storageRequestContext token = {};
     ASSERT_EQ(engine->get_async(0, key, sdslen(key), &token), STORAGE_OK);
 
     ASSERT_EQ(storageMockRunIo(2), 1);
@@ -523,7 +523,7 @@ TEST_F(StorageMockTest, AsyncGetDeliversTheValueOnTheCompletion) {
 TEST_F(StorageMockTest, AsyncMissReportsNotFoundAndNoValue) {
     openEngine();
     sds key = sdsnew("absent");
-    storageRequest token = {};
+    storageRequestContext token = {};
     ASSERT_EQ(engine->get_async(0, key, sdslen(key), &token), STORAGE_OK);
 
     ASSERT_EQ(storageMockRunIo(1), 1);
@@ -541,7 +541,7 @@ TEST_F(StorageMockTest, CompletionsArriveInSubmissionOrder) {
     sds k2 = sdsnew("k2");
     dbEntry *e1 = makeEntry(k1, "v");
     dbEntry *e2 = makeEntry(k2, "v");
-    storageRequest t1 = {}, t2 = {};
+    storageRequestContext t1 = {}, t2 = {};
 
     ASSERT_EQ(engine->put_async(0, k1, sdslen(k1), e1, &t1), STORAGE_OK);
     ASSERT_EQ(engine->put_async(0, k2, sdslen(k2), e2, &t2), STORAGE_OK);
@@ -566,7 +566,7 @@ TEST_F(StorageMockTest, ReportsWouldBlockWhenTheQueueIsFull) {
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
 
-    storageRequest token = {};
+    storageRequestContext token = {};
     int accepted = 0;
     for (int i = 0; i < 1000; i++) {
         if (engine->get_async(0, key, sdslen(key), &token) != STORAGE_OK) break;
@@ -678,7 +678,7 @@ TEST_F(StorageMockTest, IoTickExecutesOnlyUpToItsBudget) {
     dbEntry *e1 = makeEntry(k1, "v");
     dbEntry *e2 = makeEntry(k2, "v");
     dbEntry *e3 = makeEntry(k3, "v");
-    storageRequest t1 = {}, t2 = {}, t3 = {};
+    storageRequestContext t1 = {}, t2 = {}, t3 = {};
 
     ASSERT_EQ(engine->put_async(0, k1, sdslen(k1), e1, &t1), STORAGE_OK);
     ASSERT_EQ(engine->put_async(0, k2, sdslen(k2), e2, &t2), STORAGE_OK);

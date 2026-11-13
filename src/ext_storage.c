@@ -97,13 +97,14 @@ static void extStorageReleaseLoadingLock(void) {
     pthread_mutex_unlock(&ext_storage_loading_mutex);
 }
 
-/* A spill request. storageRequest must remain the first member so it can be
+/* A spill request. The request must remain the first member so it can be
  * passed through the storage API and converted back on completion. */
 typedef struct spillRequest {
-    storageRequest request;
+    storageRequestContext request;
     bool is_sized;          /* Measured while serializing. */
     size_t value_mem_usage; /* Memory usage of the value, measured while serializing. */
 } spillRequest;
+static_assert(offsetof(spillRequest, request) == 0, "spillRequest is cast from its storageRequestContext");
 
 typedef struct spillAccountStats {
     unsigned long num_unsized;   /* Spills in flight not yet sized. */
@@ -182,7 +183,7 @@ static size_t spillAccountGetEstimatedInflightMem(void) {
 /* Serialize in the DUMP wire format, so every type and encoding is handled. A
  * put from extStorageSpillItem() passes the request inside its spillRequest,
  * and its size is recorded there. */
-static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out) {
+static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     spillRequest *req = (spillRequest *)request;
     sds key_sds = sdsnewlen(key, key_len);
     robj key_obj;
@@ -729,7 +730,7 @@ void fetchItem(serverDb *db, robj *key) {
     storageState state = getStorageState(o);
     if (state == STORAGE_STATE_COPYING_TO_MEMORY) return;
     serverAssert(state == STORAGE_STATE_ONLY_FLASH);
-    storageRequest *req = zcalloc(sizeof(*req));
+    storageRequestContext *req = zcalloc(sizeof(*req));
     req->entry = o;
     storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), req);
     if (st != STORAGE_OK) {

@@ -38,12 +38,12 @@ typedef struct serverObject valkeyObject;
  * - engine_data belongs to the storage engine from the *_async call until the
  *   completion is polled. The storage engine sets it and frees what it points
  *   to before then. The valkey server never reads or writes it. */
-typedef struct storageRequest {
+typedef struct storageRequestContext {
     /* The keyspace entry the request is for. Set by the valkey server. */
     valkeyObject *entry;
     /* For the storage engine's own use. NULL when the request is submitted. */
     void *engine_data;
-} storageRequest;
+} storageRequestContext;
 
 /* Result of a storage operation. Negative values are failures. */
 typedef enum {
@@ -76,7 +76,7 @@ typedef struct storageSerializer {
     /* A keyspace entry to bytes. Returns the byte length, or -1 on failure. A
      * storage engine reports a failure here as STORAGE_ERR_REJECTED.
      * request is the one passed to put_async. */
-    int (*serialize)(const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request, char **out);
+    int (*serialize)(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out);
 
     /* Bytes to a keyless value object. Returns NULL on a malformed buffer. */
     valkeyObject *(*deserialize)(const char *key, size_t key_len, const char *bytes, int len);
@@ -92,7 +92,7 @@ typedef struct storageSerializer {
 /* A finished asynchronous request. */
 typedef struct storageCompletion {
     /* The request supplied to the *_async call. */
-    storageRequest *request;
+    storageRequestContext *request;
     /* The operation this completes. */
     storageOpType op_type;
     /* The operation's result. */
@@ -205,9 +205,9 @@ typedef struct storageEngine {
      * completion is polled. A get consumes the record, so a second get of the
      * same key reports STORAGE_NOT_FOUND until it is put again. A delete
      * completes with STORAGE_OK whether or not a record existed. */
-    storageStatus (*put_async)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request);
-    storageStatus (*get_async)(uint32_t db_id, const char *key, size_t key_len, storageRequest *request);
-    storageStatus (*del_async)(uint32_t db_id, const char *key, size_t key_len, storageRequest *request);
+    storageStatus (*put_async)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request);
+    storageStatus (*get_async)(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request);
+    storageStatus (*del_async)(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request);
 
     /* Collects finished asynchronous requests, in completion order, at most
      * max. Requests may finish out of submission order. Must not block the

@@ -40,7 +40,7 @@ typedef struct mockRequest {
     char *key;
     size_t key_len;
     const valkeyObject *entry;
-    storageRequest *request;
+    storageRequestContext *request;
 } mockRequest;
 
 /* The single storage engine instance. A storage engine is a process-wide
@@ -118,7 +118,7 @@ static storageStatus mockPut(uint32_t db_id,
                              const char *key,
                              size_t klen,
                              const valkeyObject *entry,
-                             storageRequest *request,
+                             storageRequestContext *request,
                              size_t *stored_bytes) {
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
 
@@ -210,7 +210,7 @@ static storageStatus mockDel(uint32_t db_id, const char *key, size_t klen) {
  * the two steps separately.
  * ---------------------------------------------------------------------------*/
 
-static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request) {
+static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
     if (mock.requests_len == MOCK_MAX_INFLIGHT) return STORAGE_WOULDBLOCK;
     int tail = (mock.requests_head + mock.requests_len) % MOCK_MAX_INFLIGHT;
@@ -230,15 +230,15 @@ static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *ke
     return STORAGE_OK;
 }
 
-static storageStatus mockPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request) {
+static storageStatus mockPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
     return mockSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request);
 }
 
-static storageStatus mockGetAsync(uint32_t db_id, const char *key, size_t key_len, storageRequest *request) {
+static storageStatus mockGetAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
     return mockSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request);
 }
 
-static storageStatus mockDelAsync(uint32_t db_id, const char *key, size_t key_len, storageRequest *request) {
+static storageStatus mockDelAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
     return mockSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request);
 }
 

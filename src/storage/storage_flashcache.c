@@ -306,7 +306,7 @@ static void fcFreeRequest(fcRequest *r) {
 }
 
 /* Queues a request for the IO thread. */
-static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request) {
+static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
     if (!fc_io.running) return STORAGE_ERR_REJECTED;
     if (db_id >= fc_io.num_databases) return STORAGE_ERR_REJECTED;
     if (fc_io.outstanding >= FC_QUEUE_DEPTH) return STORAGE_WOULDBLOCK;
@@ -329,15 +329,15 @@ static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key,
     return STORAGE_OK;
 }
 
-static storageStatus fcPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequest *request) {
+static storageStatus fcPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
     return fcSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request);
 }
 
-static storageStatus fcGetAsync(uint32_t db_id, const char *key, size_t key_len, storageRequest *request) {
+static storageStatus fcGetAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
     return fcSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request);
 }
 
-static storageStatus fcDelAsync(uint32_t db_id, const char *key, size_t key_len, storageRequest *request) {
+static storageStatus fcDelAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
     return fcSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request);
 }
 
