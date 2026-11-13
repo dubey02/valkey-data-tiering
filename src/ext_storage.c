@@ -47,7 +47,7 @@ typedef struct extStorageStats {
     uint64_t num_items_spilling;
     /* Puts that completed successfully. */
     uint64_t total_num_items_spilled;
-    /* Serialized bytes of the puts that completed successfully. */
+    /* Serialized value bytes of the puts that completed successfully. */
     uint64_t total_bytes_spilled;
     /* Puts the storage engine did not accept. */
     uint64_t total_num_spills_refused;
