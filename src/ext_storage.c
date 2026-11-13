@@ -65,9 +65,9 @@ typedef struct extStorageStats {
  * Completion subtracts what a spill added. The counters are atomic because
  * spillAccountAddSized() may run on a storage engine thread. */
 typedef struct spillAccount {
-    _Atomic unsigned long num_sized; /* Sizing increments, completion decrements. */
-    _Atomic size_t sized_mem_usage;  /* Sizing adds, completion subtracts. */
-    _Atomic size_t mean_mem_usage;   /* Sizing updates. */
+    _Atomic unsigned long num_sized;     /* Sizing increments, completion decrements. */
+    _Atomic size_t sized_mem_usage;      /* Sizing adds, completion subtracts. */
+    _Atomic size_t mean_value_mem_usage; /* Sizing updates. Outlives the spills. */
 } spillAccount;
 
 /* Storage Context. */
@@ -106,10 +106,10 @@ typedef struct spillRequest {
 } spillRequest;
 
 typedef struct spillAccountStats {
-    unsigned long num_unsized; /* Spills in flight not yet sized. */
-    size_t sized_mem_usage;    /* Memory usage of the sized ones. */
-    size_t mean_mem_usage;     /* EMA of their memory usage. */
-    size_t inflight_mem;       /* Estimated memory the spills in flight will free. */
+    unsigned long num_unsized;   /* Spills in flight not yet sized. */
+    size_t sized_mem_usage;      /* Memory usage of the sized ones. */
+    size_t mean_value_mem_usage; /* Moving average of value_mem_usage. */
+    size_t inflight_mem;         /* Estimated memory the spills in flight will free. */
 } spillAccountStats;
 
 /* Weight of a new value in the mean: 1/16. */
@@ -127,7 +127,7 @@ static void spillAccountReset(void) {
     spillAccount *sa = &ext_storage.spill_account;
     atomic_store_explicit(&sa->num_sized, 0, memory_order_relaxed);
     atomic_store_explicit(&sa->sized_mem_usage, 0, memory_order_relaxed);
-    atomic_store_explicit(&sa->mean_mem_usage, 0, memory_order_relaxed);
+    atomic_store_explicit(&sa->mean_value_mem_usage, 0, memory_order_relaxed);
 }
 
 /* Adds the spill's memory usage and updates the mean. Call once per spill,
@@ -142,8 +142,8 @@ static void spillAccountAddSized(spillRequest *req, size_t mem_usage) {
     atomic_fetch_add_explicit(&sa->num_sized, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&sa->sized_mem_usage, mem_usage, memory_order_release);
 
-    size_t mean = atomic_load_explicit(&sa->mean_mem_usage, memory_order_relaxed);
-    while (!atomic_compare_exchange_weak_explicit(&sa->mean_mem_usage, &mean, spillAccountUpdateMean(mean, mem_usage),
+    size_t mean = atomic_load_explicit(&sa->mean_value_mem_usage, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(&sa->mean_value_mem_usage, &mean, spillAccountUpdateMean(mean, mem_usage),
                                                   memory_order_relaxed, memory_order_relaxed));
 }
 
@@ -164,8 +164,8 @@ static void spillAccountGetStats(spillAccountStats *out) {
     unsigned long sized = atomic_load_explicit(&sa->num_sized, memory_order_relaxed);
     serverAssert(sized <= ext_storage.stats.num_items_spilling);
     out->num_unsized = ext_storage.stats.num_items_spilling - sized;
-    out->mean_mem_usage = atomic_load_explicit(&sa->mean_mem_usage, memory_order_relaxed);
-    out->inflight_mem = out->sized_mem_usage + out->num_unsized * out->mean_mem_usage;
+    out->mean_value_mem_usage = atomic_load_explicit(&sa->mean_value_mem_usage, memory_order_relaxed);
+    out->inflight_mem = out->sized_mem_usage + out->num_unsized * out->mean_value_mem_usage;
 }
 
 /* Estimated memory the spills in flight will free. Unsized spills count as
@@ -465,7 +465,7 @@ sds extStorageInfoString(sds info) {
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
                         (unsigned long long)st->num_items_spilling, sa.num_unsized, sa.sized_mem_usage,
-                        sa.mean_mem_usage, sa.inflight_mem,
+                        sa.mean_value_mem_usage, sa.inflight_mem,
                         (unsigned long long)st->total_num_items_spilled,
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted,
@@ -841,9 +841,10 @@ bool extStorageBlockClientIfRequired(client *c) {
  * 64 until the first spill is sized, since the mean is 0 until then. Returns
  * false when writes must be rejected: used memory is over 1.2x maxmemory, or
  * nothing could be spilled and no spill is in flight.
- * TODO(#110): make the cap a config, and throttle writes below it. With
- * lazyfree-lazy-server-del, a completed spill leaves the account before a
- * background thread frees its value, so the loop may spill a few extra keys. */
+ * TODO(#110): make the cap a config, and throttle writes below it.
+ * TODO(#150): with lazyfree-lazy-server-del, a completed spill leaves the
+ * account before a background thread frees its value, so the loop may spill a
+ * few extra keys. */
 bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
     if (!extStorageIsActive()) return true;
 
