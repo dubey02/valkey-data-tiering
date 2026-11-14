@@ -43,6 +43,11 @@ list(APPEND MODULES_LIST "crash")
 list(APPEND MODULES_LIST "cluster")
 list(APPEND MODULES_LIST "helloscripting")
 
+# hellostorage registers a storage engine, so it builds only with data tiering.
+if (USE_EXT_STORAGE EQUAL 1)
+    list(APPEND MODULES_LIST "hellostorage")
+endif ()
+
 foreach (MODULE_NAME ${MODULES_LIST})
     message(STATUS "Building test module: ${MODULE_NAME}")
     add_library(${MODULE_NAME} SHARED "${CMAKE_SOURCE_DIR}/tests/modules/${MODULE_NAME}.c")
