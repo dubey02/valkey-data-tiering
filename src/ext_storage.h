@@ -68,45 +68,14 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
 /* Starts fetches for spilled keys and blocks the client. Returns true if blocked. */
 bool extStorageBlockClientIfRequired(client *c);
 
-/* Spills cold keys over maxmemory. Returns false when writes must be rejected. */
-bool extStorageSpillOverMaxmemory(void);
+/* Spills cold keys to free mem_tofree. Returns false when writes must be rejected. */
+bool extStorageSpillOverMaxmemory(size_t mem_tofree);
 
 /* Waits for every spill in flight to finish. */
 void extStorageSpillDrain(void);
 
 /* Whether ext-storage-spill-policy and an LRU or LFU maxmemory-policy disagree. */
 bool extStorageSpillPolicyConflicts(void);
-
-/* Spill accounting. Main thread only, except extStorageSpillAccountSized(). */
-
-/* Per-spill accounting state. */
-typedef struct extStorageSpillSizing {
-    bool sized;       /* Serialized and measured. */
-    size_t ram_bytes; /* Measured size, once serialized. */
-} extStorageSpillSizing;
-
-/* Counts a spill as inflight. Call before put_async. */
-void extStorageSpillAccountSubmit(extStorageSpillSizing *s);
-
-/* Records a spill's serialized size. Call once per spill, before its completion
- * is posted. Safe to call from a storage engine thread. */
-void extStorageSpillAccountSized(extStorageSpillSizing *s, size_t ram_bytes);
-
-/* Removes a spill when its completion is polled or put_async refuses it. */
-void extStorageSpillAccountFinish(extStorageSpillSizing *s);
-
-/* Estimated inflight bytes of all spills. Unserialized spills count as the mean
- * size, which is 0 until the first spill is serialized. */
-size_t extStorageSpillAccountInflightRamBytes(void);
-
-typedef struct extStorageSpillAccountStats {
-    unsigned long inflight_requests; /* Spills inflight. */
-    unsigned long unsized_requests;  /* Of those, not yet serialized. */
-    size_t sized_ram_bytes;          /* Measured bytes of the serialized ones. */
-    size_t ram_mean;                 /* EMA of serialized sizes. */
-} extStorageSpillAccountStats;
-
-void extStorageSpillAccountGetStats(extStorageSpillAccountStats *out);
 
 #else
 
@@ -120,7 +89,8 @@ static inline bool extStorageIsMemoryOnly(const robj *o) {
     UNUSED(o);
     return true;
 }
-static inline bool extStorageSpillOverMaxmemory(void) {
+static inline bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
+    UNUSED(mem_tofree);
     return true;
 }
 static inline void extStorageSpillDrain(void) {

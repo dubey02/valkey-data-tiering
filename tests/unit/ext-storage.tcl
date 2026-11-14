@@ -206,12 +206,29 @@ proc spilled_keys {{level 0}} {
     return [getInfoProperty [r $level info ext_storage] ext_storage_total_num_items_spilled_to_storage]
 }
 
+# The memory spilling compares with maxmemory: used memory without replica and
+# AOF buffers. A full INFO counts its own partly built reply, so this reads
+# INFO memory, whose section comes first.
+proc counted_memory {{level 0}} {
+    set info [r $level info memory]
+    return [expr {[getInfoProperty $info used_memory] - [getInfoProperty $info mem_not_counted_for_evict]}]
+}
+
 # Prints the storage state and the end of the log of valkey server 'level',
 # then fails.
 proc fail_with_state {msg {level 0}} {
     puts [r $level info ext_storage]
     puts [exec tail -n 20 < [srv $level stdout]]
     fail $msg
+}
+
+# Waits until no spill is in flight on valkey server 'level'.
+proc wait_for_no_spills {{level 0}} {
+    wait_for_condition 100 50 {
+        [getInfoProperty [r $level info ext_storage] ext_storage_num_items_spilling_to_storage] == 0
+    } else {
+        fail_with_state "spills are still in flight" $level
+    }
 }
 
 # Puts 300 keys on flash and leaves 100 in memory, with nothing left to spill.
@@ -262,7 +279,7 @@ if {$tiering_built} {
                 r set new:$i $val
             }
             wait_for_condition 50 100 {
-                [s used_memory] <= [s maxmemory]
+                [counted_memory] <= [s maxmemory]
             } else {
                 fail_with_state "used_memory didn't drop below maxmemory"
             }
@@ -314,7 +331,7 @@ if {$tiering_built} {
             r config set maxmemory [expr {[s used_memory] * 19 / 20}]
             r set trigger $val
             wait_for_condition 50 100 {
-                [s used_memory] <= [s maxmemory]
+                [counted_memory] <= [s maxmemory]
             } else {
                 fail_with_state "used_memory didn't drop below maxmemory"
             }
@@ -357,6 +374,86 @@ if {$tiering_built} {
             assert_equal 0 [s evicted_keys]
             r config set maxmemory 0
             r config set maxmemory-policy allkeys-lru
+        }
+
+        # Once the mean is known, a small deficit spills a few keys, not 64.
+        test "Spills only what the deficit needs ($engine)" {
+            r flushall
+            r config set maxmemory 0
+            set val [string repeat x 1000]
+            for {set i 0} {$i < 2000} {incr i} {
+                r set key:$i $val
+            }
+            # The first spills size the mean.
+            r config set maxmemory [expr {[s used_memory] - 50000}]
+            r set trigger v
+            wait_for_no_spills
+            wait_for_condition 50 100 {
+                [counted_memory] <= [s maxmemory]
+            } else {
+                fail_with_state "used_memory didn't drop below maxmemory"
+            }
+            # About 10 values cover a 10 KB deficit. The bound leaves room for
+            # values freed in the background.
+            set before [spilled_keys]
+            r config set maxmemory [expr {[s used_memory] - 10000}]
+            r set trigger v
+            wait_for_no_spills
+            set spilled [expr {[spilled_keys] - $before}]
+            assert_morethan $spilled 0
+            assert_lessthan_equal $spilled 30
+            r config set maxmemory 0
+        }
+
+        # One sample can land only on keys already on flash. Selection samples
+        # again, so writes go on while spillable keys remain.
+        test "Writes don't fail with OOM while most keys are on flash ($engine)" {
+            r flushall
+            r config set maxmemory 0
+            set val [string repeat x 1000]
+            set keys {}
+            for {set i 0} {$i < 2000} {incr i} {
+                r set key:$i $val
+                if {$i < 1500} { lappend keys key:$i }
+            }
+            for {set i 0} {$i < 1500} {incr i 200} {
+                r debug ext-storage spill {*}[lrange $keys $i [expr {$i + 199}]]
+                wait_for_no_spills
+            }
+            r config set maxmemory [expr {[s used_memory] - 20000}]
+            for {set i 0} {$i < 300} {incr i} {
+                r set new:$i $val
+            }
+            r config set maxmemory 0
+            assert_equal 0 [s evicted_keys]
+        } {} {needs:debug}
+
+        # TODO(#143): test that a sustained write load keeps spilling without
+        # OOM once writes are throttled. Without throttling, writes can outpace
+        # spills under load and reach the OOM cap.
+
+        # The mean of 200 byte and 50 KB values fits neither, but used memory
+        # still comes back under maxmemory and no write is refused.
+        test "Values of mixed sizes are spilled under maxmemory without OOM ($engine)" {
+            r flushall
+            r config set maxmemory 0
+            set small [string repeat x 200]
+            set big [string repeat x 50000]
+            for {set i 0} {$i < 500} {incr i} {
+                r set key:$i [expr {$i % 10 == 0 ? $big : $small}]
+            }
+            r config set maxmemory [expr {[s used_memory] * 9 / 10}]
+            for {set i 0} {$i < 300} {incr i} {
+                r set new:$i [expr {$i % 10 == 0 ? $big : $small}]
+            }
+            wait_for_no_spills
+            wait_for_condition 50 100 {
+                [counted_memory] <= [s maxmemory]
+            } else {
+                fail_with_state "used_memory didn't drop below maxmemory"
+            }
+            assert_equal 0 [s evicted_keys]
+            r config set maxmemory 0
         }
 
         test "Keys on flash can be flushed ($engine)" {

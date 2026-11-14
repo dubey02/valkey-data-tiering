@@ -199,7 +199,8 @@ static bool fcSubmitToFlashCache(fcRequest *r) {
 
     if (r->op == STORAGE_OP_PUT) {
         if (r->put_bytes == NULL) {
-            r->put_len = fc_io.serializer.serialize(r->key, r->key_len, r->entry, &r->put_bytes);
+            r->put_len = fc_io.serializer.serialize(r->key, r->key_len, r->entry, r->completed_request.request,
+                                                    &r->put_bytes);
             if (r->put_len < 0 || r->put_bytes == NULL) {
                 r->put_bytes = NULL;
                 r->completed_request.status = STORAGE_ERR_REJECTED;
@@ -305,7 +306,7 @@ static void fcFreeRequest(fcRequest *r) {
 }
 
 /* Queues a request for the IO thread. */
-static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
+static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
     if (!fc_io.running) return STORAGE_ERR_REJECTED;
     if (db_id >= fc_io.num_databases) return STORAGE_ERR_REJECTED;
     if (fc_io.outstanding >= FC_QUEUE_DEPTH) return STORAGE_WOULDBLOCK;
@@ -320,7 +321,7 @@ static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key,
     r->entry = entry;
     r->put_bytes = NULL;
     r->put_len = 0;
-    r->completed_request = (storageCompletion){.request_ctx = request_ctx, .op_type = op, .db_id = db_id};
+    r->completed_request = (storageCompletion){.request = request, .op_type = op, .db_id = db_id};
 
     fc_io.outstanding++;
     mutexQueueAdd(fc_io.requests, r);
@@ -328,16 +329,16 @@ static storageStatus fcSubmit(storageOpType op, uint32_t db_id, const char *key,
     return STORAGE_OK;
 }
 
-static storageStatus fcPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
-    return fcSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request_ctx);
+static storageStatus fcPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
+    return fcSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request);
 }
 
-static storageStatus fcGetAsync(uint32_t db_id, const char *key, size_t key_len, void *request_ctx) {
-    return fcSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request_ctx);
+static storageStatus fcGetAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
+    return fcSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request);
 }
 
-static storageStatus fcDelAsync(uint32_t db_id, const char *key, size_t key_len, void *request_ctx) {
-    return fcSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request_ctx);
+static storageStatus fcDelAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
+    return fcSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request);
 }
 
 /* Reports the last snapshot. The IO thread refreshes it, so a value can be up

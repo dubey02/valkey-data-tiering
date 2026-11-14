@@ -40,7 +40,7 @@ typedef struct mockRequest {
     char *key;
     size_t key_len;
     const valkeyObject *entry;
-    void *request_ctx;
+    storageRequestContext *request;
 } mockRequest;
 
 /* The single storage engine instance. A storage engine is a process-wide
@@ -114,11 +114,16 @@ static void *mockAlloc(size_t n) {
  * the interface. Execution calls them when it retires a queued request.
  * ---------------------------------------------------------------------------*/
 
-static storageStatus mockPut(uint32_t db_id, const char *key, size_t klen, const valkeyObject *entry, size_t *stored_bytes) {
+static storageStatus mockPut(uint32_t db_id,
+                             const char *key,
+                             size_t klen,
+                             const valkeyObject *entry,
+                             storageRequestContext *request,
+                             size_t *stored_bytes) {
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
 
     char *vbytes = NULL;
-    int vlen = mock.cfg.serializer.serialize(key, klen, entry, &vbytes);
+    int vlen = mock.cfg.serializer.serialize(key, klen, entry, request, &vbytes);
     if (vlen < 0 || vbytes == NULL) return STORAGE_ERR_REJECTED;
 
     storageStatus st = STORAGE_OK;
@@ -205,7 +210,7 @@ static storageStatus mockDel(uint32_t db_id, const char *key, size_t klen) {
  * the two steps separately.
  * ---------------------------------------------------------------------------*/
 
-static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
+static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
     if (mock.requests_len == MOCK_MAX_INFLIGHT) return STORAGE_WOULDBLOCK;
     int tail = (mock.requests_head + mock.requests_len) % MOCK_MAX_INFLIGHT;
@@ -220,21 +225,21 @@ static storageStatus mockSubmit(storageOpType op, uint32_t db_id, const char *ke
         .key = key_copy,
         .key_len = key_len,
         .entry = entry,
-        .request_ctx = request_ctx};
+        .request = request};
     mock.requests_len++;
     return STORAGE_OK;
 }
 
-static storageStatus mockPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
-    return mockSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request_ctx);
+static storageStatus mockPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
+    return mockSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request);
 }
 
-static storageStatus mockGetAsync(uint32_t db_id, const char *key, size_t key_len, void *request_ctx) {
-    return mockSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request_ctx);
+static storageStatus mockGetAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
+    return mockSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request);
 }
 
-static storageStatus mockDelAsync(uint32_t db_id, const char *key, size_t key_len, void *request_ctx) {
-    return mockSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request_ctx);
+static storageStatus mockDelAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
+    return mockSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request);
 }
 
 static void mockInfo(const storageInfoSink *s) {
@@ -252,13 +257,13 @@ int storageMockRunIo(int max) {
         int tail = (mock.completions_head + mock.completions_len) % MOCK_MAX_COMPLETED;
         storageCompletion *comp = &mock.completions[tail];
         memset(comp, 0, sizeof(*comp));
-        comp->request_ctx = req->request_ctx;
+        comp->request = req->request;
         comp->op_type = req->op;
         comp->db_id = req->db_id;
 
         switch (req->op) {
         case STORAGE_OP_PUT:
-            comp->status = mockPut(req->db_id, req->key, req->key_len, req->entry, &comp->stored_bytes);
+            comp->status = mockPut(req->db_id, req->key, req->key_len, req->entry, req->request, &comp->stored_bytes);
             break;
         case STORAGE_OP_GET:
             comp->status = mockGet(req->db_id, req->key, req->key_len, &comp->value);
