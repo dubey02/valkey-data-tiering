@@ -40,12 +40,19 @@ void extStorageTestResetRegistry(void) {
     registered_engine = NULL;
 }
 
-/* Counted on the main thread as requests are submitted and completed. */
+/* Counted on the main thread as requests are submitted and completed.
+ * TODO(#147): reset the totals on CONFIG RESETSTAT. */
 typedef struct extStorageStats {
     /* Writes submitted and not yet completed. */
     uint64_t num_items_spilling;
     /* Puts that completed successfully. */
     uint64_t total_num_items_spilled;
+    /* Serialized value bytes of the puts that completed successfully. */
+    uint64_t total_bytes_spilled;
+    /* Puts the storage engine did not accept. */
+    uint64_t total_num_spills_refused;
+    /* Spill rounds that found no key to spill. */
+    uint64_t total_num_spill_candidate_misses;
     /* Fetches that completed successfully. */
     uint64_t total_num_items_fetched;
     /* Deletes that completed successfully. */
@@ -459,6 +466,9 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_spilling_mean_bytes:%zu\r\n"
                         "ext_storage_spilling_bytes:%zu\r\n"
                         "ext_storage_total_num_items_spilled_to_storage:%llu\r\n"
+                        "ext_storage_total_bytes_spilled_to_storage:%llu\r\n"
+                        "ext_storage_total_num_spills_refused:%llu\r\n"
+                        "ext_storage_total_num_spill_candidate_misses:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
                         "ext_storage_num_items_fetching_from_storage:%llu\r\n"
@@ -468,6 +478,9 @@ sds extStorageInfoString(sds info) {
                         (unsigned long long)st->num_items_spilling, sa.num_unsized, sa.sized_mem_usage,
                         sa.mean_value_mem_usage, sa.inflight_mem,
                         (unsigned long long)st->total_num_items_spilled,
+                        (unsigned long long)st->total_bytes_spilled,
+                        (unsigned long long)st->total_num_spills_refused,
+                        (unsigned long long)st->total_num_spill_candidate_misses,
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted,
                         (unsigned long long)st->num_items_fetching,
@@ -621,6 +634,7 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
         ext_storage.stats.num_items_spilling--;
         decrRefCount(entry);
         zfree(req);
+        ext_storage.stats.total_num_spills_refused++;
         return status;
     }
 
@@ -710,6 +724,7 @@ static void spillComplete(const storageCompletion *comp) {
     spillAccountSubtractSized(req);
     ext_storage.stats.num_items_spilling--;
     ext_storage.stats.total_num_items_spilled++;
+    ext_storage.stats.total_bytes_spilled += comp->stored_bytes;
 
     /* Unblock clients blocked on the key while it was being spilled. */
     sds name = objectGetKey(entry);
@@ -852,7 +867,11 @@ bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
     for (int i = 0; i < SPILL_MAX_PER_CALL && spillAccountGetEstimatedInflightMem() < mem_tofree; i++) {
         int dbid;
         robj *entry = extStorageSpillSelectCandidate(&dbid);
-        if (entry == NULL || extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
+        if (entry == NULL) {
+            ext_storage.stats.total_num_spill_candidate_misses++;
+            break;
+        }
+        if (extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
 
     if (mem_tofree > server.maxmemory / 5) return false; /* Over 1.2x maxmemory. */

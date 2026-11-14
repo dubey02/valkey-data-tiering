@@ -1592,10 +1592,10 @@ class SpillSubmitTest : public SpillSelectTest {
         return n;
     }
 
-    /* Reads one ext_storage INFO field. The stats outlive each test, so
-     * callers compare before and after. */
+    /* Reads one ext_storage or storage_engine INFO field. The stats outlive
+     * each test, so callers compare before and after. */
     unsigned long long infoField(const char *name) {
-        sds info = extStorageInfoString(sdsempty());
+        sds info = extStorageEngineInfoString(extStorageInfoString(sdsempty()));
         sds field = sdscatfmt(sdsempty(), "%s:", name);
         const char *at = strstr(info, field);
         EXPECT_NE(at, nullptr) << name;
@@ -1669,11 +1669,13 @@ TEST_F(SpillSubmitTest, WouldBlockChangesNothing) {
 
 TEST_F(SpillSubmitTest, ARejectedItemChangesNothing) {
     robj *entry = addRawKey("key");
+    unsigned long long refused = infoField("ext_storage_total_num_spills_refused");
 
     /* The engine rejects a database it wasn't opened with. */
     EXPECT_EQ(extStorageSpillItem(server.dbnum, entry), STORAGE_ERR_REJECTED);
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_MEMORY);
     EXPECT_EQ(objectGetRefcount(entry), 1);
+    EXPECT_EQ(infoField("ext_storage_total_num_spills_refused"), refused + 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2165,19 +2167,26 @@ TEST_F(SpillSubmitTest, ShutdownFinishesASpillInFlight) {
     EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling);
 }
 
-/* A write counts as spilling until it completes, then as spilled. */
+/* A write counts as spilling until it completes, then as spilled. Its bytes
+ * match what the storage engine stored. */
 TEST_F(SpillSubmitTest, ASpillIsCountedAsSpillingThenSpilled) {
     robj *entry = addRawKey("key");
     unsigned long long spilling = infoField("ext_storage_num_items_spilling_to_storage");
     unsigned long long spilled = infoField("ext_storage_total_num_items_spilled_to_storage");
+    unsigned long long bytes = infoField("ext_storage_total_bytes_spilled_to_storage");
+    unsigned long long stored = infoField("storage_engine_allocated_db_size_bytes");
 
     ASSERT_EQ(extStorageSpillItem(0, entry), STORAGE_OK);
     EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling + 1);
     EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled);
+    EXPECT_EQ(infoField("ext_storage_total_bytes_spilled_to_storage"), bytes);
 
     ASSERT_EQ(finishSpills(), 1);
     EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), spilling);
     EXPECT_EQ(infoField("ext_storage_total_num_items_spilled_to_storage"), spilled + 1);
+    unsigned long long stored_delta = infoField("storage_engine_allocated_db_size_bytes") - stored;
+    EXPECT_GT(stored_delta, 0u);
+    EXPECT_EQ(infoField("ext_storage_total_bytes_spilled_to_storage"), bytes + stored_delta);
 }
 
 /* Counts from a previous open must not carry over. */
@@ -2847,7 +2856,9 @@ TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
 TEST_F(SpillSubmitTest, RejectsWritesWhenNothingCanBeSpilled) {
     server.maxmemory = 100000000;
     addKey("embedded", createStringObject("short", 5));
+    unsigned long long misses = infoField("ext_storage_total_num_spill_candidate_misses");
     EXPECT_FALSE(extStorageSpillOverMaxmemory(1));
+    EXPECT_EQ(infoField("ext_storage_total_num_spill_candidate_misses"), misses + 1);
     server.maxmemory = 0;
 }
 
