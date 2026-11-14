@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include "include/util.h"
 #ifdef FC_USE_JEMALLOC
