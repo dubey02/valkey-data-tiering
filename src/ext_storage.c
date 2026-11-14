@@ -587,7 +587,9 @@ void setStorageState(robj *o, storageState state) {
  * Embedded strings and INT encodings have no separate allocation to free.
  * A key with a TTL, or a hash with field expirations, stays in DRAM because
  * expiry deletes and changes values without checking where they are.
- * TODO(#57): spill them once expiry handles keys on flash. */
+ * TODO(#57): spill them once expiry handles keys on flash.
+ * TODO(#47): deleting a module key on flash without a fetch, as RM_Call or
+ * slot cleanup does, crashes reading the module type from its value. */
 static bool isSpillCandidate(const robj *o) {
     if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
     if (objectGetEncoding(o) == OBJ_ENCODING_INT) return false;
