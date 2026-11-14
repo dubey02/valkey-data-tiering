@@ -585,13 +585,12 @@ void setStorageState(robj *o, storageState state) {
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
- * Module values have no serializer yet (#81). A key with a TTL, or a hash with
- * field expirations, stays in DRAM because expiry deletes and changes values
- * without checking where they are.
+ * A key with a TTL, or a hash with field expirations, stays in DRAM because
+ * expiry deletes and changes values without checking where they are.
  * TODO(#57): spill them once expiry handles keys on flash. */
 static bool isSpillCandidate(const robj *o) {
     if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
-    if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
+    if (objectGetEncoding(o) == OBJ_ENCODING_INT) return false;
     if (objectGetExpire(o) != EXPIRY_NONE) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }
@@ -698,9 +697,7 @@ int extStorageDebugCommand(client *c) {
 }
 
 /* Frees the value the way dbSetValue() frees an overwritten one. The object,
- * which holds the key, stays.
- * TODO(#81): pass the key and dbid once module values spill, since a module's
- * free_effort callback may read them. */
+ * which holds the key, stays. */
 static void spillFreeValue(robj *entry) {
     robj *val = createObject(objectGetType(entry), objectGetVal(entry));
     val->encoding = objectGetEncoding(entry);
