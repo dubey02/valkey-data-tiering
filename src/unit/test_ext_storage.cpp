@@ -1186,8 +1186,7 @@ TEST_F(SpillSelectTest, SkipsKeysThatCannotBeSpilled) {
     decrRefCount(referenced);
 }
 
-/* Module keys aren't spillable yet (#81). */
-TEST_F(SpillSelectTest, SkipsModuleKeys) {
+TEST_F(SpillSelectTest, SelectsModuleKeys) {
     usePolicy(MAXMEMORY_ALLKEYS_LRU);
     static moduleType mt = {};
     mt.free = freeNothingOnRelease;
@@ -1198,11 +1197,11 @@ TEST_F(SpillSelectTest, SkipsModuleKeys) {
     ASSERT_FALSE(module_key->hasembval);
     objectSetLRUOrLFU(module_key, -1, 5000);
 
-    robj *candidate = addRawKey("candidate");
-    objectSetLRUOrLFU(candidate, -1, 10);
+    robj *warm = addRawKey("warm");
+    objectSetLRUOrLFU(warm, -1, 10);
 
     int dbid = -1;
-    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), candidate);
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), module_key);
 }
 
 /* Expiry deletes keys without checking where their values are, so a key with a
@@ -1952,6 +1951,35 @@ TEST_F(SpillSizingTest, EstimatesTheIndexOfABtreeSortedSet) {
     size_t measured = measure(zset);
     size_t freed = freeValue(zset);
     EXPECT_NEAR((double)measured, (double)freed, freed * 0.02);
+}
+
+static void saveOneUnsigned(ValkeyModuleIO *io, void *value) {
+    UNUSED(value);
+    VM_SaveUnsigned(io, 1);
+}
+
+static size_t allocatedSize(const void *value) {
+    return zmalloc_size((void *)value);
+}
+
+/* A module value counts its wrapper and what its type's mem_usage reports. */
+TEST_F(SpillSizingTest, AModuleValueMeasuresWhatItsTypeReports) {
+    moduleType mt = {};
+    mt.id = 1;
+    mt.rdb_save = saveOneUnsigned;
+    mt.mem_usage = allocatedSize;
+    mt.free = zfree;
+    strcpy(mt.name, "testtype1");
+
+    moduleValue *mv = (moduleValue *)zmalloc(sizeof(*mv));
+    mv->type = &mt;
+    mv->value = zmalloc(1000);
+    robj *o = createObject(OBJ_MODULE, mv);
+
+    size_t measured = measure(o);
+    size_t freed = freeValue(o);
+    EXPECT_GE(freed, 1000u);
+    EXPECT_EQ(measured, freed);
 }
 
 /* ---------------------------------------------------------------------------
