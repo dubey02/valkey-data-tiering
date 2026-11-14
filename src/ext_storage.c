@@ -842,7 +842,7 @@ bool extStorageBlockClientIfRequired(client *c) {
  * 64 until the first spill is sized, since the mean is 0 until then. Returns
  * false when writes must be rejected: used memory is over 1.2x maxmemory, or
  * nothing could be spilled and no spill is in flight.
- * TODO(#110): make the cap a config, and throttle writes below it.
+ * TODO(#151): make the cap a config, and throttle writes below it.
  * TODO(#150): with lazyfree-lazy-server-del, a completed spill leaves the
  * account before a background thread frees its value, so the loop may spill a
  * few extra keys. */
