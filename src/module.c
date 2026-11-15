@@ -13680,8 +13680,15 @@ int parseLoadexArguments(ValkeyModuleString ***module_argv, int *module_argc) {
     return VALKEYMODULE_OK;
 }
 
+#ifdef USE_EXT_STORAGE
+static void moduleUnregisterStorageEngine(ValkeyModule *module);
+#endif
+
 /* Unregister module-related things, called when moduleLoad fails or moduleUnload. */
 void moduleUnregisterCleanup(ValkeyModule *module) {
+#ifdef USE_EXT_STORAGE
+    moduleUnregisterStorageEngine(module);
+#endif
     moduleFreeAuthenticatedClients(module);
     moduleUnregisterCommands(module);
     moduleUnsubscribeNotifications(module);
@@ -15568,6 +15575,14 @@ int VM_ACLCheckKeyPrefixPermissions(ValkeyModuleUser *user, const char *key, siz
  * -------------------------------------------------------------------------- */
 #ifdef USE_EXT_STORAGE
 #include "storage/storage.h"
+
+/* Drops the storage engine a module registered. Unload is refused for that
+ * module, so this only runs when its OnLoad fails after registering. */
+static void moduleUnregisterStorageEngine(ValkeyModule *module) {
+    if (module != storage_engine_module) return;
+    storageUnregisterEngine();
+    storage_engine_module = NULL;
+}
 
 int VM_RegisterStorageEngine(ValkeyModuleCtx *ctx, void *storage_engine) {
     if (storage_engine == NULL) {

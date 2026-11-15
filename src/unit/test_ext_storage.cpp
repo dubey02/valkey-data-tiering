@@ -26,7 +26,6 @@ extern "C" {
 #include "module.h"
 #include "storage/storage.h"
 #include "storage/storage_mock.h"
-void extStorageTestResetRegistry(void);
 void fetchItem(serverDb *db, robj *key);
 extern hashtableType commandSetType;
 void streamFreeCG(streamCG *cg);
@@ -88,7 +87,7 @@ class StorageMockTest : public ::testing::Test {
     storageConfig cfg = {};
 
     void SetUp() override {
-        extStorageTestResetRegistry();
+        storageUnregisterEngine();
         /* The real value serde uses the CRC64 table and logs through
          * server.logfile. Both must be initialized. */
         memset(&server, 0, sizeof(valkeyServer));
@@ -186,7 +185,7 @@ class StorageMockTest : public ::testing::Test {
     void TearDown() override {
         drainCompletions();
         EXPECT_EQ(engine->close(), STORAGE_OK);
-        extStorageTestResetRegistry();
+        storageUnregisterEngine();
         zfree(server.logfile);
         server.logfile = NULL;
     }
@@ -1565,7 +1564,7 @@ class SpillSubmitTest : public SpillSelectTest {
   protected:
     void SetUp() override {
         SpillSelectTest::SetUp();
-        extStorageTestResetRegistry();
+        storageUnregisterEngine();
         server.hz = CONFIG_DEFAULT_HZ;
         server.logfile = zstrdup("");
         crc64_init();
@@ -2220,7 +2219,7 @@ class FetchCompletionTest : public SpillSelectTest {
 
     void SetUp() override {
         SpillSelectTest::SetUp();
-        extStorageTestResetRegistry();
+        storageUnregisterEngine();
         server.logfile = zstrdup("");
         crc64_init();
         server.ext_storage_enabled = 1;

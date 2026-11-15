@@ -232,4 +232,8 @@ storageStatus storageRegisterEngine(const storageEngine *engine);
 /* Returns the registered module storage engine matching the name, or NULL. */
 const storageEngine *storageLookupEngine(const char *name);
 
+/* Drops the registered module storage engine, if any. Used when the module
+ * that registered it fails to load, and by tests to start from a clean registry. */
+void storageUnregisterEngine(void);
+
 #endif /* VALKEY_STORAGE_H */

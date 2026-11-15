@@ -10,7 +10,8 @@
  * (db_id, key). A storage engine can be built into the valkey server, or it can
  * arrive as a loadable module. This file is the module path, written to be read.
  * It is a complete, if minimal, in-memory storage engine so a third party can
- * see every part a real storage engine must provide.
+ * see every part a real storage engine must provide. One worker thread runs
+ * the requests, the way a real storage engine's IO threads would.
  *
  * The storage engine keeps serialized values in an in-memory per-database hash
  * table. It does not use disk. It only serves as an example of implementing the
@@ -32,8 +33,10 @@
 #include "storage/storage.h"
 #include "valkeymodule.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ---------------------------------------------------------------------------
  * Storage
@@ -43,10 +46,9 @@
  * ---------------------------------------------------------------------------*/
 
 #define HELLO_BUCKETS 1024
-/* Submitted requests waiting to run before the storage engine reports it is busy. */
+/* Requests submitted and not yet polled before the storage engine reports it
+ * is busy. Both rings hold this many, so neither can overflow. */
 #define HELLO_MAX_INFLIGHT 256
-/* Finished requests waiting for the valkey server to collect them. */
-#define HELLO_MAX_COMPLETED 256
 
 typedef struct helloRecord {
     char *key;
@@ -72,12 +74,22 @@ typedef struct helloRequest {
     void *request_ctx;
 } helloRequest;
 
+/* The counters INFO reports. */
+typedef struct helloStats {
+    /* Number of records stored. */
+    uint64_t total_num_items;
+    /* Bytes the stored records take up. */
+    uint64_t allocated_db_size_bytes;
+} helloStats;
+
 /* A storage engine is a process-wide singleton, so its state lives here rather
  * than behind a handle.
  *
- * The asynchronous path uses two rings. A submitted request lands in the
- * request ring. Running it moves it to the completion ring, which the valkey
- * server drains with poll_completions. */
+ * The asynchronous path uses two rings and one worker thread. A submitted
+ * request lands in the request ring. The worker runs it and moves it to the
+ * completion ring, which the valkey server drains with poll_completions. The
+ * rings are shared, so they are only touched under the lock. The store and its
+ * counters belong to the worker alone. */
 static struct {
     storageConfig cfg;
     helloDb *dbs;
@@ -87,19 +99,29 @@ static struct {
     int requests_head;
     int requests_len;
 
-    storageCompletion completions[HELLO_MAX_COMPLETED];
+    storageCompletion completions[HELLO_MAX_INFLIGHT];
     int completions_head;
     int completions_len;
 
-    /* The counters INFO reports. Everything here runs on the main thread, so
-     * INFO reads them as they are. */
-    struct {
-        /* Number of records stored. */
-        uint64_t total_num_items;
-        /* Bytes the stored records take up. */
-        uint64_t allocated_db_size_bytes;
-    } stats;
+    /* Requests submitted and not yet polled, including the one running. Only
+     * the main thread reads or changes it, so it needs no lock. */
+    int outstanding;
+
+    /* Updated by the worker as it runs requests. */
+    helloStats stats;
+    /* The copy INFO reads. The worker refreshes it under the lock after each
+     * request. */
+    helloStats stats_snapshot;
+
+    pthread_t worker;
+    int running;
+    int stopping;
 } hello;
+
+/* Kept outside the state above, since close clears that state. */
+static pthread_mutex_t hello_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Signals the worker that a request arrived or that it must stop. */
+static pthread_cond_t hello_wake = PTHREAD_COND_INITIALIZER;
 
 /* FNV-1a hash. */
 static size_t helloHash(const char *p, size_t len) {
@@ -139,8 +161,8 @@ static void *helloAlloc(size_t n) {
 /* ---------------------------------------------------------------------------
  * The three operations
  *
- * Each one does a single put, get, or delete against the store. The valkey
- * server never calls these directly. They run when a queued request is retired.
+ * Each one does a single put, get, or delete against the store. Only the
+ * worker thread calls them, so serialization never runs on the main thread.
  * ---------------------------------------------------------------------------*/
 
 static storageStatus helloPut(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, size_t *stored_bytes) {
@@ -230,22 +252,24 @@ static storageStatus helloDel(uint32_t db_id, const char *key, size_t key_len) {
  * The asynchronous path
  *
  * The valkey server submits a request and later collects its completion. It
- * never blocks on the storage engine. This example runs the queued work at poll time,
- * which is the simplest thing that honors the contract. A real storage engine
- * runs it on its own IO threads instead.
+ * never blocks on the storage engine. One worker thread runs the requests in
+ * submission order. The main thread only touches the rings, under a lock the
+ * worker never holds while it runs a request.
  * ---------------------------------------------------------------------------*/
 
 static storageStatus helloSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
     if (db_id >= hello.num_databases) return STORAGE_ERR_REJECTED;
-    /* A full request ring means the storage engine is busy. The valkey server retries. */
-    if (hello.requests_len == HELLO_MAX_INFLIGHT) return STORAGE_WOULDBLOCK;
 
-    int tail = (hello.requests_head + hello.requests_len) % HELLO_MAX_INFLIGHT;
+    /* Too many unpolled requests means the storage engine is busy. The valkey
+     * server retries. */
+    if (hello.outstanding == HELLO_MAX_INFLIGHT) return STORAGE_WOULDBLOCK;
 
     /* The key is borrowed for the call, so the storage engine copies it to keep it. */
     char *key_copy = helloAlloc(key_len);
     memcpy(key_copy, key, key_len);
 
+    pthread_mutex_lock(&hello_lock);
+    int tail = (hello.requests_head + hello.requests_len) % HELLO_MAX_INFLIGHT;
     hello.requests[tail] = (helloRequest){
         .op = op,
         .db_id = db_id,
@@ -254,6 +278,9 @@ static storageStatus helloSubmit(storageOpType op, uint32_t db_id, const char *k
         .entry = entry,
         .request_ctx = request_ctx};
     hello.requests_len++;
+    pthread_cond_signal(&hello_wake);
+    pthread_mutex_unlock(&hello_lock);
+    hello.outstanding++;
     return STORAGE_OK;
 }
 
@@ -269,51 +296,68 @@ static storageStatus helloDelAsync(uint32_t db_id, const char *key, size_t key_l
     return helloSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request_ctx);
 }
 
-/* Runs up to max queued requests, one completion each. Stops early if the
- * completion ring fills, leaving the request for a later pass. */
-static int helloRunQueued(int max) {
-    int n = 0;
-    while (n < max && hello.requests_len > 0 && hello.completions_len < HELLO_MAX_COMPLETED) {
-        helloRequest *req = &hello.requests[hello.requests_head];
-        int tail = (hello.completions_head + hello.completions_len) % HELLO_MAX_COMPLETED;
-        storageCompletion *comp = &hello.completions[tail];
-        memset(comp, 0, sizeof(*comp));
-        comp->request_ctx = req->request_ctx;
-        comp->op_type = req->op;
-        comp->db_id = req->db_id;
+/* Runs one request against the store and fills in its completion. */
+static void helloRun(const helloRequest *req, storageCompletion *comp) {
+    memset(comp, 0, sizeof(*comp));
+    comp->request_ctx = req->request_ctx;
+    comp->op_type = req->op;
+    comp->db_id = req->db_id;
 
-        switch (req->op) {
-        case STORAGE_OP_PUT:
-            comp->status = helloPut(req->db_id, req->key, req->key_len, req->entry, &comp->stored_bytes);
-            break;
-        case STORAGE_OP_GET:
-            comp->status = helloGet(req->db_id, req->key, req->key_len, &comp->value);
-            break;
-        case STORAGE_OP_DEL:
-            comp->status = helloDel(req->db_id, req->key, req->key_len);
-            break;
-        }
-
-        free(req->key);
-        hello.requests_head = (hello.requests_head + 1) % HELLO_MAX_INFLIGHT;
-        hello.requests_len--;
-        hello.completions_len++;
-        n++;
+    switch (req->op) {
+    case STORAGE_OP_PUT:
+        comp->status = helloPut(req->db_id, req->key, req->key_len, req->entry, &comp->stored_bytes);
+        break;
+    case STORAGE_OP_GET:
+        comp->status = helloGet(req->db_id, req->key, req->key_len, &comp->value);
+        break;
+    case STORAGE_OP_DEL:
+        comp->status = helloDel(req->db_id, req->key, req->key_len);
+        break;
     }
-    return n;
 }
 
-/* Hands finished requests to the valkey server. This example runs the queued
- * work first, then drains it. */
+/* The worker thread. It takes the oldest request, runs it without the lock,
+ * and queues its completion. It sleeps while there is nothing to run. */
+static void *helloWorkerMain(void *arg) {
+    (void)arg;
+    if (hello.cfg.thread_config.on_thread_start) hello.cfg.thread_config.on_thread_start("hellostorage");
+
+    pthread_mutex_lock(&hello_lock);
+    while (1) {
+        while (hello.requests_len == 0 && !hello.stopping) pthread_cond_wait(&hello_wake, &hello_lock);
+        if (hello.requests_len == 0) break;
+
+        helloRequest req = hello.requests[hello.requests_head];
+        hello.requests_head = (hello.requests_head + 1) % HELLO_MAX_INFLIGHT;
+        hello.requests_len--;
+        pthread_mutex_unlock(&hello_lock);
+
+        storageCompletion comp;
+        helloRun(&req, &comp);
+        free(req.key);
+
+        pthread_mutex_lock(&hello_lock);
+        int tail = (hello.completions_head + hello.completions_len) % HELLO_MAX_INFLIGHT;
+        hello.completions[tail] = comp;
+        hello.completions_len++;
+        hello.stats_snapshot = hello.stats;
+    }
+    pthread_mutex_unlock(&hello_lock);
+    return NULL;
+}
+
+/* Hands finished requests to the valkey server. */
 static int helloPollCompletions(storageCompletion *out, int max) {
-    helloRunQueued(max);
+    pthread_mutex_lock(&hello_lock);
     int n = 0;
     while (n < max && hello.completions_len > 0) {
         out[n] = hello.completions[hello.completions_head];
-        hello.completions_head = (hello.completions_head + 1) % HELLO_MAX_COMPLETED;
+        hello.completions_head = (hello.completions_head + 1) % HELLO_MAX_INFLIGHT;
         hello.completions_len--;
         n++;
     }
+    pthread_mutex_unlock(&hello_lock);
+    hello.outstanding -= n;
     return n;
 }
 
@@ -345,13 +389,36 @@ static storageStatus helloOpen(const storageConfig *cfg) {
     memset(hello.dbs, 0, cfg->num_databases * sizeof(helloDb));
     hello.cfg = *cfg;
     hello.num_databases = cfg->num_databases;
+
+    /* The valkey server asks for a minimum stack size on its threads. */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    size_t stack_size = 0;
+    pthread_attr_getstacksize(&attr, &stack_size);
+    if (stack_size < cfg->thread_config.stack_size) pthread_attr_setstacksize(&attr, cfg->thread_config.stack_size);
+    int err = pthread_create(&hello.worker, &attr, helloWorkerMain, NULL);
+    pthread_attr_destroy(&attr);
+    if (err != 0) {
+        cfg->logger(STORAGE_LOG_WARNING, "hellostorage: can't start the worker thread: %s", strerror(err));
+        free(hello.dbs);
+        memset(&hello, 0, sizeof(hello));
+        return STORAGE_ERR_IO;
+    }
+    hello.running = 1;
     return STORAGE_OK;
 }
 
 static storageStatus helloClose(void) {
     /* An unpolled request may hold a fetched value nobody else has, so the
      * storage engine stays open until the valkey server has polled it. */
-    if (hello.requests_len > 0 || hello.completions_len > 0) return STORAGE_WOULDBLOCK;
+    if (hello.outstanding > 0) return STORAGE_WOULDBLOCK;
+
+    pthread_mutex_lock(&hello_lock);
+    hello.stopping = 1;
+    pthread_cond_signal(&hello_wake);
+    pthread_mutex_unlock(&hello_lock);
+    if (hello.running) pthread_join(hello.worker, NULL);
+
     if (hello.dbs) {
         for (uint32_t d = 0; d < hello.num_databases; d++) {
             for (int b = 0; b < HELLO_BUCKETS; b++) {
@@ -371,8 +438,17 @@ static storageStatus helloClose(void) {
 
 /* Reports the counters through the sink. They print in INFO ext_storage. */
 static void helloInfo(const storageInfoSink *s) {
-    s->add_ulong_long(s->ctx, "total_num_items", hello.stats.total_num_items);
-    s->add_ulong_long(s->ctx, "allocated_db_size_bytes", hello.stats.allocated_db_size_bytes);
+    pthread_mutex_lock(&hello_lock);
+    helloStats stats = hello.stats_snapshot;
+    pthread_mutex_unlock(&hello_lock);
+    s->add_ulong_long(s->ctx, "total_num_items", stats.total_num_items);
+    s->add_ulong_long(s->ctx, "allocated_db_size_bytes", stats.allocated_db_size_bytes);
+}
+
+/* Crash handler only. Stops the worker with no cleanup. */
+static void helloKillThreads(void) {
+    if (!hello.running || pthread_equal(hello.worker, pthread_self())) return;
+    if (pthread_cancel(hello.worker) == 0) pthread_join(hello.worker, NULL);
 }
 
 /* ---------------------------------------------------------------------------
@@ -388,6 +464,7 @@ static storageEngine hellostorage_engine = {
     .api_version = VALKEY_STORAGE_API_VERSION,
     .open = helloOpen,
     .close = helloClose,
+    .kill_threads = helloKillThreads,
     .put_async = helloPutAsync,
     .get_async = helloGetAsync,
     .del_async = helloDelAsync,
@@ -396,9 +473,6 @@ static storageEngine hellostorage_engine = {
 };
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    VALKEYMODULE_NOT_USED(argv);
-    VALKEYMODULE_NOT_USED(argc);
-
     if (ValkeyModule_Init(ctx, "hellostorage", 1, VALKEYMODULE_APIVER_1) == VALKEYMODULE_ERR) {
         return VALKEYMODULE_ERR;
     }
@@ -406,6 +480,12 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     /* The vtable is static, so the pointer the valkey server keeps stays valid
      * after OnLoad returns. */
     if (ValkeyModule_RegisterStorageEngine(ctx, &hellostorage_engine) == VALKEYMODULE_ERR) {
+        return VALKEYMODULE_ERR;
+    }
+
+    /* The argument noload makes the load fail after the registration, so a test
+     * can check that the valkey server drops it. */
+    if (argc == 1 && !strcasecmp(ValkeyModule_StringPtrLen(argv[0], NULL), "noload")) {
         return VALKEYMODULE_ERR;
     }
     return VALKEYMODULE_OK;

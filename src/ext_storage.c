@@ -35,8 +35,7 @@ const storageEngine *storageLookupEngine(const char *name) {
     return NULL;
 }
 
-/* Test-only reset. Allows test fixtures to isolate storage engine registration. */
-void extStorageTestResetRegistry(void) {
+void storageUnregisterEngine(void) {
     registered_engine = NULL;
 }
 

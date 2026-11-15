@@ -25,7 +25,6 @@ extern "C" {
 #include "ext_storage.h"
 #include "storage/storage.h"
 #include "storage/storage_flashcache.h"
-void extStorageTestResetRegistry(void);
 }
 
 /* The tests own the log and the thread setup. The log goes to stderr. The
@@ -98,7 +97,7 @@ class StorageFlashCacheTest : public ::testing::Test {
     char fc_db[300];
 
     void SetUp() override {
-        extStorageTestResetRegistry();
+        storageUnregisterEngine();
         memset(&server, 0, sizeof(valkeyServer));
         server.hz = CONFIG_DEFAULT_HZ;
         server.logfile = zstrdup("");
@@ -223,7 +222,7 @@ class StorageFlashCacheTest : public ::testing::Test {
 
     void TearDown() override {
         drainAndClose();
-        extStorageTestResetRegistry();
+        storageUnregisterEngine();
         zfree(server.logfile);
         server.logfile = NULL;
         removeDataDir();

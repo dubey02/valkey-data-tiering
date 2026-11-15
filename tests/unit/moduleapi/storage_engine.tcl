@@ -45,3 +45,12 @@ foreach {engine module} $storage_engines {
         }
     }
 }
+
+# Invariant under test: the storage engine registration is dropped when the
+# module that made it fails OnLoad, so another module can register.
+start_server {tags {"modules" "ext-storage"}} {
+    test {failed OnLoad drops the storage engine registration} {
+        assert_error "*module initialization failed*" {r module load $hellostorage noload}
+        assert_equal {OK} [r module load $hellostorage]
+    }
+}
