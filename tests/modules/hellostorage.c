@@ -71,7 +71,7 @@ typedef struct helloRequest {
     /* The entry a PUT spills. It is borrowed, not owned, so the storage engine must
      * serialize it before the request completes and never free it. */
     const valkeyObject *entry;
-    void *request_ctx;
+    storageRequestContext *request;
 } helloRequest;
 
 /* The counters INFO reports. */
@@ -165,13 +165,13 @@ static void *helloAlloc(size_t n) {
  * worker thread calls them, so serialization never runs on the main thread.
  * ---------------------------------------------------------------------------*/
 
-static storageStatus helloPut(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, size_t *stored_bytes) {
+static storageStatus helloPut(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, size_t *stored_bytes) {
     if (db_id >= hello.num_databases) return STORAGE_ERR_REJECTED;
 
     /* The storage engine stores bytes, not objects. The valkey server hands it a
      * serializer so it never needs to know the object layout. */
     char *bytes = NULL;
-    int len = hello.cfg.serializer.serialize(key, key_len, entry, &bytes);
+    int len = hello.cfg.serializer.serialize(key, key_len, entry, request, &bytes);
     if (len < 0 || bytes == NULL) return STORAGE_ERR_REJECTED;
 
     storageStatus st = STORAGE_OK;
@@ -257,7 +257,7 @@ static storageStatus helloDel(uint32_t db_id, const char *key, size_t key_len) {
  * worker never holds while it runs a request.
  * ---------------------------------------------------------------------------*/
 
-static storageStatus helloSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
+static storageStatus helloSubmit(storageOpType op, uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
     if (db_id >= hello.num_databases) return STORAGE_ERR_REJECTED;
 
     /* Too many unpolled requests means the storage engine is busy. The valkey
@@ -276,7 +276,7 @@ static storageStatus helloSubmit(storageOpType op, uint32_t db_id, const char *k
         .key = key_copy,
         .key_len = key_len,
         .entry = entry,
-        .request_ctx = request_ctx};
+        .request = request};
     hello.requests_len++;
     pthread_cond_signal(&hello_wake);
     pthread_mutex_unlock(&hello_lock);
@@ -284,28 +284,28 @@ static storageStatus helloSubmit(storageOpType op, uint32_t db_id, const char *k
     return STORAGE_OK;
 }
 
-static storageStatus helloPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, void *request_ctx) {
-    return helloSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request_ctx);
+static storageStatus helloPutAsync(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request) {
+    return helloSubmit(STORAGE_OP_PUT, db_id, key, key_len, entry, request);
 }
 
-static storageStatus helloGetAsync(uint32_t db_id, const char *key, size_t key_len, void *request_ctx) {
-    return helloSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request_ctx);
+static storageStatus helloGetAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
+    return helloSubmit(STORAGE_OP_GET, db_id, key, key_len, NULL, request);
 }
 
-static storageStatus helloDelAsync(uint32_t db_id, const char *key, size_t key_len, void *request_ctx) {
-    return helloSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request_ctx);
+static storageStatus helloDelAsync(uint32_t db_id, const char *key, size_t key_len, storageRequestContext *request) {
+    return helloSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request);
 }
 
 /* Runs one request against the store and fills in its completion. */
 static void helloRun(const helloRequest *req, storageCompletion *comp) {
     memset(comp, 0, sizeof(*comp));
-    comp->request_ctx = req->request_ctx;
+    comp->request = req->request;
     comp->op_type = req->op;
     comp->db_id = req->db_id;
 
     switch (req->op) {
     case STORAGE_OP_PUT:
-        comp->status = helloPut(req->db_id, req->key, req->key_len, req->entry, &comp->stored_bytes);
+        comp->status = helloPut(req->db_id, req->key, req->key_len, req->entry, req->request, &comp->stored_bytes);
         break;
     case STORAGE_OP_GET:
         comp->status = helloGet(req->db_id, req->key, req->key_len, &comp->value);
