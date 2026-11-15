@@ -50,27 +50,34 @@
  * is busy. Both rings hold this many, so neither can overflow. */
 #define HELLO_MAX_INFLIGHT 256
 
+/* One stored record, chained in its hash bucket. */
 typedef struct helloRecord {
+    /* Copy of the key. */
     char *key;
     size_t key_len;
+    /* The serialized value. */
     char *val;
     size_t val_len;
+    /* Next record in the same bucket. */
     struct helloRecord *next;
 } helloRecord;
 
+/* The records of one database. */
 typedef struct helloDb {
     helloRecord *buckets[HELLO_BUCKETS];
 } helloDb;
 
-/* One submitted asynchronous request, held until the storage engine runs it. */
+/* One submitted asynchronous request, held until the worker runs it. */
 typedef struct helloRequest {
     storageOpType op;
     uint32_t db_id;
+    /* Copy of the key. The worker frees it. */
     char *key;
     size_t key_len;
-    /* The entry a PUT spills. It is borrowed, not owned, so the storage engine must
-     * serialize it before the request completes and never free it. */
+    /* The entry a PUT spills. It is borrowed. The storage engine serializes it
+     * before the request completes. */
     const valkeyObject *entry;
+    /* Handed back unchanged in the completion. */
     storageRequestContext *request;
 } helloRequest;
 
@@ -91,14 +98,18 @@ typedef struct helloStats {
  * rings are shared, so they are only touched under the lock. The store and its
  * counters belong to the worker alone. */
 static struct {
+    /* The settings the valkey server opened the storage engine with. */
     storageConfig cfg;
+    /* One table per database. */
     helloDb *dbs;
     uint32_t num_databases;
 
+    /* Requests waiting for the worker, oldest first. */
     helloRequest requests[HELLO_MAX_INFLIGHT];
     int requests_head;
     int requests_len;
 
+    /* Finished requests waiting for the valkey server, oldest first. */
     storageCompletion completions[HELLO_MAX_INFLIGHT];
     int completions_head;
     int completions_len;
@@ -114,7 +125,9 @@ static struct {
     helloStats stats_snapshot;
 
     pthread_t worker;
+    /* Set once the worker thread has started. */
     int running;
+    /* Tells the worker to exit once the request ring is empty. */
     int stopping;
 } hello;
 
