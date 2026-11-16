@@ -64,6 +64,31 @@ if {$tiering_built} {
             # The module key on flash still reads back.
             assert_equal 100 [lindex [r datatype.get dtkey] 0]
         } {} {needs:debug}
+
+        test "Module APIs see a key on flash as missing outside a command ($engine)" {
+            r flushall
+            r module load [file normalize tests/modules/scan.so]
+            r module load [file normalize tests/modules/blockedclient.so]
+            r set mem v
+            r set str [string repeat x 1000]
+            r hset hash f [string repeat x 1000]
+            r datatype.set dtkey 100 [string repeat x 1000]
+            assert_equal OK [r debug ext-storage spill str hash dtkey]
+            wait_for_flash str
+            wait_for_flash hash
+            wait_for_flash dtkey
+            # ValkeyModule_Scan skips keys on flash.
+            assert_equal {{mem v}} [r scan.scan_strings]
+            # ValkeyModule_OpenKey on a key the command didn't declare.
+            assert_error {*not found*} {r scan.scan_key hash}
+            # RM_Call skips the fetch a client command gets.
+            assert_equal {} [r do_rm_call datatype.get dtkey]
+            assert_equal PONG [r ping]
+            # A client command still fetches and reads them.
+            assert_equal [string repeat x 1000] [r get str]
+            assert_equal [string repeat x 1000] [r hget hash f]
+            assert_equal 100 [lindex [r datatype.get dtkey] 0]
+        } {} {needs:debug}
     }
     file delete -force $path
   }
