@@ -13680,8 +13680,15 @@ int parseLoadexArguments(ValkeyModuleString ***module_argv, int *module_argc) {
     return VALKEYMODULE_OK;
 }
 
+#ifdef USE_EXT_STORAGE
+static void moduleUnregisterStorageEngine(ValkeyModule *module);
+#endif
+
 /* Unregister module-related things, called when moduleLoad fails or moduleUnload. */
 void moduleUnregisterCleanup(ValkeyModule *module) {
+#ifdef USE_EXT_STORAGE
+    moduleUnregisterStorageEngine(module);
+#endif
     moduleFreeAuthenticatedClients(module);
     moduleUnregisterCommands(module);
     moduleUnsubscribeNotifications(module);
@@ -13930,11 +13937,22 @@ int moduleLoadStatic(const char *module_name, void **module_argv, int module_arg
                                         is_loadex, 1, NULL);
 }
 
+#ifdef USE_EXT_STORAGE
+/* The module that registered the storage engine. The valkey server calls into
+ * it until exit, so it cannot be unloaded. */
+static struct ValkeyModule *storage_engine_module = NULL;
+#endif
+
 static int moduleUnloadInternal(struct ValkeyModule *module, const char **errmsg) {
     if (listLength(module->types)) {
         *errmsg = "the module exports one or more module-side data "
                   "types, can't unload";
         return C_ERR;
+#ifdef USE_EXT_STORAGE
+    } else if (module == storage_engine_module) {
+        *errmsg = "the module registered a storage engine, can't unload";
+        return C_ERR;
+#endif
     } else if (listLength(module->usedby)) {
         *errmsg = "the module exports APIs used by other modules. "
                   "Please unload them first and try again";
@@ -15558,8 +15576,15 @@ int VM_ACLCheckKeyPrefixPermissions(ValkeyModuleUser *user, const char *key, siz
 #ifdef USE_EXT_STORAGE
 #include "storage/storage.h"
 
+/* Drops the storage engine a module registered. Unload is refused for that
+ * module, so this only runs when its OnLoad fails after registering. */
+static void moduleUnregisterStorageEngine(ValkeyModule *module) {
+    if (module != storage_engine_module) return;
+    storageUnregisterEngine();
+    storage_engine_module = NULL;
+}
+
 int VM_RegisterStorageEngine(ValkeyModuleCtx *ctx, void *storage_engine) {
-    UNUSED(ctx);
     if (storage_engine == NULL) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
@@ -15571,6 +15596,7 @@ int VM_RegisterStorageEngine(ValkeyModuleCtx *ctx, void *storage_engine) {
         errno = EINVAL;
         return VALKEYMODULE_ERR;
     }
+    storage_engine_module = ctx->module;
     serverLog(LL_NOTICE, "Module registered storage engine: %s", ((const storageEngine *)storage_engine)->name);
     return VALKEYMODULE_OK;
 }
