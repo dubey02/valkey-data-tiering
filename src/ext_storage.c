@@ -384,6 +384,7 @@ static void extStorageProcessCompletion(const storageCompletion *completion) {
 
 /* Polls the storage engine once and handles what finished. Returns the count. */
 static int extStoragePollCompletions(void) {
+    if (ext_storage.foreground_paused) return 0;
     storageCompletion done[EXT_STORAGE_POLL_BATCH];
     int n = ext_storage.engine->poll_completions(done, EXT_STORAGE_POLL_BATCH);
     for (int i = 0; i < n; i++) extStorageProcessCompletion(&done[i]);
@@ -403,7 +404,7 @@ static void spillIfOverMaxmemory(void) {
 /* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
  * the loop at least every tick, so a completion waits at most that long. */
 void extStorageBeforeSleep(void) {
-    if (!ext_storage.open || ext_storage.foreground_paused) return;
+    if (!ext_storage.open) return;
     spillIfOverMaxmemory();
     extStoragePollCompletions();
 }
