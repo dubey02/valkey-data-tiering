@@ -72,6 +72,7 @@
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
 #include "bgiteration.h"
+#include "ext_storage.h"
 #include "forkless.h"
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -4379,7 +4380,9 @@ ValkeyModuleKey *VM_OpenKey(ValkeyModuleCtx *ctx, robj *keyname, int mode) {
         if (value && bgIteration_isEntryInuse(value)) return NULL;
     } else {
         value = lookupKeyReadWithFlags(ctx->client->db, keyname, flags);
-        if (value == NULL) {
+        /* A value on flash can't be read here, so the key looks missing.
+         * TODO(#47): fetch it. */
+        if (value == NULL || !extStorageIsMemoryOnly(value)) {
             return NULL;
         }
     }
@@ -12054,6 +12057,9 @@ static void moduleScanCallback(void *privdata, void *element, int didx) {
     UNUSED(didx);
     ScanCBData *data = privdata;
     robj *val = element;
+    /* A value on flash can't be read here, so the key is skipped.
+     * TODO(#47): fetch it. */
+    if (!extStorageIsMemoryOnly(val)) return;
     sds key = objectGetKey(val);
     ValkeyModuleString *keyname = createObject(OBJ_STRING, sdsdup(key));
 
