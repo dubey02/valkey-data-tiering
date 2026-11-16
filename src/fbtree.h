@@ -34,6 +34,11 @@ fbtreeIndex *fbtreeIteratorGetIndex(fbtreeIterator *iterator);
  * position, or NULL when there are no more elements in that direction. */
 const_sds fbtreeNext(fbtreeIterator *iterator);
 const_sds fbtreePrev(fbtreeIterator *iterator);
+/* Like fbtreePrev(), and adds each leaf's allocation size to *leaf_bytes as the
+ * iterator enters it. */
+const_sds fbtreePrevSized(fbtreeIterator *iterator, size_t *leaf_bytes);
+/* Allocation size of the index struct and its inner nodes, without the leaves. */
+size_t fbtreeAllocSizeWithoutLeaves(const fbtreeIndex *fbt);
 
 void fbtreeSeekToRank(fbtreeIterator *iterator, unsigned long rank);
 const_sds fbtreeGetAtRank(fbtreeIndex *fbt, unsigned long rank);
