@@ -764,6 +764,33 @@ if {$tiering_built} {
             $replica config set ext-storage-throttle-enabled no maxmemory 0
             $replica config set ext-storage-throttle-start-percent 105 ext-storage-throttle-max-percent 120
         }
+
+        # The primary's writes don't count toward the baseline, so a replica
+        # relies on ext-storage-throttle-min-baseline to keep serving.
+        test "A replica just past the start still serves reads of values on flash ($engine)" {
+            $primary set flashed [string repeat x 1000]
+            wait_for_condition 50 100 {
+                [$replica exists flashed] == 1
+            } else {
+                fail_with_state "the key didn't reach the replica"
+            }
+            $replica debug ext-storage spill flashed
+            wait_for_flash flashed
+            $replica config set ext-storage-throttle-enabled yes
+            $replica config set maxmemory [expr {[s 0 used_memory] * 100 / 106}]
+            wait_for_condition 50 100 {
+                [getInfoProperty [$replica info throttling] ext_storage_throttle_fraction] > 0
+            } else {
+                fail_with_state "the replica's throttle didn't start"
+            }
+            set rd [valkey_deferring_client]
+            $rd get flashed
+            after 300
+            assert_equal 0 [getInfoProperty [$replica info throttling] ext_storage_throttle_queued_clients]
+            assert_equal [string repeat x 1000] [$rd read]
+            $rd close
+            $replica config set ext-storage-throttle-enabled no maxmemory 0
+        } {OK} {needs:debug}
     }
     }
     file delete -force $primary_path $replica_path

@@ -3705,7 +3705,7 @@ standardConfig static_configs[] = {
     createIntConfig("ext-storage-throttle-measure-percent", NULL, MODIFIABLE_CONFIG, 0, EXT_STORAGE_OOM_PERCENT - 1, server.ext_storage_throttle_measure_percent, 100, INTEGER_CONFIG, NULL, applyExtStorageThrottleBand),
     createIntConfig("ext-storage-throttle-start-percent", NULL, MODIFIABLE_CONFIG, 100, EXT_STORAGE_OOM_PERCENT - 1, server.ext_storage_throttle_start_percent, 105, INTEGER_CONFIG, NULL, applyExtStorageThrottleBand),
     createIntConfig("ext-storage-throttle-max-percent", NULL, MODIFIABLE_CONFIG, 101, EXT_STORAGE_OOM_PERCENT, server.ext_storage_throttle_max_percent, EXT_STORAGE_OOM_PERCENT, INTEGER_CONFIG, NULL, applyExtStorageThrottleBand),
-    createIntConfig("ext-storage-throttle-min-baseline", NULL, MODIFIABLE_CONFIG, 0, 10000000, server.ext_storage_throttle_min_baseline, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("ext-storage-throttle-min-baseline", NULL, MODIFIABLE_CONFIG, 0, 10000000, server.ext_storage_throttle_min_baseline, 50000, INTEGER_CONFIG, NULL, NULL),
 
     /* Tls configs */
     createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */
