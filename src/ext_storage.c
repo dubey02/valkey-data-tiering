@@ -328,6 +328,11 @@ void extStorageInit(void) {
         exit(1);
     }
 
+    if (!extStorageThrottleBandIsValid()) {
+        serverLog(LL_WARNING, "ext-storage-throttle percents must keep measure <= start < max.");
+        exit(1);
+    }
+
     storageConfig cfg = {
         .path = server.ext_storage_path,
         .capacity_bytes = server.ext_storage_capacity,

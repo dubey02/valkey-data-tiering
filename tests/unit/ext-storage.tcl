@@ -594,8 +594,12 @@ if {$tiering_built} {
             r debug ext-storage spill flashed
             wait_for_flash flashed
             set used [s used_memory]
+            # The percents must keep measure <= start < max.
+            assert_error {*must keep*} {r config set ext-storage-throttle-max-percent 104}
+            assert_error {*must keep*} {r config set ext-storage-throttle-measure-percent 110}
             r config set ext-storage-throttle-enabled yes
-            foreach {percent min max} {110 0.3 0.7 125 1 1 50 0 0} {
+            # By default throttling starts at 105% and is full at 120%.
+            foreach {percent min max} {112 0.3 0.7 125 1 1 50 0 0} {
                 r config set maxmemory [expr {$used * 100 / $percent}]
                 wait_for_condition 50 100 {
                     [throttle_info fraction] >= $min && [throttle_info fraction] <= $max

@@ -49,7 +49,11 @@ class ExtStorageThrottleTest : public ::testing::Test {
         server.ext_storage_path = zstrdup("");
         server.maxmemory = 1000000;
         server.ext_storage_throttle_enabled = 1;
+        /* Band from 100 to 120%, with commands checked at any memory level. */
+        server.ext_storage_throttle_measure_percent = 0;
+        server.ext_storage_throttle_start_percent = 100;
         server.ext_storage_throttle_max_percent = 120;
+        server.ext_storage_throttle_min_baseline = 0;
         extStorageTestResetRegistry();
         extStorageInit();
         engine_open = true;
@@ -224,6 +228,58 @@ TEST_F(ExtStorageThrottleTest, TheMaxPercentSetsWhereThrottlingIsFull) {
     setUsedPercent(107.5);
     extStorageThrottleAdjust();
     EXPECT_NEAR(readMetric("ext_storage_throttle_fraction"), 0.75, 1e-4);
+}
+
+TEST_F(ExtStorageThrottleTest, TheStartPercentSetsWhereThrottlingStarts) {
+    server.ext_storage_throttle_start_percent = 110;
+    install(10000);
+    EXPECT_CALL(mock, throttle_setRate(dummy_throttler, _)).Times(0);
+    setUsedPercent(105);
+    extStorageThrottleAdjust();
+    EXPECT_EQ(readMetric("ext_storage_throttle_fraction"), 0.0);
+
+    EXPECT_CALL(mock, throttle_setRate(dummy_throttler, DoubleNear(5000, 1e-6))).Times(1);
+    setUsedPercent(115);
+    extStorageThrottleAdjust();
+    EXPECT_NEAR(readMetric("ext_storage_throttle_fraction"), 0.5, 1e-4);
+}
+
+/* The floor applies when too little traffic was measured. */
+TEST_F(ExtStorageThrottleTest, TheMinBaselineFloorsTheBaseline) {
+    server.ext_storage_throttle_min_baseline = 2000;
+    install(0);
+    EXPECT_EQ(readMetric("ext_storage_throttle_baseline_ops_per_sec"), 2000.0);
+
+    EXPECT_CALL(mock, throttle_setRate(dummy_throttler, DoubleNear(1000, 1e-6))).Times(1);
+    setUsedPercent(110);
+    extStorageThrottleAdjust();
+}
+
+/* Below the measure percent nothing matches, writes included. */
+TEST_F(ExtStorageThrottleTest, BelowTheMeasurePercentNoCommandMatches) {
+    server.ext_storage_throttle_measure_percent = 100;
+    throttleCriteriaProc *criteria = install(1000);
+    ASSERT_NE(criteria, nullptr);
+    struct serverCommand write_cmd;
+    memset(&write_cmd, 0, sizeof(write_cmd));
+    write_cmd.flags = CMD_WRITE | CMD_DENYOOM;
+    client *c = (client *)zcalloc(sizeof(client));
+    c->cmd = &write_cmd;
+
+    EXPECT_FALSE(criteria(c, NULL));
+    setUsedPercent(101);
+    extStorageThrottleAdjust();
+    EXPECT_TRUE(criteria(c, NULL));
+
+    zfree(c);
+}
+
+TEST_F(ExtStorageThrottleTest, NoInfoWithoutAStorageEngine) {
+    extStorageDeinit();
+    engine_open = false;
+    sds info = extStorageThrottleInfoString(sdsempty());
+    EXPECT_EQ(sdslen(info), 0u);
+    sdsfree(info);
 }
 
 TEST_F(ExtStorageThrottleTest, NoMaxmemoryRemovesTheThrottler) {

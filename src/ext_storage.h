@@ -17,6 +17,12 @@
  * spilling. TODO(#151): make it a config. */
 #define EXT_STORAGE_OOM_PERCENT 120
 
+/* Whether the throttle percents keep measure <= start < max. */
+static inline bool extStorageThrottleBandIsValid(void) {
+    return server.ext_storage_throttle_measure_percent <= server.ext_storage_throttle_start_percent &&
+           server.ext_storage_throttle_start_percent < server.ext_storage_throttle_max_percent;
+}
+
 #ifdef USE_EXT_STORAGE
 
 #include "storage/storage.h"
