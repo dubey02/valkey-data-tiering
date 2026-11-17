@@ -78,7 +78,23 @@ foreach {engine module} $storage_engines {
             assert_equal new [r get kept]
         } {} {needs:debug}
 
+        test "$engine: PAUSE-FOREGROUND holds a finished spill until resumed" {
+            r set held [string repeat h 1000]
+            r debug ext-storage pause-foreground 1
+            r debug ext-storage spill held
+            after 100
+            assert_match {* storage_state:1 *} [r debug object held fast]
+            r debug ext-storage pause-foreground 0
+            wait_for_flash held
+            assert_equal [string repeat h 1000] [r get held]
+        } {} {needs:debug}
+
         if {$module ne {}} {
+            test "$engine: PAUSE-BACKGROUND is refused without pause_processing" {
+                assert_error "*does not support pausing*" {r debug ext-storage pause-background 1}
+                assert_equal 0 [getInfoProperty [r info ext_storage] ext_storage_background_paused]
+            }
+
             test "$engine: module that registered the storage engine cannot be unloaded" {
                 assert_error "*registered a storage engine*" {r module unload $engine}
                 assert_equal [getInfoProperty [r info ext_storage] ext_storage_engine] $engine
