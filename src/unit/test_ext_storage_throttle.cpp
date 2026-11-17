@@ -17,7 +17,6 @@ extern "C" {
 extern "C" {
 #include "ext_storage.h"
 #include "ext_storage_throttle.h"
-void extStorageTestResetRegistry(void);
 void setStorageState(robj *o, storageState state);
 }
 
@@ -54,7 +53,7 @@ class ExtStorageThrottleTest : public ::testing::Test {
         server.ext_storage_throttle_start_percent = 100;
         server.ext_storage_throttle_max_percent = 120;
         server.ext_storage_throttle_min_baseline = 0;
-        extStorageTestResetRegistry();
+        storageUnregisterEngine();
         extStorageInit();
         engine_open = true;
 
