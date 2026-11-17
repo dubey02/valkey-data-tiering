@@ -49,6 +49,9 @@ static bool criteriaProc(client *c, void *priv_data) {
     /* If the command is known to increase memory, we decide to throttle */
     if (cmd_flags & CMD_DENYOOM) return true;
 
+    /* Deleting frees memory, so it's never held. */
+    if (c->cmd->proc == delCommand || c->cmd->proc == unlinkCommand) return false;
+
     /* Only throttle other commands on items that are not in memory. Preferably we do this last since it's more expensive. */
     if (!doesCommandHaveKeys(c->cmd)) return false; /* Skip keyless commands */
     getKeysResult result;
@@ -108,7 +111,7 @@ void extStorageThrottleAdjust(void) {
     }
     if (!ext_storage_throttler) install();
 
-    /* Same measure as spilling. The OOM check also counts replica and AOF buffers. */
+    /* Same measure as spilling and the OOM check. */
     size_t used = 0;
     getMaxmemoryState(&used, NULL, NULL, NULL);
     state.memory_percent = 100.0 * (double)used / (double)server.maxmemory;

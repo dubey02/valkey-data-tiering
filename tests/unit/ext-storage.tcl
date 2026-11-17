@@ -591,13 +591,16 @@ if {$tiering_built} {
                 r hexpire mem:$i 100000 FIELDS 1 f
             }
             r set flashed $val
-            r debug ext-storage spill flashed
-            wait_for_flash flashed
+            r set deleted $val
+            r debug ext-storage spill flashed deleted
+            wait_for_flash flashed deleted
             set used [s used_memory]
-            # The percents must keep measure <= start < max.
-            assert_error {*must keep*} {r config set ext-storage-throttle-max-percent 104}
-            assert_error {*must keep*} {r config set ext-storage-throttle-measure-percent 110}
+            # The percents must keep measure <= start < max while the throttle is on.
+            r config set ext-storage-throttle-max-percent 104
+            assert_error {*must keep*} {r config set ext-storage-throttle-enabled yes}
+            r config set ext-storage-throttle-max-percent 120
             r config set ext-storage-throttle-enabled yes
+            assert_error {*must keep*} {r config set ext-storage-throttle-measure-percent 110}
             # By default throttling starts at 105% and is full at 120%.
             foreach {percent min max} {112 0.3 0.7 125 1 1 50 0 0} {
                 r config set maxmemory [expr {$used * 100 / $percent}]
@@ -608,12 +611,8 @@ if {$tiering_built} {
                 }
             }
 
-            # Past the max percent a read of a value on flash is held, and it
-            # runs once used memory falls below maxmemory. A read of a value in
-            # memory isn't held. A write over maxmemory with no spill in flight
-            # is refused with OOM before the throttle sees it.
-            # TODO(#N): hold a write, using the foreground and background
-            # processing pause points once they are available.
+            # Past the max percent a read of a value on flash is held until
+            # memory falls back. A read of a value in memory isn't.
             r config set maxmemory [expr {$used * 100 / 125}]
             wait_for_condition 50 100 {
                 [throttle_info fraction] == 1
@@ -621,7 +620,12 @@ if {$tiering_built} {
                 fail_with_state "the throttle didn't reach a full stop"
             }
             assert_equal $val [r hget mem:0 f]
+            # Deleting a value on flash frees memory, so it isn't held.
             set rd [valkey_deferring_client]
+            $rd del deleted
+            after 300
+            assert_equal 0 [throttle_info queued_clients]
+            assert_equal 1 [$rd read]
             $rd get flashed
             wait_for_condition 50 100 {
                 [throttle_info queued_clients] == 1
@@ -630,8 +634,65 @@ if {$tiering_built} {
             }
             r config set maxmemory [expr {$used * 2}]
             assert_equal $val [$rd read]
+
+            # Disabling the throttle releases held clients.
+            r debug ext-storage spill flashed
+            wait_for_flash flashed
+            r config set maxmemory [expr {$used * 100 / 125}]
+            wait_for_condition 50 100 {
+                [throttle_info fraction] == 1
+            } else {
+                fail_with_state "the throttle didn't reach a full stop again"
+            }
+            $rd get flashed
+            wait_for_condition 50 100 {
+                [throttle_info queued_clients] == 1
+            } else {
+                fail_with_state "the read wasn't held again"
+            }
+            r config set ext-storage-throttle-enabled no
+            assert_equal $val [$rd read]
             $rd close
-            r config set ext-storage-throttle-enabled no maxmemory 0
+            r config set maxmemory 0
+            r flushall
+        } {OK} {needs:debug}
+
+        test "A write is held at a full stop and runs once memory falls back ($engine)" {
+            r flushall
+            set val [string repeat x 1000]
+            for {set i 0} {$i < 2000} {incr i} {
+                r hset mem:$i f $val
+                r hexpire mem:$i 100000 FIELDS 1 f
+            }
+            # A spill held in flight lets writes past the OOM check.
+            r set inflight $val
+            r debug ext-storage pause-background 1
+            r debug ext-storage pause-foreground 1
+            r debug ext-storage spill inflight
+            set used [s used_memory]
+            r config set ext-storage-throttle-max-percent 110 ext-storage-throttle-enabled yes
+            r config set maxmemory [expr {$used * 100 / 112}]
+            wait_for_condition 50 100 {
+                [throttle_info fraction] == 1
+            } else {
+                fail_with_state "the throttle didn't reach a full stop"
+            }
+            set rd [valkey_deferring_client]
+            $rd set written v
+            wait_for_condition 50 100 {
+                [throttle_info queued_clients] == 1
+            } else {
+                fail_with_state "the write wasn't held"
+            }
+            assert_equal 0 [r exists written]
+            r config set maxmemory [expr {$used * 2}]
+            assert_equal OK [$rd read]
+            assert_equal v [r get written]
+            $rd close
+            r debug ext-storage pause-foreground 0
+            r debug ext-storage pause-background 0
+            wait_for_no_spills
+            r config set ext-storage-throttle-enabled no ext-storage-throttle-max-percent 120 maxmemory 0
             r flushall
         } {OK} {needs:debug}
     }
@@ -670,6 +731,38 @@ if {$tiering_built} {
             $replica config set maxmemory 0
             assert_equal $val [$replica get key:0]
             assert_equal $val [$replica get key:999]
+        }
+
+        test "A replica applies its primary's writes while its throttle allows nothing ($engine)" {
+            $primary flushall
+            set val [string repeat x 1000]
+            # Keys with a TTL can't be spilled, so the replica's memory stays put.
+            for {set i 0} {$i < 1000} {incr i} {
+                $primary set ttl:$i $val EX 100000
+            }
+            wait_for_condition 50 100 {
+                [$replica dbsize] == 1000
+            } else {
+                fail_with_state "replica didn't sync"
+            }
+            $replica config set ext-storage-throttle-start-percent 100 ext-storage-throttle-max-percent 101 ext-storage-throttle-enabled yes
+            $replica config set maxmemory [expr {[s 0 used_memory] * 100 / 110}]
+            wait_for_condition 50 100 {
+                [getInfoProperty [$replica info throttling] ext_storage_throttle_fraction] == 1
+            } else {
+                fail_with_state "the replica's throttle didn't reach a full stop"
+            }
+            for {set i 0} {$i < 100} {incr i} {
+                $primary set new:$i $val EX 100000
+            }
+            wait_for_condition 50 100 {
+                [$replica dbsize] == 1100
+            } else {
+                fail_with_state "the primary's writes didn't reach the replica"
+            }
+            assert_equal 0 [getInfoProperty [$replica info throttling] ext_storage_throttle_queued_clients]
+            $replica config set ext-storage-throttle-enabled no maxmemory 0
+            $replica config set ext-storage-throttle-start-percent 105 ext-storage-throttle-max-percent 120
         }
     }
     }

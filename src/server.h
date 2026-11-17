@@ -2501,7 +2501,7 @@ struct valkeyServer {
     unsigned long long ext_storage_capacity; /* Max bytes the engine may use. */
     char *ext_storage_cpulist;               /* cpu affinity list of the storage engine threads. */
     int ext_storage_spill_policy;            /* Ranks keys for spilling: MAXMEMORY_ALLKEYS_LRU or _LFU. */
-    int ext_storage_throttle_enabled;        /* Throttle memory-growing commands over maxmemory. */
+    int ext_storage_throttle_enabled;        /* Throttle memory-growing commands. */
     int ext_storage_throttle_start_percent;  /* Used memory, as % of maxmemory, where throttling starts. */
     int ext_storage_throttle_max_percent;    /* Used memory, as % of maxmemory, where the throttle allows nothing. */
     int ext_storage_throttle_min_baseline;   /* Lowest baseline, in commands per second. */

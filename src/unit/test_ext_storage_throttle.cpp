@@ -92,8 +92,7 @@ class ExtStorageThrottleTest : public ::testing::Test {
         setMetrics(ops_per_sec, 0);
     }
 
-    /* Registers the throttler below the throttle start, where it measures the
-     * incoming rate without throttling, and returns its criteria proc. */
+    /* Registers the throttler below the start and returns its criteria proc. */
     throttleCriteriaProc *install(double incoming) {
         throttleCriteriaProc *criteria = NULL;
         EXPECT_CALL(mock, throttle_register(_, _, _))
@@ -131,8 +130,8 @@ TEST_F(ExtStorageThrottleTest, NoStorageEngineNeverRegisters) {
     extStorageThrottleAdjust();
 }
 
-/* Below the throttle start the throttler stays registered at the unlimited
- * rate, and the incoming rate becomes the baseline. */
+/* Below the start the rate is unlimited and the incoming rate becomes the
+ * baseline. */
 TEST_F(ExtStorageThrottleTest, BelowTheStartMeasuresWithoutThrottling) {
     EXPECT_CALL(mock, throttle_setRate(dummy_throttler, _)).Times(0);
     install(5000);
@@ -142,9 +141,8 @@ TEST_F(ExtStorageThrottleTest, BelowTheStartMeasuresWithoutThrottling) {
     EXPECT_DOUBLE_EQ(readMetric("ext_storage_throttle_memory_percent"), 95.0);
 }
 
-/* Inside the band, the share of the baseline held back is proportional to how
- * far used memory is past the start. The baseline is the incoming rate measured
- * before throttling began. */
+/* Inside the band the cut is proportional to used memory past the start, and
+ * applies to the rate measured before throttling began. */
 TEST_F(ExtStorageThrottleTest, ThrottlesInProportionToTheBand) {
     install(10000);
     double activations = readMetric("ext_storage_throttle_activation_events");
@@ -173,9 +171,8 @@ TEST_F(ExtStorageThrottleTest, AtTheFullPercentAllowsNothing) {
     EXPECT_EQ(readMetric("ext_storage_throttle_fraction"), 1.0);
 }
 
-/* Back under the start with clients still held, the rate rises step by step
- * and returns to unlimited once no client is held. The baseline stays frozen
- * until then. */
+/* Back under the start with clients held, the rate rises step by step, then
+ * goes unlimited once none are held. The baseline stays frozen until then. */
 TEST_F(ExtStorageThrottleTest, BelowTheStartWithHeldClientsRaisesTheRateGradually) {
     install(10000);
     setUsedPercent(110);
@@ -200,8 +197,8 @@ TEST_F(ExtStorageThrottleTest, BelowTheStartWithHeldClientsRaisesTheRateGraduall
     EXPECT_EQ(readMetric("ext_storage_throttle_baseline_ops_per_sec"), 6000.0);
 }
 
-/* Going back over the start while the rate still ramps up continues the same
- * activation, and the rate is set from the frozen baseline again. */
+/* Crossing the start again while ramping up is the same activation, with the
+ * same baseline. */
 TEST_F(ExtStorageThrottleTest, BackOverTheStartWhileRampingIsTheSameActivation) {
     install(10000);
     double activations = readMetric("ext_storage_throttle_activation_events");
@@ -242,6 +239,16 @@ TEST_F(ExtStorageThrottleTest, TheStartPercentSetsWhereThrottlingStarts) {
     setUsedPercent(115);
     extStorageThrottleAdjust();
     EXPECT_NEAR(readMetric("ext_storage_throttle_fraction"), 0.5, 1e-4);
+}
+
+/* With nothing measured and no floor, the baseline is 0, so every matching
+ * command is held at any fraction. */
+TEST_F(ExtStorageThrottleTest, AZeroBaselineHoldsEveryMatchingCommand) {
+    install(0);
+    EXPECT_CALL(mock, throttle_setRate(dummy_throttler, 0.0)).Times(1);
+    setUsedPercent(105);
+    extStorageThrottleAdjust();
+    EXPECT_NEAR(readMetric("ext_storage_throttle_fraction"), 0.25, 1e-4);
 }
 
 /* The floor applies when too little traffic was measured. */
@@ -306,10 +313,8 @@ TEST_F(ExtStorageThrottleTest, ClosingTheStorageEngineRemovesTheThrottler) {
     extStorageThrottleAdjust();
 }
 
-/* Writes that may grow memory and scripts that may write are slowed. Other
- * commands with no key on flash, here ones with no keys at all, go through, as
- * does the primary's replication stream. Commands on values on flash are
- * covered with a keyspace below. */
+/* Writes that may grow memory and scripts match. Keyless commands and the
+ * primary's stream don't. */
 TEST_F(ExtStorageThrottleTest, OnlyCommandsThatMayGrowMemoryAreThrottled) {
     throttleCriteriaProc *criteria = install(1000);
     ASSERT_NE(criteria, nullptr);
@@ -351,9 +356,8 @@ TEST_F(ExtStorageThrottleTest, OnlyCommandsThatMayGrowMemoryAreThrottled) {
     zfree(c);
 }
 
-/* A read, or a write that doesn't grow memory, is slowed only when one of its
- * keys is not in memory, since only then does it fetch a value back. A missing
- * key fetches nothing. */
+/* Other commands match only when a key's value is not in memory. A missing
+ * key doesn't match. */
 TEST_F(ExtStorageThrottleTest, CommandsAreThrottledOnlyForValuesNotInMemory) {
     throttleCriteriaProc *criteria = install(1000);
     ASSERT_NE(criteria, nullptr);
