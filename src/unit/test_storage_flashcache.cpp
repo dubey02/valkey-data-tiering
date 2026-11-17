@@ -222,7 +222,7 @@ class StorageFlashCacheTest : public ::testing::Test {
 
     void TearDown() override {
         /* Resume first, so a test that failed while paused still closes. */
-        engine->pause_processing(0);
+        engine->pause_processing(false);
         drainAndClose();
         storageUnregisterEngine();
         zfree(server.logfile);
@@ -723,7 +723,7 @@ TEST_F(StorageFlashCacheTest, NothingCompletesWhilePaused) {
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "paused-value");
 
-    engine->pause_processing(1);
+    engine->pause_processing(true);
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
     storageCompletion comp = {};
     for (int i = 0; i < 50; i++) {
@@ -731,7 +731,7 @@ TEST_F(StorageFlashCacheTest, NothingCompletesWhilePaused) {
         usleep(WAIT_STEP_US);
     }
 
-    engine->pause_processing(0);
+    engine->pause_processing(false);
     ASSERT_EQ(waitForCompletions(&comp), 1);
     EXPECT_EQ(comp.op_type, STORAGE_OP_PUT);
     EXPECT_EQ(comp.status, STORAGE_OK);
@@ -755,12 +755,12 @@ TEST_F(StorageFlashCacheTest, ACompletionFromBeforeThePauseCanBePolled) {
     /* The IO thread queues the completion before it counts the item. */
     ASSERT_TRUE(waitForStat("total_num_items", [](unsigned long long n) { return n == 1; }));
 
-    engine->pause_processing(1);
+    engine->pause_processing(true);
     storageCompletion comp = {};
     EXPECT_EQ(engine->poll_completions(&comp, 1), 1);
     EXPECT_EQ(comp.status, STORAGE_OK);
 
-    engine->pause_processing(0);
+    engine->pause_processing(false);
     sdsfree(key);
     decrRefCount(entry);
 }
@@ -768,7 +768,7 @@ TEST_F(StorageFlashCacheTest, ACompletionFromBeforeThePauseCanBePolled) {
 /* A paused storage engine returns the same codes at submit as a running one. */
 TEST_F(StorageFlashCacheTest, SubmitReturnsTheUsualCodesWhilePaused) {
     openEngine();
-    engine->pause_processing(1);
+    engine->pause_processing(true);
     sds key = sdsnew("k");
     EXPECT_EQ(engine->get_async(cfg.num_databases, key, sdslen(key), nullptr), STORAGE_ERR_REJECTED);
 
@@ -780,23 +780,23 @@ TEST_F(StorageFlashCacheTest, SubmitReturnsTheUsualCodesWhilePaused) {
     ASSERT_GT(accepted, 0);
     EXPECT_EQ(engine->get_async(0, key, sdslen(key), nullptr), STORAGE_WOULDBLOCK);
 
-    engine->pause_processing(0);
+    engine->pause_processing(false);
     sdsfree(key);
 }
 
 /* A second pause and a second resume are harmless. Requests then flow again. */
 TEST_F(StorageFlashCacheTest, PausingAndResumingTwiceIsHarmless) {
     openEngine();
-    engine->pause_processing(1);
-    engine->pause_processing(1);
+    engine->pause_processing(true);
+    engine->pause_processing(true);
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
     storageCompletion comp = {};
     EXPECT_EQ(engine->poll_completions(&comp, 1), 0);
 
-    engine->pause_processing(0);
-    engine->pause_processing(0);
+    engine->pause_processing(false);
+    engine->pause_processing(false);
     ASSERT_EQ(waitForCompletions(&comp), 1);
     EXPECT_EQ(comp.status, STORAGE_OK);
     sdsfree(key);
@@ -820,17 +820,17 @@ TEST_F(StorageFlashCacheTest, PausingUnderLoadLosesNoRequest) {
 
     int completed = 0;
     for (int i = 0; i < total; i++) {
-        if (i % 50 == 0) engine->pause_processing(1);
-        if (i % 50 == 25) engine->pause_processing(0);
+        if (i % 50 == 0) engine->pause_processing(true);
+        if (i % 50 == 25) engine->pause_processing(false);
         storageStatus st;
         while ((st = engine->put_async(0, keys[i], sdslen(keys[i]), entries[i], &reqs[i])) ==
                STORAGE_WOULDBLOCK) {
-            engine->pause_processing(0);
+            engine->pause_processing(false);
             ASSERT_NO_FATAL_FAILURE(collectCompletions(reqs, seen, &completed));
         }
         ASSERT_EQ(st, STORAGE_OK);
     }
-    engine->pause_processing(0);
+    engine->pause_processing(false);
     while (completed < total) ASSERT_NO_FATAL_FAILURE(collectCompletions(reqs, seen, &completed));
     for (int i = 0; i < total; i++) EXPECT_EQ(seen[i], 1) << "request " << i;
 

@@ -118,7 +118,7 @@ static struct {
     pthread_cond_t wake_cond;
 
     /* Set while paused. Written under submit_mutex and wake_mutex. */
-    int paused;
+    bool is_paused;
     /* Held for each submit to FlashCache. Pausing takes it, so a submit in
      * progress finishes before the pause takes effect. */
     pthread_mutex_t submit_mutex;
@@ -257,7 +257,7 @@ static void fcWaitForWork(void) {
         deadline.tv_nsec -= 1000000000L;
     }
     pthread_mutex_lock(&fc_io.wake_mutex);
-    if (mutexQueueLength(fc_io.requests) == 0 || fc_io.paused) {
+    if (mutexQueueLength(fc_io.requests) == 0 || fc_io.is_paused) {
         pthread_cond_timedwait(&fc_io.wake_cond, &fc_io.wake_mutex, &deadline);
     }
     pthread_mutex_unlock(&fc_io.wake_mutex);
@@ -267,7 +267,7 @@ static void fcWaitForWork(void) {
  * by fcTrySubmit, which checks the flag again before submitting. */
 static fcRequest *fcPopRequest(void) {
     pthread_mutex_lock(&fc_io.wake_mutex);
-    fcRequest *r = fc_io.paused ? NULL : mutexQueuePop(fc_io.requests, false);
+    fcRequest *r = fc_io.is_paused ? NULL : mutexQueuePop(fc_io.requests, false);
     pthread_mutex_unlock(&fc_io.wake_mutex);
     return r;
 }
@@ -277,7 +277,7 @@ static fcRequest *fcPopRequest(void) {
 static int fcTrySubmit(fcRequest *r) {
     pthread_mutex_lock(&fc_io.submit_mutex);
     int result = -1;
-    if (!fc_io.paused) result = fcSubmitToFlashCache(r) ? 1 : 0;
+    if (!fc_io.is_paused) result = fcSubmitToFlashCache(r) ? 1 : 0;
     pthread_mutex_unlock(&fc_io.submit_mutex);
     return result;
 }
@@ -385,11 +385,11 @@ static void fcInfo(const storageInfoSink *s) {
 
 /* Waits for any submit in progress, then pauses. While paused, cron keeps
  * running, so a request already handed to FlashCache can finish. */
-static void fcPauseProcessing(int paused) {
+static void fcPauseProcessing(bool paused) {
     if (!fc_io.running) return;
     pthread_mutex_lock(&fc_io.submit_mutex);
     pthread_mutex_lock(&fc_io.wake_mutex);
-    fc_io.paused = paused;
+    fc_io.is_paused = paused;
     pthread_cond_signal(&fc_io.wake_cond);
     pthread_mutex_unlock(&fc_io.wake_mutex);
     pthread_mutex_unlock(&fc_io.submit_mutex);
@@ -595,7 +595,7 @@ static storageStatus fcOpen(const storageConfig *cfg) {
 static storageStatus fcClose(void) {
     if (!fc_io.running) return STORAGE_OK;
     /* A paused IO thread never takes the stop request. */
-    assert(!fc_io.paused);
+    assert(!fc_io.is_paused);
     /* An unpolled completion may hold a fetched value nobody else owns. */
     if (fc_io.outstanding > 0) return STORAGE_WOULDBLOCK;
 

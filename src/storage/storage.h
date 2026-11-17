@@ -16,6 +16,7 @@
 #ifndef VALKEY_STORAGE_H
 #define VALKEY_STORAGE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -219,11 +220,11 @@ typedef struct storageEngine {
      * refreshes itself. May be NULL when there is nothing to report. */
     void (*info)(const storageInfoSink *sink);
 
-    /* For tests. paused=1 stops the storage engine from starting requests,
-     * paused=0 resumes. Submits still return the usual codes. A request
+    /* For tests. paused=true stops the storage engine from starting requests,
+     * paused=false resumes. Submits still return the usual codes. A request
      * already started may still complete. close is never called while
      * paused. May be NULL. */
-    void (*pause_processing)(int paused);
+    void (*pause_processing)(bool paused);
 } storageEngine;
 
 /* ---------------------------------------------------------------------------

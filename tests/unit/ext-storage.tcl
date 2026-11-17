@@ -113,6 +113,19 @@ if {$tiering_built} {
             assert_error {*unknown subcommand*} {r debug ext-storage nosuch}
         } {} {needs:debug}
 
+        test "FLUSHALL with a held spill lifts the pauses and finishes ($engine)" {
+            r flushall
+            r set held [string repeat x 1000]
+            r debug ext-storage pause-foreground 1
+            r debug ext-storage pause-background 1
+            assert_equal OK [r debug ext-storage spill held]
+            assert_equal OK [r flushall]
+            assert_equal 0 [r dbsize]
+            assert_equal 0 [getInfoProperty [r info ext_storage] ext_storage_foreground_paused]
+            assert_equal 0 [getInfoProperty [r info ext_storage] ext_storage_background_paused]
+            verify_log_message 0 "*Lifting the DEBUG pause*to drain spills in flight*" 0
+        } {} {needs:debug}
+
         test "DEBUG EXT-STORAGE SPILL submits several keys and stops at the first one that fails ($engine)" {
             r flushall
             r set a [string repeat x 1000]

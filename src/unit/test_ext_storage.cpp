@@ -221,7 +221,7 @@ class StorageMockTest : public ::testing::Test {
 
     void TearDown() override {
         /* Resume first, so a test that failed while paused still closes. */
-        engine->pause_processing(0);
+        engine->pause_processing(false);
         drainCompletions();
         EXPECT_EQ(engine->close(), STORAGE_OK);
         storageUnregisterEngine();
@@ -752,14 +752,14 @@ TEST_F(StorageMockTest, NothingRunsWhilePaused) {
     sds key = sdsnew("k");
     dbEntry *entry = makeEntry(key, "v");
 
-    engine->pause_processing(1);
+    engine->pause_processing(true);
     ASSERT_EQ(engine->put_async(0, key, sdslen(key), entry, nullptr), STORAGE_OK);
     EXPECT_EQ(storageMockRunIo(8), 0);
     storageCompletion comp = {};
     EXPECT_EQ(engine->poll_completions(&comp, 1), 0);
     EXPECT_EQ(readStats()["total_num_items"], 0u);
 
-    engine->pause_processing(0);
+    engine->pause_processing(false);
     ASSERT_EQ(waitForCompletedRequest(&comp), 1);
     EXPECT_EQ(comp.status, STORAGE_OK);
     robj *out = nullptr;
@@ -774,7 +774,7 @@ TEST_F(StorageMockTest, NothingRunsWhilePaused) {
 /* A paused storage engine returns the same codes at submit as a running one. */
 TEST_F(StorageMockTest, SubmitReturnsTheUsualCodesWhilePaused) {
     openEngine();
-    engine->pause_processing(1);
+    engine->pause_processing(true);
     sds key = sdsnew("k");
     EXPECT_EQ(engine->get_async(cfg.num_databases, key, sdslen(key), nullptr), STORAGE_ERR_REJECTED);
 
@@ -786,7 +786,7 @@ TEST_F(StorageMockTest, SubmitReturnsTheUsualCodesWhilePaused) {
     ASSERT_GT(accepted, 0);
     EXPECT_EQ(engine->get_async(0, key, sdslen(key), nullptr), STORAGE_WOULDBLOCK);
 
-    engine->pause_processing(0);
+    engine->pause_processing(false);
     sdsfree(key);
 }
 
@@ -797,12 +797,12 @@ TEST_F(StorageMockTest, ACompletionFromBeforeThePauseCanBePolled) {
     ASSERT_EQ(engine->get_async(0, key, sdslen(key), nullptr), STORAGE_OK);
     ASSERT_EQ(storageMockRunIo(1), 1);
 
-    engine->pause_processing(1);
+    engine->pause_processing(true);
     storageCompletion comp = {};
     EXPECT_EQ(engine->poll_completions(&comp, 1), 1);
     EXPECT_EQ(comp.status, STORAGE_NOT_FOUND);
 
-    engine->pause_processing(0);
+    engine->pause_processing(false);
     sdsfree(key);
 }
 

@@ -72,7 +72,7 @@ bool extStorageBlockClientIfRequired(client *c);
 /* Spills cold keys to free mem_tofree. Returns false when writes must be rejected. */
 bool extStorageSpillOverMaxmemory(size_t mem_tofree);
 
-/* Waits for every spill in flight to finish. */
+/* Waits for every spill in flight to finish. Any DEBUG pause is lifted first. */
 void extStorageSpillDrain(void);
 
 /* Whether ext-storage-spill-policy and an LRU or LFU maxmemory-policy disagree. */
