@@ -577,6 +577,8 @@ void debugCommand(client *c) {
             "EXT-STORAGE <subcommand> [<arg> ...]",
             "    Data tiering test hooks. Subcommands:",
             "    SPILL <key> [<key> ...]: Submit each key's value to the storage engine. Stops at the first key that fails.",
+            "    PAUSE-FOREGROUND <0|1>: Pause handling of storage engine completions.",
+            "    PAUSE-BACKGROUND <0|1>: Stop the storage engine from starting new requests.",
 #endif
             NULL};
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());

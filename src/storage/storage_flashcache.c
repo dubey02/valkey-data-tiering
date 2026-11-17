@@ -117,6 +117,12 @@ static struct {
     pthread_mutex_t wake_mutex;
     pthread_cond_t wake_cond;
 
+    /* Set while paused. Written under submit_mutex and wake_mutex. */
+    bool is_paused;
+    /* Held for each submit to FlashCache. Pausing takes it, so a submit in
+     * progress finishes before the pause takes effect. */
+    pthread_mutex_t submit_mutex;
+
     /* Counters the IO thread owns. Nothing else reads them. */
     struct {
         /* Number of puts FlashCache turned away. Each one was retried later. */
@@ -251,8 +257,29 @@ static void fcWaitForWork(void) {
         deadline.tv_nsec -= 1000000000L;
     }
     pthread_mutex_lock(&fc_io.wake_mutex);
-    if (mutexQueueLength(fc_io.requests) == 0) pthread_cond_timedwait(&fc_io.wake_cond, &fc_io.wake_mutex, &deadline);
+    if (mutexQueueLength(fc_io.requests) == 0 || fc_io.is_paused) {
+        pthread_cond_timedwait(&fc_io.wake_cond, &fc_io.wake_mutex, &deadline);
+    }
     pthread_mutex_unlock(&fc_io.wake_mutex);
+}
+
+/* Returns the next request. NULL while paused. The pause itself is enforced
+ * by fcTrySubmit, which checks the flag again before submitting. */
+static fcRequest *fcPopRequest(void) {
+    pthread_mutex_lock(&fc_io.wake_mutex);
+    fcRequest *r = fc_io.is_paused ? NULL : mutexQueuePop(fc_io.requests, false);
+    pthread_mutex_unlock(&fc_io.wake_mutex);
+    return r;
+}
+
+/* Submits a request unless processing is paused. Returns 1 when FlashCache
+ * took it, 0 when FlashCache throttled it, -1 when paused and not submitted. */
+static int fcTrySubmit(fcRequest *r) {
+    pthread_mutex_lock(&fc_io.submit_mutex);
+    int result = -1;
+    if (!fc_io.is_paused) result = fcSubmitToFlashCache(r) ? 1 : 0;
+    pthread_mutex_unlock(&fc_io.submit_mutex);
+    return result;
 }
 
 /* The IO thread. It hands requests to FlashCache and pumps FlashCache's cron,
@@ -267,20 +294,19 @@ static void *fcIOThreadMain(void *arg) {
         bool progressed = false;
 
         if (held != NULL) {
-            if (fcSubmitToFlashCache(held)) {
+            if (fcTrySubmit(held) == 1) {
                 held = NULL;
                 progressed = true;
             }
         } else {
-            fcRequest *r = mutexQueuePop(fc_io.requests, false);
+            fcRequest *r = fcPopRequest();
             if (r == &FC_STOP_REQUEST) break;
             if (r != NULL) {
                 progressed = true;
-                if (!fcSubmitToFlashCache(r)) {
-                    /* Counted once per request, not once per retry. */
-                    fc_io.io_stats.num_requests_throttled++;
-                    held = r;
-                }
+                int rc = fcTrySubmit(r);
+                if (rc != 1) held = r;
+                /* Counted once per request, not once per retry. */
+                if (rc == 0) fc_io.io_stats.num_requests_throttled++;
             }
         }
 
@@ -355,6 +381,18 @@ static void fcInfo(const storageInfoSink *s) {
     s->add_ulong_long(s->ctx, "total_num_items_evicted", snap.num_items_evicted);
     s->add_ulong_long(s->ctx, "total_num_disk_reads", snap.num_disk_reads);
     s->add_ulong_long(s->ctx, "total_num_disk_writes", snap.num_disk_writes);
+}
+
+/* Waits for any submit in progress, then pauses. While paused, cron keeps
+ * running, so a request already handed to FlashCache can finish. */
+static void fcPauseProcessing(bool paused) {
+    if (!fc_io.running) return;
+    pthread_mutex_lock(&fc_io.submit_mutex);
+    pthread_mutex_lock(&fc_io.wake_mutex);
+    fc_io.is_paused = paused;
+    pthread_cond_signal(&fc_io.wake_cond);
+    pthread_mutex_unlock(&fc_io.wake_mutex);
+    pthread_mutex_unlock(&fc_io.submit_mutex);
 }
 
 /* Collects finished requests. */
@@ -528,6 +566,7 @@ static storageStatus fcOpen(const storageConfig *cfg) {
     pthread_condattr_destroy(&cond_attr);
     pthread_mutex_init(&fc_io.wake_mutex, NULL);
     pthread_mutex_init(&fc_io.snap_mutex, NULL);
+    pthread_mutex_init(&fc_io.submit_mutex, NULL);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -542,6 +581,7 @@ static storageStatus fcOpen(const storageConfig *cfg) {
         pthread_cond_destroy(&fc_io.wake_cond);
         pthread_mutex_destroy(&fc_io.wake_mutex);
         pthread_mutex_destroy(&fc_io.snap_mutex);
+        pthread_mutex_destroy(&fc_io.submit_mutex);
         mutexQueueRelease(fc_io.requests);
         mutexQueueRelease(fc_io.completions);
         memset(&fc_io, 0, sizeof(fc_io));
@@ -554,6 +594,8 @@ static storageStatus fcOpen(const storageConfig *cfg) {
 /* Stops the IO thread and tears FlashCache down. */
 static storageStatus fcClose(void) {
     if (!fc_io.running) return STORAGE_OK;
+    /* A paused IO thread never takes the stop request. */
+    assert(!fc_io.is_paused);
     /* An unpolled completion may hold a fetched value nobody else owns. */
     if (fc_io.outstanding > 0) return STORAGE_WOULDBLOCK;
 
@@ -572,6 +614,7 @@ static storageStatus fcClose(void) {
     pthread_cond_destroy(&fc_io.wake_cond);
     pthread_mutex_destroy(&fc_io.wake_mutex);
     pthread_mutex_destroy(&fc_io.snap_mutex);
+    pthread_mutex_destroy(&fc_io.submit_mutex);
     mutexQueueRelease(fc_io.requests);
     mutexQueueRelease(fc_io.completions);
     memset(&fc_io, 0, sizeof(fc_io));
@@ -597,6 +640,7 @@ static const storageEngine flashcache_storage_engine = {
     .del_async = fcDelAsync,
     .poll_completions = fcPollCompletions,
     .info = fcInfo,
+    .pause_processing = fcPauseProcessing,
 };
 
 const storageEngine *storageFlashCacheEngine(void) {

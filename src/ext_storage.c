@@ -83,6 +83,10 @@ typedef struct extStorageContext {
     int open;
     /* The byte budget the storage engine was opened with. */
     uint64_t capacity_bytes;
+    /* While set, completions are not polled. */
+    bool is_foreground_paused;
+    /* While set, the storage engine starts no new request. */
+    bool is_background_paused;
     extStorageStats stats;
     spillAccount spill_account;
 } extStorageContext;
@@ -348,6 +352,8 @@ void extStorageInit(void) {
     ext_storage.engine = engine;
     ext_storage.open = 1;
     ext_storage.capacity_bytes = cfg.capacity_bytes;
+    ext_storage.is_foreground_paused = false;
+    ext_storage.is_background_paused = false;
     ext_storage.stats = (extStorageStats){0};
     spillAccountReset();
 
@@ -378,6 +384,7 @@ static void extStorageProcessCompletion(const storageCompletion *completion) {
 
 /* Polls the storage engine once and handles what finished. Returns the count. */
 static int extStoragePollCompletions(void) {
+    if (ext_storage.is_foreground_paused) return 0;
     storageCompletion done[EXT_STORAGE_POLL_BATCH];
     int n = ext_storage.engine->poll_completions(done, EXT_STORAGE_POLL_BATCH);
     for (int i = 0; i < n; i++) extStorageProcessCompletion(&done[i]);
@@ -402,10 +409,31 @@ void extStorageBeforeSleep(void) {
     extStoragePollCompletions();
 }
 
+/* Pauses or resumes the handling of completions. */
+static void extStoragePauseForeground(bool paused) {
+    ext_storage.is_foreground_paused = paused;
+}
+
+/* Pauses or resumes the storage engine. Returns false if it can't pause. */
+static bool extStoragePauseBackground(bool paused) {
+    if (ext_storage.engine->pause_processing == NULL) return false;
+    ext_storage.engine->pause_processing(paused);
+    ext_storage.is_background_paused = paused;
+    return true;
+}
+
+/* Lifts both DEBUG pauses, so a drain can finish. */
+static void extStorageResumeProcessing(void) {
+    extStoragePauseForeground(false);
+    if (ext_storage.is_background_paused) extStoragePauseBackground(false);
+}
+
 /* Closes the storage engine. Outstanding requests are polled and handled first.
- * Nothing new is submitted, so the drain ends when they finish. */
+ * Nothing new is submitted, so the drain ends when they finish. Any DEBUG
+ * pause is lifted first. */
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
+    extStorageResumeProcessing();
     storageStatus st;
     int drained = 0;
     mstime_t drain_start = 0;
@@ -443,6 +471,37 @@ int extStorageIsActive(void) {
     return ext_storage.open;
 }
 
+/* DEBUG EXT-STORAGE PAUSE-FOREGROUND|PAUSE-BACKGROUND <0|1>
+ * Foreground stops completion handling. Background stops the storage engine
+ * from starting requests. */
+static void extStorageDebugPause(client *c, const char *subcommand) {
+    if (c->argc != 4) {
+        addReplySubcommandSyntaxError(c);
+        return;
+    }
+    long paused;
+    if (getLongFromObjectOrReply(c, c->argv[3], &paused, NULL) != C_OK) return;
+    if (paused != 0 && paused != 1) {
+        addReplyError(c, "Value must be 0 or 1");
+        return;
+    }
+
+    const char *side;
+    if (!strcasecmp(subcommand, "pause-foreground")) {
+        extStoragePauseForeground(paused);
+        side = "Foreground";
+    } else {
+        if (!extStoragePauseBackground(paused)) {
+            addReplyErrorFormat(c, "Storage engine \"%s\" does not support pausing", ext_storage.engine->name);
+            return;
+        }
+        side = "Background";
+    }
+    serverLog(LL_NOTICE, "%s processing of storage engine \"%s\" %s by DEBUG.", side, ext_storage.engine->name,
+              paused ? "paused" : "resumed");
+    addReply(c, shared.ok);
+}
+
 /* INFO
  * The Ext_storage section holds what the valkey server counts. The
  * Storage_engine section holds what the storage engine reports through the
@@ -471,7 +530,9 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
                         "ext_storage_num_items_fetching_from_storage:%llu\r\n"
-                        "ext_storage_total_num_fetch_errors:%llu\r\n",
+                        "ext_storage_total_num_fetch_errors:%llu\r\n"
+                        "ext_storage_foreground_paused:%d\r\n"
+                        "ext_storage_background_paused:%d\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
                         (unsigned long long)ext_storage.capacity_bytes,
                         (unsigned long long)st->num_items_spilling, sa.num_unsized, sa.sized_mem_usage,
@@ -483,7 +544,9 @@ sds extStorageInfoString(sds info) {
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted,
                         (unsigned long long)st->num_items_fetching,
-                        (unsigned long long)st->total_num_fetch_errors);
+                        (unsigned long long)st->total_num_fetch_errors,
+                        ext_storage.is_foreground_paused,
+                        ext_storage.is_background_paused);
 }
 
 /* The INFO buffer under construction, handed to the storage engine as the
@@ -690,6 +753,8 @@ int extStorageDebugCommand(client *c) {
     const char *subcommand = objectGetVal(c->argv[2]);
     if (!strcasecmp(subcommand, "spill")) {
         extStorageDebugSpill(c);
+    } else if (!strcasecmp(subcommand, "pause-foreground") || !strcasecmp(subcommand, "pause-background")) {
+        extStorageDebugPause(c, subcommand);
     } else {
         addReplySubcommandSyntaxError(c);
     }
@@ -877,9 +942,15 @@ bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
     return ext_storage.stats.num_items_spilling > 0;
 }
 
-/* Waits for every spill in flight to finish. */
+/* Waits for every spill in flight to finish. A DEBUG pause would make the wait
+ * endless, so it is lifted first. */
 void extStorageSpillDrain(void) {
     if (!ext_storage.open) return;
+    if (ext_storage.is_foreground_paused || ext_storage.is_background_paused) {
+        serverLog(LL_WARNING, "Lifting the DEBUG pause of storage engine \"%s\" to drain spills in flight.",
+                  ext_storage.engine->name);
+        extStorageResumeProcessing();
+    }
     while (ext_storage.stats.num_items_spilling > 0) extStoragePollCompletions();
 }
 
