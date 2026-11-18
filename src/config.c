@@ -2682,6 +2682,12 @@ static int isValidProcTitleTemplate(char *val, const char **err) {
     return 1;
 }
 
+static int applyExtStorageThrottleBand(const char **err) {
+    if (extStorageThrottleBandIsValid()) return 1;
+    *err = "ext-storage-throttle percents must keep measure <= start < max";
+    return 0;
+}
+
 static int applySpillPolicy(const char **err) {
     if (!extStorageSpillPolicyConflicts()) return 1;
     *err = "ext-storage-spill-policy must match an LRU or LFU maxmemory-policy";
@@ -3695,6 +3701,11 @@ standardConfig static_configs[] = {
     createULongLongConfig("ext-storage-capacity", NULL, IMMUTABLE_CONFIG, 1, ULLONG_MAX, server.ext_storage_capacity, 1024ULL * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
     createStringConfig("ext-storage-cpulist", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ext_storage_cpulist, NULL, NULL, NULL),
     createEnumConfig("ext-storage-spill-policy", NULL, MODIFIABLE_CONFIG, ext_storage_spill_policy_enum, server.ext_storage_spill_policy, MAXMEMORY_ALLKEYS_LRU, NULL, applySpillPolicy),
+    createBoolConfig("ext-storage-throttle-enabled", NULL, MODIFIABLE_CONFIG, server.ext_storage_throttle_enabled, 0, NULL, applyExtStorageThrottleBand),
+    createIntConfig("ext-storage-throttle-measure-percent", NULL, MODIFIABLE_CONFIG, 0, EXT_STORAGE_OOM_PERCENT - 1, server.ext_storage_throttle_measure_percent, 100, INTEGER_CONFIG, NULL, applyExtStorageThrottleBand),
+    createIntConfig("ext-storage-throttle-start-percent", NULL, MODIFIABLE_CONFIG, 100, EXT_STORAGE_OOM_PERCENT - 1, server.ext_storage_throttle_start_percent, 105, INTEGER_CONFIG, NULL, applyExtStorageThrottleBand),
+    createIntConfig("ext-storage-throttle-max-percent", NULL, MODIFIABLE_CONFIG, 101, EXT_STORAGE_OOM_PERCENT, server.ext_storage_throttle_max_percent, EXT_STORAGE_OOM_PERCENT, INTEGER_CONFIG, NULL, applyExtStorageThrottleBand),
+    createIntConfig("ext-storage-throttle-min-baseline", NULL, MODIFIABLE_CONFIG, 0, 10000000, server.ext_storage_throttle_min_baseline, 50000, INTEGER_CONFIG, NULL, NULL),
 
     /* Tls configs */
     createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */

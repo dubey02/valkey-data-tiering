@@ -13,6 +13,17 @@
 
 #include "server.h"
 
+/* Used memory, as a percent of maxmemory, over which writes are refused while
+ * spilling. TODO(#151): make it a config. */
+#define EXT_STORAGE_OOM_PERCENT 120
+
+/* Whether the throttle is off, or its percents keep measure <= start < max. */
+static inline bool extStorageThrottleBandIsValid(void) {
+    return !server.ext_storage_throttle_enabled ||
+           (server.ext_storage_throttle_measure_percent <= server.ext_storage_throttle_start_percent &&
+            server.ext_storage_throttle_start_percent < server.ext_storage_throttle_max_percent);
+}
+
 #ifdef USE_EXT_STORAGE
 
 #include "storage/storage.h"
