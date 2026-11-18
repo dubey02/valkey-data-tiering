@@ -20,7 +20,7 @@ static const double THROTTLE_RAMP_MULTIPLIER = 1.1;
 /* Throttle state, reported by INFO. */
 typedef struct {
     double rate;                     /* Allowed commands per second, THROTTLE_UNLIMITED_RATE when not throttling. */
-    double baseline;                 /* Rate the cut applies to, frozen while throttling. */
+    double baseline;                 /* Incoming rate measured before throttling, frozen while throttling. */
     double fraction;                 /* Share of the baseline held back, 0 to 1. */
     double memory_percent;           /* Used memory as a percent of maxmemory. */
     unsigned long activation_events; /* Times throttling started. */
@@ -72,6 +72,7 @@ static void install(void) {
     serverAssert(ext_storage_throttler == NULL);
     ext_storage_throttler = throttle_register(criteriaProc, NULL, METRICS_NAME);
     state.rate = THROTTLE_UNLIMITED_RATE;
+    state.baseline = 0; /* Nothing measured yet, so the floor applies. */
 }
 
 static void uninstall(void) {
@@ -86,6 +87,11 @@ static void setRate(double rate) {
     if (rate == state.rate) return;
     throttle_setRate(ext_storage_throttler, rate);
     state.rate = rate;
+}
+
+/* The baseline, raised to ext-storage-throttle-min-baseline. */
+static double flooredBaseline(void) {
+    return MAX(state.baseline, (double)server.ext_storage_throttle_min_baseline);
 }
 
 /* 0 at the start percent, rising linearly to 1 at the max percent. */
@@ -130,14 +136,14 @@ void extStorageThrottleAdjust(void) {
             state.rate = throttle_adjustRate(ext_storage_throttler, THROTTLE_RAMP_MULTIPLIER);
             return;
         }
-        state.baseline = MAX(metrics.incoming_tps, (double)server.ext_storage_throttle_min_baseline);
+        state.baseline = metrics.incoming_tps;
         setRate(THROTTLE_UNLIMITED_RATE);
         return;
     }
     /* Crossing the start again while ramping up is the same activation. */
     if (state.rate == THROTTLE_UNLIMITED_RATE) state.activation_events++;
     state.fraction = fraction;
-    setRate(state.baseline * (1.0 - fraction));
+    setRate(flooredBaseline() * (1.0 - fraction));
 }
 
 sds extStorageThrottleInfoString(sds info) {
@@ -156,7 +162,7 @@ sds extStorageThrottleInfoString(sds info) {
                         "ext_storage_throttle_total_commands:%lld\r\n"
                         "ext_storage_throttle_queued_clients:%d\r\n"
                         "ext_storage_throttle_oldest_delay_us:%ld\r\n",
-                        is_throttling ? state.rate : -1.0, state.fraction, state.baseline, metrics.incoming_tps,
+                        is_throttling ? state.rate : -1.0, state.fraction, flooredBaseline(), metrics.incoming_tps,
                         state.memory_percent, state.measuring, state.activation_events, metrics.num_commands_throttled,
                         metrics.num_clients_throttled, metrics.oldest_client_delay_us);
 }
