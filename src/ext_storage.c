@@ -188,12 +188,15 @@ static size_t spillAccountGetEstimatedInflightMem(void) {
 }
 
 /* Serialization and Deserialization Functions
- * The storage engine may call these from its own IO thread. */
+ * The storage engine may call these from its own IO thread. So a module type's
+ * rdb_save, rdb_load and mem_usage run there too. They must not share unlocked
+ * state with the module's commands, and may use only the IO, memory, string
+ * and logging APIs. */
 
 /* Serialize in the DUMP wire format, so every type and encoding is handled. A
  * put from extStorageSpillItem() passes the request inside its spillRequest,
  * and its size is recorded there. */
-static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
+static int extStorageSerialize(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     spillRequest *req = (spillRequest *)request;
     sds key_sds = sdsnewlen(key, key_len);
     robj key_obj;
@@ -201,7 +204,7 @@ static int extStorageSerialize(const char *key, size_t key_len, const valkeyObje
 
     rio payload;
     size_t value_mem_usage = 0;
-    createDumpPayloadSized(&payload, (robj *)entry, &key_obj, -1, req ? &value_mem_usage : NULL);
+    createDumpPayloadSized(&payload, (robj *)entry, &key_obj, (int)db_id, req ? &value_mem_usage : NULL);
     sdsfree(key_sds);
 
     size_t len = sdslen(payload.io.buffer.ptr);
@@ -215,7 +218,7 @@ static int extStorageSerialize(const char *key, size_t key_len, const valkeyObje
     return (int)len;
 }
 
-static valkeyObject *extStorageDeserialize(const char *key, size_t key_len, const char *bytes, int len) {
+static valkeyObject *extStorageDeserialize(uint32_t db_id, const char *key, size_t key_len, const char *bytes, int len) {
     if (len < 0) return NULL;
     /* Verify the DUMP footer (version + CRC) before loading, so a corrupt or
      * truncated record returns NULL instead of garbage, as restoreCommand does. */
@@ -228,7 +231,7 @@ static valkeyObject *extStorageDeserialize(const char *key, size_t key_len, cons
     if (type != -1) {
         sds key_sds = sdsnewlen(key, key_len);
         if (extStorageTryAcquireLoadingLock()) {
-            o = rdbLoadObject(type, &payload, key_sds, -1, NULL, RDBFLAGS_NONE, 0);
+            o = rdbLoadObject(type, &payload, key_sds, (int)db_id, NULL, RDBFLAGS_NONE, 0);
             extStorageReleaseLoadingLock();
         }
         sdsfree(key_sds);
@@ -769,14 +772,17 @@ int extStorageDebugCommand(client *c) {
 
 /* Frees the value the way dbSetValue() frees an overwritten one. The object,
  * which holds the key, stays. */
-static void spillFreeValue(robj *entry) {
+static void spillFreeValue(robj *entry, int dbid) {
     robj *val = createObject(objectGetType(entry), objectGetVal(entry));
     val->encoding = objectGetEncoding(entry);
     objectSetVal(entry, NULL);
-    if (server.lazyfree_lazy_server_del)
-        freeObjAsync(NULL, val, -1);
-    else
+    if (server.lazyfree_lazy_server_del) {
+        robj key;
+        initStaticStringObject(key, objectGetKey(entry));
+        freeObjAsync(&key, val, dbid);
+    } else {
         decrRefCount(val);
+    }
 }
 
 /* Handles a finished write. A write accepted by the storage engine must
@@ -787,7 +793,7 @@ static void spillComplete(const storageCompletion *comp) {
     serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
     serverAssert(comp->status == STORAGE_OK);
 
-    spillFreeValue(entry);
+    spillFreeValue(entry, (int)comp->db_id);
     setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
     spillAccountSubtractSized(req);
     ext_storage.stats.num_items_spilling--;

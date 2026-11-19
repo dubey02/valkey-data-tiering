@@ -160,7 +160,7 @@ static void fcGetItemCallback(void *request_context, char *value, size_t value_l
     } else if (value == NULL) {
         r->completed_request.status = STORAGE_NOT_FOUND;
     } else {
-        valkeyObject *obj = fc_io.serializer.deserialize(r->key, r->key_len, value, (int)value_len);
+        valkeyObject *obj = fc_io.serializer.deserialize(r->db_id, r->key, r->key_len, value, (int)value_len);
         if (obj == NULL) {
             r->completed_request.status = STORAGE_ERR_IO;
         } else {
@@ -205,8 +205,8 @@ static bool fcSubmitToFlashCache(fcRequest *r) {
 
     if (r->op == STORAGE_OP_PUT) {
         if (r->put_bytes == NULL) {
-            r->put_len = fc_io.serializer.serialize(r->key, r->key_len, r->entry, r->completed_request.request,
-                                                    &r->put_bytes);
+            r->put_len = fc_io.serializer.serialize(r->db_id, r->key, r->key_len, r->entry,
+                                                    r->completed_request.request, &r->put_bytes);
             if (r->put_len < 0 || r->put_bytes == NULL) {
                 r->put_bytes = NULL;
                 r->completed_request.status = STORAGE_ERR_REJECTED;
