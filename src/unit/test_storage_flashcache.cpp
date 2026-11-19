@@ -64,9 +64,9 @@ static const storageInfoSink stat_map_sink_template = {
 
 /* The real serializer without spill sizing. These tests pass their own tokens
  * as the request, not spill requests, so the request isn't passed on. */
-static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
+static int serializeIgnoringCtx(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     (void)request;
-    return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
+    return extStorageSerializer()->serialize(db_id, key, key_len, entry, NULL, out);
 }
 
 /* Records the thread that ran serialize and the key it was handed, then
@@ -75,13 +75,13 @@ static int serialize_calls = 0;
 static pthread_t serialize_thread;
 static const char *serialize_key_ptr;
 static char serialize_key[16];
-static int (*real_serialize)(const char *, size_t, const valkeyObject *, storageRequestContext *, char **);
-static int recordingSerialize(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
+static int (*real_serialize)(uint32_t, const char *, size_t, const valkeyObject *, storageRequestContext *, char **);
+static int recordingSerialize(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     serialize_thread = pthread_self();
     serialize_calls++;
     serialize_key_ptr = key;
     snprintf(serialize_key, sizeof(serialize_key), "%.*s", (int)key_len, key);
-    return real_serialize(key, key_len, entry, request, out);
+    return real_serialize(db_id, key, key_len, entry, request, out);
 }
 
 class StorageFlashCacheTest : public ::testing::Test {

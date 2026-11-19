@@ -65,6 +65,27 @@ if {$tiering_built} {
             assert_equal 100 [lindex [r datatype.get dtkey] 0]
         } {} {needs:debug}
 
+        test "A module that reads the dbid in rdb_save and rdb_load gets the key's database ($engine)" {
+            r flushall
+            r module load [file normalize tests/modules/datatype2.so]
+            r select 9
+            assert_equal 1 [r mem.alloc k 1]
+            assert_equal 5 [r mem.write k 0 hello]
+            assert_equal OK [r debug ext-storage spill k]
+            wait_for_flash k
+            assert_equal hello [string trimright [r mem.read k 0] "\0"]
+            assert_equal OK [r select 0]
+        } {} {needs:debug}
+
+        test "A module that gets a context in rdb_load can spill and fetch ($engine)" {
+            r flushall
+            r module load [file normalize tests/modules/testrdb.so]
+            r testrdb.set.key k [string repeat x 1000]
+            assert_equal OK [r debug ext-storage spill k]
+            wait_for_flash k
+            assert_equal [string repeat x 1000] [r testrdb.get.key k]
+        } {} {needs:debug}
+
         test "Module APIs see a key on flash as missing outside a command ($engine)" {
             r flushall
             r module load [file normalize tests/modules/scan.so]
@@ -83,6 +104,8 @@ if {$tiering_built} {
             assert_error {*not found*} {r scan.scan_key hash}
             # RM_Call skips the fetch a client command gets.
             assert_equal {} [r do_rm_call datatype.get dtkey]
+            # A write open fails, so the value on flash isn't overwritten.
+            assert_error {*can't be opened for writing*} {r do_rm_call datatype.set dtkey 7 new}
             assert_equal PONG [r ping]
             # A client command still fetches and reads them.
             assert_equal [string repeat x 1000] [r get str]

@@ -110,9 +110,9 @@ static const storageInfoSink stat_map_sink_template = {
 
 /* The real serializer without spill sizing. These tests pass their own tokens
  * as the request, not spill requests, so the request isn't passed on. */
-static int serializeIgnoringCtx(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
+static int serializeIgnoringCtx(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     (void)request;
-    return extStorageSerializer()->serialize(key, key_len, entry, NULL, out);
+    return extStorageSerializer()->serialize(db_id, key, key_len, entry, NULL, out);
 }
 
 class StorageMockTest : public ::testing::Test {
@@ -233,7 +233,7 @@ class StorageMockTest : public ::testing::Test {
     size_t serializedLen(const char *s) {
         robj *o = createStringObject(s, strlen(s));
         char *bytes = nullptr;
-        int len = cfg.serializer.serialize("k", 1, o, NULL, &bytes);
+        int len = cfg.serializer.serialize(0, "k", 1, o, NULL, &bytes);
         cfg.serializer.free_serialized(bytes);
         decrRefCount(o);
         return (size_t)len;
@@ -850,11 +850,11 @@ TEST_F(ExtStorageSerializerTest, StringValueSurvivesTheRoundTrip) {
     dbEntry *entry = makeEntry("mykey", "some value");
 
     char *bytes = nullptr;
-    int len = s->serialize("mykey", 5, entry, NULL, &bytes);
+    int len = s->serialize(0, "mykey", 5, entry, NULL, &bytes);
     ASSERT_GT(len, 0);
     ASSERT_NE(bytes, nullptr);
 
-    robj *back = (robj *)s->deserialize("mykey", 5, bytes, len);
+    robj *back = (robj *)s->deserialize(0, "mykey", 5, bytes, len);
     ASSERT_NE(back, nullptr);
     EXPECT_EQ((int)back->type, OBJ_STRING);
     EXPECT_EQ(strcmp((const char *)objectGetVal(back), "some value"), 0);
@@ -876,13 +876,13 @@ TEST_F(ExtStorageSerializerTest, TheKeyIsNotPartOfTheRecord) {
 
     char *a = nullptr;
     char *b = nullptr;
-    int alen = s->serialize("short", 5, e1, NULL, &a);
-    int blen = s->serialize("a-much-longer-key", 17, e2, NULL, &b);
+    int alen = s->serialize(0, "short", 5, e1, NULL, &a);
+    int blen = s->serialize(0, "a-much-longer-key", 17, e2, NULL, &b);
     ASSERT_GT(alen, 0);
     ASSERT_EQ(alen, blen);
     EXPECT_EQ(memcmp(a, b, (size_t)alen), 0);
 
-    robj *back = (robj *)s->deserialize("unrelated", 9, a, alen);
+    robj *back = (robj *)s->deserialize(0, "unrelated", 9, a, alen);
     ASSERT_NE(back, nullptr);
     EXPECT_EQ(strcmp((const char *)objectGetVal(back), "same value"), 0);
 
@@ -900,8 +900,8 @@ TEST_F(ExtStorageSerializerTest, AnExpireIsNotPartOfTheRecord) {
 
     char *a = nullptr;
     char *b = nullptr;
-    int alen = s->serialize("k", 1, with, NULL, &a);
-    int blen = s->serialize("k", 1, without, NULL, &b);
+    int alen = s->serialize(0, "k", 1, with, NULL, &a);
+    int blen = s->serialize(0, "k", 1, without, NULL, &b);
     ASSERT_GT(alen, 0);
     ASSERT_EQ(alen, blen);
     EXPECT_EQ(memcmp(a, b, (size_t)alen), 0);
@@ -914,17 +914,17 @@ TEST_F(ExtStorageSerializerTest, AnExpireIsNotPartOfTheRecord) {
 
 TEST_F(ExtStorageSerializerTest, RejectsAMalformedBuffer) {
     const storageSerializer *s = extStorageSerializer();
-    EXPECT_EQ(s->deserialize("k", 1, "not a dump payload", 18), nullptr);
-    EXPECT_EQ(s->deserialize("k", 1, "", -1), nullptr);
+    EXPECT_EQ(s->deserialize(0, "k", 1, "not a dump payload", 18), nullptr);
+    EXPECT_EQ(s->deserialize(0, "k", 1, "", -1), nullptr);
 
     // A real payload with its trailing version and CRC chopped off must be
     // rejected, not loaded. This is the case that matters: the bytes parse as a
     // valid type but fail verification.
     dbEntry *entry = makeEntry("k", "some value");
     char *bytes = nullptr;
-    int len = s->serialize("k", 1, entry, NULL, &bytes);
+    int len = s->serialize(0, "k", 1, entry, NULL, &bytes);
     ASSERT_GT(len, 10);
-    EXPECT_EQ(s->deserialize("k", 1, bytes, len - 4), nullptr);
+    EXPECT_EQ(s->deserialize(0, "k", 1, bytes, len - 4), nullptr);
     s->free_serialized(bytes);
     decrRefCount(entry);
 }
@@ -943,6 +943,7 @@ extern "C" {
 const ValkeyModuleString *VM_GetKeyNameFromIO(ValkeyModuleIO *io);
 int VM_GetDbIdFromIO(ValkeyModuleIO *io);
 void VM_SaveUnsigned(ValkeyModuleIO *io, uint64_t value);
+void VM_SaveStringBuffer(ValkeyModuleIO *io, const char *str, size_t len);
 }
 
 static void recordIoContextOnSave(ValkeyModuleIO *io, void *value) {
@@ -960,7 +961,7 @@ static void freeNothingOnRelease(void *value) {
     UNUSED(value);
 }
 
-TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndNoDbId) {
+TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndDbId) {
     const storageSerializer *s = extStorageSerializer();
 
     moduleType mt = {};
@@ -982,11 +983,11 @@ TEST_F(ExtStorageSerializerTest, AModuleTypeSeesTheKeyAndNoDbId) {
     observed_saves = 0;
 
     char *bytes = nullptr;
-    int len = s->serialize(key, sdslen(key), entry, NULL, &bytes);
+    int len = s->serialize(9, key, sdslen(key), entry, NULL, &bytes);
     ASSERT_GT(len, 0);
     ASSERT_EQ(observed_saves, 1);
     EXPECT_EQ(observed_key, "mykey");
-    EXPECT_EQ(observed_dbid, -1);
+    EXPECT_EQ(observed_dbid, 9);
 
     s->free_serialized(bytes);
     sdsfree(key);
@@ -2081,6 +2082,27 @@ TEST_F(SpillSizingTest, AModuleValueMeasuresWhatItsTypeReports) {
     EXPECT_EQ(measured, freed);
 }
 
+static void saveItsBuffer(ValkeyModuleIO *io, void *value) {
+    VM_SaveStringBuffer(io, (const char *)value, 1000);
+}
+
+/* A type with no mem_usage is measured by the size it saves. */
+TEST_F(SpillSizingTest, AModuleValueWithNoMemUsageMeasuresWhatItSaves) {
+    moduleType mt = {};
+    mt.id = 1;
+    mt.rdb_save = saveItsBuffer;
+    mt.free = zfree;
+    strcpy(mt.name, "testtype1");
+
+    moduleValue *mv = (moduleValue *)zmalloc(sizeof(*mv));
+    mv->type = &mt;
+    mv->value = zcalloc(1000);
+    robj *o = createObject(OBJ_MODULE, mv);
+
+    EXPECT_GE(measure(o), 1000u);
+    decrRefCount(o);
+}
+
 /* ---------------------------------------------------------------------------
  * Spill accounting
  * ---------------------------------------------------------------------------*/
@@ -2512,9 +2534,9 @@ TEST_F(FetchCompletionTest, EverySpillableTypeComesBackAsLoaded) {
         if (entry->hasembval || entry->encoding == OBJ_ENCODING_INT) continue;
 
         char *bytes;
-        int len = serializer->serialize(key, strlen(key), entry, NULL, &bytes);
+        int len = serializer->serialize(0, key, strlen(key), entry, NULL, &bytes);
         ASSERT_GT(len, 0);
-        loaded[num_spilled] = (robj *)serializer->deserialize(key, strlen(key), bytes, len);
+        loaded[num_spilled] = (robj *)serializer->deserialize(0, key, strlen(key), bytes, len);
         serializer->free_serialized(bytes);
         ASSERT_NE(loaded[num_spilled], nullptr);
 
@@ -2537,8 +2559,8 @@ TEST_F(FetchCompletionTest, EverySpillableTypeComesBackAsLoaded) {
         EXPECT_EQ(entry->encoding, encoding) << key;
 
         char *got, *want;
-        int got_len = serializer->serialize(key, sdslen(key), entry, NULL, &got);
-        int want_len = serializer->serialize(key, sdslen(key), loaded[i], NULL, &want);
+        int got_len = serializer->serialize(0, key, sdslen(key), entry, NULL, &got);
+        int want_len = serializer->serialize(0, key, sdslen(key), loaded[i], NULL, &want);
         EXPECT_TRUE(got_len == want_len && memcmp(got, want, got_len) == 0)
             << key << " type " << entry->type << " encoding " << strEncoding(entry->encoding);
         serializer->free_serialized(got);

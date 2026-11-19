@@ -4378,6 +4378,8 @@ ValkeyModuleKey *VM_OpenKey(ValkeyModuleCtx *ctx, robj *keyname, int mode) {
     if (mode & VALKEYMODULE_WRITE) {
         value = lookupKeyWriteWithFlags(ctx->client->db, keyname, flags);
         if (value && bgIteration_isEntryInuse(value)) return NULL;
+        /* A value on flash can't be changed here. TODO(#47): fetch it. */
+        if (value && !extStorageIsMemoryOnly(value)) return NULL;
     } else {
         value = lookupKeyReadWithFlags(ctx->client->db, keyname, flags);
         /* A value on flash can't be read here, so the key looks missing.
@@ -7341,15 +7343,18 @@ moduleType *moduleTypeLookupModuleByNameIgnoreCase(const char *name) {
 moduleType *moduleTypeLookupModuleByID(uint64_t id) {
     if (listLength(modules) == 0) return NULL;
 
-    static struct {
-        uint64_t id;
-        moduleType *mt;
-    } cache[MODULE_LOOKUP_CACHE_SIZE];
+    /* A slot is set once, from NULL to a type. Readers take the id from the
+     * type, so a slot can't pair one type's id with another's pointer. The
+     * storage engine's IO thread loads module values too. */
+    static _Atomic(moduleType *) cache[MODULE_LOOKUP_CACHE_SIZE];
 
     /* Search in cache to start. */
     int j;
-    for (j = 0; j < MODULE_LOOKUP_CACHE_SIZE && cache[j].mt != NULL; j++)
-        if (cache[j].id == id) return cache[j].mt;
+    for (j = 0; j < MODULE_LOOKUP_CACHE_SIZE; j++) {
+        moduleType *cached = atomic_load_explicit(&cache[j], memory_order_acquire);
+        if (cached == NULL) break;
+        if (cached->id >> 10 == id >> 10) return cached;
+    }
 
     /* Slow module by module lookup. */
     moduleType *mt = NULL;
@@ -7374,10 +7379,10 @@ moduleType *moduleTypeLookupModuleByID(uint64_t id) {
         }
     }
 
-    /* Add to cache if possible. */
+    /* Add to cache if possible. Another thread may fill the slot first. */
     if (mt && j < MODULE_LOOKUP_CACHE_SIZE) {
-        cache[j].id = id;
-        cache[j].mt = mt;
+        moduleType *expected = NULL;
+        atomic_compare_exchange_strong_explicit(&cache[j], &expected, mt, memory_order_release, memory_order_relaxed);
     }
     return mt;
 }
@@ -8252,7 +8257,10 @@ void VM_EmitAOF(ValkeyModuleIO *io, const char *cmdname, const char *fmt, ...) {
 ValkeyModuleCtx *VM_GetContextFromIO(ValkeyModuleIO *io) {
     if (io->ctx) return io->ctx; /* Can't have more than one... */
     io->ctx = zmalloc(sizeof(ValkeyModuleCtx));
-    moduleCreateContext(io->ctx, io->type->module, VALKEYMODULE_CTX_NONE);
+    /* Off the main thread, as when data tiering or a forkless save calls a
+     * module, the context must not touch the server's execution state. */
+    int flags = onServerMainThread() ? VALKEYMODULE_CTX_NONE : VALKEYMODULE_CTX_THREAD_SAFE;
+    moduleCreateContext(io->ctx, io->type->module, flags);
     return io->ctx;
 }
 

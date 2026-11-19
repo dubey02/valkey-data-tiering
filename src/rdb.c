@@ -1312,11 +1312,10 @@ ssize_t rdbSaveObjectSized(rio *rdb, robj *o, robj *key, int dbid, unsigned char
         raxStop(&paths);
     } else if (objectGetType(o) == OBJ_MODULE) {
         /* Save a module-specific value. ram_bytes counts what the module type
-         * reports through mem_usage, 0 when it has none. */
+         * reports through mem_usage, or the saved size when it reports 0. */
         ValkeyModuleIO io;
         moduleValue *mv = objectGetVal(o);
         moduleType *mt = mv->type;
-        if (ram_bytes) *ram_bytes += zmalloc_size(mv) + moduleGetMemUsage(key, o, 0, dbid);
 
         /* Write the "module" identifier as prefix, so that we'll be able
          * to call the right module during loading. */
@@ -1332,6 +1331,11 @@ ssize_t rdbSaveObjectSized(rio *rdb, robj *o, robj *key, int dbid, unsigned char
             io.error = 1;
         else
             io.bytes += retval;
+
+        if (ram_bytes) {
+            size_t usage = moduleGetMemUsage(key, o, 0, dbid);
+            *ram_bytes += zmalloc_size(mv) + (usage ? usage : io.bytes);
+        }
 
         if (io.ctx) {
             moduleFreeContext(io.ctx);

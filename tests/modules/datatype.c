@@ -103,6 +103,7 @@ static int datatype_set(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     }
 
     ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, argv[1], VALKEYMODULE_WRITE);
+    if (key == NULL) return ValkeyModule_ReplyWithError(ctx, "ERR key can't be opened for writing");
     DataType *dt = ValkeyModule_Calloc(sizeof(DataType), 1);
     dt->intval = intval;
     dt->strval = argv[3];
