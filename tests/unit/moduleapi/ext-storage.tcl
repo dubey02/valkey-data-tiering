@@ -86,6 +86,15 @@ if {$tiering_built} {
             assert_equal [string repeat x 1000] [r testrdb.get.key k]
         } {} {needs:debug}
 
+        test "A module value stays in memory unless its module opts in ($engine)" {
+            r flushall
+            r module load [file normalize tests/modules/test_lazyfree.so]
+            r lazyfreelink.insert k 1
+            assert_error {*can't be spilled*} {r debug ext-storage spill k}
+            assert_match {* storage_state:0 *} [r debug object k fast]
+            assert_equal 1 [r lazyfreelink.len k]
+        } {} {needs:debug}
+
         test "Module APIs see a key on flash as missing outside a command ($engine)" {
             r flushall
             r module load [file normalize tests/modules/scan.so]

@@ -12,6 +12,7 @@
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
+#include "module.h"
 #include "rdb.h"
 #include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
@@ -189,9 +190,8 @@ static size_t spillAccountGetEstimatedInflightMem(void) {
 
 /* Serialization and Deserialization Functions
  * The storage engine may call these from its own IO thread. So a module type's
- * rdb_save, rdb_load and mem_usage run there too. They must not share unlocked
- * state with the module's commands, and may use only the IO, memory, string
- * and logging APIs. */
+ * rdb_save, rdb_load and mem_usage run there too, which its module accepts
+ * with VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE. */
 
 /* Serialize in the DUMP wire format, so every type and encoding is handled. A
  * put from extStorageSpillItem() passes the request inside its spillRequest,
@@ -655,6 +655,8 @@ void setStorageState(robj *o, storageState state) {
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
+ * A module value spills only if its module declared
+ * VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE.
  * A key with a TTL, or a hash with field expirations, stays in DRAM because
  * expiry deletes and changes values without checking where they are.
  * TODO(#57): spill them once expiry handles keys on flash.
@@ -663,6 +665,7 @@ void setStorageState(robj *o, storageState state) {
 static bool isSpillCandidate(const robj *o) {
     if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
     if (objectGetEncoding(o) == OBJ_ENCODING_INT) return false;
+    if (objectGetType(o) == OBJ_MODULE && !moduleValueHandlesExtStorage((robj *)o)) return false;
     if (objectGetExpire(o) != EXPIRY_NONE) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }

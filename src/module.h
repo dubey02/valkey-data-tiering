@@ -229,6 +229,7 @@ ssize_t rdbSaveModulesAux(rio *rdb, int when);
 int moduleAllDatatypesHandleErrors(void);
 int moduleAllModulesHandleReplAsyncLoad(void);
 int moduleAllModulesHandleForkless(void);
+int moduleValueHandlesExtStorage(robj *val);
 int moduleVerifyAllAllowAtomicSlotMigrationOrReply(client *c);
 sds modulesCollectInfo(sds info, dict *sections_dict, int for_crash_report, int sections);
 void moduleFireServerEvent(uint64_t eid, int subid, void *data);

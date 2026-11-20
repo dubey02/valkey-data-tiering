@@ -2696,6 +2696,14 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
  *   operation).
  * When forkless background saving is configured, if any loaded module does not
  * set this flag, the server falls back to fork-based saving.
+ *
+ * VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE:
+ * When set, the module's data type values can be moved to external storage
+ * when data tiering is enabled. The module declares that its rdb_save,
+ * rdb_load and mem_usage callbacks are thread-safe, since a storage engine may
+ * call them on its own thread. They must not share unlocked state with the
+ * module's commands, and may use only the IO, memory, string and logging APIs.
+ * When not set, the module's values stay in memory.
  */
 void VM_SetModuleOptions(ValkeyModuleCtx *ctx, int options) {
     ctx->module->options = options;
@@ -7755,6 +7763,13 @@ int moduleVerifyAllAllowAtomicSlotMigrationOrReply(client *c) {
         }
     }
     return C_OK;
+}
+
+/* Returns 1 if the module that owns the type of 'val' declared
+ * VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE. */
+int moduleValueHandlesExtStorage(robj *val) {
+    moduleValue *mv = objectGetVal(val);
+    return (mv->type->module->options & VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE) != 0;
 }
 
 /* Returns 0 if any loaded module did not declare
