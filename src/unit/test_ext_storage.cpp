@@ -1288,7 +1288,10 @@ TEST_F(SpillSelectTest, SkipsKeysThatCannotBeSpilled) {
 
 TEST_F(SpillSelectTest, SelectsModuleKeys) {
     usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    static ValkeyModule module = {};
+    module.options = VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE;
     static moduleType mt = {};
+    mt.module = &module;
     mt.free = freeNothingOnRelease;
     moduleValue *mv = (moduleValue *)zmalloc(sizeof(*mv));
     mv->type = &mt;
@@ -1302,6 +1305,27 @@ TEST_F(SpillSelectTest, SelectsModuleKeys) {
 
     int dbid = -1;
     EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), module_key);
+}
+
+/* A module that didn't declare VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE keeps its
+ * values in memory, however cold they are. */
+TEST_F(SpillSelectTest, SkipsModuleKeysWhoseModuleDidNotOptIn) {
+    usePolicy(MAXMEMORY_ALLKEYS_LRU);
+    server.maxmemory_samples = 64; /* sample every key in one pass */
+    static ValkeyModule module = {};
+    static moduleType mt = {};
+    mt.module = &module;
+    mt.free = freeNothingOnRelease;
+    moduleValue *mv = (moduleValue *)zmalloc(sizeof(*mv));
+    mv->type = &mt;
+    mv->value = nullptr;
+    objectSetLRUOrLFU(addKey("module", createObject(OBJ_MODULE, mv)), -1, 5000);
+
+    robj *warm = addRawKey("warm");
+    objectSetLRUOrLFU(warm, -1, 10);
+
+    int dbid = -1;
+    EXPECT_EQ(extStorageSpillSelectCandidate(&dbid), warm);
 }
 
 /* Expiry deletes keys without checking where their values are, so a key with a

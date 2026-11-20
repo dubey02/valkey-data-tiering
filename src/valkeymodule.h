@@ -352,10 +352,16 @@ typedef uint64_t ValkeyModuleTimerID;
  * does not set this, forkless operations are blocked. */
 #define VALKEYMODULE_OPTIONS_HANDLE_FORKLESS (1 << 6)
 
+/* Declare that the module's data type values can be moved to external storage.
+ * Their RDB save, RDB load and memory usage callbacks may then run on a storage
+ * engine thread, so they must be thread-safe. When not set, the module's values
+ * stay in memory. */
+#define VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE (1 << 7)
+
 /* Next option flag, must be updated when adding new module flags above!
  * This flag should not be used directly by the module.
  * Use ValkeyModule_GetModuleOptionsAll instead. */
-#define _VALKEYMODULE_OPTIONS_FLAGS_NEXT (1 << 7)
+#define _VALKEYMODULE_OPTIONS_FLAGS_NEXT (1 << 8)
 
 /* Definitions for ValkeyModule_SetCommandInfo. */
 
