@@ -704,7 +704,7 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     }
 
     /* This option tests skip command validation for ValkeyModule_EmitAOF */
-    ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTIONS_SKIP_COMMAND_VALIDATION);
+    ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTIONS_SKIP_COMMAND_VALIDATION | VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE);
 
     if (ValkeyModule_CreateCommand(ctx, "mem.alloc", MemAlloc_RedisCommand, "write deny-oom", 1, 1, 1) == VALKEYMODULE_ERR) {
         return VALKEYMODULE_ERR;

@@ -1064,6 +1064,9 @@ void keysScanCallback(void *privdata, void *entry, int didx) {
 
     /* Filter an object if it isn't the type we want. */
     if (data->type != LLONG_MAX) {
+        /* TODO(#52): a module key on flash has no value to read its module type
+         * from, so it never matches. */
+        if (obj->type == OBJ_MODULE && !extStorageIsMemoryOnly(obj)) return;
         if (!objectTypeCompare(obj, data->type)) return;
     }
 

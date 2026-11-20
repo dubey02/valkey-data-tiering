@@ -76,11 +76,12 @@ typedef enum {
 typedef struct storageSerializer {
     /* A keyspace entry to bytes. Returns the byte length, or -1 on failure. A
      * storage engine reports a failure here as STORAGE_ERR_REJECTED.
-     * request is the one passed to put_async. */
-    int (*serialize)(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out);
+     * db_id and request are the ones passed to put_async. */
+    int (*serialize)(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out);
 
-    /* Bytes to a keyless value object. Returns NULL on a malformed buffer. */
-    valkeyObject *(*deserialize)(const char *key, size_t key_len, const char *bytes, int len);
+    /* Bytes to a keyless value object. Returns NULL on a malformed buffer.
+     * db_id is the one passed to get_async. */
+    valkeyObject *(*deserialize)(uint32_t db_id, const char *key, size_t key_len, const char *bytes, int len);
 
     /* Frees a buffer from serialize. */
     void (*free_serialized)(char *bytes);

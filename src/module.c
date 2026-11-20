@@ -72,6 +72,7 @@
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
 #include "bgiteration.h"
+#include "ext_storage.h"
 #include "forkless.h"
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -2695,6 +2696,14 @@ void VM_Yield(ValkeyModuleCtx *ctx, int flags, const char *busy_reply) {
  *   operation).
  * When forkless background saving is configured, if any loaded module does not
  * set this flag, the server falls back to fork-based saving.
+ *
+ * VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE:
+ * When set, the module's data type values can be moved to external storage
+ * when data tiering is enabled. The module declares that its rdb_save,
+ * rdb_load and mem_usage callbacks are thread-safe, since a storage engine may
+ * call them on its own thread. They must not share unlocked state with the
+ * module's commands, and may use only the IO, memory, string and logging APIs.
+ * When not set, the module's values stay in memory.
  */
 void VM_SetModuleOptions(ValkeyModuleCtx *ctx, int options) {
     ctx->module->options = options;
@@ -4377,9 +4386,13 @@ ValkeyModuleKey *VM_OpenKey(ValkeyModuleCtx *ctx, robj *keyname, int mode) {
     if (mode & VALKEYMODULE_WRITE) {
         value = lookupKeyWriteWithFlags(ctx->client->db, keyname, flags);
         if (value && bgIteration_isEntryInuse(value)) return NULL;
+        /* A value on flash can't be changed here. TODO(#47): fetch it. */
+        if (value && !extStorageIsMemoryOnly(value)) return NULL;
     } else {
         value = lookupKeyReadWithFlags(ctx->client->db, keyname, flags);
-        if (value == NULL) {
+        /* A value on flash can't be read here, so the key looks missing.
+         * TODO(#47): fetch it. */
+        if (value == NULL || !extStorageIsMemoryOnly(value)) {
             return NULL;
         }
     }
@@ -7338,15 +7351,18 @@ moduleType *moduleTypeLookupModuleByNameIgnoreCase(const char *name) {
 moduleType *moduleTypeLookupModuleByID(uint64_t id) {
     if (listLength(modules) == 0) return NULL;
 
-    static struct {
-        uint64_t id;
-        moduleType *mt;
-    } cache[MODULE_LOOKUP_CACHE_SIZE];
+    /* A slot is set once, from NULL to a type. Readers take the id from the
+     * type, so a slot can't pair one type's id with another's pointer. The
+     * storage engine's IO thread loads module values too. */
+    static _Atomic(moduleType *) cache[MODULE_LOOKUP_CACHE_SIZE];
 
     /* Search in cache to start. */
     int j;
-    for (j = 0; j < MODULE_LOOKUP_CACHE_SIZE && cache[j].mt != NULL; j++)
-        if (cache[j].id == id) return cache[j].mt;
+    for (j = 0; j < MODULE_LOOKUP_CACHE_SIZE; j++) {
+        moduleType *cached = atomic_load_explicit(&cache[j], memory_order_acquire);
+        if (cached == NULL) break;
+        if (cached->id >> 10 == id >> 10) return cached;
+    }
 
     /* Slow module by module lookup. */
     moduleType *mt = NULL;
@@ -7371,10 +7387,10 @@ moduleType *moduleTypeLookupModuleByID(uint64_t id) {
         }
     }
 
-    /* Add to cache if possible. */
+    /* Add to cache if possible. Another thread may fill the slot first. */
     if (mt && j < MODULE_LOOKUP_CACHE_SIZE) {
-        cache[j].id = id;
-        cache[j].mt = mt;
+        moduleType *expected = NULL;
+        atomic_compare_exchange_strong_explicit(&cache[j], &expected, mt, memory_order_release, memory_order_relaxed);
     }
     return mt;
 }
@@ -7747,6 +7763,13 @@ int moduleVerifyAllAllowAtomicSlotMigrationOrReply(client *c) {
         }
     }
     return C_OK;
+}
+
+/* Returns 1 if the module that owns the type of 'val' declared
+ * VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE. */
+int moduleValueHandlesExtStorage(robj *val) {
+    moduleValue *mv = objectGetVal(val);
+    return (mv->type->module->options & VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE) != 0;
 }
 
 /* Returns 0 if any loaded module did not declare
@@ -8249,7 +8272,10 @@ void VM_EmitAOF(ValkeyModuleIO *io, const char *cmdname, const char *fmt, ...) {
 ValkeyModuleCtx *VM_GetContextFromIO(ValkeyModuleIO *io) {
     if (io->ctx) return io->ctx; /* Can't have more than one... */
     io->ctx = zmalloc(sizeof(ValkeyModuleCtx));
-    moduleCreateContext(io->ctx, io->type->module, VALKEYMODULE_CTX_NONE);
+    /* Off the main thread, as when data tiering or a forkless save calls a
+     * module, the context must not touch the server's execution state. */
+    int flags = onServerMainThread() ? VALKEYMODULE_CTX_NONE : VALKEYMODULE_CTX_THREAD_SAFE;
+    moduleCreateContext(io->ctx, io->type->module, flags);
     return io->ctx;
 }
 
@@ -12054,6 +12080,9 @@ static void moduleScanCallback(void *privdata, void *element, int didx) {
     UNUSED(didx);
     ScanCBData *data = privdata;
     robj *val = element;
+    /* A value on flash can't be read here, so the key is skipped.
+     * TODO(#47): fetch it. */
+    if (!extStorageIsMemoryOnly(val)) return;
     sds key = objectGetKey(val);
     ValkeyModuleString *keyname = createObject(OBJ_STRING, sdsdup(key));
 

@@ -126,7 +126,7 @@ static storageStatus mockPut(uint32_t db_id,
     if (db_id >= mock.num_databases) return STORAGE_ERR_REJECTED;
 
     char *vbytes = NULL;
-    int vlen = mock.cfg.serializer.serialize(key, klen, entry, request, &vbytes);
+    int vlen = mock.cfg.serializer.serialize(db_id, key, klen, entry, request, &vbytes);
     if (vlen < 0 || vbytes == NULL) return STORAGE_ERR_REJECTED;
 
     storageStatus st = STORAGE_OK;
@@ -173,7 +173,7 @@ static storageStatus mockGet(uint32_t db_id, const char *key, size_t klen, valke
     if (*slot == NULL) {
         st = STORAGE_NOT_FOUND;
     } else {
-        valkeyObject *obj = mock.cfg.serializer.deserialize(key, klen, (*slot)->val, (int)(*slot)->vlen);
+        valkeyObject *obj = mock.cfg.serializer.deserialize(db_id, key, klen, (*slot)->val, (int)(*slot)->vlen);
         if (obj == NULL) {
             st = STORAGE_ERR_IO;
         } else {
