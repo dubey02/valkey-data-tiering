@@ -40,11 +40,18 @@ static void testLog(storageLogLevel level, const char *fmt, ...) {
 
 static const storageThreadConfig test_thread_config = {VALKEY_THREAD_STACK_SIZE, NULL};
 
-/* A sink that keeps the reported fields by name. The storage engine reports
- * only unsigned counters today, so the other field kinds are not kept. */
+/* Keeps reported fields by name, with dict fields as <dict>:<field>. Only
+ * unsigned counters are kept. */
 typedef std::map<std::string, unsigned long long> StatMap;
+static char sink_dict[64];
 static void sinkAddULongLong(void *c, const char *name, unsigned long long v) {
-    (*(StatMap *)c)[name] = v;
+    char field[128];
+    if (sink_dict[0]) {
+        snprintf(field, sizeof(field), "%s:%s", sink_dict, name);
+    } else {
+        snprintf(field, sizeof(field), "%s", name);
+    }
+    (*(StatMap *)c)[field] = v;
 }
 static void sinkAddLongLong(void *, const char *, long long) {
 }
@@ -52,9 +59,25 @@ static void sinkAddDouble(void *, const char *, double) {
 }
 static void sinkAddCString(void *, const char *, const char *) {
 }
-static void sinkBeginDict(void *, const char *) {
+static void sinkBeginDict(void *, const char *name) {
+    snprintf(sink_dict, sizeof(sink_dict), "%s", name);
 }
 static void sinkEndDict(void *) {
+    sink_dict[0] = '\0';
+}
+
+/* Sums a reported latency histogram and counts its buckets. */
+static unsigned long long sumHistogram(StatMap &stats, const char *name, int *buckets) {
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "%s:", name);
+    unsigned long long sum = 0;
+    *buckets = 0;
+    for (StatMap::iterator it = stats.begin(); it != stats.end(); ++it) {
+        if (strncmp(it->first.c_str(), prefix, strlen(prefix)) != 0) continue;
+        sum += it->second;
+        (*buckets)++;
+    }
+    return sum;
 }
 static const storageInfoSink stat_map_sink_template = {
     nullptr, sinkAddLongLong, sinkAddULongLong, sinkAddDouble, sinkAddCString, sinkBeginDict, sinkEndDict};
@@ -539,6 +562,22 @@ TEST_F(StorageFlashCacheTest, GetAfterAFlushReadsFromDisk) {
     decrRefCount(want);
     decrRefCount((robj *)comp.value);
     EXPECT_TRUE(waitForStat("total_num_disk_reads", [reads_before](unsigned long long v) { return v > reads_before; }));
+
+    StatMap stats = readStats();
+    EXPECT_GE(stats["total_num_write_requests"], 2u);
+    EXPECT_GE(stats["total_num_read_requests"], 1u);
+    EXPECT_GE(stats["total_disk_write_bytes"], 1u);
+    EXPECT_GE(stats["total_disk_read_bytes"], 1u);
+    EXPECT_GE(stats["db_size_bytes"], stats["active_db_size_bytes"]);
+    EXPECT_GE(stats["fc_used_memory_bytes"], 1u);
+    EXPECT_EQ(stats["db_used_over_allocatable_bytes"], 0u);
+    int buckets = 0;
+    EXPECT_GE(sumHistogram(stats, "disk_write_latency_usec", &buckets), 1u);
+    EXPECT_EQ(buckets, 9);
+    EXPECT_GE(sumHistogram(stats, "disk_read_latency_usec", &buckets), 1u);
+    EXPECT_EQ(buckets, 9);
+    EXPECT_EQ(stats.count("disk_read_latency_usec:0-100"), 1u);
+    EXPECT_EQ(stats.count("disk_read_latency_usec:100000-inf"), 1u);
 
     sdsfree(blob);
     sdsfree(key);
