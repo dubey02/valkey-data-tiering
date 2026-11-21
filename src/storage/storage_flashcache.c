@@ -68,8 +68,8 @@ typedef struct fcRequest {
     storageCompletion completed_request;
 } fcRequest;
 
-/* Buckets in FlashCache's disk latency histograms. FlashCache asserts the
- * size it is asked for, so this must match FIO_LATENCY_HISTOGRAM_SZ. */
+/* Buckets in FlashCache's latency histograms. Must match FIO_LATENCY_HISTOGRAM_SZ,
+ * which FlashCache asserts. */
 #define FC_LATENCY_BUCKETS 9
 
 /* The counters INFO reports. */
@@ -86,15 +86,15 @@ typedef struct fcStatsSnapshot {
     uint64_t num_disk_reads;
     /* Number of times the write buffer was written to the flash device. */
     uint64_t num_disk_writes;
-    /* Size of the db file: live records, deleted records not yet collected, and free space. */
+    /* Size of the db file, free space included. */
     uint64_t db_size_bytes;
-    /* Bytes taken by live records and deleted records not yet collected. */
+    /* Bytes of live records and deleted records not yet collected. */
     uint64_t active_db_size_bytes;
     /* Bytes still free for new records. */
     uint64_t free_allocatable_db_size_bytes;
     /* Bytes stored past the space FlashCache may allocate. */
     uint64_t db_used_over_allocatable_bytes;
-    /* Bytes of records buffered in DRAM and not yet written to the flash device. */
+    /* Bytes buffered in DRAM, not yet on flash. */
     uint64_t pending_flush_bytes;
     /* DRAM FlashCache uses. */
     uint64_t used_memory_bytes;
@@ -112,13 +112,13 @@ typedef struct fcStatsSnapshot {
     uint64_t num_delete_requests;
     /* Disk errors FlashCache retried. */
     uint64_t num_retryable_disk_errors;
-    /* Disk reads thrown away because a hash collision pointed at the wrong record. */
+    /* Disk reads wasted on a hash collision. */
     uint64_t num_unused_disk_reads;
-    /* Bytes of those thrown-away reads. */
+    /* Bytes of disk reads wasted on a hash collision. */
     uint64_t unused_disk_read_bytes;
-    /* Disk reads thrown away because they held only part of a record. */
+    /* Disk reads that held only part of a record. */
     uint64_t num_partial_item_reads;
-    /* Bytes of those partial reads. */
+    /* Bytes of disk reads that held only part of a record. */
     uint64_t partial_item_read_bytes;
     /* Deletes FlashCache served without a disk read. */
     uint64_t num_optimized_deletes;
@@ -468,8 +468,8 @@ static storageStatus fcDelAsync(uint32_t db_id, const char *key, size_t key_len,
 
 /* Reports the last snapshot. The IO thread refreshes it, so a value can be up
  * to FC_STATS_REFRESH_US old. */
-/* Reports one latency histogram as a dict, one count per bucket, keyed by the
- * bucket's bounds in microseconds, such as 100-200, with the last one open. */
+/* Reports a latency histogram as one dict, keyed by bucket bounds in
+ * microseconds, such as 100-200 and 100000-inf. */
 static void fcInfoLatency(const storageInfoSink *s, const char *name, const unsigned long long *counts) {
     s->begin_dict(s->ctx, name);
     for (int i = 0; i < FC_LATENCY_BUCKETS; i++) {

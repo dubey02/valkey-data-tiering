@@ -40,9 +40,8 @@ static void testLog(storageLogLevel level, const char *fmt, ...) {
 
 static const storageThreadConfig test_thread_config = {VALKEY_THREAD_STACK_SIZE, NULL};
 
-/* A sink that keeps the reported fields by name, and a field inside a dict as
- * <dict>:<field>. The storage engine reports only unsigned counters, so the
- * other field kinds are not kept. */
+/* Keeps reported fields by name, with dict fields as <dict>:<field>. Only
+ * unsigned counters are kept. */
 typedef std::map<std::string, unsigned long long> StatMap;
 static char sink_dict[64];
 static void sinkAddULongLong(void *c, const char *name, unsigned long long v) {
@@ -67,7 +66,7 @@ static void sinkEndDict(void *) {
     sink_dict[0] = '\0';
 }
 
-/* Sums the buckets of a reported latency histogram, and counts them. */
+/* Sums a reported latency histogram and counts its buckets. */
 static unsigned long long sumHistogram(StatMap &stats, const char *name, int *buckets) {
     char prefix[64];
     snprintf(prefix, sizeof(prefix), "%s:", name);
