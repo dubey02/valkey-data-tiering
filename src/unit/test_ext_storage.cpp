@@ -2927,12 +2927,16 @@ TEST_F(BlockClientTest, AFetchInAnotherDbWakesTheClientToBlockAgain) {
 
 /* A full storage engine queue is not an error. The fetch waits for room, then goes in. */
 TEST_F(BlockClientTest, AFetchWaitsWhenTheEngineQueueIsFull) {
-    addFlashKey("a");
+    robj *a = addFlashKey("a");
     client *c = makeClient("get a");
     fillEngineQueue();
 
     EXPECT_TRUE(extStorageBlockClientIfRequired(c));
     EXPECT_EQ(numFetching(), 1u);
+
+    extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
 }
 
 /* ---------------------------------------------------------------------------
