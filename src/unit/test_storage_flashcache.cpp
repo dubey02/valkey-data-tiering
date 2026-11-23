@@ -345,7 +345,7 @@ TEST_F(StorageFlashCacheTest, CompletionCarriesTheRequestContext) {
 
 TEST_F(StorageFlashCacheTest, EveryRequestCompletesExactlyOnce) {
     openEngine();
-    const int total = 5000;
+    const int total = 2 * FC_QUEUE_DEPTH;
     static int seen[total];
     static storageRequestContext reqs[total];
     static sds keys[total];
@@ -773,11 +773,11 @@ TEST_F(StorageFlashCacheTest, SubmitReturnsTheUsualCodesWhilePaused) {
     EXPECT_EQ(engine->get_async(cfg.num_databases, key, sdslen(key), nullptr), STORAGE_ERR_REJECTED);
 
     int accepted = 0;
-    for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < FC_QUEUE_DEPTH; i++) {
         if (engine->get_async(0, key, sdslen(key), nullptr) != STORAGE_OK) break;
         accepted++;
     }
-    ASSERT_GT(accepted, 0);
+    ASSERT_EQ(accepted, FC_QUEUE_DEPTH);
     EXPECT_EQ(engine->get_async(0, key, sdslen(key), nullptr), STORAGE_WOULDBLOCK);
 
     engine->pause_processing(false);
