@@ -2934,7 +2934,8 @@ TEST_F(BlockClientTest, AFetchWaitsWhenTheEngineQueueIsFull) {
     EXPECT_TRUE(extStorageBlockClientIfRequired(c));
     EXPECT_EQ(numFetching(), 1u);
 
-    extStorageBeforeSleep();
+    /* The fetch is queued behind the fillers, so one poll batch may not reach it. */
+    for (int i = 0; i < 16 && numFetching() > 0; i++) extStorageBeforeSleep();
     EXPECT_FALSE(isBlocked(c));
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
 }
