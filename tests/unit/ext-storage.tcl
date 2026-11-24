@@ -98,6 +98,35 @@ if {$tiering_built} {
     # The valkey server runs in its own directory, so the path is absolute.
     set path [file normalize [tmpdir ext-storage-$engine]]
     start_server [list tags {"ext-storage external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $path ext-storage-capacity 128mb save ""]] {
+        if {$engine eq "flashcache"} {
+            test "INFO storage_engine reports every FlashCache metric" {
+                set info [r info storage_engine]
+                foreach field {
+                    total_num_items allocated_db_size_bytes total_num_requests_throttled
+                    total_num_items_evicted total_num_disk_reads total_num_disk_writes
+                    db_size_bytes active_db_size_bytes free_allocatable_db_size_bytes
+                    db_used_over_allocatable_bytes pending_flush_bytes fc_used_memory_bytes
+                    total_disk_read_bytes total_disk_write_bytes num_reads_in_flight
+                    total_num_read_requests total_num_write_requests total_num_delete_requests
+                    total_num_retryable_disk_errors total_num_unused_disk_reads
+                    total_unused_disk_read_bytes total_num_partial_item_reads
+                    total_partial_item_read_bytes total_num_optimized_deletes index_growing
+                    total_num_index_growths total_evicted_bytes evicting_under_max_log_size
+                    total_num_items_evicted_under_max_log_size gc_rate_bytes_per_sec
+                    min_gc_rate_bytes_per_sec total_gc_num_disk_reads total_gc_read_bytes
+                    total_gc_write_bytes total_gc_num_items_moved num_requests_queued
+                } {
+                    assert_match "*storage_engine_$field:*" $info
+                }
+                # Each latency histogram is one line with nine buckets.
+                foreach histogram {disk_read_latency_usec disk_write_latency_usec} {
+                    assert_match "*storage_engine_$histogram:0-100=*,100000-inf=*" $info
+                    set line [lsearch -inline [split $info "\r\n"] "storage_engine_$histogram:*"]
+                    assert_equal 9 [llength [split [lindex [split $line :] 1] ,]]
+                }
+            }
+        }
+
         test "DEBUG EXT-STORAGE SPILL submits a key and refuses keys it can't spill ($engine)" {
             r set big [string repeat x 1000]
             r set small v

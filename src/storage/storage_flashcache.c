@@ -65,6 +65,10 @@ typedef struct fcRequest {
     storageCompletion completed_request;
 } fcRequest;
 
+/* Buckets in FlashCache's latency histograms. Must match FIO_LATENCY_HISTOGRAM_SZ,
+ * which FlashCache asserts. */
+#define FC_LATENCY_BUCKETS 9
+
 /* The counters INFO reports. */
 typedef struct fcStatsSnapshot {
     /* Number of records stored on flash. */
@@ -79,6 +83,68 @@ typedef struct fcStatsSnapshot {
     uint64_t num_disk_reads;
     /* Number of times the write buffer was written to the flash device. */
     uint64_t num_disk_writes;
+    /* Size of the db file, free space included. */
+    uint64_t db_size_bytes;
+    /* Bytes of live records and deleted records not yet collected. */
+    uint64_t active_db_size_bytes;
+    /* Bytes still free for new records. */
+    uint64_t free_allocatable_db_size_bytes;
+    /* Bytes stored past the space FlashCache may allocate. */
+    uint64_t db_used_over_allocatable_bytes;
+    /* Bytes buffered in DRAM, not yet on flash. */
+    uint64_t pending_flush_bytes;
+    /* DRAM FlashCache uses. */
+    uint64_t used_memory_bytes;
+    /* Bytes read from the flash device. */
+    uint64_t disk_read_bytes;
+    /* Bytes written to the flash device. */
+    uint64_t disk_write_bytes;
+    /* Reads FlashCache is serving now. */
+    uint64_t num_reads_in_flight;
+    /* Read requests FlashCache received. */
+    uint64_t num_read_requests;
+    /* Write requests FlashCache received. */
+    uint64_t num_write_requests;
+    /* Delete requests FlashCache received. */
+    uint64_t num_delete_requests;
+    /* Disk errors FlashCache retried. */
+    uint64_t num_retryable_disk_errors;
+    /* Disk reads wasted on a hash collision. */
+    uint64_t num_unused_disk_reads;
+    /* Bytes of disk reads wasted on a hash collision. */
+    uint64_t unused_disk_read_bytes;
+    /* Disk reads that held only part of a record. */
+    uint64_t num_partial_item_reads;
+    /* Bytes of disk reads that held only part of a record. */
+    uint64_t partial_item_read_bytes;
+    /* Deletes FlashCache served without a disk read. */
+    uint64_t num_optimized_deletes;
+    /* 1 while FlashCache grows its index. */
+    uint64_t index_growing;
+    /* Times FlashCache grew its index. */
+    uint64_t num_index_growths;
+    /* Bytes of records evicted to make room. */
+    uint64_t evicted_bytes;
+    /* 1 while FlashCache evicts before its log reaches its maximum size. */
+    uint64_t evicting_under_max_log_size;
+    /* Records evicted before the log reached its maximum size. */
+    uint64_t num_items_evicted_under_max_log_size;
+    /* Garbage collection rate FlashCache needs now, in bytes per second. */
+    uint64_t gc_rate_bytes_per_sec;
+    /* Lowest garbage collection rate FlashCache picked, in bytes per second. */
+    uint64_t min_gc_rate_bytes_per_sec;
+    /* Disk reads garbage collection made. */
+    uint64_t gc_num_disk_reads;
+    /* Bytes garbage collection read. */
+    uint64_t gc_read_bytes;
+    /* Bytes garbage collection wrote. */
+    uint64_t gc_write_bytes;
+    /* Records garbage collection moved. */
+    uint64_t gc_num_items_moved;
+    /* Disk reads per latency bucket. */
+    unsigned long long disk_read_latency[FC_LATENCY_BUCKETS];
+    /* Disk writes per latency bucket. */
+    unsigned long long disk_write_latency[FC_LATENCY_BUCKETS];
 } fcStatsSnapshot;
 
 /* The IO thread refreshes the snapshot INFO reads at this interval. */
@@ -133,6 +199,8 @@ static struct {
     pthread_mutex_t snap_mutex;
     fcStatsSnapshot snap;
     uint64_t snap_refreshed_us;
+    /* Microsecond bounds of the latency buckets, read once at open. */
+    flashcacheHistogramInterval latency_buckets[FC_LATENCY_BUCKETS];
 
     /* The IO thread. */
     pthread_t io_thread;
@@ -184,7 +252,38 @@ static void fcRefreshStatsSnapshot(void) {
         .num_items_evicted = fc_io.io_stats.num_items_evicted,
         .num_disk_reads = flashcacheGetCountBasedMetric(FC_NUM_DISK_READ),
         .num_disk_writes = flashcacheGetCountBasedMetric(FC_NUM_DISK_WRITE),
+        .db_size_bytes = flashcacheGetCountBasedMetric(FC_TOTAL_DB_SIZE_BYTES),
+        .active_db_size_bytes = flashcacheGetCountBasedMetric(FC_ACTIVE_DB_SIZE_BYTES),
+        .free_allocatable_db_size_bytes = flashcacheGetCountBasedMetric(FC_FREE_ALLOCATABLE_DB_SIZE_BYTES),
+        .db_used_over_allocatable_bytes = flashcacheGetCountBasedMetric(FC_DB_USED_OVER_ALLOCATABLE_DB_SIZE_BYTES),
+        .pending_flush_bytes = flashcacheGetCountBasedMetric(FC_ITEM_PENDING_FLUSH_SIZE_BYTES),
+        .used_memory_bytes = flashcacheGetCountBasedMetric(FC_ACTIVE_MEMORY_SIZE),
+        .disk_read_bytes = flashcacheGetCountBasedMetric(FC_TOTAL_DISK_READ_BYTES),
+        .disk_write_bytes = flashcacheGetCountBasedMetric(FC_TOTAL_DISK_WRITE_BYTES),
+        .num_reads_in_flight = flashcacheGetCountBasedMetric(FC_NUM_READ_IN_FLIGHT),
+        .num_read_requests = flashcacheGetCountBasedMetric(FC_NUM_READ_REQUEST),
+        .num_write_requests = flashcacheGetCountBasedMetric(FC_NUM_WRITE_REQUEST),
+        .num_delete_requests = flashcacheGetCountBasedMetric(FC_NUM_DELETE_REQUEST),
+        .num_retryable_disk_errors = flashcacheGetCountBasedMetric(FC_NUM_RETRYABLE_DISK_ERROR),
+        .num_unused_disk_reads = flashcacheGetCountBasedMetric(FC_NUM_UNUSED_DISK_READ_HASH_COLLISION),
+        .unused_disk_read_bytes = flashcacheGetCountBasedMetric(FC_UNUSED_DISK_READ_BYTES_HASH_COLLISION),
+        .num_partial_item_reads = flashcacheGetCountBasedMetric(FC_NUM_PARTIAL_ITEM_READ),
+        .partial_item_read_bytes = flashcacheGetCountBasedMetric(FC_PARTIAL_ITEM_READ_BYTES),
+        .num_optimized_deletes = flashcacheGetCountBasedMetric(FC_NUM_OPTIMIZED_DELETES),
+        .index_growing = flashcacheGetCountBasedMetric(FC_IS_INDEX_GROWING),
+        .num_index_growths = flashcacheGetCountBasedMetric(FC_NUM_INDEX_GROWTH_RUN),
+        .evicted_bytes = flashcacheGetCountBasedMetric(FC_TOTAL_EVICTED_ITEMS_SIZE_BYTES),
+        .evicting_under_max_log_size = flashcacheGetCountBasedMetric(FC_IS_EVICTING_UNDER_MAX_LOGSIZE),
+        .num_items_evicted_under_max_log_size = flashcacheGetCountBasedMetric(FC_NUM_ITEMS_EVICTED_UNDER_MAX_LOGSIZE),
+        .gc_rate_bytes_per_sec = flashcacheGetCountBasedMetric(FC_GARBAGE_COLLECTION_CURR_RATE_BYTES_PER_SECOND),
+        .min_gc_rate_bytes_per_sec = flashcacheGetCountBasedMetric(FC_MIN_GARBAGE_COLLECTION_RATE),
+        .gc_num_disk_reads = flashcacheGetCountBasedMetric(FC_GARBAGE_COLLECTION_NUM_DISK_READ),
+        .gc_read_bytes = flashcacheGetCountBasedMetric(FC_GARBAGE_COLLECTION_READ_BYTES),
+        .gc_write_bytes = flashcacheGetCountBasedMetric(FC_GARBAGE_COLLECTION_WRITE_BYTES),
+        .gc_num_items_moved = flashcacheGetCountBasedMetric(FC_GARBAGE_COLLECTION_NUM_ITEMS_MOVED),
     };
+    flashcacheGetHistogramMetrics(FC_DISK_READ_LATENCY_HISTOGRAM, snap.disk_read_latency, FC_LATENCY_BUCKETS);
+    flashcacheGetHistogramMetrics(FC_DISK_WRITE_LATENCY_HISTOGRAM, snap.disk_write_latency, FC_LATENCY_BUCKETS);
     pthread_mutex_lock(&fc_io.snap_mutex);
     fc_io.snap = snap;
     pthread_mutex_unlock(&fc_io.snap_mutex);
@@ -364,6 +463,23 @@ static storageStatus fcDelAsync(uint32_t db_id, const char *key, size_t key_len,
     return fcSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request);
 }
 
+/* Reports a latency histogram as one dict, keyed by bucket bounds in
+ * microseconds, such as 100-200 and 100000-inf. */
+static void fcInfoLatency(const storageInfoSink *s, const char *name, const unsigned long long *counts) {
+    s->begin_dict(s->ctx, name);
+    for (int i = 0; i < FC_LATENCY_BUCKETS; i++) {
+        const flashcacheHistogramInterval *bounds = &fc_io.latency_buckets[i];
+        char bucket[48];
+        if (bounds->interval_end == LLONG_MAX) {
+            snprintf(bucket, sizeof(bucket), "%lld-inf", bounds->interval_start);
+        } else {
+            snprintf(bucket, sizeof(bucket), "%lld-%lld", bounds->interval_start, bounds->interval_end);
+        }
+        s->add_ulong_long(s->ctx, bucket, counts[i]);
+    }
+    s->end_dict(s->ctx);
+}
+
 /* Reports the last snapshot. The IO thread refreshes it, so a value can be up
  * to FC_STATS_REFRESH_US old. */
 static void fcInfo(const storageInfoSink *s) {
@@ -378,6 +494,39 @@ static void fcInfo(const storageInfoSink *s) {
     s->add_ulong_long(s->ctx, "total_num_items_evicted", snap.num_items_evicted);
     s->add_ulong_long(s->ctx, "total_num_disk_reads", snap.num_disk_reads);
     s->add_ulong_long(s->ctx, "total_num_disk_writes", snap.num_disk_writes);
+    s->add_ulong_long(s->ctx, "db_size_bytes", snap.db_size_bytes);
+    s->add_ulong_long(s->ctx, "active_db_size_bytes", snap.active_db_size_bytes);
+    s->add_ulong_long(s->ctx, "free_allocatable_db_size_bytes", snap.free_allocatable_db_size_bytes);
+    s->add_ulong_long(s->ctx, "db_used_over_allocatable_bytes", snap.db_used_over_allocatable_bytes);
+    s->add_ulong_long(s->ctx, "pending_flush_bytes", snap.pending_flush_bytes);
+    s->add_ulong_long(s->ctx, "fc_used_memory_bytes", snap.used_memory_bytes);
+    s->add_ulong_long(s->ctx, "total_disk_read_bytes", snap.disk_read_bytes);
+    s->add_ulong_long(s->ctx, "total_disk_write_bytes", snap.disk_write_bytes);
+    s->add_ulong_long(s->ctx, "num_reads_in_flight", snap.num_reads_in_flight);
+    s->add_ulong_long(s->ctx, "total_num_read_requests", snap.num_read_requests);
+    s->add_ulong_long(s->ctx, "total_num_write_requests", snap.num_write_requests);
+    s->add_ulong_long(s->ctx, "total_num_delete_requests", snap.num_delete_requests);
+    s->add_ulong_long(s->ctx, "total_num_retryable_disk_errors", snap.num_retryable_disk_errors);
+    s->add_ulong_long(s->ctx, "total_num_unused_disk_reads", snap.num_unused_disk_reads);
+    s->add_ulong_long(s->ctx, "total_unused_disk_read_bytes", snap.unused_disk_read_bytes);
+    s->add_ulong_long(s->ctx, "total_num_partial_item_reads", snap.num_partial_item_reads);
+    s->add_ulong_long(s->ctx, "total_partial_item_read_bytes", snap.partial_item_read_bytes);
+    s->add_ulong_long(s->ctx, "total_num_optimized_deletes", snap.num_optimized_deletes);
+    s->add_ulong_long(s->ctx, "index_growing", snap.index_growing);
+    s->add_ulong_long(s->ctx, "total_num_index_growths", snap.num_index_growths);
+    s->add_ulong_long(s->ctx, "total_evicted_bytes", snap.evicted_bytes);
+    s->add_ulong_long(s->ctx, "evicting_under_max_log_size", snap.evicting_under_max_log_size);
+    s->add_ulong_long(s->ctx, "total_num_items_evicted_under_max_log_size", snap.num_items_evicted_under_max_log_size);
+    s->add_ulong_long(s->ctx, "gc_rate_bytes_per_sec", snap.gc_rate_bytes_per_sec);
+    s->add_ulong_long(s->ctx, "min_gc_rate_bytes_per_sec", snap.min_gc_rate_bytes_per_sec);
+    s->add_ulong_long(s->ctx, "total_gc_num_disk_reads", snap.gc_num_disk_reads);
+    s->add_ulong_long(s->ctx, "total_gc_read_bytes", snap.gc_read_bytes);
+    s->add_ulong_long(s->ctx, "total_gc_write_bytes", snap.gc_write_bytes);
+    s->add_ulong_long(s->ctx, "total_gc_num_items_moved", snap.gc_num_items_moved);
+    /* Requests waiting for the IO thread. The queue has its own lock. */
+    s->add_ulong_long(s->ctx, "num_requests_queued", mutexQueueLength(fc_io.requests));
+    fcInfoLatency(s, "disk_read_latency_usec", snap.disk_read_latency);
+    fcInfoLatency(s, "disk_write_latency_usec", snap.disk_write_latency);
 }
 
 /* Waits for any submit in progress, then pauses. While paused, cron keeps
@@ -550,6 +699,7 @@ static storageStatus fcOpen(const storageConfig *cfg) {
         return STORAGE_ERR_IO;
     }
     fc_io.fc_initialized = 1;
+    flashcacheGetHistogramIntervals(FC_DISK_READ_LATENCY_HISTOGRAM, fc_io.latency_buckets, FC_LATENCY_BUCKETS);
 
     fc_io.requests = mutexQueueCreate();
     fc_io.completions = mutexQueueCreate();
