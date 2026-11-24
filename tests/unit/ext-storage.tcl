@@ -262,7 +262,6 @@ if {$tiering_built} {
             assert_error {*at most 256 keys*} {r debug ext-storage spill {*}$keys}
             assert_match {* storage_state:0 *} [r debug object key:0 fast]
             assert_equal OK [r debug ext-storage spill {*}[lrange $keys 0 255]]
-            # The storage engine completes a batch per event loop cycle.
             wait_for_condition 100 50 {
                 [getInfoProperty [r info ext_storage] ext_storage_num_items_spilling_to_storage] == 0
             } else {
@@ -271,6 +270,27 @@ if {$tiering_built} {
                 fail "spills didn't complete"
             }
             assert_match {* storage_state:2 *} [r debug object key:255 fast]
+        } {} {needs:debug}
+
+        test "Fetches on an idle server finish without waiting for serverCron ($engine)" {
+            r flushall
+            set keys {}
+            for {set i 0} {$i < 5} {incr i} {
+                r set key:$i [string repeat x 1000]
+                lappend keys key:$i
+            }
+            assert_equal OK [r debug ext-storage spill {*}$keys]
+            wait_for_flash {*}$keys
+            # At hz 1, a fetch that waits for serverCron takes about half a second.
+            set hz [lindex [r config get hz] 1]
+            r config set hz 1
+            set start [clock milliseconds]
+            foreach key $keys {
+                assert_equal [string repeat x 1000] [r get $key]
+            }
+            set elapsed [expr {[clock milliseconds] - $start}]
+            r config set hz $hz
+            assert_lessthan $elapsed 500
         } {} {needs:debug}
 
         test "DEBUG commands that read a value fail on a key on flash ($engine)" {

@@ -2147,6 +2147,21 @@ TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
     EXPECT_FALSE(isSelected(entry));
 }
 
+/* One beforeSleep handles more finished spills than one poll returns. */
+TEST_F(SpillSubmitTest, OneBeforeSleepHandlesEveryFinishedSpill) {
+    std::vector<robj *> entries;
+    for (int i = 0; i < 100; i++) {
+        std::string key = "key" + std::to_string(i);
+        entries.push_back(addRawKey(key.c_str()));
+        ASSERT_EQ(extStorageSpillItem(0, entries.back()), STORAGE_OK);
+    }
+
+    ASSERT_EQ(finishSpills(), 100);
+
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 0u);
+    for (robj *entry : entries) EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+}
+
 /* The spill's reference keeps a key deleted while it is being spilled alive
  * until the completion. */
 TEST_F(SpillSubmitTest, AKeyDeletedWhileSpillingIsFreedOnCompletion) {

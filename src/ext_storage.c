@@ -103,6 +103,8 @@ typedef struct extStorageContext {
     bool is_foreground_paused;
     /* While set, the storage engine starts no new request. */
     bool is_background_paused;
+    /* Set while the keep-awake timer is scheduled, as it is whenever requests are in flight. */
+    bool is_keep_awake_running;
     extStorageStats stats;
     spillAccount spill_account;
     /* Fetches refused for lack of a queue slot, in arrival order. */
@@ -115,6 +117,9 @@ static extStorageContext ext_storage = {0};
 
 /* Completions handled per poll. */
 #define EXT_STORAGE_POLL_BATCH 64
+
+/* Longest the event loop sleeps while requests are in flight. */
+#define EXT_STORAGE_KEEP_AWAKE_MS 1
 
 /* Guards rdbLoadObject during deserialization. */
 static pthread_mutex_t ext_storage_loading_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -421,6 +426,28 @@ static int extStoragePollCompletions(void) {
     return n;
 }
 
+static bool extStorageHasRequestsInFlight(void) {
+    return ext_storage.stats.num_items_spilling + ext_storage.stats.num_items_fetching > 0;
+}
+
+/* Wakes the event loop while requests are in flight, so beforeSleep handles
+ * their completions. */
+static long long extStorageKeepAwakeProc(struct aeEventLoop *el, long long id, void *client_data) {
+    UNUSED(el);
+    UNUSED(id);
+    UNUSED(client_data);
+    if (ext_storage.open && extStorageHasRequestsInFlight()) return EXT_STORAGE_KEEP_AWAKE_MS;
+    ext_storage.is_keep_awake_running = false;
+    return AE_NOMORE;
+}
+
+/* Keeps the event loop awake until the requests in flight complete. */
+static void extStorageKeepAwake(void) {
+    if (ext_storage.is_keep_awake_running || server.el == NULL) return;
+    ext_storage.is_keep_awake_running =
+        aeCreateTimeEvent(server.el, EXT_STORAGE_KEEP_AWAKE_MS, extStorageKeepAwakeProc, NULL, NULL) != AE_ERR;
+}
+
 /* Spills over maxmemory without a command, also on replicas, which never evict.
  * TODO(#74): on a replica, a replicated write to a spilled key would block the
  * primary's client, which blockClient() doesn't allow. */
@@ -431,14 +458,16 @@ static void spillIfOverMaxmemory(void) {
     extStorageSpillOverMaxmemory(mem_tofree);
 }
 
-/* Runs once per event loop iteration, from beforeSleep. The cron timer wakes
- * the loop at least every tick, so a completion waits at most that long. */
+/* Runs once per event loop iteration, from beforeSleep. Handles every
+ * completion that is ready. */
 void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
     spillIfOverMaxmemory();
     /* Completions free queue slots. Waiting fetches take them before the next pass spills. */
-    extStoragePollCompletions();
+    while (extStoragePollCompletions() == EXT_STORAGE_POLL_BATCH) {
+    }
     retryDeferredFetches();
+    serverAssert(server.el == NULL || ext_storage.is_keep_awake_running || !extStorageHasRequestsInFlight());
 }
 
 /* Pauses or resumes the handling of completions. */
@@ -748,6 +777,7 @@ storageStatus extStorageSpillItem(int dbid, robj *entry) {
     }
 
     setStorageState(entry, STORAGE_STATE_COPYING_TO_FLASH);
+    extStorageKeepAwake();
     return STORAGE_OK;
 }
 
@@ -865,6 +895,7 @@ static storageStatus submitFetch(int dbid, robj *o) {
     incrRefCount(o); /* Released in handleGetCompletion. */
     setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
     ext_storage.stats.num_items_fetching++;
+    extStorageKeepAwake();
     return STORAGE_OK;
 }
 
