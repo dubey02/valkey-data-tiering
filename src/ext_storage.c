@@ -816,11 +816,15 @@ void fetchItem(serverDb *db, robj *key) {
     serverAssert(state == STORAGE_STATE_ONLY_FLASH);
     storageRequestContext *req = zcalloc(sizeof(*req));
     req->entry = o;
-    storageStatus st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), req);
-    if (st != STORAGE_OK) {
-        /* STORAGE_WOULDBLOCK: queue full. TODO(#136): retry later, or reply with an error. */
-        serverPanic("Storage engine rejected the fetch");
+    storageStatus st;
+    /* A full queue holds spills and fetches that are already running. Handling
+     * their completions makes room, so the fetch is submitted again. TODO(#136) */
+    while ((st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), req)) ==
+               STORAGE_WOULDBLOCK &&
+           !ext_storage.is_foreground_paused) {
+        if (extStoragePollCompletions() == 0) usleep(100);
     }
+    if (st != STORAGE_OK) serverPanic("Storage engine rejected the fetch");
     incrRefCount(o); /* Released in handleGetCompletion. */
     setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
     ext_storage.stats.num_items_fetching++;

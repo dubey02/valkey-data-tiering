@@ -36,9 +36,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Maximum number of requests in flight. */
-#define FC_QUEUE_DEPTH 256
-
 /* The idle IO thread runs FlashCache's cron once per tick. A request wakes it
  * at once. The tick only keeps garbage collection going when no requests
  * arrive. */

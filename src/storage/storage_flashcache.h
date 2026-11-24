@@ -11,6 +11,9 @@
 
 #define STORAGE_FLASHCACHE_DB_FILE "flashcache.db"
 
+/* Maximum number of requests in flight. */
+#define FC_QUEUE_DEPTH 4096
+
 /* The FlashCache storage engine, selected by the name "flashcache". */
 const storageEngine *storageFlashCacheEngine(void);
 

@@ -2925,18 +2925,19 @@ TEST_F(BlockClientTest, AFetchInAnotherDbWakesTheClientToBlockAgain) {
     server.dbnum = 1;
 }
 
-TEST_F(BlockClientTest, AFetchTheEngineRefusesPanics) {
-    addFlashKey("a");
+/* A full storage engine queue is not an error. The fetch waits for room, then goes in. */
+TEST_F(BlockClientTest, AFetchWaitsWhenTheEngineQueueIsFull) {
+    robj *a = addFlashKey("a");
     client *c = makeClient("get a");
     fillEngineQueue();
 
-    EXPECT_DEATH(
-        {
-            /* The panic message goes to the server log, which is stdout by default. */
-            server.logfile = (char *)"/dev/stderr";
-            extStorageBlockClientIfRequired(c);
-        },
-        "Storage engine rejected the fetch");
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numFetching(), 1u);
+
+    /* The fetch is queued behind the fillers, so one poll batch may not reach it. */
+    for (int i = 0; i < 16 && numFetching() > 0; i++) extStorageBeforeSleep();
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
 }
 
 /* ---------------------------------------------------------------------------
