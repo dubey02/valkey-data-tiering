@@ -571,6 +571,7 @@ TEST_F(StorageFlashCacheTest, GetAfterAFlushReadsFromDisk) {
     EXPECT_GE(stats["db_size_bytes"], stats["active_db_size_bytes"]);
     EXPECT_GE(stats["fc_used_memory_bytes"], 1u);
     EXPECT_EQ(stats["db_used_over_allocatable_bytes"], 0u);
+    EXPECT_EQ(stats["num_requests_queued"], 0u);
     int buckets = 0;
     EXPECT_GE(sumHistogram(stats, "disk_write_latency_usec", &buckets), 1u);
     EXPECT_EQ(buckets, 9);

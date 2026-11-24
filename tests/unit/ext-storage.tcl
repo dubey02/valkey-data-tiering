@@ -114,7 +114,7 @@ if {$tiering_built} {
                     total_num_index_growths total_evicted_bytes evicting_under_max_log_size
                     total_num_items_evicted_under_max_log_size gc_rate_bytes_per_sec
                     min_gc_rate_bytes_per_sec total_gc_num_disk_reads total_gc_read_bytes
-                    total_gc_write_bytes total_gc_num_items_moved
+                    total_gc_write_bytes total_gc_num_items_moved num_requests_queued
                 } {
                     assert_match "*storage_engine_$field:*" $info
                 }

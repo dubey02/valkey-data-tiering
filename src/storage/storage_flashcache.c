@@ -466,8 +466,6 @@ static storageStatus fcDelAsync(uint32_t db_id, const char *key, size_t key_len,
     return fcSubmit(STORAGE_OP_DEL, db_id, key, key_len, NULL, request);
 }
 
-/* Reports the last snapshot. The IO thread refreshes it, so a value can be up
- * to FC_STATS_REFRESH_US old. */
 /* Reports a latency histogram as one dict, keyed by bucket bounds in
  * microseconds, such as 100-200 and 100000-inf. */
 static void fcInfoLatency(const storageInfoSink *s, const char *name, const unsigned long long *counts) {
@@ -485,6 +483,8 @@ static void fcInfoLatency(const storageInfoSink *s, const char *name, const unsi
     s->end_dict(s->ctx);
 }
 
+/* Reports the last snapshot. The IO thread refreshes it, so a value can be up
+ * to FC_STATS_REFRESH_US old. */
 static void fcInfo(const storageInfoSink *s) {
     if (!fc_io.running) return;
     pthread_mutex_lock(&fc_io.snap_mutex);
@@ -526,6 +526,8 @@ static void fcInfo(const storageInfoSink *s) {
     s->add_ulong_long(s->ctx, "total_gc_read_bytes", snap.gc_read_bytes);
     s->add_ulong_long(s->ctx, "total_gc_write_bytes", snap.gc_write_bytes);
     s->add_ulong_long(s->ctx, "total_gc_num_items_moved", snap.gc_num_items_moved);
+    /* Requests waiting for the IO thread. The queue has its own lock. */
+    s->add_ulong_long(s->ctx, "num_requests_queued", mutexQueueLength(fc_io.requests));
     fcInfoLatency(s, "disk_read_latency_usec", snap.disk_read_latency);
     fcInfoLatency(s, "disk_write_latency_usec", snap.disk_write_latency);
 }
