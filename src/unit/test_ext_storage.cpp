@@ -2679,6 +2679,23 @@ class BlockClientTest : public FetchCompletionTest {
     uint64_t numFetching() {
         return infoField("ext_storage_num_items_fetching_from_storage:");
     }
+
+    uint64_t numDeferred() {
+        return infoField("ext_storage_num_fetches_deferred:");
+    }
+
+    bool hasInfoField(const char *field) {
+        sds info = extStorageInfoString(sdsempty());
+        bool found = strstr(info, field) != NULL;
+        sdsfree(info);
+        return found;
+    }
+
+    /* Runs event loop passes until the client's fetches are done. The fetch may
+     * sit behind a full queue of fillers, so one pass is not always enough. */
+    void waitForFetches(client *c) {
+        for (int i = 0; i < 32 && isBlocked(c); i++) extStorageBeforeSleep();
+    }
 };
 
 TEST_F(BlockClientTest, NoKeysOnFlashDoesNotBlock) {
@@ -2925,19 +2942,198 @@ TEST_F(BlockClientTest, AFetchInAnotherDbWakesTheClientToBlockAgain) {
     server.dbnum = 1;
 }
 
-/* A full storage engine queue is not an error. The fetch waits for room, then goes in. */
-TEST_F(BlockClientTest, AFetchWaitsWhenTheEngineQueueIsFull) {
+/* A fetch refused for lack of a queue slot is deferred, not submitted. The
+ * client stays blocked and the main thread does not wait. The fetch goes in on
+ * a later pass, once completions have freed a slot. */
+TEST_F(BlockClientTest, AFetchIsDeferredWhenTheQueueIsFullAndRunsLater) {
     robj *a = addFlashKey("a");
     client *c = makeClient("get a");
     fillEngineQueue();
 
     EXPECT_TRUE(extStorageBlockClientIfRequired(c));
-    EXPECT_EQ(numFetching(), 1u);
+    EXPECT_TRUE(isBlocked(c));
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_EQ(numDeferred(), 1u);
+    EXPECT_EQ(numFetching(), 0u);
 
-    /* The fetch is queued behind the fillers, so one poll batch may not reach it. */
-    for (int i = 0; i < 16 && numFetching() > 0; i++) extStorageBeforeSleep();
+    /* The first pass frees slots and submits the fetch. The next completes it. */
+    extStorageBeforeSleep();
+    EXPECT_EQ(numDeferred(), 0u);
+    EXPECT_EQ(numFetching(), 1u);
+    EXPECT_TRUE(isBlocked(c));
+
+    waitForFetches(c);
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_TRUE(c->flag.unblocked);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(numFetched(), 1u);
+}
+
+/* A second client on the same deferred key adds no second entry. Both wake
+ * when the one fetch completes. */
+TEST_F(BlockClientTest, TwoClientsOnOneDeferredKeyShareOneEntry) {
+    addFlashKey("a");
+    client *c1 = makeClient("get a");
+    client *c2 = makeClient("get a");
+    fillEngineQueue();
+
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c1));
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c2));
+    EXPECT_EQ(numDeferred(), 1u);
+    EXPECT_EQ(infoField("ext_storage_total_num_fetches_deferred:"), 1u);
+
+    waitForFetches(c1);
+    EXPECT_FALSE(isBlocked(c1));
+    EXPECT_FALSE(isBlocked(c2));
+    EXPECT_EQ(numFetched(), 1u);
+}
+
+/* A key removed while its fetch is deferred is not fetched. The client wakes
+ * so its command runs again and finds the key gone. */
+TEST_F(BlockClientTest, ADeferredFetchOfARemovedKeyIsDroppedAndWakesTheClient) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+    fillEngineQueue();
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numDeferred(), 1u);
+
+    kvstoreHashtableDelete(server.db[0]->keys, 0, objectGetKey(a)); /* the deferred fetch still holds the entry */
+
+    extStorageBeforeSleep();
+    EXPECT_EQ(numDeferred(), 0u);
+    EXPECT_EQ(numFetching(), 0u);
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_TRUE(c->flag.unblocked);
+    EXPECT_EQ(numFetched(), 0u);
+}
+
+/* Deferred fetches take the freed slots before spills do, so a spill storm
+ * cannot starve a waiting client. */
+TEST_F(BlockClientTest, DeferredFetchesRunBeforeSpills) {
+    robj *a = addFlashKey("a");
+    for (int i = 0; i < 200; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "cold%d", i);
+        addRawKey(key);
+    }
+    client *c = makeClient("get a");
+    fillEngineQueue();
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numDeferred(), 1u);
+
+    /* Everything is over maxmemory from here, so each pass spills as much as
+     * the queue takes. The first pass finds it full and refuses every spill,
+     * yet the fetch gets a slot the moment completions free some. */
+    server.maxmemory = 1;
+    extStorageBeforeSleep();
+    EXPECT_EQ(numDeferred(), 0u);
+    EXPECT_EQ(numFetching(), 1u);
+    EXPECT_GT(infoField("ext_storage_total_num_spills_refused:"), 0u);
+    extStorageBeforeSleep();
+    EXPECT_GT(infoField("ext_storage_total_num_items_spilled_to_storage:"), 0u);
+    server.maxmemory = 0;
+
+    waitForFetches(c);
     EXPECT_FALSE(isBlocked(c));
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    extStorageSpillDrain();
+}
+
+/* Deferred fetches go in by age, and only as far as the free slots reach. The
+ * foreground is paused so the pass cannot free more than the one slot made by
+ * hand. */
+TEST_F(BlockClientTest, DeferredFetchesRetryInArrivalOrderUntilTheQueueIsFullAgain) {
+    robj *a = addFlashKey("a");
+    robj *b = addFlashKey("b");
+    client *ca = makeClient("get a");
+    client *cb = makeClient("get b");
+    fillEngineQueue();
+    EXPECT_TRUE(extStorageBlockClientIfRequired(ca));
+    EXPECT_TRUE(extStorageBlockClientIfRequired(cb));
+    EXPECT_EQ(numDeferred(), 2u);
+
+    debugExtStorage("pause-foreground", "1");
+    ASSERT_EQ(storageMockRunIo(1), 1); /* one slot */
+    extStorageBeforeSleep();
+    EXPECT_EQ(numDeferred(), 1u);
+    EXPECT_EQ(numFetching(), 1u);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_COPYING_TO_MEMORY);
+    EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_FLASH);
+    EXPECT_TRUE(isBlocked(ca));
+    EXPECT_TRUE(isBlocked(cb));
+
+    debugExtStorage("pause-foreground", "0");
+    waitForFetches(cb);
+    EXPECT_FALSE(isBlocked(ca));
+    EXPECT_FALSE(isBlocked(cb));
+    EXPECT_EQ(numDeferred(), 0u);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(getStorageState(b), STORAGE_STATE_ONLY_MEMORY);
+}
+
+/* A deferred fetch whose client went away is dropped at shutdown. Nothing is
+ * left to wake and nothing was handed to the storage engine. */
+TEST_F(BlockClientTest, ShutdownDropsADeferredFetchAfterItsClientIsFreed) {
+    addFlashKey("a");
+    client *c = makeClient("get a");
+    fillEngineQueue();
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numDeferred(), 1u);
+
+    unblockClient(c, 0); /* as freeClient does */
+    EXPECT_FALSE(isBlocked(c));
+
+    extStorageDeinit(); /* TearDown's call is then a no-op */
+    EXPECT_FALSE(c->flag.unblocked);
+}
+
+/* The age of the oldest deferred fetch is 0 with none waiting. */
+TEST_F(BlockClientTest, OldestDeferredFetchAgeFollowsTheList) {
+    robj *a = addFlashKey("a");
+    client *c = makeClient("get a");
+    EXPECT_TRUE(hasInfoField("ext_storage_deferred_fetch_oldest_ms:"));
+    EXPECT_EQ(infoField("ext_storage_deferred_fetch_oldest_ms:"), 0u);
+
+    fillEngineQueue();
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_LT(infoField("ext_storage_deferred_fetch_oldest_ms:"), 60000u); /* just deferred */
+
+    waitForFetches(c);
+    EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(infoField("ext_storage_deferred_fetch_oldest_ms:"), 0u);
+}
+
+/* The retry looks the key up in the db the fetch was deferred for. */
+TEST_F(BlockClientTest, ADeferredFetchInAnotherDbRunsAgainstThatDb) {
+    server.dbnum = 2;
+    server.db = (serverDb **)zrealloc(server.db, sizeof(serverDb *) * 2);
+    server.db[1] = (serverDb *)zcalloc(sizeof(serverDb));
+    server.db[1]->id = 1;
+    server.db[1]->keys = kvstoreCreate(&kvstoreKeysHashtableType, 0, 0);
+    server.db[1]->expires = kvstoreCreate(&kvstoreExpiresHashtableType, 0, 0);
+    /* Reopened so the storage engine accepts db 1. */
+    extStorageDeinit();
+    extStorageInit();
+
+    robj *b1 = addKeyTo(server.db[1], 0, "b", rawValue(), -1);
+    spill(b1, 1);
+    client *c = makeClient("get b");
+    c->db = server.db[1];
+    fillEngineQueue();
+    EXPECT_TRUE(extStorageBlockClientIfRequired(c));
+    EXPECT_EQ(numDeferred(), 1u);
+
+    waitForFetches(c);
+    EXPECT_FALSE(isBlocked(c));
+    EXPECT_EQ(numDeferred(), 0u);
+    EXPECT_EQ(getStorageState(b1), STORAGE_STATE_ONLY_MEMORY);
+    EXPECT_EQ(numFetched(), 1u);
+
+    drainPool();
+    kvstoreRelease(server.db[1]->expires);
+    kvstoreRelease(server.db[1]->keys);
+    zfree(server.db[1]);
+    server.dbnum = 1;
 }
 
 /* ---------------------------------------------------------------------------

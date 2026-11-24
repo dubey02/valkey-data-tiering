@@ -60,7 +60,33 @@ typedef struct extStorageStats {
     uint64_t num_items_fetching;
     /* Fetches that completed with an error. */
     uint64_t total_num_fetch_errors;
+    /* Fetches the storage engine refused for lack of a queue slot. */
+    uint64_t total_num_fetches_deferred;
 } extStorageStats;
+
+/* A fetch waiting for a queue slot. */
+typedef struct deferredFetch {
+    int dbid;
+    robj *entry; /* Referenced until the fetch is submitted or dropped. */
+    mstime_t since;
+} deferredFetch;
+
+/* Keyed by the entry pointer. The reference held by the deferred fetch keeps
+ * the entry in place, so the pointer stays valid. */
+static uint64_t deferredFetchHash(const void *key) {
+    return dictGenHashFunction((const char *)&key, sizeof(key));
+}
+
+static int deferredFetchKeyCompare(const void *key1, const void *key2) {
+    return key1 == key2;
+}
+
+static dictType deferredFetchDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = deferredFetchHash,
+    .keyCompare = deferredFetchKeyCompare,
+    .entryDestructor = dictVanillaFree,
+};
 
 /* Spill accounting
  *
@@ -89,6 +115,10 @@ typedef struct extStorageContext {
     bool is_background_paused;
     extStorageStats stats;
     spillAccount spill_account;
+    /* Fetches refused for lack of a queue slot, in arrival order. */
+    list *deferred_fetches;
+    /* The deferred entries, so a second client on one key adds no second fetch. */
+    dict *deferred_fetch_index;
 } extStorageContext;
 
 static extStorageContext ext_storage = {0};
@@ -360,6 +390,8 @@ void extStorageInit(void) {
     ext_storage.is_foreground_paused = false;
     ext_storage.is_background_paused = false;
     ext_storage.stats = (extStorageStats){0};
+    ext_storage.deferred_fetches = listCreate();
+    ext_storage.deferred_fetch_index = dictCreate(&deferredFetchDictType);
     spillAccountReset();
 
     serverLog(LL_NOTICE, "Data tiering enabled. Storage engine \"%s\", capacity %llu bytes.", engine->name,
@@ -371,6 +403,9 @@ void extStorageInit(void) {
 
 static void spillComplete(const storageCompletion *comp);
 static void handleGetCompletion(const storageCompletion *completion);
+static void retryDeferredFetches(void);
+static void dropDeferredFetch(listNode *ln);
+static mstime_t oldestDeferredFetchMs(void);
 
 /* Handles one finished request. */
 static void extStorageProcessCompletion(const storageCompletion *completion) {
@@ -411,7 +446,9 @@ static void spillIfOverMaxmemory(void) {
 void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
     spillIfOverMaxmemory();
+    /* Completions free queue slots. Waiting fetches take them before the next pass spills. */
     extStoragePollCompletions();
+    retryDeferredFetches();
 }
 
 /* Pauses or resumes the handling of completions. */
@@ -439,6 +476,13 @@ static void extStorageResumeProcessing(void) {
 void extStorageDeinit(void) {
     if (!ext_storage.open) return;
     extStorageResumeProcessing();
+    /* A deferred fetch was never handed to the storage engine, so it is dropped. */
+    listNode *ln;
+    while ((ln = listFirst(ext_storage.deferred_fetches)) != NULL) dropDeferredFetch(ln);
+    listRelease(ext_storage.deferred_fetches);
+    ext_storage.deferred_fetches = NULL;
+    dictRelease(ext_storage.deferred_fetch_index);
+    ext_storage.deferred_fetch_index = NULL;
     storageStatus st;
     int drained = 0;
     mstime_t drain_start = 0;
@@ -536,6 +580,9 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
                         "ext_storage_num_items_fetching_from_storage:%llu\r\n"
                         "ext_storage_total_num_fetch_errors:%llu\r\n"
+                        "ext_storage_num_fetches_deferred:%lu\r\n"
+                        "ext_storage_total_num_fetches_deferred:%llu\r\n"
+                        "ext_storage_deferred_fetch_oldest_ms:%lld\r\n"
                         "ext_storage_foreground_paused:%d\r\n"
                         "ext_storage_background_paused:%d\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
@@ -550,6 +597,9 @@ sds extStorageInfoString(sds info) {
                         (unsigned long long)st->total_num_items_deleted,
                         (unsigned long long)st->num_items_fetching,
                         (unsigned long long)st->total_num_fetch_errors,
+                        listLength(ext_storage.deferred_fetches),
+                        (unsigned long long)st->total_num_fetches_deferred,
+                        (long long)oldestDeferredFetchMs(),
                         ext_storage.is_foreground_paused,
                         ext_storage.is_background_paused);
 }
@@ -808,26 +858,89 @@ static void spillComplete(const storageCompletion *comp) {
  * Fetching Paths
  * ---------------------------------------------------------------------------*/
 
-/* Submits a fetch for one ONLY_FLASH object. */
-void fetchItem(serverDb *db, robj *key) {
-    robj *o = dbFind(db, objectGetVal(key));
-    storageState state = getStorageState(o);
-    if (state == STORAGE_STATE_COPYING_TO_MEMORY) return;
-    serverAssert(state == STORAGE_STATE_ONLY_FLASH);
+/* Hands one fetch to the storage engine. Returns STORAGE_WOULDBLOCK, with
+ * nothing changed, when the queue is full. */
+static storageStatus submitFetch(int dbid, robj *o) {
+    sds key = objectGetKey(o);
     storageRequestContext *req = zcalloc(sizeof(*req));
     req->entry = o;
-    storageStatus st;
-    /* A full queue holds spills and fetches that are already running. Handling
-     * their completions makes room, so the fetch is submitted again. TODO(#136) */
-    while ((st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), req)) ==
-               STORAGE_WOULDBLOCK &&
-           !ext_storage.is_foreground_paused) {
-        if (extStoragePollCompletions() == 0) usleep(100);
+    storageStatus st = ext_storage.engine->get_async(dbid, key, sdslen(key), req);
+    if (st == STORAGE_WOULDBLOCK) {
+        zfree(req);
+        return st;
     }
     if (st != STORAGE_OK) serverPanic("Storage engine rejected the fetch");
     incrRefCount(o); /* Released in handleGetCompletion. */
     setStorageState(o, STORAGE_STATE_COPYING_TO_MEMORY);
     ext_storage.stats.num_items_fetching++;
+    return STORAGE_OK;
+}
+
+/* Puts a fetch aside until a queue slot frees. The entry stays ONLY_FLASH and
+ * the clients blocked on the key stay blocked meanwhile. */
+static void deferFetch(int dbid, robj *o) {
+    deferredFetch *df = zmalloc(sizeof(*df));
+    df->dbid = dbid;
+    df->entry = o;
+    df->since = mstime();
+    incrRefCount(o); /* Released when the fetch is submitted or dropped. */
+    listAddNodeTail(ext_storage.deferred_fetches, df);
+    serverAssert(dictAdd(ext_storage.deferred_fetch_index, o, NULL) == DICT_OK);
+    ext_storage.stats.total_num_fetches_deferred++;
+}
+
+/* Submits a fetch for one ONLY_FLASH object, or defers it when the queue is
+ * full. A key whose fetch is already deferred gets no second one. */
+void fetchItem(serverDb *db, robj *key) {
+    robj *o = dbFind(db, objectGetVal(key));
+    storageState state = getStorageState(o);
+    if (state == STORAGE_STATE_COPYING_TO_MEMORY) return;
+    serverAssert(state == STORAGE_STATE_ONLY_FLASH);
+    if (dictFind(ext_storage.deferred_fetch_index, o) != NULL) return;
+    if (submitFetch(db->id, o) == STORAGE_WOULDBLOCK) deferFetch(db->id, o);
+}
+
+/* Takes a deferred fetch off the list and the index. */
+static void removeDeferredFetch(listNode *ln) {
+    deferredFetch *df = listNodeValue(ln);
+    serverAssert(dictDelete(ext_storage.deferred_fetch_index, df->entry) == DICT_OK);
+    decrRefCount(df->entry);
+    zfree(df);
+    listDelNode(ext_storage.deferred_fetches, ln);
+}
+
+/* Drops a deferred fetch and wakes the clients blocked on its key, so the
+ * command runs again against whatever the key is now. */
+static void dropDeferredFetch(listNode *ln) {
+    deferredFetch *df = listNodeValue(ln);
+    robj key;
+    initStaticStringObject(key, objectGetKey(df->entry));
+    unblockClientsInUseOnKey(&key);
+    removeDeferredFetch(ln);
+}
+
+/* Submits deferred fetches in arrival order until the queue is full again. A
+ * key that was flushed or replaced meanwhile is dropped instead. */
+static void retryDeferredFetches(void) {
+    listNode *ln;
+    while ((ln = listFirst(ext_storage.deferred_fetches)) != NULL) {
+        deferredFetch *df = listNodeValue(ln);
+        robj *o = df->entry;
+        if (dbFind(server.db[df->dbid], objectGetKey(o)) != o) {
+            dropDeferredFetch(ln);
+            continue;
+        }
+        serverAssert(getStorageState(o) == STORAGE_STATE_ONLY_FLASH);
+        if (submitFetch(df->dbid, o) == STORAGE_WOULDBLOCK) return;
+        removeDeferredFetch(ln);
+    }
+}
+
+/* Age of the oldest deferred fetch, 0 when none is waiting. */
+static mstime_t oldestDeferredFetchMs(void) {
+    listNode *ln = listFirst(ext_storage.deferred_fetches);
+    if (ln == NULL) return 0;
+    return mstime() - ((deferredFetch *)listNodeValue(ln))->since;
 }
 
 /* Moves a fetched value into its entry, then unblocks the clients waiting on
