@@ -818,7 +818,7 @@ void fetchItem(serverDb *db, robj *key) {
     req->entry = o;
     storageStatus st;
     /* A full queue holds spills and fetches that are already running. Handling
-     * their completions makes room, so the fetch is submitted again. */
+     * their completions makes room, so the fetch is submitted again. TODO(#136) */
     while ((st = ext_storage.engine->get_async(db->id, objectGetVal(key), sdslen(objectGetVal(key)), req)) ==
                STORAGE_WOULDBLOCK &&
            !ext_storage.is_foreground_paused) {
