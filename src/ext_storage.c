@@ -71,22 +71,10 @@ typedef struct deferredFetch {
     mstime_t since;
 } deferredFetch;
 
-/* Keyed by the entry pointer. The reference held by the deferred fetch keeps
- * the entry in place, so the pointer stays valid. */
-static uint64_t deferredFetchHash(const void *key) {
-    return dictGenHashFunction((const char *)&key, sizeof(key));
-}
-
-static int deferredFetchKeyCompare(const void *key1, const void *key2) {
-    return key1 == key2;
-}
-
-static dictType deferredFetchDictType = {
-    .entryGetKey = dictEntryGetKey,
-    .hashFunction = deferredFetchHash,
-    .keyCompare = deferredFetchKeyCompare,
-    .entryDestructor = dictVanillaFree,
-};
+/* A set of entry pointers. The hashtable defaults hash and compare the pointer
+ * itself. The reference held by the deferred fetch keeps the entry in place,
+ * so the pointer stays valid. */
+static hashtableType deferredFetchSetType = {0};
 
 /* Spill accounting
  *
@@ -118,7 +106,7 @@ typedef struct extStorageContext {
     /* Fetches refused for lack of a queue slot, in arrival order. */
     list *deferred_fetches;
     /* The deferred entries, so a second client on one key adds no second fetch. */
-    dict *deferred_fetch_index;
+    hashtable *deferred_fetch_index;
 } extStorageContext;
 
 static extStorageContext ext_storage = {0};
@@ -391,7 +379,7 @@ void extStorageInit(void) {
     ext_storage.is_background_paused = false;
     ext_storage.stats = (extStorageStats){0};
     ext_storage.deferred_fetches = listCreate();
-    ext_storage.deferred_fetch_index = dictCreate(&deferredFetchDictType);
+    ext_storage.deferred_fetch_index = hashtableCreate(&deferredFetchSetType);
     spillAccountReset();
 
     serverLog(LL_NOTICE, "Data tiering enabled. Storage engine \"%s\", capacity %llu bytes.", engine->name,
@@ -481,7 +469,7 @@ void extStorageDeinit(void) {
     while ((ln = listFirst(ext_storage.deferred_fetches)) != NULL) dropDeferredFetch(ln);
     listRelease(ext_storage.deferred_fetches);
     ext_storage.deferred_fetches = NULL;
-    dictRelease(ext_storage.deferred_fetch_index);
+    hashtableRelease(ext_storage.deferred_fetch_index);
     ext_storage.deferred_fetch_index = NULL;
     storageStatus st;
     int drained = 0;
@@ -885,7 +873,7 @@ static void deferFetch(int dbid, robj *o) {
     df->since = mstime();
     incrRefCount(o); /* Released when the fetch is submitted or dropped. */
     listAddNodeTail(ext_storage.deferred_fetches, df);
-    serverAssert(dictAdd(ext_storage.deferred_fetch_index, o, NULL) == DICT_OK);
+    serverAssert(hashtableAdd(ext_storage.deferred_fetch_index, o));
     ext_storage.stats.total_num_fetches_deferred++;
 }
 
@@ -896,14 +884,14 @@ void fetchItem(serverDb *db, robj *key) {
     storageState state = getStorageState(o);
     if (state == STORAGE_STATE_COPYING_TO_MEMORY) return;
     serverAssert(state == STORAGE_STATE_ONLY_FLASH);
-    if (dictFind(ext_storage.deferred_fetch_index, o) != NULL) return;
+    if (hashtableFind(ext_storage.deferred_fetch_index, o, NULL)) return;
     if (submitFetch(db->id, o) == STORAGE_WOULDBLOCK) deferFetch(db->id, o);
 }
 
 /* Takes a deferred fetch off the list and the index. */
 static void removeDeferredFetch(listNode *ln) {
     deferredFetch *df = listNodeValue(ln);
-    serverAssert(dictDelete(ext_storage.deferred_fetch_index, df->entry) == DICT_OK);
+    serverAssert(hashtableDelete(ext_storage.deferred_fetch_index, df->entry));
     decrRefCount(df->entry);
     zfree(df);
     listDelNode(ext_storage.deferred_fetches, ln);
