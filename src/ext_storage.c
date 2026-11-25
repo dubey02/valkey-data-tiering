@@ -12,6 +12,7 @@
 #ifdef USE_EXT_STORAGE
 
 #include "ext_storage.h"
+#include "module.h"
 #include "rdb.h"
 #include "storage/storage_flashcache.h"
 #include "storage/storage_mock.h"
@@ -188,12 +189,14 @@ static size_t spillAccountGetEstimatedInflightMem(void) {
 }
 
 /* Serialization and Deserialization Functions
- * The storage engine may call these from its own IO thread. */
+ * The storage engine may call these from its own IO thread. So a module type's
+ * rdb_save, rdb_load and mem_usage run there too, which its module accepts
+ * with VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE. */
 
 /* Serialize in the DUMP wire format, so every type and encoding is handled. A
  * put from extStorageSpillItem() passes the request inside its spillRequest,
  * and its size is recorded there. */
-static int extStorageSerialize(const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
+static int extStorageSerialize(uint32_t db_id, const char *key, size_t key_len, const valkeyObject *entry, storageRequestContext *request, char **out) {
     spillRequest *req = (spillRequest *)request;
     sds key_sds = sdsnewlen(key, key_len);
     robj key_obj;
@@ -201,7 +204,7 @@ static int extStorageSerialize(const char *key, size_t key_len, const valkeyObje
 
     rio payload;
     size_t value_mem_usage = 0;
-    createDumpPayloadSized(&payload, (robj *)entry, &key_obj, -1, req ? &value_mem_usage : NULL);
+    createDumpPayloadSized(&payload, (robj *)entry, &key_obj, (int)db_id, req ? &value_mem_usage : NULL);
     sdsfree(key_sds);
 
     size_t len = sdslen(payload.io.buffer.ptr);
@@ -215,7 +218,7 @@ static int extStorageSerialize(const char *key, size_t key_len, const valkeyObje
     return (int)len;
 }
 
-static valkeyObject *extStorageDeserialize(const char *key, size_t key_len, const char *bytes, int len) {
+static valkeyObject *extStorageDeserialize(uint32_t db_id, const char *key, size_t key_len, const char *bytes, int len) {
     if (len < 0) return NULL;
     /* Verify the DUMP footer (version + CRC) before loading, so a corrupt or
      * truncated record returns NULL instead of garbage, as restoreCommand does. */
@@ -228,7 +231,7 @@ static valkeyObject *extStorageDeserialize(const char *key, size_t key_len, cons
     if (type != -1) {
         sds key_sds = sdsnewlen(key, key_len);
         if (extStorageTryAcquireLoadingLock()) {
-            o = rdbLoadObject(type, &payload, key_sds, -1, NULL, RDBFLAGS_NONE, 0);
+            o = rdbLoadObject(type, &payload, key_sds, (int)db_id, NULL, RDBFLAGS_NONE, 0);
             extStorageReleaseLoadingLock();
         }
         sdsfree(key_sds);
@@ -652,13 +655,17 @@ void setStorageState(robj *o, storageState state) {
 /* True when the value of 'o' may be moved to the storage engine. The value
  * must still be in memory and be the only reference to its allocation.
  * Embedded strings and INT encodings have no separate allocation to free.
- * Module values have no serializer yet (#81). A key with a TTL, or a hash with
- * field expirations, stays in DRAM because expiry deletes and changes values
- * without checking where they are.
- * TODO(#57): spill them once expiry handles keys on flash. */
+ * A module value spills only if its module declared
+ * VALKEYMODULE_OPTIONS_HANDLE_EXT_STORAGE.
+ * A key with a TTL, or a hash with field expirations, stays in DRAM because
+ * expiry deletes and changes values without checking where they are.
+ * TODO(#57): spill them once expiry handles keys on flash.
+ * TODO(#47): deleting a module key on flash without a fetch, as RM_Call or
+ * slot cleanup does, crashes reading the module type from its value. */
 static bool isSpillCandidate(const robj *o) {
     if (!extStorageIsMemoryOnly(o) || o->hasembval || objectGetRefcount(o) != 1) return false;
-    if (objectGetEncoding(o) == OBJ_ENCODING_INT || objectGetType(o) == OBJ_MODULE) return false;
+    if (objectGetEncoding(o) == OBJ_ENCODING_INT) return false;
+    if (objectGetType(o) == OBJ_MODULE && !moduleValueHandlesExtStorage((robj *)o)) return false;
     if (objectGetExpire(o) != EXPIRY_NONE) return false;
     return !(objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields((robj *)o));
 }
@@ -767,17 +774,18 @@ int extStorageDebugCommand(client *c) {
 }
 
 /* Frees the value the way dbSetValue() frees an overwritten one. The object,
- * which holds the key, stays.
- * TODO(#81): pass the key and dbid once module values spill, since a module's
- * free_effort callback may read them. */
-static void spillFreeValue(robj *entry) {
+ * which holds the key, stays. */
+static void spillFreeValue(robj *entry, int dbid) {
     robj *val = createObject(objectGetType(entry), objectGetVal(entry));
     val->encoding = objectGetEncoding(entry);
     objectSetVal(entry, NULL);
-    if (server.lazyfree_lazy_server_del)
-        freeObjAsync(NULL, val, -1);
-    else
+    if (server.lazyfree_lazy_server_del) {
+        robj key;
+        initStaticStringObject(key, objectGetKey(entry));
+        freeObjAsync(&key, val, dbid);
+    } else {
         decrRefCount(val);
+    }
 }
 
 /* Handles a finished write. A write accepted by the storage engine must
@@ -788,7 +796,7 @@ static void spillComplete(const storageCompletion *comp) {
     serverAssert(getStorageState(entry) == STORAGE_STATE_COPYING_TO_FLASH);
     serverAssert(comp->status == STORAGE_OK);
 
-    spillFreeValue(entry);
+    spillFreeValue(entry, (int)comp->db_id);
     setStorageState(entry, STORAGE_STATE_ONLY_FLASH);
     spillAccountSubtractSized(req);
     ext_storage.stats.num_items_spilling--;

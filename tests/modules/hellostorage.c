@@ -184,7 +184,7 @@ static storageStatus helloPut(uint32_t db_id, const char *key, size_t key_len, c
     /* The storage engine stores bytes, not objects. The valkey server hands it a
      * serializer so it never needs to know the object layout. */
     char *bytes = NULL;
-    int len = hello.cfg.serializer.serialize(key, key_len, entry, request, &bytes);
+    int len = hello.cfg.serializer.serialize(db_id, key, key_len, entry, request, &bytes);
     if (len < 0 || bytes == NULL) return STORAGE_ERR_REJECTED;
 
     storageStatus st = STORAGE_OK;
@@ -232,7 +232,7 @@ static storageStatus helloGet(uint32_t db_id, const char *key, size_t key_len, v
 
     /* The storage engine turns stored bytes back into a keyless value object through the
      * same serializer. The valkey server owns the object after this. */
-    valkeyObject *obj = hello.cfg.serializer.deserialize(key, key_len, (*slot)->val, (int)(*slot)->val_len);
+    valkeyObject *obj = hello.cfg.serializer.deserialize(db_id, key, key_len, (*slot)->val, (int)(*slot)->val_len);
 
     /* A get consumes the record, so the stored copy goes away either way. */
     helloRecord *victim = *slot;
