@@ -272,26 +272,37 @@ if {$tiering_built} {
             assert_match {* storage_state:2 *} [r debug object key:255 fast]
         } {} {needs:debug}
 
-        test "Fetches on an idle server finish without waiting for serverCron ($engine)" {
-            r flushall
-            set keys {}
-            for {set i 0} {$i < 5} {incr i} {
-                r set key:$i [string repeat x 1000]
-                lappend keys key:$i
-            }
-            assert_equal OK [r debug ext-storage spill {*}$keys]
-            wait_for_flash {*}$keys
-            # At hz 1, a fetch that waits for serverCron takes about half a second.
-            set hz [lindex [r config get hz] 1]
-            r config set hz 1
-            set start [clock milliseconds]
-            foreach key $keys {
-                assert_equal [string repeat x 1000] [r get $key]
-            }
-            set elapsed [expr {[clock milliseconds] - $start}]
-            r config set hz $hz
-            assert_lessthan $elapsed 500
-        } {} {needs:debug}
+        # The mock storage engine finishes requests when they are polled, so only
+        # FlashCache can leave a completion waiting while the event loop sleeps.
+        if {$engine eq "flashcache"} {
+            test "Fetches on an idle server don't wait for serverCron, and the keep-awake timer stops" {
+                r flushall
+                set keys {}
+                for {set i 0} {$i < 5} {incr i} {
+                    r set key:$i [string repeat x 1000]
+                    lappend keys key:$i
+                }
+                assert_equal OK [r debug ext-storage spill {*}$keys]
+                wait_for_flash {*}$keys
+                # At hz 1, a fetch that waits for serverCron takes about half a second.
+                set hz [lindex [r config get hz] 1]
+                r config set hz 1
+                set wakeups [getInfoProperty [r info ext_storage] ext_storage_total_num_keep_awake_wakeups]
+                set start [clock milliseconds]
+                foreach key $keys {
+                    assert_equal [string repeat x 1000] [r get $key]
+                }
+                set elapsed [expr {[clock milliseconds] - $start}]
+                # With nothing in flight, a running timer would add about 500 cycles.
+                set cycles [s eventloop_cycles]
+                after 500
+                set idle_cycles [expr {[s eventloop_cycles] - $cycles}]
+                r config set hz $hz
+                assert_lessthan $elapsed 500
+                assert_morethan [getInfoProperty [r info ext_storage] ext_storage_total_num_keep_awake_wakeups] $wakeups
+                assert_lessthan $idle_cycles 50
+            } {} {needs:debug}
+        }
 
         test "DEBUG commands that read a value fail on a key on flash ($engine)" {
             r flushall

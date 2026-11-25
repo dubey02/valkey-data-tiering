@@ -1074,6 +1074,7 @@ class SpillSelectTest : public ::testing::Test {
 
     void SetUp() override {
         memset(&server, 0, sizeof(valkeyServer));
+        server.el = aeCreateEventLoop(1024); /* Never run, so its timers don't fire. */
         server.dbnum = 1;
         server.maxmemory_samples = 5;
         server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
@@ -1091,6 +1092,8 @@ class SpillSelectTest : public ::testing::Test {
         kvstoreRelease(server.db[0]->keys);
         zfree(server.db[0]);
         zfree(server.db);
+        aeDeleteEventLoop(server.el);
+        server.el = NULL;
     }
 
     void drainPool(void) {
@@ -3389,8 +3392,7 @@ TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
 }
 
 /* beforeSleep() spills without a command. The replica case is in ext-storage.tcl.
- * The mock storage engine runs the spill when completions are polled, so it
- * completes within the same extStorageBeforeSleep(). */
+ * beforeSleep() polls before it spills, so the spill completes in the next one. */
 TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
     robj *entry = addRawKey("key");
     extStorageBeforeSleep();
@@ -3399,6 +3401,8 @@ TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
     server.maxmemory = zmalloc_used_memory() - 1;
     extStorageBeforeSleep();
     server.maxmemory = 0;
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    extStorageBeforeSleep();
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 

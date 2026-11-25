@@ -64,6 +64,8 @@ typedef struct extStorageStats {
     uint64_t total_num_fetch_errors;
     /* Fetches the storage engine refused for lack of a queue slot. */
     uint64_t total_num_fetches_deferred;
+    /* Keep-awake timer runs. */
+    uint64_t total_num_keep_awake_wakeups;
 } extStorageStats;
 
 /* A fetch waiting for a queue slot. */
@@ -120,6 +122,9 @@ static extStorageContext ext_storage = {0};
 
 /* Longest the event loop sleeps while requests are in flight. */
 #define EXT_STORAGE_KEEP_AWAKE_MS 1
+
+/* Longest beforeSleep spends handling completions. */
+#define EXT_STORAGE_DRAIN_BUDGET_US 1000
 
 /* Guards rdbLoadObject during deserialization. */
 static pthread_mutex_t ext_storage_loading_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -384,6 +389,7 @@ void extStorageInit(void) {
     ext_storage.capacity_bytes = cfg.capacity_bytes;
     ext_storage.is_foreground_paused = false;
     ext_storage.is_background_paused = false;
+    ext_storage.is_keep_awake_running = false;
     ext_storage.stats = (extStorageStats){0};
     ext_storage.deferred_fetches = listCreate();
     ext_storage.deferred_fetch_index = hashtableCreate(&deferredFetchSetType);
@@ -436,6 +442,7 @@ static long long extStorageKeepAwakeProc(struct aeEventLoop *el, long long id, v
     UNUSED(el);
     UNUSED(id);
     UNUSED(client_data);
+    ext_storage.stats.total_num_keep_awake_wakeups++;
     if (ext_storage.open && extStorageHasRequestsInFlight()) return EXT_STORAGE_KEEP_AWAKE_MS;
     ext_storage.is_keep_awake_running = false;
     return AE_NOMORE;
@@ -443,7 +450,7 @@ static long long extStorageKeepAwakeProc(struct aeEventLoop *el, long long id, v
 
 /* Keeps the event loop awake until the requests in flight complete. */
 static void extStorageKeepAwake(void) {
-    if (ext_storage.is_keep_awake_running || server.el == NULL) return;
+    if (ext_storage.is_keep_awake_running) return;
     ext_storage.is_keep_awake_running =
         aeCreateTimeEvent(server.el, EXT_STORAGE_KEEP_AWAKE_MS, extStorageKeepAwakeProc, NULL, NULL) != AE_ERR;
 }
@@ -458,16 +465,18 @@ static void spillIfOverMaxmemory(void) {
     extStorageSpillOverMaxmemory(mem_tofree);
 }
 
-/* Runs once per event loop iteration, from beforeSleep. Handles every
- * completion that is ready. */
+/* Runs once per event loop iteration, from beforeSleep. Handles the completions
+ * that are ready, up to the drain budget, then spills over maxmemory. */
 void extStorageBeforeSleep(void) {
     if (!ext_storage.open) return;
-    spillIfOverMaxmemory();
     /* Completions free queue slots. Waiting fetches take them before the next pass spills. */
-    while (extStoragePollCompletions() == EXT_STORAGE_POLL_BATCH) {
+    monotime start = getMonotonicUs();
+    while (extStoragePollCompletions() == EXT_STORAGE_POLL_BATCH &&
+           getMonotonicUs() - start < EXT_STORAGE_DRAIN_BUDGET_US) {
     }
     retryDeferredFetches();
-    serverAssert(server.el == NULL || ext_storage.is_keep_awake_running || !extStorageHasRequestsInFlight());
+    spillIfOverMaxmemory();
+    debugServerAssert(ext_storage.is_keep_awake_running || !extStorageHasRequestsInFlight());
 }
 
 /* Pauses or resumes the handling of completions. */
@@ -603,6 +612,7 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_num_fetches_deferred:%lu\r\n"
                         "ext_storage_total_num_fetches_deferred:%llu\r\n"
                         "ext_storage_deferred_fetch_oldest_ms:%lld\r\n"
+                        "ext_storage_total_num_keep_awake_wakeups:%llu\r\n"
                         "ext_storage_foreground_paused:%d\r\n"
                         "ext_storage_background_paused:%d\r\n",
                         ext_storage.engine->name, VALKEY_STORAGE_API_VERSION,
@@ -621,6 +631,7 @@ sds extStorageInfoString(sds info) {
                         listLength(ext_storage.deferred_fetches),
                         (unsigned long long)st->total_num_fetches_deferred,
                         (long long)oldestDeferredFetchMs(),
+                        (unsigned long long)st->total_num_keep_awake_wakeups,
                         ext_storage.is_foreground_paused,
                         ext_storage.is_background_paused);
 }
