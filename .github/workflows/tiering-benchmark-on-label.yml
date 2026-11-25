@@ -501,8 +501,6 @@ jobs:
       - name: Comment results
         if: needs.benchmark.result != 'skipped' && hashFiles('comparison.md') != ''
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        env:
-          BENCHMARK_RESULT: ${{ needs.benchmark.result }}
         with:
           script: |
             const fs = require('fs');
@@ -515,15 +513,11 @@ jobs:
             const what = pr
               ? `PR #${pr} merged onto base ${link(base)} (PR head ${link(head)})`
               : `${link(head)} compared with base ${link(base)}`;
-            const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const title = process.env.BENCHMARK_RESULT === 'success'
-              ? 'Data tiering benchmark'
-              : `Data tiering benchmark, partial results (the benchmark ${process.env.BENCHMARK_RESULT}, [see the run](${run}))`;
             await github.rest.issues.createComment({
               issue_number: Number('${{ needs.prepare.outputs.comment-number }}'),
               owner,
               repo,
-              body: `**${title}:** ${what}\n\n${body}`
+              body: `**Data tiering benchmark:** ${what}\n\n${body}`
             });
 
       - name: Comment that the benchmark failed
