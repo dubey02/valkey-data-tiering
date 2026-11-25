@@ -3032,6 +3032,11 @@ TEST_F(DebugSpillTest, ADebugReadOfAKeyBeingSpilledFails) {
  * Spilling over maxmemory
  * ---------------------------------------------------------------------------*/
 
+/* Bytes over maxmemory at the spill OOM cap. */
+static size_t oomCapBytesOverMaxmemory() {
+    return server.maxmemory / 100 * (EXT_STORAGE_OOM_PERCENT - 100);
+}
+
 /* While spills are in flight, writes are allowed: the spills free memory once
  * they complete. */
 TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
@@ -3063,7 +3068,7 @@ TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhenNothingCanBeSpilled) {
     server.maxmemory = 100000000;
     addKey("embedded", createStringObject("short", 5));
     unsigned long long over_limit = infoField("ext_storage_total_num_spill_rounds_over_oom_limit");
-    EXPECT_FALSE(extStorageSpillOverMaxmemory(server.maxmemory / 5 + 1));
+    EXPECT_FALSE(extStorageSpillOverMaxmemory(oomCapBytesOverMaxmemory() + 1));
     EXPECT_EQ(infoField("ext_storage_total_num_spill_rounds_over_oom_limit"), over_limit + 1);
     server.maxmemory = 0;
 }
@@ -3073,11 +3078,11 @@ TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhenNothingCanBeSpilled) {
 TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhileStillSpilling) {
     server.maxmemory = 100000000;
     addRawKey("key");
-    EXPECT_TRUE(extStorageSpillOverMaxmemory(server.maxmemory / 5)); /* Exactly at the cap. */
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(oomCapBytesOverMaxmemory())); /* Exactly at the cap. */
     ASSERT_EQ(finishSpills(), 1);
 
     robj *second = addRawKey("second");
-    EXPECT_FALSE(extStorageSpillOverMaxmemory(server.maxmemory / 5 + 1));
+    EXPECT_FALSE(extStorageSpillOverMaxmemory(oomCapBytesOverMaxmemory() + 1));
     EXPECT_EQ(getStorageState(second), STORAGE_STATE_COPYING_TO_FLASH);
     ASSERT_EQ(finishSpills(), 1);
     server.maxmemory = 0;

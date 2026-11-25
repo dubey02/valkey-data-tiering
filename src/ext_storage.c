@@ -935,6 +935,7 @@ bool extStorageBlockClientIfRequired(client *c) {
  * false when writes must be rejected, which is only when used memory is over
  * EXT_STORAGE_OOM_PERCENT of maxmemory. Below that, writes go on even when no
  * key could be spilled.
+ * TODO(#163): evict a key in memory when no key can be spilled.
  * TODO(#151): make the cap a config.
  * TODO(#150): with lazyfree-lazy-server-del, a completed spill leaves the
  * account before a background thread frees its value, so the loop may spill a

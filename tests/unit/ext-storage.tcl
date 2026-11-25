@@ -620,12 +620,13 @@ if {$tiering_built} {
             mostly_on_flash
             r config set maxmemory-policy allkeys-lru ext-storage-spill-policy allkeys-lru
             set misses [getInfoProperty [r info ext_storage] ext_storage_total_num_spill_candidate_misses]
+            set keys [r dbsize]
             r config set maxmemory [expr {[s used_memory] * 100 / 110}]
             assert_equal OK [r set trigger v]
             assert_morethan [getInfoProperty [r info ext_storage] ext_storage_total_num_spill_candidate_misses] $misses
             r config set maxmemory 0
             assert_equal 0 [s evicted_keys]
-            assert_equal 401 [r dbsize]
+            assert_equal [expr {$keys + 1}] [r dbsize]
         }
 
         test "The throttle slows commands in proportion to used memory past maxmemory ($engine)" {
