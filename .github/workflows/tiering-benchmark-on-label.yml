@@ -455,12 +455,19 @@ jobs:
             done
           done
 
+      # Also runs after a timeout or a failure, to compare the runs that finished.
       - name: Compare results
+        if: always() && hashFiles('valkey-perf-benchmark/results/*/metrics.json') != ''
         working-directory: valkey-perf-benchmark
         run: |
+          if [[ ! -s "./results/$BASE_SHA/metrics.json" || ! -s "./results/$PR_SHA/metrics.json" ]]; then
+            echo "::warning::no results for one of the commits, nothing to compare"
+            exit 0
+          fi
           python ./utils/compare_benchmark_results.py \
             --baseline "./results/$BASE_SHA/metrics.json" \
             --new "./results/$PR_SHA/metrics.json" \
+            --metrics rps \
             --output ../results.md
           { echo "Ran on \`$INSTANCE_TYPE\` ($(nproc) cores): $CPU_LAYOUT"; echo; cat ../results.md; } > ../comparison.md
           cat ../comparison.md >> "$GITHUB_STEP_SUMMARY"
@@ -485,13 +492,14 @@ jobs:
       issues: write
     steps:
       - name: Download results
-        if: needs.benchmark.result == 'success'
+        if: needs.benchmark.result != 'skipped'
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tiering-benchmark-results
 
       - name: Comment results
-        if: needs.benchmark.result == 'success'
+        if: needs.benchmark.result != 'skipped' && hashFiles('comparison.md') != ''
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
@@ -513,7 +521,7 @@ jobs:
             });
 
       - name: Comment that the benchmark failed
-        if: needs.benchmark.result != 'success'
+        if: hashFiles('comparison.md') == ''
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           RESULTS: ${{ needs.prepare.result }} ${{ needs.config.result }} ${{ needs.start-runner.result }} ${{ needs.benchmark.result }}
