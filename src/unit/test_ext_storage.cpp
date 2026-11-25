@@ -3046,13 +3046,25 @@ TEST_F(SpillSubmitTest, AllowsWritesWhileSpillsAreInFlight) {
     server.maxmemory = 0;
 }
 
-/* Writes are rejected when no key can be spilled. */
-TEST_F(SpillSubmitTest, RejectsWritesWhenNothingCanBeSpilled) {
+/* Below the 120% line, writes go on when no key can be spilled and nothing is in flight. */
+TEST_F(SpillSubmitTest, AllowsWritesBelowTheCapWhenNothingCanBeSpilled) {
     server.maxmemory = 100000000;
     addKey("embedded", createStringObject("short", 5));
     unsigned long long misses = infoField("ext_storage_total_num_spill_candidate_misses");
-    EXPECT_FALSE(extStorageSpillOverMaxmemory(1));
+    unsigned long long over_limit = infoField("ext_storage_total_num_spill_rounds_over_oom_limit");
+    EXPECT_TRUE(extStorageSpillOverMaxmemory(1));
     EXPECT_EQ(infoField("ext_storage_total_num_spill_candidate_misses"), misses + 1);
+    EXPECT_EQ(infoField("ext_storage_total_num_spill_rounds_over_oom_limit"), over_limit);
+    server.maxmemory = 0;
+}
+
+/* Over the 120% line, writes are rejected when no key can be spilled. */
+TEST_F(SpillSubmitTest, RejectsWritesOverTheCapWhenNothingCanBeSpilled) {
+    server.maxmemory = 100000000;
+    addKey("embedded", createStringObject("short", 5));
+    unsigned long long over_limit = infoField("ext_storage_total_num_spill_rounds_over_oom_limit");
+    EXPECT_FALSE(extStorageSpillOverMaxmemory(server.maxmemory / 5 + 1));
+    EXPECT_EQ(infoField("ext_storage_total_num_spill_rounds_over_oom_limit"), over_limit + 1);
     server.maxmemory = 0;
 }
 
