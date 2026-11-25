@@ -92,6 +92,40 @@ proc wait_for_flash {args} {
     }
 }
 
+# Pauses the storage engine and submits spills until the queue refuses one, so
+# the next fetch has no slot. The pause stays on until the caller lifts it.
+proc fill_storage_queue {} {
+    r debug ext-storage pause-background 1
+    set batch 0
+    while {1} {
+        set keys {}
+        for {set i 0} {$i < 256} {incr i} {
+            set k "fill:$batch:$i"
+            r set $k [string repeat y 1000]
+            lappend keys $k
+        }
+        if {[catch {r debug ext-storage spill {*}$keys} err]} {
+            assert_match {*Spilling the key*failed*} $err
+            break
+        }
+        incr batch
+        assert {$batch < 100}
+    }
+}
+
+# Sends GET $key from a new deferring client and waits until its fetch is on the
+# deferred list. Returns the client.
+proc start_deferred_get {key} {
+    set rd [valkey_deferring_client]
+    $rd get $key
+    wait_for_condition 50 100 {
+        [getInfoProperty [r info ext_storage] ext_storage_num_fetches_deferred] >= 1
+    } else {
+        fail "the fetch was not deferred"
+    }
+    return $rd
+}
+
 # A valkey server built without data tiering refuses to start with it enabled.
 if {$tiering_built} {
   foreach engine {mock flashcache} {
@@ -153,6 +187,53 @@ if {$tiering_built} {
             assert_equal 0 [getInfoProperty [r info ext_storage] ext_storage_foreground_paused]
             assert_equal 0 [getInfoProperty [r info ext_storage] ext_storage_background_paused]
             verify_log_message 0 "*Lifting the DEBUG pause*to drain spills in flight*" 0
+        } {} {needs:debug}
+
+        test "A fetch that finds the queue full is deferred and the valkey server keeps serving ($engine)" {
+            r flushall
+            r set onflash [string repeat x 1000]
+            assert_equal OK [r debug ext-storage spill onflash]
+            wait_for_flash onflash
+            fill_storage_queue
+
+            # A fetch now has no slot. The client waits, the main thread does not.
+            set rd [start_deferred_get onflash]
+            assert_equal PONG [r ping]
+            assert_equal 1 [getInfoProperty [r info] blocked_clients]
+
+            # Once the storage engine runs again, the fetch goes in and the client gets its value.
+            r debug ext-storage pause-background 0
+            assert_equal [string repeat x 1000] [$rd read]
+            $rd close
+            wait_for_condition 50 100 {
+                [getInfoProperty [r info ext_storage] ext_storage_num_fetches_deferred] == 0
+            } else {
+                fail "the deferred fetch was not retried"
+            }
+            assert {[getInfoProperty [r info ext_storage] ext_storage_total_num_fetches_deferred] >= 1}
+        } {} {needs:debug}
+
+        test "FLUSHALL drops a deferred fetch and the client sees the key gone ($engine)" {
+            r flushall
+            r set onflash [string repeat x 1000]
+            assert_equal OK [r debug ext-storage spill onflash]
+            wait_for_flash onflash
+            fill_storage_queue
+            set rd [start_deferred_get onflash]
+            set fetched [getInfoProperty [r info ext_storage] ext_storage_total_num_items_fetched_from_storage]
+
+            # The flush lifts the pause and empties the keyspace. The deferred fetch
+            # finds its key gone, so it is dropped and the GET runs again on nothing.
+            assert_equal OK [r flushall]
+            assert_equal {} [$rd read]
+            $rd close
+            wait_for_condition 50 100 {
+                [getInfoProperty [r info ext_storage] ext_storage_num_fetches_deferred] == 0
+            } else {
+                fail "the deferred fetch was not dropped"
+            }
+            assert_equal $fetched [getInfoProperty [r info ext_storage] ext_storage_total_num_items_fetched_from_storage]
+            assert_equal 0 [getInfoProperty [r info] blocked_clients]
         } {} {needs:debug}
 
         test "DEBUG EXT-STORAGE SPILL submits several keys and stops at the first one that fails ($engine)" {
