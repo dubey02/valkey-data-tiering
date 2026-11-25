@@ -132,6 +132,10 @@ if {$tiering_built} {
     # The valkey server runs in its own directory, so the path is absolute.
     set path [file normalize [tmpdir ext-storage-$engine]]
     start_server [list tags {"ext-storage external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $path ext-storage-capacity 128mb save ""]] {
+        test "The throttle is on by default ($engine)" {
+            assert_equal yes [lindex [r config get ext-storage-throttle-enabled] 1]
+        }
+
         if {$engine eq "flashcache"} {
             test "INFO storage_engine reports every FlashCache metric" {
                 set info [r info storage_engine]
@@ -450,8 +454,9 @@ proc mostly_on_flash {} {
 if {$tiering_built} {
   foreach engine {mock flashcache} {
     # The valkey server runs in its own directory, so the paths are absolute.
+    # The throttle starts off here, since its tests change one percent at a time.
     set path [file normalize [tmpdir ext-storage-$engine]]
-    start_server [list tags {"ext-storage external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $path ext-storage-capacity 128mb save ""]] {
+    start_server [list tags {"ext-storage external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $path ext-storage-capacity 128mb ext-storage-throttle-enabled no save ""]] {
         test "Keys over maxmemory are spilled instead of evicted ($engine)" {
             r config set maxmemory-policy allkeys-lru
             set val [string repeat x 1000]
@@ -681,8 +686,8 @@ if {$tiering_built} {
                 # An LFU maxmemory-policy needs spilling to rank by LFU too.
                 set spill_policy [expr {$policy eq "allkeys-lfu" ? "allkeys-lfu" : "allkeys-lru"}]
                 r config set maxmemory-policy $policy ext-storage-spill-policy $spill_policy
-                # Nothing is left to spill, so the write is refused.
-                r config set maxmemory [expr {[s used_memory] - 20000}]
+                # Nothing is left to spill, and memory is 130% of maxmemory, so the write is refused.
+                r config set maxmemory [expr {[s used_memory] * 100 / 130}]
                 assert_error {OOM*} {r set trigger v}
                 r config set maxmemory 0
                 r config set maxmemory-policy allkeys-lru ext-storage-spill-policy allkeys-lru
@@ -690,6 +695,19 @@ if {$tiering_built} {
                 assert_equal 400 [r dbsize]
                 assert_equal [string repeat x 1000] [r get flash:0]
             }
+        }
+
+        test "Writes succeed below 120% of maxmemory while nothing is left to spill ($engine)" {
+            mostly_on_flash
+            r config set maxmemory-policy allkeys-lru ext-storage-spill-policy allkeys-lru
+            set misses [getInfoProperty [r info ext_storage] ext_storage_total_num_spill_candidate_misses]
+            set keys [r dbsize]
+            r config set maxmemory [expr {[s used_memory] * 100 / 110}]
+            assert_equal OK [r set trigger v]
+            assert_morethan [getInfoProperty [r info ext_storage] ext_storage_total_num_spill_candidate_misses] $misses
+            r config set maxmemory 0
+            assert_equal 0 [s evicted_keys]
+            assert_equal [expr {$keys + 1}] [r dbsize]
         }
 
         test "The throttle slows commands in proportion to used memory past maxmemory ($engine)" {
@@ -774,7 +792,7 @@ if {$tiering_built} {
                 r hset mem:$i f $val
                 r hexpire mem:$i 100000 FIELDS 1 f
             }
-            # A spill held in flight lets writes past the OOM check.
+            # Nothing else can be spilled, and this spill never completes, so memory stays put.
             r set inflight $val
             r debug ext-storage pause-background 1
             r debug ext-storage pause-foreground 1

@@ -52,6 +52,8 @@ typedef struct extStorageStats {
     uint64_t total_num_spills_refused;
     /* Spill rounds that found no key to spill. */
     uint64_t total_num_spill_candidate_misses;
+    /* Spill rounds that found used memory over EXT_STORAGE_OOM_PERCENT of maxmemory. */
+    uint64_t total_num_spill_rounds_over_oom_limit;
     /* Fetches that completed successfully. */
     uint64_t total_num_items_fetched;
     /* Deletes that completed successfully. */
@@ -564,6 +566,7 @@ sds extStorageInfoString(sds info) {
                         "ext_storage_total_bytes_spilled_to_storage:%llu\r\n"
                         "ext_storage_total_num_spills_refused:%llu\r\n"
                         "ext_storage_total_num_spill_candidate_misses:%llu\r\n"
+                        "ext_storage_total_num_spill_rounds_over_oom_limit:%llu\r\n"
                         "ext_storage_total_num_items_fetched_from_storage:%llu\r\n"
                         "ext_storage_total_num_items_deleted_from_storage:%llu\r\n"
                         "ext_storage_num_items_fetching_from_storage:%llu\r\n"
@@ -581,6 +584,7 @@ sds extStorageInfoString(sds info) {
                         (unsigned long long)st->total_bytes_spilled,
                         (unsigned long long)st->total_num_spills_refused,
                         (unsigned long long)st->total_num_spill_candidate_misses,
+                        (unsigned long long)st->total_num_spill_rounds_over_oom_limit,
                         (unsigned long long)st->total_num_items_fetched,
                         (unsigned long long)st->total_num_items_deleted,
                         (unsigned long long)st->num_items_fetching,
@@ -1029,9 +1033,10 @@ bool extStorageBlockClientIfRequired(client *c) {
  * what getMaxmemoryState() reports over maxmemory. Spills at most 64, or fewer
  * if no candidate is found or the storage engine refuses one. Every call spills
  * 64 until the first spill is sized, since the mean is 0 until then. Returns
- * false when writes must be rejected: used memory is over
- * EXT_STORAGE_OOM_PERCENT of maxmemory, or nothing could be spilled and no
- * spill is in flight.
+ * false when writes must be rejected, which is only when used memory is over
+ * EXT_STORAGE_OOM_PERCENT of maxmemory. Below that, writes go on even when no
+ * key could be spilled.
+ * TODO(#163): evict a key in memory when no key can be spilled.
  * TODO(#151): make the cap a config.
  * TODO(#150): with lazyfree-lazy-server-del, a completed spill leaves the
  * account before a background thread frees its value, so the loop may spill a
@@ -1049,8 +1054,11 @@ bool extStorageSpillOverMaxmemory(size_t mem_tofree) {
         if (extStorageSpillItem(dbid, entry) != STORAGE_OK) break;
     }
 
-    if (mem_tofree > server.maxmemory / 100 * (EXT_STORAGE_OOM_PERCENT - 100)) return false;
-    return ext_storage.stats.num_items_spilling > 0;
+    if (mem_tofree > server.maxmemory / 100 * (EXT_STORAGE_OOM_PERCENT - 100)) {
+        ext_storage.stats.total_num_spill_rounds_over_oom_limit++;
+        return false;
+    }
+    return true;
 }
 
 /* Waits for every spill in flight to finish. A DEBUG pause would make the wait
