@@ -402,6 +402,10 @@ OrderedIndexItem *orderedIndexPrev(OrderedIndexIterator *iter) {
     return (OrderedIndexItem *)fbtreePrev((fbtreeIterator *)iter);
 }
 
+OrderedIndexItem *orderedIndexPrevSized(OrderedIndexIterator *iter, size_t *leaf_bytes) {
+    return (OrderedIndexItem *)fbtreePrevSized((fbtreeIterator *)iter, leaf_bytes);
+}
+
 void orderedIndexSeekToIndex(OrderedIndexIterator *iter, unsigned long index) {
     fbtreeSeekToRank((fbtreeIterator *)iter, index);
 }
@@ -531,6 +535,10 @@ void orderedIndexDismissMemory(OrderedIndex *oi) {
 
 size_t orderedIndexEstimateStructureMemory(const OrderedIndex *oi) {
     return fbtreeEstimateStructureMemory((fbtreeIndex *)oi);
+}
+
+size_t orderedIndexAllocSizeWithoutLeaves(const OrderedIndex *oi) {
+    return fbtreeAllocSizeWithoutLeaves((const fbtreeIndex *)oi);
 }
 
 /* ==========================================================================

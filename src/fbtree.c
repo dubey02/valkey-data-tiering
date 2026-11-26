@@ -1277,7 +1277,9 @@ const_sds fbtreeNext(fbtreeIterator *iterator) {
     return NULL;
 }
 
-const_sds fbtreePrev(fbtreeIterator *iterator) {
+/* When leaf_bytes isn't NULL, each leaf's allocation size is added to it as the
+ * iterator enters that leaf. */
+static inline const_sds iterPrev(fbtreeIterator *iterator, size_t *leaf_bytes) {
     iter *it = iteratorFromOpaque(iterator);
     if (!it->fbt) return NULL;
     if (it->state == ITER_BEFORE_START) return NULL;
@@ -1288,6 +1290,7 @@ const_sds fbtreePrev(fbtreeIterator *iterator) {
         it->leaf_count = it->current_leaf ? it->current_leaf->header.num_items : 0;
         it->current_index = it->leaf_count;
         it->state = ITER_AT_POSITION;
+        if (leaf_bytes && it->current_leaf) *leaf_bytes += zmalloc_size(it->current_leaf);
     }
 
     while (it->current_leaf) {
@@ -1301,9 +1304,38 @@ const_sds fbtreePrev(fbtreeIterator *iterator) {
         it->current_leaf = it->current_leaf->prev;
         it->leaf_count = it->current_leaf ? it->current_leaf->header.num_items : 0;
         it->current_index = it->leaf_count;
+        if (leaf_bytes && it->current_leaf) *leaf_bytes += zmalloc_size(it->current_leaf);
     }
     it->state = ITER_BEFORE_START;
     return NULL;
+}
+
+const_sds fbtreePrev(fbtreeIterator *iterator) {
+    return iterPrev(iterator, NULL);
+}
+
+const_sds fbtreePrevSized(fbtreeIterator *iterator, size_t *leaf_bytes) {
+    return iterPrev(iterator, leaf_bytes);
+}
+
+/* Inner nodes 'levels' above the leaves, with any heap prefixes. Doesn't touch
+ * the leaves. */
+static size_t innerNodesAllocSize(const innerNode *inner, unsigned long levels) {
+    size_t size = zmalloc_size((void *)inner);
+    if (innerNodeHasLongPrefix((innerNode *)inner)) size += zmalloc_size((void *)innerNodeGetPrefix((innerNode *)inner));
+    if (levels > 1) {
+        for (int i = 0; i < inner->header.num_items; i++) {
+            size += innerNodesAllocSize((const innerNode *)inner->children[i], levels - 1);
+        }
+    }
+    return size;
+}
+
+size_t fbtreeAllocSizeWithoutLeaves(const fbtreeIndex *fbt) {
+    size_t size = zmalloc_size((void *)fbt);
+    unsigned long height = fbtreeHeight(fbt);
+    if (height > 1) size += innerNodesAllocSize((const innerNode *)fbt->root, height - 1);
+    return size;
 }
 
 void fbtreeSeekToRank(fbtreeIterator *iterator, unsigned long rank) {
