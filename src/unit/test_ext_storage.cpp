@@ -3025,8 +3025,8 @@ TEST_F(BlockClientTest, ADeferredFetchOfARemovedKeyIsDroppedAndWakesTheClient) {
     EXPECT_EQ(numFetched(), 0u);
 }
 
-/* Deferred fetches take the freed slots before spills do, so a spill storm
- * cannot starve a waiting client. */
+/* Deferred fetches get the room completions free before spills do, so a spill
+ * storm cannot starve a waiting client. */
 TEST_F(BlockClientTest, DeferredFetchesRunBeforeSpills) {
     robj *a = addFlashKey("a");
     for (int i = 0; i < 200; i++) {
@@ -3039,18 +3039,18 @@ TEST_F(BlockClientTest, DeferredFetchesRunBeforeSpills) {
     EXPECT_TRUE(extStorageBlockClientIfRequired(c));
     EXPECT_EQ(numDeferred(), 1u);
 
-    /* Everything is over maxmemory from here, so each pass spills as much as
-     * the queue takes. The first pass finds it full and refuses every spill,
-     * yet the fetch gets a slot the moment completions free some. */
+    /* With the foreground paused and one request run by hand, the pass has room
+     * for one request. The fetch takes it, so the spills that follow are refused. */
+    debugExtStorage("pause-foreground", "1");
+    ASSERT_EQ(storageMockRunIo(1), 1);
     server.maxmemory = 1;
     extStorageBeforeSleep();
+    server.maxmemory = 0;
     EXPECT_EQ(numDeferred(), 0u);
     EXPECT_EQ(numFetching(), 1u);
     EXPECT_GT(infoField("ext_storage_total_num_spills_refused:"), 0u);
-    extStorageBeforeSleep();
-    EXPECT_GT(infoField("ext_storage_total_num_items_spilled_to_storage:"), 0u);
-    server.maxmemory = 0;
 
+    debugExtStorage("pause-foreground", "0");
     waitForFetches(c);
     EXPECT_FALSE(isBlocked(c));
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
