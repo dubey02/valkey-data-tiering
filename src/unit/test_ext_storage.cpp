@@ -1074,6 +1074,7 @@ class SpillSelectTest : public ::testing::Test {
 
     void SetUp() override {
         memset(&server, 0, sizeof(valkeyServer));
+        server.el = aeCreateEventLoop(1024); /* Never run, so its timers don't fire. */
         server.dbnum = 1;
         server.maxmemory_samples = 5;
         server.maxmemory_policy = MAXMEMORY_ALLKEYS_LRU;
@@ -1091,6 +1092,8 @@ class SpillSelectTest : public ::testing::Test {
         kvstoreRelease(server.db[0]->keys);
         zfree(server.db[0]);
         zfree(server.db);
+        aeDeleteEventLoop(server.el);
+        server.el = NULL;
     }
 
     void drainPool(void) {
@@ -2147,6 +2150,21 @@ TEST_F(SpillSubmitTest, ASpilledValueIsFreedAndOnlyTheKeyStays) {
     EXPECT_FALSE(isSelected(entry));
 }
 
+/* One beforeSleep handles more finished spills than one poll returns. */
+TEST_F(SpillSubmitTest, OneBeforeSleepHandlesEveryFinishedSpill) {
+    std::vector<robj *> entries;
+    for (int i = 0; i < 100; i++) {
+        std::string key = "key" + std::to_string(i);
+        entries.push_back(addRawKey(key.c_str()));
+        ASSERT_EQ(extStorageSpillItem(0, entries.back()), STORAGE_OK);
+    }
+
+    ASSERT_EQ(finishSpills(), 100);
+
+    EXPECT_EQ(infoField("ext_storage_num_items_spilling_to_storage"), 0u);
+    for (robj *entry : entries) EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
+}
+
 /* The spill's reference keeps a key deleted while it is being spilled alive
  * until the completion. */
 TEST_F(SpillSubmitTest, AKeyDeletedWhileSpillingIsFreedOnCompletion) {
@@ -3007,8 +3025,8 @@ TEST_F(BlockClientTest, ADeferredFetchOfARemovedKeyIsDroppedAndWakesTheClient) {
     EXPECT_EQ(numFetched(), 0u);
 }
 
-/* Deferred fetches take the freed slots before spills do, so a spill storm
- * cannot starve a waiting client. */
+/* Deferred fetches get the room completions free before spills do, so a spill
+ * storm cannot starve a waiting client. */
 TEST_F(BlockClientTest, DeferredFetchesRunBeforeSpills) {
     robj *a = addFlashKey("a");
     for (int i = 0; i < 200; i++) {
@@ -3021,18 +3039,18 @@ TEST_F(BlockClientTest, DeferredFetchesRunBeforeSpills) {
     EXPECT_TRUE(extStorageBlockClientIfRequired(c));
     EXPECT_EQ(numDeferred(), 1u);
 
-    /* Everything is over maxmemory from here, so each pass spills as much as
-     * the queue takes. The first pass finds it full and refuses every spill,
-     * yet the fetch gets a slot the moment completions free some. */
+    /* With the foreground paused and one request run by hand, the pass has room
+     * for one request. The fetch takes it, so the spills that follow are refused. */
+    debugExtStorage("pause-foreground", "1");
+    ASSERT_EQ(storageMockRunIo(1), 1);
     server.maxmemory = 1;
     extStorageBeforeSleep();
+    server.maxmemory = 0;
     EXPECT_EQ(numDeferred(), 0u);
     EXPECT_EQ(numFetching(), 1u);
     EXPECT_GT(infoField("ext_storage_total_num_spills_refused:"), 0u);
-    extStorageBeforeSleep();
-    EXPECT_GT(infoField("ext_storage_total_num_items_spilled_to_storage:"), 0u);
-    server.maxmemory = 0;
 
+    debugExtStorage("pause-foreground", "0");
     waitForFetches(c);
     EXPECT_FALSE(isBlocked(c));
     EXPECT_EQ(getStorageState(a), STORAGE_STATE_ONLY_MEMORY);
@@ -3374,8 +3392,7 @@ TEST_F(SpillSubmitTest, SpillsNothingUnlessTheEngineIsOpen) {
 }
 
 /* beforeSleep() spills without a command. The replica case is in ext-storage.tcl.
- * The mock storage engine runs the spill when completions are polled, so it
- * completes within the same extStorageBeforeSleep(). */
+ * beforeSleep() polls before it spills, so the spill completes in the next one. */
 TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
     robj *entry = addRawKey("key");
     extStorageBeforeSleep();
@@ -3384,6 +3401,8 @@ TEST_F(SpillSubmitTest, BeforeSleepSpillsOverMaxmemory) {
     server.maxmemory = zmalloc_used_memory() - 1;
     extStorageBeforeSleep();
     server.maxmemory = 0;
+    EXPECT_EQ(getStorageState(entry), STORAGE_STATE_COPYING_TO_FLASH);
+    extStorageBeforeSleep();
     EXPECT_EQ(getStorageState(entry), STORAGE_STATE_ONLY_FLASH);
 }
 
