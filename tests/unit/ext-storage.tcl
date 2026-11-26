@@ -275,19 +275,21 @@ if {$tiering_built} {
         # The mock storage engine finishes requests when they are polled, so only
         # FlashCache can leave a completion waiting while the event loop sleeps.
         if {$engine eq "flashcache"} {
-            test "Fetches on an idle server don't wait for serverCron, and the keep-awake timer stops" {
+            test "Spills and fetches on an idle server don't wait for serverCron, and the keep-awake timer stops" {
                 r flushall
                 set keys {}
                 for {set i 0} {$i < 5} {incr i} {
                     r set key:$i [string repeat x 1000]
                     lappend keys key:$i
                 }
-                assert_equal OK [r debug ext-storage spill {*}$keys]
-                wait_for_flash {*}$keys
-                # At hz 1, a fetch that waits for serverCron takes about half a second.
+                # At hz 1, a request that waits for serverCron takes about half a second.
                 set hz [lindex [r config get hz] 1]
                 r config set hz 1
                 set wakeups [getInfoProperty [r info ext_storage] ext_storage_total_num_keep_awake_wakeups]
+                assert_equal OK [r debug ext-storage spill {*}$keys]
+                # Read once, since each command wakes the event loop and collects what finished.
+                after 100
+                set spilling [getInfoProperty [r info ext_storage] ext_storage_num_items_spilling_to_storage]
                 set start [clock milliseconds]
                 foreach key $keys {
                     assert_equal [string repeat x 1000] [r get $key]
@@ -298,6 +300,7 @@ if {$tiering_built} {
                 after 500
                 set idle_cycles [expr {[s eventloop_cycles] - $cycles}]
                 r config set hz $hz
+                assert_equal 0 $spilling
                 assert_lessthan $elapsed 500
                 assert_morethan [getInfoProperty [r info ext_storage] ext_storage_total_num_keep_awake_wakeups] $wakeups
                 assert_lessthan $idle_cycles 50
