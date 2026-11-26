@@ -126,6 +126,275 @@ proc start_deferred_get {key} {
     return $rd
 }
 
+# The value of the INFO ext_storage field ext_storage_<name>.
+proc ext_storage_info {name} {
+    return [getInfoProperty [r info ext_storage] ext_storage_$name]
+}
+
+proc fetched_keys {} {
+    return [ext_storage_info total_num_items_fetched_from_storage]
+}
+
+# Prints the storage state and the end of the log of valkey server 'level',
+# then fails.
+proc fail_with_state {msg {level 0}} {
+    puts [r $level info ext_storage]
+    puts [exec tail -n 20 < [srv $level stdout]]
+    fail $msg
+}
+
+proc spill_and_wait {args} {
+    assert_equal OK [r debug ext-storage spill {*}$args]
+    wait_for_flash {*}$args
+}
+
+proc wait_for_blocked {count} {
+    wait_for_condition 50 100 {
+        [getInfoProperty [r info clients] blocked_clients] == $count
+    } else {
+        fail_with_state "$count clients weren't blocked"
+    }
+}
+
+# Creates one spillable key of each type and encoding in the selected database,
+# and returns a dict of each key and its encoding. No key has a TTL, and every
+# string is too long to be embedded, so each one can be spilled.
+proc build_every_type {} {
+    set bytes {}
+    for {set i 0} {$i < 256} {incr i} {
+        lappend bytes $i
+    }
+    r set string:binary [string repeat [binary format c* $bytes] 4]
+    r set string:large [string repeat l [expr {1024 * 1024 + 1}]]
+    r rpush list:listpack a b c
+    # Over list-max-listpack-size.
+    r rpush list:quicklist [string repeat q 10000] b
+    r sadd set:intset 1 2 3
+    r sadd set:listpack a b c
+    # Over set-max-listpack-entries.
+    set members {}
+    for {set i 0} {$i < 200} {incr i} {
+        lappend members m$i
+    }
+    r sadd set:hashtable {*}$members
+    # Members with the same score are ordered by name.
+    r zadd zset:listpack 1 a 1 b 2 c
+    # Over zset-max-listpack-value.
+    r zadd zset:btree 1 [string repeat z 100] 1 b 2 c
+    r hset hash:listpack f1 v1 f2 v2
+    # Over hash-max-listpack-value.
+    r hset hash:hashtable f1 [string repeat h 100] f2 v2
+    # Two consumer groups, one with a pending entry.
+    r xadd stream 1-0 f v1
+    r xadd stream 2-0 f v2
+    r xgroup create stream g1 0
+    r xgroup create stream g2 $
+    r xreadgroup group g1 c1 count 1 streams stream >
+    set encodings {
+        string:binary raw string:large raw
+        list:listpack listpack list:quicklist quicklist
+        set:intset intset set:listpack listpack set:hashtable hashtable
+        zset:listpack listpack zset:btree btree
+        hash:listpack listpack hash:hashtable hashtable
+        stream stream
+    }
+    dict for {key encoding} $encodings {
+        assert_encoding $encoding $key
+    }
+    return $encodings
+}
+
+# For each key build_every_type creates, a read and a write. KEY stands for the
+# key.
+set reads_and_writes {
+    string:binary   {getrange KEY 0 300}            {append KEY y}
+    string:large    {strlen KEY}                    {setrange KEY 0 y}
+    list:listpack   {lindex KEY 1}                  {lpush KEY new}
+    list:quicklist  {lrange KEY 0 -1}               {rpop KEY}
+    set:intset      {sismember KEY 2}               {sadd KEY 4}
+    set:listpack    {smembers KEY}                  {srem KEY a}
+    set:hashtable   {scard KEY}                     {sadd KEY new}
+    zset:listpack   {zrange KEY 0 -1 withscores}    {zadd KEY 3 d}
+    zset:btree      {zscore KEY b}                  {zincrby KEY 5 b}
+    hash:listpack   {hgetall KEY}                   {hset KEY f3 v3}
+    hash:hashtable  {hget KEY f1}                   {hdel KEY f2}
+    stream          {xinfo stream KEY full}         {xadd KEY 3-0 f v3}
+}
+
+# Spill and fetch of every type, and clients waiting on a fetch.
+if {$tiering_built} {
+  foreach engine {mock flashcache} {
+    # The valkey server runs in its own directory, so the path is absolute.
+    set path [file normalize [tmpdir ext-storage-fetch-$engine]]
+    start_server [list tags {"ext-storage external:skip"} overrides [list ext-storage-enabled yes ext-storage-engine $engine ext-storage-path $path ext-storage-capacity 128mb save ""]] {
+        test "Every type and encoding comes back from flash unchanged ($engine)" {
+            r flushall
+            set encodings [build_every_type]
+            set keys [dict keys $encodings]
+            set digests [r debug digest-value {*}$keys]
+            # The stream digest leaves out consumer groups.
+            set stream_info [r xinfo stream stream full]
+            # Each later round spills values that were fetched in the round before.
+            for {set round 0} {$round < 3} {incr round} {
+                set spilled [ext_storage_info total_num_items_spilled_to_storage]
+                set fetched [fetched_keys]
+                spill_and_wait {*}$keys
+                assert_equal [expr {$spilled + [llength $keys]}] [ext_storage_info total_num_items_spilled_to_storage]
+                # OBJECT ENCODING names the key, so it fetches the value.
+                dict for {key encoding} $encodings {
+                    assert_equal $encoding [r object encoding $key]
+                    assert_match {* storage_state:0 *} [r debug object $key fast]
+                }
+                assert_equal [expr {$fetched + [llength $keys]}] [fetched_keys]
+                assert_equal $digests [r debug digest-value {*}$keys]
+                assert_equal $stream_info [r xinfo stream stream full]
+            }
+        } {} {needs:debug}
+
+        test "Keys with the same name in two databases come back with their own values ($engine)" {
+            r flushall
+            set val9 [string repeat a 1000]
+            set val10 [string repeat b 1000]
+            r set k $val9
+            r select 10
+            r set k $val10
+            spill_and_wait k
+            r select 9
+            spill_and_wait k
+            set fetched [fetched_keys]
+            assert_equal $val9 [r get k]
+            r select 10
+            assert_equal $val10 [r get k]
+            assert_equal [expr {$fetched + 2}] [fetched_keys]
+
+            # A spill in one database leaves the key in the other in memory.
+            spill_and_wait k
+            r select 9
+            assert_match {* storage_state:0 *} [r debug object k fast]
+            assert_equal $val9 [r get k]
+            r select 10
+            set got10 [r get k]
+            r select 9
+            assert_equal $val10 $got10
+        } {} {needs:debug}
+
+        test "Reading a key on flash gives the same reply as reading it in memory ($engine)" {
+            r flushall
+            build_every_type
+            foreach {key read write} $reads_and_writes {
+                r copy $key mem:$key
+                spill_and_wait $key
+                set fetched [fetched_keys]
+                set flash_reply [r {*}[string map [list KEY $key] $read]]
+                set mem_reply [r {*}[string map [list KEY mem:$key] $read]]
+                # Sets and hashes are unordered.
+                if {[string match {set:*} $key] || [string match {hash:*} $key]} {
+                    set flash_reply [lsort $flash_reply]
+                    set mem_reply [lsort $mem_reply]
+                }
+                assert_equal $mem_reply $flash_reply
+                assert_equal [expr {$fetched + 1}] [fetched_keys]
+                assert_match {* storage_state:0 *} [r debug object $key fast]
+            }
+
+            # One command that names a key in memory and a key on flash waits
+            # for the fetch and replies with both values.
+            set val [string repeat x 1000]
+            r set mem v
+            r set flash $val
+            spill_and_wait flash
+            set fetched [fetched_keys]
+            assert_equal [list v $val] [r mget mem flash]
+            assert_equal [expr {$fetched + 1}] [fetched_keys]
+            assert_match {* storage_state:0 *} [r debug object flash fast]
+
+            # DEL also waits for the fetch before it deletes the key.
+            spill_and_wait flash
+            assert_equal 1 [r del flash]
+            assert_equal 0 [r exists flash]
+        } {} {needs:debug}
+
+        test "Writing a key on flash gives the same result as writing it in memory ($engine)" {
+            r flushall
+            build_every_type
+            foreach {key read write} $reads_and_writes {
+                r copy $key mem:$key
+                spill_and_wait $key
+                set fetched [fetched_keys]
+                set mem_reply [r {*}[string map [list KEY mem:$key] $write]]
+                assert_equal $mem_reply [r {*}[string map [list KEY $key] $write]]
+                assert_equal [expr {$fetched + 1}] [fetched_keys]
+                assert_equal [r debug digest-value mem:$key] [r debug digest-value $key]
+                # The changed value spills and comes back too. TYPE names the
+                # key, so it fetches the value.
+                spill_and_wait $key
+                assert_equal [r type mem:$key] [r type $key]
+                assert_equal [r debug digest-value mem:$key] [r debug digest-value $key]
+            }
+        } {} {needs:debug}
+
+        test "Two clients waiting on one key on flash share its fetch and run in order ($engine)" {
+            r flushall
+            set val [string repeat x 1000]
+            r set k $val
+            spill_and_wait k
+            set fetched [fetched_keys]
+            # Completions aren't handled while the foreground is paused, so both
+            # clients stay blocked on the fetch.
+            r debug ext-storage pause-foreground 1
+            set reader [valkey_deferring_client]
+            set writer [valkey_deferring_client]
+            $reader get k
+            wait_for_blocked 1
+            $writer append k y
+            wait_for_blocked 2
+            assert_match {* storage_state:3 *} [r debug object k fast]
+            assert_equal 1 [ext_storage_info num_items_fetching_from_storage]
+            r debug ext-storage pause-foreground 0
+            assert_equal $val [$reader read]
+            assert_equal 1001 [$writer read]
+            $reader close
+            $writer close
+            assert_equal ${val}y [r get k]
+            assert_equal [expr {$fetched + 1}] [fetched_keys]
+        } {} {needs:debug}
+
+        # Clients wait on a key by name in every database, so a fetch in one
+        # database can wake a client waiting on the other, which then waits
+        # again. Lifting the pause hands over both completions at once, so this
+        # checks the replies but may not reach that case.
+        test "Clients waiting on keys with the same name in two databases get their own values ($engine)" {
+            r flushall
+            set val9 [string repeat a 1000]
+            set val10 [string repeat b 1000]
+            r set k $val9
+            spill_and_wait k
+            r select 10
+            r set k $val10
+            spill_and_wait k
+            r select 9
+            set fetched [fetched_keys]
+            r debug ext-storage pause-foreground 1
+            set rd9 [valkey_deferring_client]
+            set rd10 [valkey_deferring_client]
+            $rd10 select 10
+            assert_equal OK [$rd10 read]
+            $rd9 get k
+            $rd10 get k
+            wait_for_blocked 2
+            assert_equal 2 [ext_storage_info num_items_fetching_from_storage]
+            r debug ext-storage pause-foreground 0
+            assert_equal $val9 [$rd9 read]
+            assert_equal $val10 [$rd10 read]
+            $rd9 close
+            $rd10 close
+            assert_equal [expr {$fetched + 2}] [fetched_keys]
+        } {} {needs:debug}
+    }
+    file delete -force $path
+  }
+}
+
 # A valkey server built without data tiering refuses to start with it enabled.
 if {$tiering_built} {
   foreach engine {mock flashcache} {
@@ -352,32 +621,6 @@ if {$tiering_built} {
             assert_no_match {*ql_nodes*} $info
         } {} {needs:debug}
 
-        test "A command on a key on flash fetches it back into memory ($engine)" {
-            r flushall
-            set val [string repeat x 1000]
-            r set big $val
-            r set mem v
-
-            assert_equal OK [r debug ext-storage spill big]
-            wait_for_flash big
-            assert_equal $val [r get big]
-            assert_match {* storage_state:0 *} [r debug object big fast]
-
-            assert_equal OK [r debug ext-storage spill big]
-            wait_for_flash big
-            assert_equal 1001 [r append big y]
-            assert_equal ${val}y [r get big]
-
-            assert_equal OK [r debug ext-storage spill big]
-            wait_for_flash big
-            assert_equal [list v ${val}y] [r mget mem big]
-
-            assert_equal OK [r debug ext-storage spill big]
-            wait_for_flash big
-            assert_equal 1 [r del big]
-            assert_equal 0 [r exists big]
-        } {} {needs:debug}
-
         # Active defrag needs the jemalloc the source distribution ships, as in memefficiency.tcl.
         if {[string match {*jemalloc*} [s mem_allocator]] && [r debug mallctl arenas.page] <= 8192} {
             test "Active defrag skips keys on flash ($engine)" {
@@ -430,14 +673,6 @@ proc spilled_keys {{level 0}} {
 proc counted_memory {{level 0}} {
     set info [r $level info memory]
     return [expr {[getInfoProperty $info used_memory] - [getInfoProperty $info mem_not_counted_for_evict]}]
-}
-
-# Prints the storage state and the end of the log of valkey server 'level',
-# then fails.
-proc fail_with_state {msg {level 0}} {
-    puts [r $level info ext_storage]
-    puts [exec tail -n 20 < [srv $level stdout]]
-    fail $msg
 }
 
 # Waits until no spill is in flight on valkey server 'level'.
